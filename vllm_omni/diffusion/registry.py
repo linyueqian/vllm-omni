@@ -29,6 +29,16 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2",
         "Wan22Pipeline",
     ),
+    "WanImageToVideoPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_i2v",
+        "Wan22I2VPipeline",
+    ),
+    "WanTI2VPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_ti2v",
+        "Wan22TI2VPipeline",
+    ),
 }
 
 
@@ -67,6 +77,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "ZImagePipeline": "get_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
+    "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
+    "WanTI2VPipeline": "get_wan22_ti2v_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -74,6 +86,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
+    "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
+    "WanTI2VPipeline": "get_wan22_ti2v_pre_process_func",
 }
 
 
