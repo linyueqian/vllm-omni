@@ -23,8 +23,30 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     load_transformer_config,
     retrieve_latents,
 )
-from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+
+def _load_model_index(model: str, local_files_only: bool) -> dict:
+    """Load model_index.json from local path or HF Hub."""
+    if local_files_only:
+        model_index_path = os.path.join(model, "model_index.json")
+        if os.path.exists(model_index_path):
+            import json
+
+            with open(model_index_path) as f:
+                return json.load(f)
+    else:
+        try:
+            import json
+
+            from huggingface_hub import hf_hub_download
+
+            model_index_path = hf_hub_download(model, "model_index.json")
+            with open(model_index_path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
 
 
 def get_wan22_i2v_post_process_func(
@@ -124,9 +146,11 @@ class Wan22I2VPipeline(nn.Module):
             ),
         ]
 
+        # Load model_index.json to detect available components
+        model_index = _load_model_index(model, local_files_only)
+
         # Check if this is a two-stage model (MoE with transformer_2)
-        transformer_2_path = os.path.join(model, "transformer_2") if local_files_only else None
-        self.has_transformer_2 = transformer_2_path is not None and os.path.exists(transformer_2_path)
+        self.has_transformer_2 = "transformer_2" in model_index
 
         if self.has_transformer_2:
             self.weights_sources.append(
@@ -146,8 +170,7 @@ class Wan22I2VPipeline(nn.Module):
         ).to(self.device)
 
         # Image encoder (CLIP) - optional, for Wan2.1-style I2V
-        image_encoder_path = os.path.join(model, "image_encoder") if local_files_only else None
-        self.has_image_encoder = image_encoder_path is not None and os.path.exists(image_encoder_path)
+        self.has_image_encoder = "image_encoder" in model_index
 
         if self.has_image_encoder:
             self.image_processor = CLIPImageProcessor.from_pretrained(
@@ -166,19 +189,14 @@ class Wan22I2VPipeline(nn.Module):
         ).to(self.device)
 
         # Transformers (weights loaded via load_weights)
-        # Load config from model directory to get correct in_channels for I2V models
-        if local_files_only:
-            transformer_config = load_transformer_config(model, "transformer")
-            self.transformer = create_transformer_from_config(transformer_config)
-            if self.has_transformer_2:
-                transformer_2_config = load_transformer_config(model, "transformer_2")
-                self.transformer_2 = create_transformer_from_config(transformer_2_config)
-            else:
-                self.transformer_2 = None
+        # Load config from model directory or HF Hub to get correct in_channels for I2V models
+        transformer_config = load_transformer_config(model, "transformer", local_files_only)
+        self.transformer = create_transformer_from_config(transformer_config)
+        if self.has_transformer_2:
+            transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
+            self.transformer_2 = create_transformer_from_config(transformer_2_config)
         else:
-            # For remote models, use defaults (may need adjustment for HF hub loading)
-            self.transformer = WanTransformer3DModel()
-            self.transformer_2 = WanTransformer3DModel() if self.has_transformer_2 else None
+            self.transformer_2 = None
 
         # Scheduler
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(

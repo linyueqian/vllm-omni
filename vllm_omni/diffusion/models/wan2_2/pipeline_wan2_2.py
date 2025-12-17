@@ -38,12 +38,26 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-def load_transformer_config(model_path: str, subfolder: str = "transformer") -> dict:
-    """Load transformer config from model directory."""
-    config_path = os.path.join(model_path, subfolder, "config.json")
-    if os.path.exists(config_path):
-        with open(config_path) as f:
-            return json.load(f)
+def load_transformer_config(model_path: str, subfolder: str = "transformer", local_files_only: bool = True) -> dict:
+    """Load transformer config from model directory or HF Hub."""
+    if local_files_only:
+        config_path = os.path.join(model_path, subfolder, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                return json.load(f)
+    else:
+        # Try to download config from HF Hub
+        try:
+            from huggingface_hub import hf_hub_download
+
+            config_path = hf_hub_download(
+                repo_id=model_path,
+                filename=f"{subfolder}/config.json",
+            )
+            with open(config_path) as f:
+                return json.load(f)
+        except Exception:
+            pass
     return {}
 
 
