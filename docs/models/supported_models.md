@@ -22,7 +22,9 @@ th {
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` |
 | `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` |
 |`ZImagePipeline` | Z-Image | `Tongyi-MAI/Z-Image-Turbo` |
-| `WanPipeline` | Wan2.2 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
+| `Wan22Pipeline` | Wan2.2-T2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
+| `Wan22I2VPipeline` | Wan2.2-I2V | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` |
+| `Wan22TI2VPipeline` | Wan2.2-TI2V | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` |
 
 
 ## List of Supported Models for NPU
