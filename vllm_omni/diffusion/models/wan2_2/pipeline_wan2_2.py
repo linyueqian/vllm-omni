@@ -117,6 +117,52 @@ def get_wan22_post_process_func(
     return post_process_func
 
 
+def get_wan22_pre_process_func(
+    od_config: OmniDiffusionConfig,
+):
+    """Pre-process function for Wan2.2: optionally load and resize input image for I2V mode."""
+    import numpy as np
+    from diffusers.video_processor import VideoProcessor
+
+    video_processor = VideoProcessor(vae_scale_factor=8)
+
+    def pre_process_func(requests: list[OmniDiffusionRequest]) -> list[OmniDiffusionRequest]:
+        for req in requests:
+            # Load image if path is provided
+            if req.image_path is not None and req.pil_image is None:
+                req.pil_image = PIL.Image.open(req.image_path).convert("RGB")
+
+            if req.pil_image is not None:
+                image = req.pil_image
+
+                # Calculate dimensions based on aspect ratio if not provided
+                if req.height is None or req.width is None:
+                    # Default max area for 720P
+                    max_area = 720 * 1280
+                    aspect_ratio = image.height / image.width
+
+                    # Calculate dimensions maintaining aspect ratio
+                    mod_value = 16  # Must be divisible by 16
+                    height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+                    width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+
+                    if req.height is None:
+                        req.height = height
+                    if req.width is None:
+                        req.width = width
+
+                # Resize image to target dimensions
+                image = image.resize((req.width, req.height), PIL.Image.Resampling.LANCZOS)
+                req.pil_image = image
+
+                # Preprocess for VAE
+                req.preprocessed_image = video_processor.preprocess(image, height=req.height, width=req.width)
+
+        return requests
+
+    return pre_process_func
+
+
 class Wan22Pipeline(nn.Module):
     def __init__(
         self,

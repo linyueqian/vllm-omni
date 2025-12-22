@@ -21,10 +21,13 @@ th {
 | `Qwen2_5OmniForConditionalGeneration` | Qwen2.5-Omni | `Qwen/Qwen2.5-Omni-7B`, `Qwen/Qwen2.5-Omni-3B` |
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` |
 | `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` |
+| `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2509 | `Qwen/Qwen-Image-Edit-2509` |
+| `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` |
 |`ZImagePipeline` | Z-Image | `Tongyi-MAI/Z-Image-Turbo` |
-| `Wan22Pipeline` | Wan2.2-T2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
-| `Wan22I2VPipeline` | Wan2.2-I2V | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` |
-| `Wan22TI2VPipeline` | Wan2.2-TI2V | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` |
+| `WanPipeline` | Wan2.2-T2V, Wan2.2-TI2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-TI2V-5B-Diffusers` |
+| `WanImageToVideoPipeline` | Wan2.2-I2V | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` |
+| `OvisImagePipeline` | Ovis-Image | `OvisAI/Ovis-Image` |
+|`LongcatImagePipeline` | LongCat-Image | `meituan-longcat/LongCat-Image` |
 
 
 ## List of Supported Models for NPU
