@@ -170,11 +170,11 @@ class Wan22I2VPipeline(nn.Module):
         ).to(self.device)
 
         # Image encoder (CLIP) - optional, for Wan2.1-style I2V
-        self.has_image_encoder = "image_encoder" in model_index
+        self.has_image_encoder = "image_encoder" in model_index and model_index["image_encoder"][0] is not None
 
         if self.has_image_encoder:
             self.image_processor = CLIPImageProcessor.from_pretrained(
-                model, subfolder="image_encoder", local_files_only=local_files_only
+                model, subfolder="image_processor", local_files_only=local_files_only
             )
             self.image_encoder = CLIPVisionModel.from_pretrained(
                 model, subfolder="image_encoder", torch_dtype=dtype, local_files_only=local_files_only
