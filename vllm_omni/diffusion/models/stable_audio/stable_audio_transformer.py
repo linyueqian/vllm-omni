@@ -7,7 +7,6 @@ Stable Audio DiT Model for vLLM-Omni.
 
 import math
 from collections.abc import Iterable
-from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -124,8 +123,8 @@ class StableAudioSelfAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -214,8 +213,8 @@ class StableAudioCrossAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         encoder_seq_len = encoder_hidden_states.shape[1]
@@ -328,9 +327,9 @@ class StableAudioDiTBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        rotary_embedding: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
+        rotary_embedding: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Self-attention with skip connection
         residual = hidden_states
@@ -378,7 +377,7 @@ class StableAudioDiTModel(nn.Module):
 
     def __init__(
         self,
-        od_config: Optional[OmniDiffusionConfig] = None,
+        od_config: OmniDiffusionConfig | None = None,
         sample_size: int = 1024,
         in_channels: int = 64,
         num_layers: int = 24,
@@ -486,12 +485,12 @@ class StableAudioDiTModel(nn.Module):
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        global_hidden_states: Optional[torch.Tensor] = None,
-        rotary_embedding: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        global_hidden_states: torch.Tensor | None = None,
+        rotary_embedding: tuple[torch.Tensor, torch.Tensor] | None = None,
         return_dict: bool = True,
-        attention_mask: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Transformer2DModelOutput]:
+        attention_mask: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor | Transformer2DModelOutput:
         """
         Forward pass of the Stable Audio DiT model.
 
