@@ -20,7 +20,7 @@ from diffusers.pipelines.stable_audio.modeling_stable_audio import StableAudioPr
 from diffusers.schedulers import CosineDPMSolverMultistepScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import T5EncoderModel, T5Tokenizer
+from transformers import T5EncoderModel, T5TokenizerFast
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -96,7 +96,7 @@ class StableAudioPipeline(nn.Module):
         ]
 
         # Load tokenizer
-        self.tokenizer = T5Tokenizer.from_pretrained(
+        self.tokenizer = T5TokenizerFast.from_pretrained(
             model,
             subfolder="tokenizer",
             local_files_only=local_files_only,
