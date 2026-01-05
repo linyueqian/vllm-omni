@@ -15,7 +15,8 @@ from vllm_omni import Omni
 
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
-models = ["stabilityai/stable-audio-open-1.0"]
+# Use random weights model for CI testing (small, no authentication required)
+models = ["linyueqian/stable_audio_random"]
 
 
 @pytest.mark.parametrize("model_name", models)
