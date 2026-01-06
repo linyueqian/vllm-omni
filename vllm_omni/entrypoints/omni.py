@@ -6,7 +6,7 @@ import os
 import time
 import uuid
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pprint import pformat
@@ -30,6 +30,7 @@ from vllm_omni.distributed.ray_utils.utils import (
 )
 from vllm_omni.entrypoints.log_utils import OrchestratorMetrics
 from vllm_omni.entrypoints.omni_stage import OmniStage
+from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
@@ -47,7 +48,7 @@ def _weak_close_cleanup(stage_list, stage_in_queues, ray_pg):
     if stage_list:
         for q in stage_in_queues:
             try:
-                q.put_nowait(None)
+                q.put_nowait(SHUTDOWN_TASK)
             except Exception as e:
                 logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
         for stage in stage_list:
@@ -259,7 +260,7 @@ class OmniBase:
                 number_of_stages=len(self.stage_list), address=self.ray_address, strategy="PACK"
             )
 
-        for stage_id, stage in enumerate(self.stage_list):
+        for stage_id, stage in enumerate[OmniStage](self.stage_list):
             in_q = self._queue_cls()
             out_q = self._queue_cls()
             self._stage_in_queues.append(in_q)
@@ -289,48 +290,115 @@ class OmniBase:
         logger.info(f"[{self._name}] Stage-{stage_id} reported ready")
 
     def _wait_for_stages_ready(self, timeout: int = 120) -> None:
-        """Wait for all stages to report readiness."""
-        deadline = time.time() + max(0, int(timeout))
+        """Wait for all stages to report readiness with optimized polling."""
         num_stages = len(self.stage_list)
+        deadline = time.time() + max(0, int(timeout))
+
+        logger.info(f"[{self._name}] Waiting for {num_stages} stages to initialize (timeout: {timeout}s)")
+
         while len(self._stages_ready) < num_stages and time.time() < deadline:
             progressed = False
             for stage_id, stage in enumerate(self.stage_list):
                 if stage_id in self._stages_ready:
                     continue
-                result = stage.try_collect()
-                if result is None:
-                    continue
-                progressed = True
-                if result.get("type") == "stage_ready":
-                    self._process_stage_ready(stage, stage_id, result)
+
+                # Check if the stage has reported status
+                if result := stage.try_collect():
+                    progressed = True
+                    if result.get("type") == "stage_ready":
+                        self._process_stage_ready(stage, stage_id, result)
+
             if not progressed:
-                time.sleep(0.01)
-        if len(self._stages_ready) < num_stages:
-            not_ready = sorted(set(range(num_stages)) - set(self._stages_ready))
-            logger.warning(
-                f"[{self._name}] Initialization timeout: only {len(self._stages_ready)}/{num_stages}"
-                f" stages are ready; not ready: {not_ready}.",
-            )
-            # Provide actionable suggestions before shutdown
-            try:
-                suggestions = "".join(
-                    [
-                        "Verify GPU/device assignment in config (runtime.devices) is correct.",
-                        "Check GPU/host memory availability; reduce model or batch size if needed.",
-                        "Check model weights path and network reachability (if loading remotely).",
-                        "Increase initialization wait time (stage_init_timeout or call-site timeout).",
-                    ]
-                )
-                logger.error(
-                    f"[{self._name}] Stage initialization failed, shutting down. Suggestions:\n- {suggestions}",
-                )
-            except Exception:
-                # Best-effort logging of suggestions
-                logger.error(
-                    f"[{self._name}] Stage initialization failed and an error occurred while logging suggestions",
-                )
-        elif len(self._stages_ready) == num_stages:
+                time.sleep(0.05)
+
+        # Handle Final State
+        if len(self._stages_ready) == num_stages:
             logger.info(f"[{self._name}] All stages initialized successfully")
+            return
+
+        # Handle Timeout/Failure
+        not_ready = sorted(set(range(num_stages)) - set(self._stages_ready))
+        logger.warning(
+            f"[{self._name}] Initialization timeout: {len(self._stages_ready)}/{num_stages} "
+            f"stages ready. Missing stages: {not_ready}"
+        )
+
+        suggestions = [
+            "Verify GPU/device assignment in config (runtime.devices) is correct.",
+            "Check GPU/host memory availability; reduce model or batch size if needed.",
+            "Check model weights path and network reachability (if loading remotely).",
+            "Increase initialization wait time (stage_init_timeout or call-site timeout).",
+        ]
+
+        formatted_suggestions = "\n".join(f"  {i + 1}) {msg}" for i, msg in enumerate(suggestions))
+
+        logger.error(f"[{self._name}] Stage initialization failed. Troubleshooting Steps:\n{formatted_suggestions}")
+
+    def start_profile(self, stages: list[int] | None = None) -> None:
+        """Start profiling for specified stages.
+
+        Sends start_profile command to stage workers. Profiling must be enabled
+        via VLLM_TORCH_PROFILER_DIR environment variable.
+
+        Args:
+            stages: List of stage IDs to start profiling. If None, starts
+                profiling for all stages that have profiling enabled.
+
+        Example:
+            >>> # Profile all stages
+            >>> omni.start_profile()
+            >>> outputs = omni.generate(prompts, sampling_params)
+            >>> omni.stop_profile()
+
+            >>> # Profile only stage 0 and 2
+            >>> omni.start_profile(stages=[0, 2])
+        """
+        if stages is None:
+            stages = list(range(len(self.stage_list)))
+
+        for stage_id in stages:
+            if stage_id < len(self.stage_list):
+                try:
+                    self.stage_list[stage_id].submit({"type": OmniStageTaskType.PROFILER_START})
+                    logger.info("[%s] Sent start_profile to stage-%s", self._name, stage_id)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] Failed to send start_profile to stage-%s: %s",
+                        self._name,
+                        stage_id,
+                        e,
+                    )
+
+    def stop_profile(self, stages: list[int] | None = None) -> None:
+        """Stop profiling for specified stages.
+
+        Sends stop_profile command to stage workers to finalize and save traces.
+
+        Args:
+            stages: List of stage IDs to stop profiling. If None, stops
+                profiling for all stages.
+
+        Example:
+            >>> omni.start_profile()
+            >>> outputs = omni.generate(prompts, sampling_params)
+            >>> omni.stop_profile()
+            >>> # Traces saved to VLLM_TORCH_PROFILER_DIR/stage_X_<model_stage>/
+        """
+        if stages is None:
+            stages = list(range(len(self.stage_list)))
+
+        for stage_id in stages:
+            if stage_id < len(self.stage_list):
+                try:
+                    self.stage_list[stage_id].submit({"type": OmniStageTaskType.PROFILER_STOP})
+                    logger.info("[%s] Sent stop_profile to stage-%s", self._name, stage_id)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] Failed to send stop_profile to stage-%s: %s",
+                        self._name,
+                        stage_id,
+                        e,
+                    )
 
     def close(self) -> None:
         """Close all stage processes and clean up resources."""
@@ -387,7 +455,9 @@ class Omni(OmniBase):
             self._ray_pg,
         )
 
-    def generate(self, *args: Any, **kwargs: dict[str, Any]) -> list[OmniRequestOutput]:
+    def generate(
+        self, *args: Any, **kwargs: dict[str, Any]
+    ) -> Generator[OmniRequestOutput, None, None] | list[OmniRequestOutput]:
         """Generate outputs for the given prompts.
 
         Orchestrates the multi-stage pipeline based on YAML configuration.
@@ -411,6 +481,7 @@ class Omni(OmniBase):
         """
         prompts = args[0] if args else kwargs.get("prompts")
         sampling_params_list = args[1] if len(args) > 1 else kwargs.get("sampling_params_list")
+        py_generator = kwargs.get("py_generator", False)
         if prompts is None:
             if kwargs.get("prompt") is None:
                 raise ValueError("prompts is required for generation")
@@ -438,11 +509,32 @@ class Omni(OmniBase):
 
             sampling_params_list = per_stage_params
         try:
-            return self._run_generation(prompts, sampling_params_list)
+            if py_generator:
+                return self._run_generation_with_generator(prompts, sampling_params_list)
+            else:
+                outputs = list(self._run_generation(prompts, sampling_params_list))
+                self.close()
+                return outputs
+        except Exception as e:
+            logger.exception("[Orchestrator] Failed to run generation: %s", e)
+            # Always close on exception to ensure cleanup
+            self.close()
+            raise e
+
+    def _run_generation_with_generator(
+        self,
+        prompts: PromptType | Sequence[PromptType] | OmniDiffusionRequest | Sequence[OmniDiffusionRequest],
+        sampling_params_list: Any | Sequence[Any] | None,
+    ) -> Generator[OmniRequestOutput, None, None]:
+        """Run generation through all stages in the pipeline and return a generator."""
+        gen = self._run_generation(prompts, sampling_params_list)
+        try:
+            yield from gen
         except Exception as e:
             logger.exception("[Orchestrator] Failed to run generation: %s", e)
             raise e
         finally:
+            # Cleanup when generator is exhausted or closed
             self.close()
 
     def _run_generation(
@@ -450,7 +542,7 @@ class Omni(OmniBase):
         prompts: PromptType | Sequence[PromptType] | OmniDiffusionRequest | Sequence[OmniDiffusionRequest],
         sampling_params_list: Any | Sequence[Any] | None = None,
         use_tqdm: bool | Callable[..., tqdm] = True,
-    ) -> list[OmniRequestOutput]:
+    ) -> Generator[OmniRequestOutput, None, None]:
         """Run generation through all stages in the pipeline."""
         logger.debug(f"[{self._name}] generate() called")
         if sampling_params_list is None:
@@ -470,8 +562,6 @@ class Omni(OmniBase):
             request_prompts: list[PromptType] = [prompts]
         else:
             request_prompts = list(prompts)
-
-        final_outputs: list[OmniRequestOutput] = []
 
         # Orchestrator keeps stage objects for input derivation
         num_stages = len(self.stage_list)
@@ -567,8 +657,10 @@ class Omni(OmniBase):
                 # Mark last output time for this stage whenever we receive outputs
                 metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:
-                    _m = asdict(result.get("metrics"))
+                    _m = result.get("metrics")
                     if _m is not None:
+                        if not isinstance(_m, dict):
+                            _m = asdict(_m)
                         metrics.on_stage_metrics(stage_id, req_id, _m)
                         if pbar:
                             elapsed = pbar.format_dict["elapsed"] or 1e-6
@@ -599,13 +691,6 @@ class Omni(OmniBase):
                 stage.set_engine_outputs(engine_outputs)
 
                 if getattr(stage, "final_output", False):
-                    final_outputs.append(
-                        OmniRequestOutput(
-                            stage_id=stage_id,
-                            final_output_type=stage.final_output_type,  # type: ignore[attr-defined]
-                            request_output=engine_outputs,
-                        )
-                    )
                     logger.debug(
                         f"[{self._name}] Request {req_id} finalized at stage-{stage_id}",
                     )
@@ -618,13 +703,17 @@ class Omni(OmniBase):
                             metrics.on_finalize_request(
                                 stage_id,
                                 req_id,
-                                engine_outputs,
                                 _req_start_ts.get(req_id, _wall_start_ts),
                             )
                     except Exception as e:
                         logger.exception(
                             f"[{self._name}] Finalize request handling error for req {req_id} at stage {stage_id}: {e}",
                         )
+                    yield OmniRequestOutput(
+                        stage_id=stage_id,
+                        final_output_type=stage.final_output_type,  # type: ignore[attr-defined]
+                        request_output=engine_outputs,
+                    )
 
                 next_stage_id = stage_id + 1
                 if next_stage_id <= final_stage_id_to_prompt[req_id]:
@@ -688,8 +777,6 @@ class Omni(OmniBase):
             logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
         except Exception as e:
             logger.exception(f"[{self._name}] Failed to build/log summary: {e}")
-
-        return final_outputs
 
     @property
     def _name(self) -> str:

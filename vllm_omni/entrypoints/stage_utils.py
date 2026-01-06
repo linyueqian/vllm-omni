@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import os
@@ -9,6 +10,21 @@ from typing import Any
 from omegaconf import OmegaConf
 
 logger = logging.getLogger(__name__)
+
+
+class OmniStageTaskType(enum.Enum):
+    GENERATE = "generate"
+    ABORT = "abort"
+    SHUTDOWN = "shutdown"
+    PROFILER_START = "profiler_start"
+    PROFILER_STOP = "profiler_stop"
+
+
+SHUTDOWN_TASK = {"type": OmniStageTaskType.SHUTDOWN}
+
+
+def is_profiler_task(task_type: OmniStageTaskType) -> bool:
+    return task_type in (OmniStageTaskType.PROFILER_START, OmniStageTaskType.PROFILER_STOP)
 
 
 def set_stage_devices(
