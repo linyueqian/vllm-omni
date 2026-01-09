@@ -37,13 +37,14 @@ def apply_rotary_emb_wan(
     Returns:
         Tensor with rotary embeddings applied
     """
+    orig_dtype = hidden_states.dtype
     x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
     cos = freqs_cos[..., 0::2]
     sin = freqs_sin[..., 1::2]
     out = torch.empty_like(hidden_states)
     out[..., 0::2] = x1 * cos - x2 * sin
     out[..., 1::2] = x1 * sin + x2 * cos
-    return out.type_as(hidden_states)
+    return out.to(orig_dtype)
 
 
 class WanRotaryPosEmbed(nn.Module):
@@ -193,7 +194,7 @@ class WanTimeTextImageEmbedding(nn.Module):
         time_embedder_dtype = next(iter(self.time_embedder.parameters())).dtype
         if timestep.dtype != time_embedder_dtype and time_embedder_dtype != torch.int8:
             timestep = timestep.to(time_embedder_dtype)
-        temb = self.time_embedder(timestep).type_as(encoder_hidden_states)
+        temb = self.time_embedder(timestep).to(encoder_hidden_states.dtype)
         timestep_proj = self.time_proj(self.act_fn(temb))
 
         encoder_hidden_states = self.text_embedder(encoder_hidden_states)
@@ -277,9 +278,10 @@ class WanSelfAttention(nn.Module):
             key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
 
         # Compute attention using unified attention layer
+        orig_dtype = query.dtype
         hidden_states = self.attn(query, key, value)
         hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.type_as(query)
+        hidden_states = hidden_states.to(orig_dtype)
 
         # Output projection
         hidden_states, _ = self.to_out[0](hidden_states)
@@ -377,6 +379,7 @@ class WanCrossAttention(nn.Module):
         value = value.unflatten(2, (self.num_heads, -1))
 
         # I2V: Additional attention with image embeddings
+        orig_dtype = query.dtype
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
             key_img, _ = self.add_k_proj(encoder_hidden_states_img)
@@ -388,12 +391,12 @@ class WanCrossAttention(nn.Module):
 
             hidden_states_img = self.attn(query, key_img, value_img)
             hidden_states_img = hidden_states_img.flatten(2, 3)
-            hidden_states_img = hidden_states_img.type_as(query)
+            hidden_states_img = hidden_states_img.to(orig_dtype)
 
         # Main cross-attention using unified attention layer
         hidden_states = self.attn(query, key, value)
         hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.type_as(query)
+        hidden_states = hidden_states.to(orig_dtype)
 
         # Add image attention output if present
         if hidden_states_img is not None:
