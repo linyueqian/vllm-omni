@@ -290,12 +290,12 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 "is now handled via an internal counter `self.step_index`",
             )
 
-        sigma = self.sigmas[self.step_index]
+        sigma = self.sigmas[self.step_index].to(sample.device)
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma)
 
         if self.predict_x0:
             if self.config.prediction_type == "flow_prediction":
-                sigma_t = self.sigmas[self.step_index]
+                sigma_t = sigma.to(sample.device)
                 x0_pred = sample - sigma_t * model_output
             else:
                 raise ValueError(
@@ -309,7 +309,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             return x0_pred
         else:
             if self.config.prediction_type == "flow_prediction":
-                sigma_t = self.sigmas[self.step_index]
+                sigma_t = sigma.to(sample.device)
                 epsilon = sample - (1 - sigma_t) * model_output
             else:
                 raise ValueError(
@@ -318,7 +318,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 )
 
             if self.config.thresholding:
-                sigma_t = self.sigmas[self.step_index]
+                sigma_t = sigma.to(sample.device)
                 x0_pred = sample - sigma_t * model_output
                 x0_pred = self._threshold_sample(x0_pred)
                 epsilon = model_output + x0_pred
@@ -372,9 +372,10 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             x_t = self.solver_p.step(model_output, s0, x).prev_sample
             return x_t
 
+        device = sample.device
         sigma_t, sigma_s0 = (
-            self.sigmas[self.step_index + 1],
-            self.sigmas[self.step_index],
+            self.sigmas[self.step_index + 1].to(device),
+            self.sigmas[self.step_index].to(device),
         )
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
         alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
@@ -383,14 +384,13 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0)
 
         h = lambda_t - lambda_s0
-        device = sample.device
 
         rks = []
         D1s: list[Any] | None = []
         for i in range(1, order):
             si = self.step_index - i
             mi = model_output_list[-(i + 1)]
-            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
+            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si].to(device))
             lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
             rk = (lambda_si - lambda_s0) / h
             rks.append(rk)
@@ -504,9 +504,10 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         x_t = this_sample
         model_t = this_model_output
 
+        device = this_sample.device
         sigma_t, sigma_s0 = (
-            self.sigmas[self.step_index],
-            self.sigmas[self.step_index - 1],
+            self.sigmas[self.step_index].to(device),
+            self.sigmas[self.step_index - 1].to(device),
         )
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
         alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
@@ -515,14 +516,13 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0)
 
         h = lambda_t - lambda_s0
-        device = this_sample.device
 
         rks = []
         D1s: list[Any] | None = []
         for i in range(1, order):
             si = self.step_index - (i + 1)
             mi = model_output_list[-(i + 1)]
-            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
+            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si].to(device))
             lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
             rk = (lambda_si - lambda_s0) / h
             rks.append(rk)
