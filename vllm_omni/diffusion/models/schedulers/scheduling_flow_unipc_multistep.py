@@ -22,7 +22,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.schedulers.scheduling_utils import KarrasDiffusionSchedulers, SchedulerMixin, SchedulerOutput
 from diffusers.utils import deprecate
 
-from vllm_omni.diffusion.schedulers.base import BaseScheduler
+from vllm_omni.diffusion.models.schedulers.base import BaseScheduler
 
 
 class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
