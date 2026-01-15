@@ -34,6 +34,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", type=str, default="wan22_output.mp4", help="Path to save the video (mp4).")
     parser.add_argument("--fps", type=int, default=24, help="Frames per second for the output video.")
+    parser.add_argument(
+        "--scheduler_type",
+        type=str,
+        default="unipc",
+        choices=["unipc", "euler"],
+        help="Scheduler type: 'unipc' (faster) or 'euler' (default diffusers).",
+    )
     return parser.parse_args()
 
 
@@ -52,6 +59,7 @@ def main():
         vae_use_tiling=vae_use_tiling,
         boundary_ratio=args.boundary_ratio,
         flow_shift=args.flow_shift,
+        scheduler_type=args.scheduler_type,
     )
 
     frames = omni.generate(

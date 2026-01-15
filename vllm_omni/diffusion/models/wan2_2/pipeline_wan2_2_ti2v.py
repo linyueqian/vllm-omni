@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     retrieve_latents,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.schedulers import FlowUniPCMultistepScheduler
 
 
 def get_wan22_ti2v_post_process_func(
@@ -156,12 +157,24 @@ class Wan22TI2VPipeline(nn.Module):
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
         self.transformer = create_transformer_from_config(transformer_config)
 
-        # Scheduler
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model, subfolder="scheduler", local_files_only=local_files_only
-        )
-        if od_config.flow_shift is not None:
-            self.scheduler.config.flow_shift = od_config.flow_shift
+        # Initialize scheduler based on scheduler_type config
+        # UniPC is faster (fewer steps needed) while maintaining quality
+        scheduler_type = getattr(od_config, "scheduler_type", "unipc")
+        flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0  # default for 720p
+
+        if scheduler_type == "unipc":
+            self.scheduler = FlowUniPCMultistepScheduler(
+                num_train_timesteps=1000,
+                shift=flow_shift,
+                prediction_type="flow_prediction",
+            )
+        else:
+            # Fallback to Euler scheduler from diffusers
+            self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+                model, subfolder="scheduler", local_files_only=local_files_only
+            )
+            if od_config.flow_shift is not None:
+                self.scheduler.config.flow_shift = od_config.flow_shift
 
         # VAE scale factors
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if hasattr(self.vae, "config") else 4

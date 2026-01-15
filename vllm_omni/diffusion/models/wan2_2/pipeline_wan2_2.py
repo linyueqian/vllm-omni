@@ -20,6 +20,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.schedulers import FlowUniPCMultistepScheduler
 
 
 def retrieve_latents(
@@ -244,12 +245,25 @@ class Wan22Pipeline(nn.Module):
         else:
             self.transformer_2 = None
 
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model, subfolder="scheduler", local_files_only=local_files_only
-        )
-        # Apply flow_shift if specified (12.0 for 480p, 5.0 for 720p recommended for Wan2.2)
-        if od_config.flow_shift is not None:
-            self.scheduler.config.flow_shift = od_config.flow_shift
+        # Initialize scheduler based on scheduler_type config
+        # UniPC is faster (fewer steps needed) while maintaining quality
+        scheduler_type = getattr(od_config, "scheduler_type", "unipc")
+        flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0  # default for 720p
+
+        if scheduler_type == "unipc":
+            self.scheduler = FlowUniPCMultistepScheduler(
+                num_train_timesteps=1000,
+                shift=flow_shift,
+                prediction_type="flow_prediction",
+            )
+        else:
+            # Fallback to Euler scheduler from diffusers
+            self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+                model, subfolder="scheduler", local_files_only=local_files_only
+            )
+            # Apply flow_shift if specified (12.0 for 480p, 5.0 for 720p recommended for Wan2.2)
+            if od_config.flow_shift is not None:
+                self.scheduler.config.flow_shift = od_config.flow_shift
 
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
         self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8
