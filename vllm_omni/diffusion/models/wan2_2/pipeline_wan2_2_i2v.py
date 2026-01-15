@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
+from typing import ClassVar
 
 import numpy as np
 import PIL.Image
@@ -119,6 +120,8 @@ class Wan22I2VPipeline(nn.Module):
     Supports both Wan2.1-style I2V (with CLIP image embeddings) and
     Wan2.2-style I2V (with expand_timesteps for TI2V-5B).
     """
+
+    support_image_input: ClassVar[bool] = True
 
     def __init__(
         self,

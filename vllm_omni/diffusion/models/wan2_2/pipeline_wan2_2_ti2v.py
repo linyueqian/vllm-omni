@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
+from typing import ClassVar
 
 import numpy as np
 import PIL.Image
@@ -113,6 +114,8 @@ class Wan22TI2VPipeline(nn.Module):
     Uses expand_timesteps mode for I2V conditioning where the first frame
     is conditioned on the input image latent.
     """
+
+    support_image_input: ClassVar[bool] = True
 
     def __init__(
         self,
