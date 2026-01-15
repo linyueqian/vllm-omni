@@ -350,8 +350,6 @@ class OmniDiffusionConfig:
     boundary_ratio: float | None = None
     # Scheduler flow_shift for Wan2.2 (12.0 for 480p, 5.0 for 720p)
     flow_shift: float | None = None
-    # Scheduler type for Wan2.2: "unipc" (faster, recommended) or "euler" (default diffusers)
-    scheduler_type: str = "unipc"
 
     # support multi images input
     supports_multimodal_inputs: bool = False
