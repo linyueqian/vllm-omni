@@ -60,7 +60,6 @@ python openai_speech_client.py \
 curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
-        "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
         "input": "Hello, how are you?",
         "voice": "Vivian",
         "language": "English"
@@ -70,7 +69,6 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
-        "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
         "input": "I am so excited!",
         "voice": "Vivian",
         "instructions": "Speak with great enthusiasm"
@@ -91,7 +89,6 @@ This endpoint follows the [OpenAI Audio Speech API](https://platform.openai.com/
 
 ```json
 {
-    "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
     "input": "Text to synthesize",
     "voice": "Vivian",
     "response_format": "wav",
@@ -105,6 +102,8 @@ This endpoint follows the [OpenAI Audio Speech API](https://platform.openai.com/
 }
 ```
 
+> **Note:** The `model` field is optional when serving a single model, as the server already knows which model is loaded.
+
 ### Response
 
 Returns audio data in the requested format (default: WAV).
@@ -115,11 +114,11 @@ Returns audio data in the requested format (default: WAV).
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `model` | string | required | Model name or path |
 | `input` | string | required | Text to synthesize |
 | `voice` | string | "Vivian" | Speaker/voice name |
 | `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, aac, opus |
 | `speed` | float | 1.0 | Playback speed (0.25-4.0) |
+| `model` | string | optional | Model name (optional when serving single model) |
 
 ### Qwen3-TTS Parameters
 
