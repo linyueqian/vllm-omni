@@ -17,53 +17,65 @@ from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
-# TTS model stage identifiers
-_TTS_MODEL_STAGES: set[str] = {"qwen3_tts"}
+# Model stages that require Qwen3-TTS prompt format
+_QWEN3_TTS_STAGES: set[str] = {"qwen3_tts"}
 
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
-    def _is_tts_model(self) -> bool:
-        """Check if the current model is a TTS model (e.g., Qwen3-TTS)."""
+    def _requires_qwen3_tts_prompt(self) -> bool:
+        """Check if the model requires Qwen3-TTS prompt format.
+
+        Used only for determining prompt structure. Parameter handling
+        is done separately based on what's present in the request.
+        """
         stage_list = getattr(self.engine_client, "stage_list", None)
         if stage_list:
             for stage in stage_list:
                 model_stage = getattr(stage, "model_stage", None)
-                if model_stage in _TTS_MODEL_STAGES:
+                if model_stage in _QWEN3_TTS_STAGES:
                     return True
         return False
 
-    def _build_tts_prompt(self, text: str) -> str:
-        """Build TTS prompt in the format expected by Qwen3-TTS."""
+    def _build_qwen3_tts_prompt(self, text: str) -> str:
+        """Build prompt in Qwen3-TTS format."""
         return f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
 
-    def _build_tts_additional_info(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
-        """Build additional_information dict for Qwen3-TTS.
+    def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Build TTS parameters from request.
 
-        Maps OpenAI speech API parameters to Qwen3-TTS parameters.
-        All values are wrapped in lists as required by the TTS model.
+        Processes each parameter if present, skips if not.
+        Values are wrapped in lists as required by the model.
         """
         params: dict[str, Any] = {}
 
-        # Determine task type
-        task_type = request.task_type or "CustomVoice"
-        params["task_type"] = [task_type]
-
-        # Language
-        params["language"] = [request.language or "Auto"]
-
-        # Text content
+        # Text content (always required)
         params["text"] = [request.input]
 
-        # Speaker (voice) - for CustomVoice task
-        if request.voice:
+        # Task type
+        if request.task_type is not None:
+            params["task_type"] = [request.task_type]
+        else:
+            params["task_type"] = ["CustomVoice"]
+
+        # Language
+        if request.language is not None:
+            params["language"] = [request.language]
+        else:
+            params["language"] = ["Auto"]
+
+        # Speaker (voice)
+        if request.voice is not None:
             params["speaker"] = [request.voice]
-        elif task_type == "CustomVoice":
-            params["speaker"] = ["Vivian"]  # Default speaker
+        elif params["task_type"][0] == "CustomVoice":
+            params["speaker"] = ["Vivian"]  # Default for CustomVoice
 
-        # Instructions (instruct) - for emotional/style control
-        params["instruct"] = [request.instructions or ""]
+        # Instructions for style/emotion control
+        if request.instructions is not None:
+            params["instruct"] = [request.instructions]
+        else:
+            params["instruct"] = [""]
 
-        # Voice clone parameters (Base task)
+        # Voice clone parameters (used with Base task)
         if request.ref_audio is not None:
             params["ref_audio"] = [request.ref_audio]
         if request.ref_text is not None:
@@ -72,7 +84,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             params["x_vector_only_mode"] = [request.x_vector_only_mode]
 
         # Generation parameters
-        params["max_new_tokens"] = [request.max_new_tokens or 2048]
+        if request.max_new_tokens is not None:
+            params["max_new_tokens"] = [request.max_new_tokens]
+        else:
+            params["max_new_tokens"] = [2048]
 
         return params
 
@@ -111,26 +126,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id = f"speech-{random_uuid()}"
 
         try:
-            # Check if this is a Qwen3-TTS model
-            if self._is_tts_model():
-                # Build TTS-specific prompt and parameters
-                prompt_text = self._build_tts_prompt(request.input)
-                additional_info = self._build_tts_additional_info(request)
+            # Build TTS parameters from request (processes each param if present)
+            tts_params = self._build_tts_params(request)
 
+            # Use model-specific prompt format
+            if self._requires_qwen3_tts_prompt():
+                prompt_text = self._build_qwen3_tts_prompt(request.input)
                 prompt = {
                     "prompt": prompt_text,
-                    "additional_information": additional_info,
+                    "additional_information": tts_params,
                 }
-
-                logger.info(
-                    "TTS speech request %s: text=%r, task_type=%s",
-                    request_id,
-                    request.input[:50] + "..." if len(request.input) > 50 else request.input,
-                    additional_info.get("task_type", ["unknown"])[0],
-                )
             else:
                 # Fallback for other TTS models
                 prompt = {"prompt": request.input}
+
+            logger.info(
+                "TTS speech request %s: text=%r, task_type=%s",
+                request_id,
+                request.input[:50] + "..." if len(request.input) > 50 else request.input,
+                tts_params.get("task_type", ["unknown"])[0],
+            )
 
             sampling_params_list = self.engine_client.default_sampling_params_list
 
