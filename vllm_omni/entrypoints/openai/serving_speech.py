@@ -169,9 +169,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if hasattr(audio_tensor, "float"):
                 audio_tensor = audio_tensor.float().detach().cpu().numpy()
 
-            # Ensure audio is 1D
+            # Squeeze batch dimension if present, but preserve channel dimension for stereo
             if audio_tensor.ndim > 1:
-                audio_tensor = audio_tensor.flatten()
+                audio_tensor = audio_tensor.squeeze()
 
             audio_obj = CreateAudio(
                 audio_tensor=audio_tensor,
