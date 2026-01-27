@@ -20,6 +20,19 @@ logger = init_logger(__name__)
 # Model stages that require Qwen3-TTS prompt format
 _QWEN3_TTS_STAGES: set[str] = {"qwen3_tts"}
 
+# Supported speakers for Qwen3-TTS CustomVoice task
+_QWEN3_TTS_SPEAKERS: set[str] = {
+    "Vivian",  # Bright, slightly edgy young female voice (Chinese)
+    "Serena",  # Warm, gentle young female voice (Chinese)
+    "Uncle_Fu",  # Seasoned male voice with a low, mellow timbre (Chinese)
+    "Dylan",  # Youthful Beijing male voice (Chinese, Beijing Dialect)
+    "Eric",  # Lively Chengdu male voice (Chinese, Sichuan Dialect)
+    "Ryan",  # Dynamic male voice with strong rhythmic drive (English)
+    "Aiden",  # Sunny American male voice (English)
+    "One_Anna",  # Playful Japanese female voice (Japanese)
+    "Sohee",  # Warm Korean female voice (Korean)
+}
+
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _requires_qwen3_tts_prompt(self) -> bool:
@@ -126,11 +139,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id = f"speech-{random_uuid()}"
 
         try:
-            # Build TTS parameters from request (processes each param if present)
-            tts_params = self._build_tts_params(request)
-
             # Use model-specific prompt format
             if self._requires_qwen3_tts_prompt():
+                # Validate speaker for Qwen3-TTS CustomVoice task
+                task_type = request.task_type or "CustomVoice"
+                if task_type == "CustomVoice" and request.voice is not None:
+                    if request.voice not in _QWEN3_TTS_SPEAKERS:
+                        return self.create_error_response(
+                            f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(_QWEN3_TTS_SPEAKERS))}"
+                        )
+
+                # Build TTS parameters from request
+                tts_params = self._build_tts_params(request)
                 prompt_text = self._build_qwen3_tts_prompt(request.input)
                 prompt = {
                     "prompt": prompt_text,
@@ -138,6 +158,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 }
             else:
                 # Fallback for other TTS models
+                tts_params = {}
                 prompt = {"prompt": request.input}
 
             logger.info(
