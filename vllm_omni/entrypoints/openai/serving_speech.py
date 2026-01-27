@@ -33,6 +33,14 @@ _QWEN3_TTS_SPEAKERS: set[str] = {
     "Sohee",  # Warm Korean female voice (Korean)
 }
 
+# Supported languages for Qwen3-TTS
+_QWEN3_TTS_LANGUAGES: set[str] = {"Auto", "Chinese", "English", "Japanese", "Korean"}
+
+# Constraints for Qwen3-TTS parameters
+_MAX_INSTRUCTIONS_LENGTH = 500
+_MAX_NEW_TOKENS_MIN = 1
+_MAX_NEW_TOKENS_MAX = 4096
+
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _requires_qwen3_tts_prompt(self) -> bool:
@@ -48,6 +56,58 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if model_stage in _QWEN3_TTS_STAGES:
                     return True
         return False
+
+    def _validate_qwen3_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate Qwen3-TTS specific parameters.
+
+        Returns error message if validation fails, None if valid.
+        """
+        task_type = request.task_type or "CustomVoice"
+
+        # Validate input is not empty
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+
+        # Validate language
+        if request.language is not None and request.language not in _QWEN3_TTS_LANGUAGES:
+            return f"Invalid language '{request.language}'. Supported: {', '.join(sorted(_QWEN3_TTS_LANGUAGES))}"
+
+        # Validate speaker for CustomVoice task
+        if task_type == "CustomVoice" and request.voice is not None:
+            if request.voice not in _QWEN3_TTS_SPEAKERS:
+                return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(_QWEN3_TTS_SPEAKERS))}"
+
+        # Validate Base task requirements
+        if task_type == "Base":
+            if request.ref_audio is None:
+                return "Base task requires 'ref_audio' for voice cloning"
+            # Validate ref_audio format
+            if not (request.ref_audio.startswith(("http://", "https://")) or request.ref_audio.startswith("data:")):
+                return "ref_audio must be a URL (http/https) or base64 data URL (data:...)"
+
+        # Validate cross-parameter dependencies
+        if task_type != "Base":
+            if request.ref_text is not None:
+                return "'ref_text' is only valid for Base task"
+            if request.x_vector_only_mode is not None:
+                return "'x_vector_only_mode' is only valid for Base task"
+
+        # Validate VoiceDesign task requirements
+        if task_type == "VoiceDesign" and not request.instructions:
+            return "VoiceDesign task requires 'instructions' to describe the voice"
+
+        # Validate instructions length
+        if request.instructions and len(request.instructions) > _MAX_INSTRUCTIONS_LENGTH:
+            return f"Instructions too long (max {_MAX_INSTRUCTIONS_LENGTH} characters)"
+
+        # Validate max_new_tokens range
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_MAX_NEW_TOKENS_MIN}"
+            if request.max_new_tokens > _MAX_NEW_TOKENS_MAX:
+                return f"max_new_tokens cannot exceed {_MAX_NEW_TOKENS_MAX}"
+
+        return None
 
     def _build_qwen3_tts_prompt(self, text: str) -> str:
         """Build prompt in Qwen3-TTS format."""
@@ -141,13 +201,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         try:
             # Use model-specific prompt format
             if self._requires_qwen3_tts_prompt():
-                # Validate speaker for Qwen3-TTS CustomVoice task
-                task_type = request.task_type or "CustomVoice"
-                if task_type == "CustomVoice" and request.voice is not None:
-                    if request.voice not in _QWEN3_TTS_SPEAKERS:
-                        return self.create_error_response(
-                            f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(_QWEN3_TTS_SPEAKERS))}"
-                        )
+                # Validate Qwen3-TTS specific parameters
+                validation_error = self._validate_qwen3_tts_request(request)
+                if validation_error:
+                    return self.create_error_response(validation_error)
 
                 # Build TTS parameters from request
                 tts_params = self._build_tts_params(request)
