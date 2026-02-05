@@ -38,7 +38,7 @@ _omni_server_lock = threading.Lock()
 
 
 @pytest.fixture(scope="module")
-def omni_server_customvoice(request):
+def omni_server_customvoice():
     """Start vLLM-Omni server with CustomVoice model."""
     with _omni_server_lock:
         model = models["CustomVoice"]
@@ -65,7 +65,7 @@ def omni_server_customvoice(request):
 
 
 @pytest.fixture(scope="module")
-def omni_server_voicedesign(request):
+def omni_server_voicedesign():
     """Start vLLM-Omni server with VoiceDesign model."""
     with _omni_server_lock:
         model = models["VoiceDesign"]
