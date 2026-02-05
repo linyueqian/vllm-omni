@@ -246,11 +246,11 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 
 ### Voice Clone Parameters (Base task)
 
-| Parameter | Type | Default | Description |
+| Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `ref_audio` | string | null | Reference audio (URL or base64 data URL) |
-| `ref_text` | string | null | Transcript of reference audio |
-| `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
+| `ref_audio` | string | **Yes** | Reference audio (URL or base64 data URL) |
+| `ref_text` | string | No | Transcript of reference audio (for ICL mode) |
+| `x_vector_only_mode` | bool | No | Use speaker embedding only (no ICL) |
 
 ## Limitations
 
