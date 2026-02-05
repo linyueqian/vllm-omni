@@ -12,7 +12,10 @@ Each server instance runs a single model (specified at startup via `vllm serve <
 # CustomVoice model (predefined speakers)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
-    --omni --port 8091 --trust-remote-code --enforce-eager
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager
 ```
 
 ### Generate Speech
@@ -142,7 +145,10 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 # Start server with VoiceDesign model first
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
     --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
-    --omni --port 8091 --trust-remote-code --enforce-eager
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager
 ```
 
 ```bash
@@ -161,7 +167,10 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 # Start server with Base model first
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
     --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
-    --omni --port 8091 --trust-remote-code --enforce-eager
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager
 ```
 
 ```bash
