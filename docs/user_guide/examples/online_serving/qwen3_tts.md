@@ -259,7 +259,7 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 
 ## Troubleshooting
 
-1. **"TTS model did not produce audio output"**: Ensure you're using the correct model variant for your task type (CustomVoice task → CustomVoice model, etc.)
+1. **TTS model did not produce audio output**: Ensure you're using the correct model variant for your task type (CustomVoice task → CustomVoice model, etc.)
 2. **Connection refused**: Make sure the server is running on the correct port
 3. **Out of memory**: Use smaller model variant (`Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`) or reduce `--gpu-memory-utilization`
 4. **Unsupported speaker**: Use `/v1/audio/voices` to list available voices for the loaded model
