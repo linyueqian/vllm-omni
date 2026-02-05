@@ -25,24 +25,36 @@ Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/
 # CustomVoice model (predefined speakers)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
-    --omni --port 8091 --trust-remote-code --enforce-eager
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager
 
 # VoiceDesign model
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
     --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
-    --omni --port 8091 --trust-remote-code --enforce-eager
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager
 
 # Base model (voice cloning)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
     --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
-    --omni --port 8091 --trust-remote-code --enforce-eager
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager
 ```
 
 If you have custom stage configs file, launch the server with command below
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --stage-configs-path /path/to/stage_configs_file \
-    --omni --port 8091 --trust-remote-code --enforce-eager
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager
 ```
 
 Alternatively, use the convenience script:
