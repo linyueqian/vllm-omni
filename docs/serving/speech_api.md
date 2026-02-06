@@ -259,5 +259,9 @@ Enable debug logging:
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
-    --omni --uvicorn-log-level debug
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager \
+    --uvicorn-log-level debug
 ```

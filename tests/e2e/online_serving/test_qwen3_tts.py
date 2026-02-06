@@ -19,6 +19,7 @@ import httpx
 import pytest
 
 from tests.conftest import OmniServer
+from tests.utils import hardware_test
 
 # Model variants for different TTS tasks (using 0.6B for faster CI)
 models = {
@@ -128,6 +129,9 @@ def verify_wav_audio(content: bytes) -> bool:
 class TestQwen3TTSCustomVoice:
     """E2E tests for Qwen3-TTS CustomVoice model."""
 
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "L4"}, num_cards=4)
     def test_speech_english_basic(self, omni_server_customvoice) -> None:
         """Test basic English TTS generation."""
         response = make_speech_request(
@@ -143,6 +147,9 @@ class TestQwen3TTSCustomVoice:
         assert verify_wav_audio(response.content), "Response is not valid WAV audio"
         assert len(response.content) > 1000, "Audio content too small"
 
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "L4"}, num_cards=4)
     def test_speech_chinese_basic(self, omni_server_customvoice) -> None:
         """Test basic Chinese TTS generation."""
         response = make_speech_request(
@@ -158,6 +165,9 @@ class TestQwen3TTSCustomVoice:
         assert verify_wav_audio(response.content), "Response is not valid WAV audio"
         assert len(response.content) > 1000, "Audio content too small"
 
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "L4"}, num_cards=4)
     def test_speech_different_voices(self, omni_server_customvoice) -> None:
         """Test TTS with different voice options."""
         voices = ["vivian", "ryan"]
@@ -173,6 +183,9 @@ class TestQwen3TTSCustomVoice:
             assert response.status_code == 200, f"Request failed for voice {voice}: {response.text}"
             assert verify_wav_audio(response.content), f"Invalid WAV for voice {voice}"
 
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "L4"}, num_cards=4)
     def test_speech_binary_response_not_utf8_error(self, omni_server_customvoice) -> None:
         """
         Regression test: Verify binary audio is returned, not UTF-8 error.
@@ -207,6 +220,9 @@ class TestQwen3TTSCustomVoice:
 class TestQwen3TTSVoiceDesign:
     """E2E tests for Qwen3-TTS VoiceDesign model."""
 
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "L4"}, num_cards=4)
     def test_speech_with_voice_description(self, omni_server_voicedesign) -> None:
         """Test TTS with natural language voice description."""
         response = make_speech_request(
@@ -226,6 +242,9 @@ class TestQwen3TTSVoiceDesign:
 class TestQwen3TTSAPIEndpoints:
     """Test API endpoint functionality."""
 
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "L4"}, num_cards=4)
     def test_list_voices_endpoint(self, omni_server_customvoice) -> None:
         """Test the /v1/audio/voices endpoint returns available voices."""
         url = f"http://{omni_server_customvoice.host}:{omni_server_customvoice.port}/v1/audio/voices"
@@ -242,6 +261,9 @@ class TestQwen3TTSAPIEndpoints:
         voices_lower = [v.lower() for v in data["voices"]]
         assert "vivian" in voices_lower or "ryan" in voices_lower
 
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "L4"}, num_cards=4)
     def test_models_endpoint(self, omni_server_customvoice) -> None:
         """Test the /v1/models endpoint returns loaded model."""
         url = f"http://{omni_server_customvoice.host}:{omni_server_customvoice.port}/v1/models"
