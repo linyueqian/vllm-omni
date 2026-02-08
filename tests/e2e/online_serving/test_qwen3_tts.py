@@ -100,7 +100,7 @@ def make_speech_request(
     language: str = "English",
     task_type: str | None = None,
     instructions: str | None = None,
-    timeout: float = 300.0,
+    timeout: float = 120.0,
 ) -> httpx.Response:
     """Make a request to the /v1/audio/speech endpoint."""
     url = f"http://{host}:{port}/v1/audio/speech"

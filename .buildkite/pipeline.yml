@@ -241,7 +241,7 @@ steps:
         - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Qwen3-TTS E2E Test"
-    timeout_in_minutes: 15
+    timeout_in_minutes: 30
     depends_on: image-build
     commands:
       - export VLLM_LOGGING_LEVEL=DEBUG
@@ -254,6 +254,7 @@ steps:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
           always-pull: true
           propagate-environment: true
+          shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
           volumes:
