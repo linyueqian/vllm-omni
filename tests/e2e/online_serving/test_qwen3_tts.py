@@ -18,6 +18,7 @@ import httpx
 import pytest
 
 from tests.conftest import OmniServer
+from tests.utils import hardware_test
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 
@@ -95,6 +96,9 @@ MIN_AUDIO_BYTES = 10000
 class TestQwen3TTSCustomVoice:
     """E2E tests for Qwen3-TTS CustomVoice model."""
 
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "L4"}, num_cards=4)
     def test_speech_english_basic(self, omni_server) -> None:
         """Test basic English TTS generation."""
         response = make_speech_request(
@@ -112,6 +116,9 @@ class TestQwen3TTSCustomVoice:
             f"Audio content too small ({len(response.content)} bytes), expected at least {MIN_AUDIO_BYTES} bytes"
         )
 
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "L4"}, num_cards=4)
     def test_speech_chinese_basic(self, omni_server) -> None:
         """Test basic Chinese TTS generation."""
         response = make_speech_request(
@@ -129,6 +136,9 @@ class TestQwen3TTSCustomVoice:
             f"Audio content too small ({len(response.content)} bytes), expected at least {MIN_AUDIO_BYTES} bytes"
         )
 
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "L4"}, num_cards=4)
     def test_speech_different_voices(self, omni_server) -> None:
         """Test TTS with different voice options."""
         voices = ["vivian", "ryan"]
@@ -144,6 +154,9 @@ class TestQwen3TTSCustomVoice:
             assert response.status_code == 200, f"Request failed for voice {voice}: {response.text}"
             assert verify_wav_audio(response.content), f"Invalid WAV for voice {voice}"
 
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "L4"}, num_cards=4)
     def test_speech_binary_response_not_utf8_error(self, omni_server) -> None:
         """
         Regression test: Verify binary audio is returned, not UTF-8 error.
@@ -178,6 +191,9 @@ class TestQwen3TTSCustomVoice:
 class TestQwen3TTSAPIEndpoints:
     """Test API endpoint functionality."""
 
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "L4"}, num_cards=4)
     def test_list_voices_endpoint(self, omni_server) -> None:
         """Test the /v1/audio/voices endpoint returns available voices."""
         url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/voices"
@@ -194,6 +210,9 @@ class TestQwen3TTSAPIEndpoints:
         voices_lower = [v.lower() for v in data["voices"]]
         assert "vivian" in voices_lower or "ryan" in voices_lower
 
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "L4"}, num_cards=4)
     def test_models_endpoint(self, omni_server) -> None:
         """Test the /v1/models endpoint returns loaded model."""
         url = f"http://{omni_server.host}:{omni_server.port}/v1/models"
