@@ -241,7 +241,7 @@ steps:
         - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Qwen3-TTS E2E Test"
-    timeout_in_minutes: 30
+    timeout_in_minutes: 10
     depends_on: image-build
     commands:
       - export VLLM_LOGGING_LEVEL=DEBUG
