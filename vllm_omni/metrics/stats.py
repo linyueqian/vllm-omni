@@ -225,6 +225,7 @@ class OrchestratorAggregator:
             output_to_yield.final_output_type == "audio"
             and finished
             and (multimodal_output := output_to_yield.multimodal_output.get("audio")) is not None
+            and len(multimodal_output) > 0
         ):
             nframes = int(multimodal_output[-1].shape[0])
             stage_events_for_req = self.stage_events.get(request_id, [])
