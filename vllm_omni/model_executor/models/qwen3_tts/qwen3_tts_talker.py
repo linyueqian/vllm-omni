@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import dataclasses
 import io
 import os
 from collections.abc import Callable, Iterable, Mapping
@@ -368,21 +367,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Keep it optional to avoid strict weight-loading failures.
         self.speaker_encoder: Qwen3TTSSpeakerEncoder | None = None
 
-        # Code predictor uses an isolated vLLM config so its KV cache doesn't
-        # pollute the main engine's static_forward_context (shallow-copy shares
-        # the dict by reference — must assign a fresh one).
-        predictor_compilation = dataclasses.replace(vllm_config.compilation_config)
-        predictor_compilation.static_forward_context = {}
-        self._code_predictor_vllm_config = dataclasses.replace(vllm_config, compilation_config=predictor_compilation)
-        from vllm.config.vllm import set_current_vllm_config as _set_cfg
-
-        with _set_cfg(self._code_predictor_vllm_config):
-            self.code_predictor = Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(
-                vllm_config=self._code_predictor_vllm_config,
-                config=self.talker_config.code_predictor_config,
-                talker_config=self.talker_config,
-                prefix="code_predictor",
-            )
+        self.code_predictor = Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(
+            vllm_config=vllm_config,
+            config=self.talker_config.code_predictor_config,
+            talker_config=self.talker_config,
+            prefix="code_predictor",
+        )
 
         # Constant logit mask: allow only codec ids [1, codebook_vocab_size) plus codec EOS.
         vocab = int(self.talker_config.vocab_size)
@@ -1561,15 +1551,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             audio_codes = input_ids.reshape(bsz, 1)
             return (last_id_hidden + text_step).reshape(bsz, -1), audio_codes
 
-        # Predict residual codes (1..Q-1) with HF reference sampling params.
+        # Predict residual codes (1..Q-1).  Sampling parameters (temperature,
+        # top_k) are baked into the code predictor module for CUDA graph safety.
         audio_codes = self.code_predictor(
             layer0_code=input_ids.reshape(bsz, 1),
             layer0_embed=last_id_hidden,
             last_talker_hidden=past_hidden,
-            do_sample=True,
-            temperature=0.9,
-            top_k=50,
-            top_p=1.0,
         )  # [B, Q]
 
         # Map invalid layer-0 ids (e.g. EOS) to PAD=0 so SpeechTokenizer sees only real codes.

@@ -5,170 +5,318 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from vllm.config import VllmConfig
-from vllm.config.vllm import set_current_vllm_config
-from vllm.forward_context import set_forward_context
+import torch.nn.functional as F
+from transformers.generation.logits_process import (
+    LogitsProcessorList,
+    TopKLogitsWarper,
+)
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from vllm.compilation.decorators import support_torch_compile
+from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from vllm.model_executor.models.qwen3 import Qwen3DecoderLayer
 from vllm.model_executor.models.utils import is_pp_missing_parameter
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheSpec, KVCacheTensor
-from vllm.v1.worker.gpu import attn_utils
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .configuration_qwen3_tts import Qwen3TTSTalkerCodePredictorConfig, Qwen3TTSTalkerConfig
 
+logger = init_logger(__name__)
 
-class _LocalPredictorKVCache:
-    """Minimal local KV cache + attention metadata for running
-    code_predictor inside one worker (independent of engine KV)."""
+
+# ============================================================================
+# Code Predictor Attention Layer (HF-style, batch-major, no KV cache)
+# ============================================================================
+
+
+class Qwen3TTSCodePredictorAttention(nn.Module):
+    """Multi-head self-attention for TTS code predictor.
+
+    Uses HF attention backends (SDPA/xformers/eager) instead of vLLM Attention,
+    so that the code predictor can run inside a CUDA graph without needing
+    per-step ``set_forward_context`` calls.
+    """
 
     def __init__(
         self,
-        *,
-        vllm_config: VllmConfig,
-        max_seq_len: int,
-        max_batch_size: int,
-        device: torch.device,
-    ) -> None:
-        self.vllm_config = vllm_config
-        self.device = device
+        config: Qwen3TTSTalkerCodePredictorConfig,
+        layer_idx: int,
+        quant_config: Any | None = None,
+        prefix: str = "",
+    ):
+        super().__init__()
 
-        # Collect attention layers registered in this vllm_config.
-        kv_cache_spec_by_layer = attn_utils.get_kv_cache_spec(vllm_config)
-        if not kv_cache_spec_by_layer:
-            raise RuntimeError("Local predictor KVCache requires vLLM Attention layers to be registered.")
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.head_dim = getattr(
+            config,
+            "head_dim",
+            config.hidden_size // config.num_attention_heads,
+        )
+        self.hidden_size = config.hidden_size
 
-        # We only need enough blocks for a tiny per-frame sequence (<= max_seq_len).
-        any_spec = next(iter(kv_cache_spec_by_layer.values()))
-        block_size = int(any_spec.block_size)
-        blocks_per_seq = (int(max_seq_len) + block_size - 1) // block_size
-        num_blocks = max(1, int(max_batch_size) * int(blocks_per_seq))
+        if self.num_heads % self.num_key_value_heads != 0:
+            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
 
-        # Allocate per-layer KV caches (small, independent).
-        kv_cache_tensors: list[KVCacheTensor] = []
-        for layer_name, spec in kv_cache_spec_by_layer.items():
-            kv_cache_tensors.append(KVCacheTensor(size=int(spec.page_size_bytes) * num_blocks, shared_by=[layer_name]))
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
-        merged_spec: KVCacheSpec = KVCacheSpec.merge(list(kv_cache_spec_by_layer.values()))
-        self.kv_cache_config = KVCacheConfig(
-            num_blocks=num_blocks,
-            kv_cache_tensors=kv_cache_tensors,
-            kv_cache_groups=[
-                KVCacheGroupSpec(layer_names=list(kv_cache_spec_by_layer.keys()), kv_cache_spec=merged_spec)
-            ],
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=self.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=self.num_heads,
+            total_num_kv_heads=self.num_key_value_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
+            disable_tp=True,
+        )
+        self.o_proj = RowParallelLinear(
+            input_size=self.num_heads * self.head_dim,
+            output_size=self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+            disable_tp=True,
+        )
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            max_position=config.max_position_embeddings,
+            rope_parameters=None,
+            dual_chunk_attention_config=None,
         )
 
-        # Init backend + bind KV cache tensors to attention modules.
-        self.attn_backends, self.attn_metadata_builders = attn_utils.init_attn_backend(
-            self.kv_cache_config, vllm_config, device
-        )
-        self.runner_kv_caches: list[torch.Tensor] = []
-        attn_utils.init_kv_cache(
-            self.runner_kv_caches,
-            vllm_config.compilation_config.static_forward_context,
-            self.kv_cache_config,
-            self.attn_backends,
-            device,
-        )
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_key_value_heads * self.head_dim
 
-        # Precompute a fixed block table mapping for the maximum batch.
-        self.block_size = block_size
-        self.blocks_per_seq = blocks_per_seq
-        self.max_batch_size = int(max_batch_size)
+        # Query/Key normalization (Qwen3 style)
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.is_causal = True
+        self.config = config
+        self.layer_idx = layer_idx
 
-        bt = torch.full((self.max_batch_size, self.blocks_per_seq), -1, dtype=torch.int32, device=device)
-        for i in range(self.max_batch_size):
-            for j in range(self.blocks_per_seq):
-                bt[i, j] = i * self.blocks_per_seq + j
-        self._block_table = bt
+        self.attention_backends = ["flash_attention_2", "xformers", "eager", "sdpa"]
+        cudagraph_mode = get_current_vllm_config().compilation_config.cudagraph_mode
+        if "flash_attention_2" in ALL_ATTENTION_FUNCTIONS and cudagraph_mode.has_full_cudagraphs():
+            logger.warning(
+                "CUDAGraphMode.%s is currently not supported with flash attention "
+                "for Qwen3-TTS code predictor. Removing flash_attention_2 from backends.",
+                cudagraph_mode.name,
+            )
+            self.attention_backends.remove("flash_attention_2")
 
-    def build_attn_metadata(
+    def forward(
         self,
-        *,
-        num_reqs: int,
-        query_lens: torch.Tensor,  # (num_reqs,) int32 on cpu
-        seq_lens: torch.Tensor,  # (num_reqs,) int32 on cpu
-    ) -> tuple[dict[str, Any], torch.Tensor, dict[str, torch.Tensor]]:
-        """Build attention metadata, positions, and slot_mapping dict.
+        hidden_states: torch.Tensor,
+        position_ids: torch.LongTensor | None = None,
+    ) -> torch.Tensor:
+        bsz, seq_len, _ = hidden_states.shape
 
-        Returns:
-            (attn_metadata, positions, slot_mappings_by_layer)
-            - attn_metadata: per-layer attention metadata for attn backends.
-            - positions: (num_tokens,) position IDs on device.
-            - slot_mappings_by_layer: {layer_name: slot_mapping_tensor} for
-              set_forward_context so that unified_kv_cache_update can write
-              the KV cache correctly.
-        """
-        num_reqs = int(num_reqs)
-        if num_reqs <= 0:
-            return {}, torch.empty((0,), dtype=torch.int64, device=self.device), {}
-        if num_reqs > self.max_batch_size:
-            raise ValueError(f"num_reqs={num_reqs} exceeds local predictor max_batch_size={self.max_batch_size}")
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        query_lens_i32 = query_lens.to(dtype=torch.int32, device="cpu")
-        seq_lens_i32 = seq_lens.to(dtype=torch.int32, device="cpu")
+        # Reshape for normalization
+        q = q.reshape(bsz, seq_len, self.num_heads, self.head_dim)
+        k = k.reshape(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        v = v.reshape(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
-        # query_start_loc: prefix sums of query_lens.
-        qsl = torch.zeros((num_reqs + 1,), dtype=torch.int32, device="cpu")
-        qsl[1:] = torch.cumsum(query_lens_i32, dim=0)
-        num_tokens = int(qsl[-1].item())
-        if num_tokens <= 0:
-            return {}, torch.empty((0,), dtype=torch.int64, device=self.device), {}
+        # Apply Q/K normalization
+        q = self.q_norm(q).contiguous()
+        k = self.k_norm(k).contiguous()
+        q = q.reshape(-1, self.q_size)
+        k = k.reshape(-1, self.kv_size)
 
-        # positions: for each request i, emit positions [seq_len-query_len .. seq_len-1]
-        pos_list: list[torch.Tensor] = []
-        for i in range(num_reqs):
-            ql = int(query_lens_i32[i].item())
-            sl = int(seq_lens_i32[i].item())
-            start = sl - ql
-            pos_list.append(torch.arange(start, sl, dtype=torch.int64))
-        positions_cpu = torch.cat(pos_list, dim=0)
+        # Apply RoPE
+        q, k = self.rotary_emb(position_ids, q, k)
 
-        # slot_mapping: map each query token to a physical slot in the paged KV cache.
-        # We allocate per-request contiguous blocks; slot = base + position.
-        slot_mapping = torch.empty((num_tokens,), dtype=torch.int64, device="cpu")
-        cursor = 0
-        for i in range(num_reqs):
-            ql = int(query_lens_i32[i].item())
-            sl = int(seq_lens_i32[i].item())
-            start = sl - ql
-            for p in range(start, sl):
-                block_idx = p // self.block_size
-                offset = p % self.block_size
-                block_id = int(self._block_table[i, block_idx].item())
-                slot_mapping[cursor] = block_id * self.block_size + offset
-                cursor += 1
+        # Reshape for attention
+        q = q.reshape(bsz, seq_len, self.num_heads, self.head_dim)
+        k = k.reshape(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
-        max_seq_len = int(seq_lens_i32[:num_reqs].max().item())
-        query_start_loc_gpu = qsl.to(device=self.device)
-        seq_lens_gpu = seq_lens_i32.to(device=self.device)
-        block_table = self._block_table[:num_reqs].contiguous()
-        slot_mapping_gpu = slot_mapping.to(device=self.device)
+        v_heads = v.transpose(1, 2).contiguous()
+        q_heads = q.transpose(1, 2).contiguous()
+        k_heads = k.transpose(1, 2).contiguous()
 
-        attn_metadata = attn_utils.build_attn_metadata(
-            self.attn_metadata_builders,
-            num_reqs=num_reqs,
-            num_tokens=num_tokens,
-            query_start_loc_gpu=query_start_loc_gpu,
-            query_start_loc_cpu=qsl,
-            seq_lens=seq_lens_gpu,
-            max_seq_len=max_seq_len,
-            block_tables=[block_table],
-            slot_mappings=[slot_mapping_gpu],
-            kv_cache_config=self.kv_cache_config,
+        # Try attention backends in order of preference
+        attn_output = None
+        last_error = None
+
+        for backend_name in self.attention_backends:
+            if backend_name not in ALL_ATTENTION_FUNCTIONS:
+                continue
+
+            try:
+                attention_interface = ALL_ATTENTION_FUNCTIONS[backend_name]
+                attn_output, _ = attention_interface(
+                    self,
+                    q_heads,
+                    k_heads,
+                    v_heads,
+                    None,
+                    dropout=0.0 if not self.training else getattr(self, "attention_dropout", 0.0),
+                    scaling=self.head_dim**-0.5,
+                    sliding_window=None,
+                    use_cache=False,
+                    position_ids=position_ids[:seq_len].unsqueeze(0),
+                    output_hidden_states=True,
+                    output_attentions=False,
+                )
+                break
+            except (ValueError, ImportError, RuntimeError, AttributeError) as e:
+                last_error = e
+                continue
+
+        if attn_output is None:
+            raise RuntimeError(
+                f"All attention backends failed. Last error: {last_error}. "
+                "Please install flash-attn, or ensure PyTorch's scaled_dot_product_attention is available."
+            )
+        attn_output = attn_output.reshape(*(hidden_states.shape[:-1]), -1).contiguous()
+
+        attn_output, _ = self.o_proj(attn_output)
+        return attn_output
+
+
+# ============================================================================
+# Code Predictor MLP Layer
+# ============================================================================
+
+
+class Qwen3TTSCodePredictorMLP(nn.Module):
+    """Feed-forward network for TTS code predictor with fused gate/up projection."""
+
+    def __init__(
+        self,
+        config: Qwen3TTSTalkerCodePredictorConfig,
+        quant_config: Any | None = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+
+        self.gate_up_proj = MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[intermediate_size, intermediate_size],
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+            disable_tp=True,
         )
 
-        # Build slot_mappings_by_layer for set_forward_context.
-        # Fix for vllm 0.15.0
-        slot_mappings_by_layer: dict[str, torch.Tensor] = {}
-        for kv_cache_group in self.kv_cache_config.kv_cache_groups:
-            for layer_name in kv_cache_group.layer_names:
-                slot_mappings_by_layer[layer_name] = slot_mapping_gpu
+        self.down_proj = RowParallelLinear(
+            input_size=intermediate_size,
+            output_size=hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+            disable_tp=True,
+        )
 
-        return attn_metadata, positions_cpu.to(device=self.device), slot_mappings_by_layer
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(hidden_states)
+        gate, up = gate_up.chunk(2, dim=-1)
+        down, _ = self.down_proj(F.silu(gate) * up)
+        return down
+
+
+# ============================================================================
+# Code Predictor Transformer Layer
+# ============================================================================
+
+
+class Qwen3TTSCodePredictorMTPLayer(nn.Module):
+    """Transformer layer for TTS code predictor — self-attention + MLP."""
+
+    def __init__(
+        self,
+        config: Qwen3TTSTalkerCodePredictorConfig,
+        layer_idx: int,
+        quant_config: Any | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+
+        self.self_attn = Qwen3TTSCodePredictorAttention(
+            config,
+            layer_idx,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
+        )
+        self.mlp = Qwen3TTSCodePredictorMLP(
+            config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.LongTensor | None = None,
+    ) -> torch.Tensor:
+        # Self-attention with residual
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, position_ids)
+        hidden_states = residual + hidden_states
+
+        # MLP with residual
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
+
+
+# ============================================================================
+# Custom Op for Sampling (CUDA graph compatible)
+# ============================================================================
+
+
+def tts_code_predictor_sample(
+    logits: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    scaled = logits[:, -1] / self.temperature
+    scaled = self.logits_processors(None, scaled)
+    probs = F.softmax(scaled, dim=-1)
+    code = torch.multinomial(probs, num_samples=1)  # [batch, 1]
+    return code
+
+
+def tts_code_predictor_sample_fake(
+    logits: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty((logits.shape[0], 1), dtype=torch.int64, device=logits.device)
+
+
+direct_register_custom_op(
+    op_name="qwen3_tts_code_predictor_sample",
+    op_func=tts_code_predictor_sample,
+    fake_impl=tts_code_predictor_sample_fake,
+)
+
+
+# ============================================================================
+# Code Predictor Model (Transformer backbone)
+# ============================================================================
 
 
 class Qwen3TTSTalkerCodePredictorModelVLLM(nn.Module):
@@ -177,8 +325,7 @@ class Qwen3TTSTalkerCodePredictorModelVLLM(nn.Module):
         config: Qwen3TTSTalkerCodePredictorConfig,
         *,
         talker_hidden_size: int | None = None,
-        cache_config=None,
-        quant_config=None,
+        quant_config: Any | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -187,8 +334,11 @@ class Qwen3TTSTalkerCodePredictorModelVLLM(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                Qwen3DecoderLayer(
-                    config, cache_config=cache_config, quant_config=quant_config, prefix=f"{prefix}.layers.{i}"
+                Qwen3TTSCodePredictorMTPLayer(
+                    config,
+                    layer_idx=i,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.layers.{i}",
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -208,13 +358,12 @@ class Qwen3TTSTalkerCodePredictorModelVLLM(nn.Module):
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.codec_embedding
 
-    def forward(self, positions: torch.Tensor, inputs_embeds: torch.Tensor) -> torch.Tensor:
-        # Token-major: [num_tokens, hidden]
+    def forward(self, inputs_embeds: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        """Batch-major forward: inputs_embeds is [B, seq_len, H]."""
         hidden_states = inputs_embeds
-        residual = None
         for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, residual)
-        hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states = layer(hidden_states, position_ids)
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -279,8 +428,19 @@ class Qwen3TTSTalkerCodePredictorModelVLLM(nn.Module):
         return loaded_params
 
 
+# ============================================================================
+# Code Predictor Wrapper (with @support_torch_compile)
+# ============================================================================
+
+
+@support_torch_compile
 class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
-    """vLLM-native code_predictor used by the AR talker (residual codebooks)."""
+    """vLLM-native code_predictor used by the AR talker (residual codebooks).
+
+    Uses HF-style attention (batch-major, full recompute, no KV cache) so the
+    entire forward — including the internal AR loop and sampling — can be
+    captured inside a CUDA graph.
+    """
 
     def __init__(
         self,
@@ -291,7 +451,6 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         prefix: str = "code_predictor",
     ) -> None:
         super().__init__()
-        self._vllm_config = vllm_config
         self.config = config
         self.talker_config = talker_config
 
@@ -299,7 +458,6 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         self.model = Qwen3TTSTalkerCodePredictorModelVLLM(
             config,
             talker_hidden_size=int(talker_config.hidden_size),
-            cache_config=vllm_config.cache_config,
             quant_config=vllm_config.quant_config,
             prefix=f"{prefix}.model",
         )
@@ -314,182 +472,94 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         else:
             self.small_to_mtp_projection = nn.Identity()
 
-        self._kv_cache: _LocalPredictorKVCache | None = None
+        # Sampling parameters (temperature + top_k), baked into the module
+        # so that the custom op can access them via static_forward_context.
+        self.temperature = 0.9
+        self.logits_processors = LogitsProcessorList(
+            [
+                TopKLogitsWarper(top_k=50),
+            ]
+        )
+
+        # Register in static_forward_context so the custom op can find us.
+        compilation_config = get_current_vllm_config().compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+        self.layer_name = prefix
 
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Ensure all vLLM custom layers consult the predictor vllm_config
-        # (esp. for Attention static_forward_context).
-        with set_current_vllm_config(self._vllm_config):
-            loaded: set[str] = set()
-            model_weights: list[tuple[str, torch.Tensor]] = []
-            other_weights: list[tuple[str, torch.Tensor]] = []
-            for name, w in weights:
-                if name.startswith("model."):
-                    model_weights.append((name[len("model.") :], w))
-                else:
-                    other_weights.append((name, w))
+        loaded: set[str] = set()
+        model_weights: list[tuple[str, torch.Tensor]] = []
+        other_weights: list[tuple[str, torch.Tensor]] = []
+        for name, w in weights:
+            if name.startswith("model."):
+                model_weights.append((name[len("model.") :], w))
+            else:
+                other_weights.append((name, w))
 
-            loaded_model = self.model.load_weights(model_weights)
-            loaded |= {f"model.{n}" for n in loaded_model}
+        loaded_model = self.model.load_weights(model_weights)
+        loaded |= {f"model.{n}" for n in loaded_model}
 
-            params = dict(self.named_parameters(remove_duplicate=False))
-            for name, w in other_weights:
-                if name not in params:
-                    continue
-                default_weight_loader(params[name], w)
-                loaded.add(name)
-            return loaded
+        params = dict(self.named_parameters(remove_duplicate=False))
+        for name, w in other_weights:
+            if name not in params:
+                continue
+            default_weight_loader(params[name], w)
+            loaded.add(name)
+        return loaded
 
-    def _maybe_init_kv_cache(self, device: torch.device) -> None:
-        if self._kv_cache is not None:
-            return
-        max_seq_len = int(getattr(self.config, "num_code_groups", 16) or 16)
-        # Upper bound on batch size: vLLM scheduler max_num_seqs (fallback 8).
-        max_batch = int(getattr(self._vllm_config.scheduler_config, "max_num_seqs", 8) or 8)
-        max_batch = max(1, max_batch)
-        self._kv_cache = _LocalPredictorKVCache(
-            vllm_config=self._vllm_config,
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch,
-            device=device,
-        )
-
-    @torch.inference_mode()
-    def reset_cache(self) -> None:
-        # We reuse a fixed kv cache buffer and overwrite starting at slot 0.
-        # No action required here (seq_lens controls what is read).
-        return
-
-    @torch.inference_mode()
-    def prefill_logits(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
-        """Prefill with 2 tokens: [past_hidden, layer0_embed]. Returns logits for residual group 0."""
-        self._maybe_init_kv_cache(inputs_embeds.device)
-        assert self._kv_cache is not None
-
-        bsz = int(inputs_embeds.shape[0])
-        qlen = 2
-        # Flatten to token-major.
-        hs = inputs_embeds.to(dtype=torch.bfloat16).reshape(bsz * qlen, -1)
-        hs = self.small_to_mtp_projection(hs)
-
-        query_lens = torch.full((bsz,), qlen, dtype=torch.int32)
-        seq_lens = query_lens.clone()
-        attn_metadata, positions, slot_mappings = self._kv_cache.build_attn_metadata(
-            num_reqs=bsz, query_lens=query_lens, seq_lens=seq_lens
-        )
-
-        with (
-            set_current_vllm_config(self._vllm_config),
-            set_forward_context(
-                attn_metadata,
-                self._vllm_config,
-                num_tokens=int(hs.shape[0]),
-                slot_mapping=slot_mappings,
-            ),
-        ):
-            out = self.model(positions=positions, inputs_embeds=hs)
-
-        # Gather last token per request.
-        last_idx = torch.arange(qlen - 1, bsz * qlen, step=qlen, device=out.device, dtype=torch.long)
-        last_h = out.index_select(0, last_idx)
-        logits = self.lm_head[0](last_h)
-        return logits
-
-    @torch.inference_mode()
-    def decode_logits(self, input_ids: torch.Tensor, *, generation_step: int, past_seq_len: int) -> torch.Tensor:
-        """Decode one new token for residual group `generation_step` (1..Q-1)."""
-        self._maybe_init_kv_cache(input_ids.device)
-        assert self._kv_cache is not None
-        bsz = int(input_ids.shape[0])
-        if generation_step <= 0:
-            raise ValueError("generation_step must be >= 1 for decode_logits")
-
-        embed_idx = generation_step - 1
-        hs = self.model.get_input_embeddings()[embed_idx](input_ids.to(dtype=torch.long).reshape(bsz, 1))
-        hs = self.small_to_mtp_projection(hs.reshape(bsz, -1))
-
-        query_lens = torch.ones((bsz,), dtype=torch.int32)
-        seq_lens = torch.full((bsz,), int(past_seq_len) + 1, dtype=torch.int32)
-        attn_metadata, positions, slot_mappings = self._kv_cache.build_attn_metadata(
-            num_reqs=bsz, query_lens=query_lens, seq_lens=seq_lens
-        )
-
-        with (
-            set_current_vllm_config(self._vllm_config),
-            set_forward_context(
-                attn_metadata,
-                self._vllm_config,
-                num_tokens=int(hs.shape[0]),
-                slot_mapping=slot_mappings,
-            ),
-        ):
-            out = self.model(positions=positions, inputs_embeds=hs)
-
-        logits = self.lm_head[generation_step](out)
-        return logits
-
-    @torch.inference_mode()
     def forward(
         self,
         layer0_code: torch.Tensor,
         layer0_embed: torch.Tensor,
         last_talker_hidden: torch.Tensor,
-        do_sample: bool = True,
-        temperature: float = 1.0,
-        top_k: int = 50,
-        top_p: float = 1.0,
     ) -> torch.Tensor:
         """Full autoregressive prediction of residual codebooks 1..Q-1.
 
+        Uses full-recompute attention (no KV cache) at each AR step so that
+        the entire loop is CUDA-graph-safe.
+
         Args:
             layer0_code: [B, 1] first-layer codec token ids.
-            layer0_embed: [B, 1, H] embedding of layer0_code.
+            layer0_embed: [B, 1, H] embedding of layer0_code (talker hidden space).
             last_talker_hidden: [B, 1, H] hidden state from the talker.
-            do_sample: whether to sample or take argmax.
-            temperature: sampling temperature.
-            top_k: top-k filtering.
-            top_p: top-p (nucleus) filtering.
 
         Returns:
             audio_codes: [B, Q] all codebook tokens (layer0 + residuals).
         """
         bsz = int(layer0_code.shape[0])
         num_groups = int(self.config.num_code_groups)
-        max_steps = num_groups - 1
 
-        # Reset KV cache for a fresh sequence.
-        self.reset_cache()
-
-        # Prefill: feed [last_talker_hidden, layer0_embed] → logits for group 1.
-        prefill_input = torch.cat([last_talker_hidden, layer0_embed], dim=1)  # [B, 2, H]
-        logits = self.prefill_logits(prefill_input)  # [B, vocab]
+        # Start with [last_talker_hidden, layer0_embed], project to predictor hidden size.
+        current_input = torch.cat([last_talker_hidden, layer0_embed], dim=1)  # [B, 2, talker_H]
+        current_input = current_input.to(dtype=torch.bfloat16)
+        current_input = self.small_to_mtp_projection(current_input)  # [B, 2, predictor_H]
 
         all_codes = [layer0_code.reshape(bsz, 1)]
-        past_seq_len = 2
 
-        for step in range(1, num_groups):
-            # Sample or argmax from logits.
-            if do_sample and temperature > 0:
-                scaled = logits / temperature
-                if top_k > 0:
-                    topk_vals, _ = scaled.topk(top_k, dim=-1)
-                    scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                probs = torch.softmax(scaled, dim=-1)
-                next_ids = torch.multinomial(probs, num_samples=1)  # [B, 1]
-            else:
-                next_ids = logits.argmax(dim=-1, keepdim=True)  # [B, 1]
-            all_codes.append(next_ids)
+        for layer_idx in range(num_groups - 1):
+            seq_len = layer_idx + 2
+            # Position IDs for full recompute (flat, repeated per batch element)
+            position_ids = torch.arange(seq_len, device=current_input.device, dtype=torch.int64).repeat(bsz)
 
-            # If not the last step, decode one more token.
-            if step < max_steps:
-                logits = self.decode_logits(
-                    next_ids.reshape(bsz),
-                    generation_step=step,
-                    past_seq_len=past_seq_len,
-                )
-                past_seq_len += 1
+            # Forward through transformer (batch-major, full recompute)
+            hidden_state = self.model(current_input, position_ids)  # [B, seq_len, H]
+
+            # Get logits from last token via corresponding lm_head
+            logits = self.lm_head[layer_idx](hidden_state[:, -1:, :])
+
+            # Sample via custom op (CUDA graph safe)
+            code = torch.ops.vllm.qwen3_tts_code_predictor_sample(logits, self.layer_name)
+            all_codes.append(code)
+
+            # Embed new code and concat for next step (skip on last iteration)
+            if layer_idx < num_groups - 2:
+                new_embed = self.model.codec_embedding[layer_idx](code)  # [B, 1, talker_H]
+                new_embed = self.small_to_mtp_projection(new_embed)  # [B, 1, predictor_H]
+                current_input = torch.cat([current_input, new_embed], dim=1)  # [B, seq_len+1, H]
 
         return torch.cat(all_codes, dim=1)  # [B, Q]
