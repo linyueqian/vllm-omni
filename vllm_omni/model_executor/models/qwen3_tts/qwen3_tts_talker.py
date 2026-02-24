@@ -371,7 +371,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             vllm_config=vllm_config,
             config=self.talker_config.code_predictor_config,
             talker_config=self.talker_config,
-            prefix="code_predictor",
+            prefix=maybe_prefix(prefix, "code_predictor"),
         )
 
         # Constant logit mask: allow only codec ids [1, codebook_vocab_size) plus codec EOS.
