@@ -394,16 +394,277 @@ class Qwen3TTSTalkerCodePredictorModelVLLM(nn.Module):
 
 
 # ============================================================================
-# Code Predictor Wrapper (eager — AR loop has dynamic shapes)
+# Code Predictor CUDA Graph (captures full AR loop as a single graph)
+# ============================================================================
+
+
+class CodePredictorGraph:
+    """Captures the full code predictor AR loop as a single CUDA graph.
+
+    Replaces the eager multi-step forward (dynamic shapes + torch.multinomial)
+    with a static, graph-safe version using:
+    - Pre-allocated KV caches (fixed shapes, written at static Python-int offsets)
+    - torch.argmax instead of torch.multinomial (deterministic, graph-safe)
+    - All steps unrolled inside a single torch.cuda.CUDAGraph context
+
+    NOTE: argmax is greedy/deterministic; the eager fallback uses multinomial
+    sampling (stochastic). This is a quality trade-off in exchange for speed.
+    """
+
+    def __init__(
+        self,
+        code_predictor: Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM,
+        talker_hidden_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        batch_size: int = 1,
+    ) -> None:
+        self.code_predictor = code_predictor
+        self.model = code_predictor.model
+        self.lm_head = code_predictor.lm_head
+        self.small_to_mtp_projection = code_predictor.small_to_mtp_projection
+        self.batch_size = batch_size
+
+        cfg = code_predictor.config
+        self.num_groups = int(cfg.num_code_groups)  # e.g. 16
+        self.max_seq = self.num_groups  # positions 0 .. num_groups-1
+        self.num_layers = len(self.model.layers)
+
+        attn0 = self.model.layers[0].self_attn
+        num_kv_heads = attn0.num_key_value_heads
+        head_dim = attn0.head_dim
+
+        # Static KV caches — [B, kv_heads, max_seq, head_dim] per layer
+        self.k_caches: list[torch.Tensor] = [
+            torch.zeros(batch_size, num_kv_heads, self.max_seq, head_dim, device=device, dtype=dtype)
+            for _ in range(self.num_layers)
+        ]
+        self.v_caches: list[torch.Tensor] = [
+            torch.zeros(batch_size, num_kv_heads, self.max_seq, head_dim, device=device, dtype=dtype)
+            for _ in range(self.num_layers)
+        ]
+
+        # Pre-built position tensors — [B] per step (all B tokens share the same position)
+        self.pos_tensors: list[torch.Tensor] = [
+            torch.full((batch_size,), i, device=device, dtype=torch.int64) for i in range(self.max_seq)
+        ]
+
+        # Pre-built causal attention masks — shape [1, 1, 1, max_seq] per step (broadcast over B)
+        self.attn_masks: list[torch.Tensor] = self._build_masks(device, dtype)
+
+        # Static I/O buffers — [B, 1, H]
+        self.buf_talker_hidden = torch.zeros(batch_size, 1, talker_hidden_size, device=device, dtype=dtype)
+        self.buf_layer0_embed = torch.zeros(batch_size, 1, talker_hidden_size, device=device, dtype=dtype)
+        # Output buffer: slot 0 is set externally, slots 1..num_groups-1 filled by graph
+        self.output_codes = torch.zeros(batch_size, self.num_groups, device=device, dtype=torch.int64)
+
+        self._graph: torch.cuda.CUDAGraph | None = None
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _build_masks(self, device: torch.device, dtype: torch.dtype) -> list[torch.Tensor]:
+        """Build per-step causal masks of shape [1, 1, 1, max_seq]."""
+        neg_inf = torch.finfo(dtype).min
+        masks = []
+        for step_idx in range(self.max_seq):
+            mask = torch.full((1, 1, 1, self.max_seq), neg_inf, device=device, dtype=dtype)
+            mask[:, :, :, : step_idx + 1] = 0.0
+            masks.append(mask)
+        return masks
+
+    def _reset_kv_caches(self) -> None:
+        for k, v in zip(self.k_caches, self.v_caches):
+            k.zero_()
+            v.zero_()
+
+    def _attn_step(
+        self,
+        attn: Qwen3TTSCodePredictorAttention,
+        hidden_states: torch.Tensor,
+        step_idx: int,
+        layer_i: int,
+    ) -> torch.Tensor:
+        """Single-token decode through one attention layer with static KV cache."""
+        B = self.batch_size
+        qkv, _ = attn.qkv_proj(hidden_states)
+        q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+
+        q = q.reshape(B, 1, attn.num_heads, attn.head_dim)
+        k = k.reshape(B, 1, attn.num_key_value_heads, attn.head_dim)
+        v = v.reshape(B, 1, attn.num_key_value_heads, attn.head_dim)
+
+        q = attn.q_norm(q).contiguous()
+        k = attn.k_norm(k).contiguous()
+
+        # Flatten for vLLM RoPE API: (positions [B], q/k [B, dim]) — B tokens, one per sequence
+        q = q.reshape(B, attn.q_size)
+        k = k.reshape(B, attn.kv_size)
+        q, k = attn.rotary_emb(self.pos_tensors[step_idx], q, k)
+
+        q = q.reshape(B, attn.num_heads, 1, attn.head_dim)
+        k = k.reshape(B, attn.num_key_value_heads, 1, attn.head_dim)
+        v = v.reshape(B, attn.num_key_value_heads, 1, attn.head_dim)
+
+        # Write at static Python-int offset (static slice at graph-capture time)
+        self.k_caches[layer_i][:, :, step_idx : step_idx + 1, :] = k
+        self.v_caches[layer_i][:, :, step_idx : step_idx + 1, :] = v
+
+        k_full = self.k_caches[layer_i]
+        v_full = self.v_caches[layer_i]
+        if attn.num_key_value_groups > 1:
+            k_full = k_full.repeat_interleave(attn.num_key_value_groups, dim=1)
+            v_full = v_full.repeat_interleave(attn.num_key_value_groups, dim=1)
+
+        # attn_mask [1,1,1,max_seq] broadcasts over batch dim B
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            k_full,
+            v_full,
+            attn_mask=self.attn_masks[step_idx],
+            dropout_p=0.0,
+            scale=attn.head_dim**-0.5,
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(B, 1, attn.num_heads * attn.head_dim)
+        attn_out, _ = attn.o_proj(attn_out)
+        return attn_out
+
+    def _layer_step(
+        self,
+        layer: Qwen3TTSCodePredictorMTPLayer,
+        hidden_states: torch.Tensor,
+        step_idx: int,
+        layer_i: int,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = layer.input_layernorm(hidden_states)
+        hidden_states = self._attn_step(layer.self_attn, hidden_states, step_idx, layer_i)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = layer.post_attention_layernorm(hidden_states)
+        hidden_states = layer.mlp(hidden_states)
+        return residual + hidden_states
+
+    def _model_step(self, embed: torch.Tensor, step_idx: int) -> torch.Tensor:
+        """One-token forward through the full transformer backbone."""
+        hidden = embed
+        for layer_i, layer in enumerate(self.model.layers):
+            hidden = self._layer_step(layer, hidden, step_idx, layer_i)
+        return self.model.norm(hidden)
+
+    # ------------------------------------------------------------------
+    # Captured loop
+    # ------------------------------------------------------------------
+
+    def _full_loop(self) -> None:
+        """Unrolled AR loop — all steps captured as one CUDA graph.
+
+        Step 0 : prefill last_talker_hidden into KV cache (no code output).
+        Step 1 : process layer0_embed, emit code[1] via lm_head[0].
+        Steps 2+: embed previous code, emit next code via lm_head[step-1].
+        """
+        # ── step 0: last_talker_hidden → KV cache (hidden discarded) ────
+        h = self.small_to_mtp_projection(self.buf_talker_hidden)
+        self._model_step(h, 0)
+
+        # ── step 1: layer0_embed → code[1] ──────────────────────────────
+        h = self.small_to_mtp_projection(self.buf_layer0_embed)
+        h = self._model_step(h, 1)
+        logits = self.lm_head[0](h)  # [1, 1, vocab]
+        self.output_codes[:, 1:2] = logits[:, 0, :].argmax(dim=-1, keepdim=True)
+
+        # ── steps 2 .. max_seq-1 ────────────────────────────────────────
+        for step_idx in range(2, self.max_seq):
+            layer_idx = step_idx - 2
+            prev_code = self.output_codes[:, step_idx - 1 : step_idx]  # static slice
+            embed = self.model.codec_embedding[layer_idx](prev_code)
+            embed = self.small_to_mtp_projection(embed)
+            h = self._model_step(embed, step_idx)
+            logits = self.lm_head[step_idx - 1](h)
+            self.output_codes[:, step_idx : step_idx + 1] = logits[:, 0, :].argmax(dim=-1, keepdim=True)
+
+    # ------------------------------------------------------------------
+    # Capture & run
+    # ------------------------------------------------------------------
+
+    def capture(self, num_warmup: int = 3) -> None:
+        """Warm up then capture the AR loop as a CUDA graph."""
+        import gc
+
+        logger.info(
+            "CodePredictorGraph: capturing CUDA graph for %d-step AR loop (%d layers, max_seq=%d).",
+            self.num_groups,
+            self.num_layers,
+            self.max_seq,
+        )
+
+        # Warmup on a side stream to avoid polluting the default stream
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(num_warmup):
+                self._reset_kv_caches()
+                self._full_loop()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        self._graph = torch.cuda.CUDAGraph()
+        self._reset_kv_caches()
+        with torch.cuda.graph(self._graph):
+            self._full_loop()
+
+        logger.info("CodePredictorGraph: capture complete.")
+
+    def run(
+        self,
+        layer0_code: torch.Tensor,
+        layer0_embed: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        actual_bsz: int | None = None,
+    ) -> torch.Tensor:
+        """Copy inputs to static buffers, replay graph, return codes [actual_bsz, Q].
+
+        If actual_bsz < self.batch_size the inputs are padded (replicate first row)
+        and only the first actual_bsz rows of the output are returned.
+        """
+        assert self._graph is not None, "capture() must be called before run()"
+        B = self.batch_size
+        if actual_bsz is None:
+            actual_bsz = B
+
+        h = last_talker_hidden.reshape(actual_bsz, 1, -1)
+        e = layer0_embed.reshape(actual_bsz, 1, -1)
+        c = layer0_code.reshape(actual_bsz, 1)
+        if actual_bsz < B:
+            pad = B - actual_bsz
+            h = torch.cat([h, h[:1].expand(pad, 1, -1)], dim=0)
+            e = torch.cat([e, e[:1].expand(pad, 1, -1)], dim=0)
+            c = torch.cat([c, c[:1].expand(pad, 1)], dim=0)
+
+        self.buf_talker_hidden.copy_(h)
+        self.buf_layer0_embed.copy_(e)
+        self._reset_kv_caches()
+        self._graph.replay()
+        # Slot 0 holds layer0_code — set after replay (graph never reads/writes it)
+        self.output_codes[:, 0:1] = c
+        return self.output_codes[:actual_bsz].clone()
+
+
+# ============================================================================
+# Code Predictor Wrapper
 # ============================================================================
 
 
 class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
     """vLLM-native code_predictor used by the AR talker (residual codebooks).
 
-    Uses HF-style attention (batch-major, full recompute, no KV cache).
-    The internal AR loop has dynamic tensor shapes (sequence grows each step),
-    so this module runs eagerly — torch.compile and CUDA graphs are not used.
+    Uses HF-style attention (batch-major, full recompute, no KV cache) in the
+    default eager path. When setup_graph() is called (CUDA graphs enabled,
+    batch_size=1), dispatches to CodePredictorGraph which captures the full
+    AR loop as a single CUDA graph using static KV caches and torch.argmax.
     """
 
     def __init__(
@@ -444,6 +705,9 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             ]
         )
 
+        # Populated by setup_graph(): maps batch_size → CodePredictorGraph.
+        self._graphs: dict[int, CodePredictorGraph] = {}
+
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
 
@@ -468,6 +732,25 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             loaded.add(name)
         return loaded
 
+    def setup_graph(self, batch_sizes: tuple[int, ...] = (1,)) -> None:
+        """Build and capture CodePredictorGraphs for the given batch sizes.
+
+        Called once by OmniGPUModelRunner.load_model() when CUDA graphs are
+        enabled. After this, forward() dispatches to the smallest captured graph
+        whose batch_size >= bsz, padding inputs as needed.
+        """
+        params = list(self.parameters())
+        if not params:
+            logger.warning("CodePredictorGraph: no parameters, skipping capture.")
+            return
+        device = params[0].device
+        dtype = params[0].dtype
+        talker_hidden_size = int(self.talker_config.hidden_size)
+        for bs in sorted(set(batch_sizes)):
+            g = CodePredictorGraph(self, talker_hidden_size, device, dtype, batch_size=bs)
+            g.capture()
+            self._graphs[bs] = g
+
     def forward(
         self,
         layer0_code: torch.Tensor,
@@ -476,7 +759,9 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
     ) -> torch.Tensor:
         """Full autoregressive prediction of residual codebooks 1..Q-1.
 
-        Uses full-recompute attention (no KV cache) at each AR step.
+        Dispatches to CodePredictorGraph (argmax, CUDA graph) for batch_size=1
+        when a graph has been captured via setup_graph(). Falls back to the
+        original eager path (multinomial sampling) otherwise.
 
         Args:
             layer0_code: [B, 1] first-layer codec token ids.
@@ -487,6 +772,13 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             audio_codes: [B, Q] all codebook tokens (layer0 + residuals).
         """
         bsz = int(layer0_code.shape[0])
+
+        if self._graphs:
+            # Pick smallest pre-captured graph whose batch_size >= bsz
+            for bs in sorted(self._graphs):
+                if bs >= bsz:
+                    return self._graphs[bs].run(layer0_code, layer0_embed, last_talker_hidden, actual_bsz=bsz)
+
         num_groups = int(self.config.num_code_groups)
 
         # Start with [last_talker_hidden, layer0_embed], project to predictor hidden size.
