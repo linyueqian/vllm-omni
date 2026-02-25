@@ -96,6 +96,16 @@ class OmniGPUModelRunner(GPUModelRunner):
             )
             self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
             self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+            # Set up CUDA graph for TTS code predictor.
+            # TTS models expose .code_predictor directly; Omni nests it under .talker.
+            code_predictor = getattr(self.model, "code_predictor", None)
+            if code_predictor is not None and cudagraph_mode.has_full_cudagraphs():
+                import math
+
+                bs_cap = min(max(self.max_num_reqs, 1), 8)
+                n = int(math.log2(bs_cap)) + 1
+                batch_sizes = tuple(2**i for i in range(n))
+                code_predictor.setup_graph(batch_sizes=batch_sizes)
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         """Initialize M-RoPE positions for multimodal inputs.
