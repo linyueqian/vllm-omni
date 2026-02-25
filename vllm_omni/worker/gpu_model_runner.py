@@ -104,7 +104,9 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 bs_cap = min(max(self.max_num_reqs, 1), 8)
                 n = int(math.log2(bs_cap)) + 1
-                batch_sizes = tuple(2**i for i in range(n))
+                batch_sizes_set = {2**i for i in range(n)}
+                batch_sizes_set.add(bs_cap)  # cover non-power-of-two caps
+                batch_sizes = tuple(sorted(batch_sizes_set))
                 code_predictor.setup_graph(batch_sizes=batch_sizes)
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
