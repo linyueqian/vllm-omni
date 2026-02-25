@@ -11,9 +11,7 @@ from transformers.generation.logits_process import (
     TopKLogitsWarper,
 )
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -27,7 +25,6 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.utils import is_pp_missing_parameter
-from vllm.utils.torch_utils import direct_register_custom_op
 
 from .configuration_qwen3_tts import Qwen3TTSTalkerCodePredictorConfig, Qwen3TTSTalkerConfig
 
@@ -283,38 +280,6 @@ class Qwen3TTSCodePredictorMTPLayer(nn.Module):
 
 
 # ============================================================================
-# Custom Op for Sampling (CUDA graph compatible)
-# ============================================================================
-
-
-def tts_code_predictor_sample(
-    logits: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    forward_context = get_forward_context()
-    self = forward_context.no_compile_layers[layer_name]
-    scaled = logits[:, -1] / self.temperature
-    scaled = self.logits_processors(None, scaled)
-    probs = F.softmax(scaled, dim=-1)
-    code = torch.multinomial(probs, num_samples=1)  # [batch, 1]
-    return code
-
-
-def tts_code_predictor_sample_fake(
-    logits: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    return torch.empty((logits.shape[0], 1), dtype=torch.int64, device=logits.device)
-
-
-direct_register_custom_op(
-    op_name="qwen3_tts_code_predictor_sample",
-    op_func=tts_code_predictor_sample,
-    fake_impl=tts_code_predictor_sample_fake,
-)
-
-
-# ============================================================================
 # Code Predictor Model (Transformer backbone)
 # ============================================================================
 
@@ -429,17 +394,16 @@ class Qwen3TTSTalkerCodePredictorModelVLLM(nn.Module):
 
 
 # ============================================================================
-# Code Predictor Wrapper (with @support_torch_compile)
+# Code Predictor Wrapper (eager — AR loop has dynamic shapes)
 # ============================================================================
 
 
-@support_torch_compile
 class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
     """vLLM-native code_predictor used by the AR talker (residual codebooks).
 
-    Uses HF-style attention (batch-major, full recompute, no KV cache) so the
-    entire forward — including the internal AR loop and sampling — can be
-    captured inside a CUDA graph.
+    Uses HF-style attention (batch-major, full recompute, no KV cache).
+    The internal AR loop has dynamic tensor shapes (sequence grows each step),
+    so this module runs eagerly — torch.compile and CUDA graphs are not used.
     """
 
     def __init__(
@@ -472,21 +436,13 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         else:
             self.small_to_mtp_projection = nn.Identity()
 
-        # Sampling parameters (temperature + top_k), baked into the module
-        # so that the custom op can access them via static_forward_context.
+        # Sampling parameters (temperature + top_k).
         self.temperature = 0.9
         self.logits_processors = LogitsProcessorList(
             [
                 TopKLogitsWarper(top_k=50),
             ]
         )
-
-        # Register in static_forward_context so the custom op can find us.
-        compilation_config = get_current_vllm_config().compilation_config
-        if prefix in compilation_config.static_forward_context:
-            raise ValueError(f"Duplicate layer name: {prefix}")
-        compilation_config.static_forward_context[prefix] = self
-        self.layer_name = prefix
 
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
@@ -520,8 +476,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
     ) -> torch.Tensor:
         """Full autoregressive prediction of residual codebooks 1..Q-1.
 
-        Uses full-recompute attention (no KV cache) at each AR step so that
-        the entire loop is CUDA-graph-safe.
+        Uses full-recompute attention (no KV cache) at each AR step.
 
         Args:
             layer0_code: [B, 1] first-layer codec token ids.
@@ -552,8 +507,11 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             # Get logits from last token via corresponding lm_head
             logits = self.lm_head[layer_idx](hidden_state[:, -1:, :])
 
-            # Sample via custom op (CUDA graph safe)
-            code = torch.ops.vllm.qwen3_tts_code_predictor_sample(logits, self.layer_name)
+            # Sample (temperature + top_k)
+            scaled = logits[:, -1] / self.temperature
+            scaled = self.logits_processors(None, scaled)
+            probs = F.softmax(scaled, dim=-1)
+            code = torch.multinomial(probs, num_samples=1)  # [B, 1]
             all_codes.append(code)
 
             # Embed new code and concat for next step (skip on last iteration)
