@@ -1522,6 +1522,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 self.speaker_encoder = Qwen3TTSSpeakerEncoder(self.config.speaker_encoder_config)
             loaded |= loader.load_weights(speaker_weights, mapper=self.hf_to_vllm_mapper)
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
+
+        cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
+        if cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs():
+            max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs
+            bs_cap = min(max(max_num_reqs, 1), 8)
+            self.code_predictor.setup_graph(max_batch_size=bs_cap)
+
         return loaded
 
     # -------------------- GPU-side MTP fast-path --------------------

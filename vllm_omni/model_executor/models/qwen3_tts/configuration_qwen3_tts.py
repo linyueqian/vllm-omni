@@ -396,6 +396,8 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
         attention_dropout=0,
         num_code_groups=32,
         text_hidden_size=2048,
+        code_predictor_temperature=0.9,
+        code_predictor_top_k=50,
         codec_eos_token_id=4198,
         codec_think_id=4202,
         codec_nothink_id=4203,
@@ -455,6 +457,8 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
         self.codec_bos_id = codec_bos_id
         self.spk_id = spk_id
         self.spk_is_dialect = spk_is_dialect
+        self.code_predictor_temperature = code_predictor_temperature
+        self.code_predictor_top_k = code_predictor_top_k
 
 
 class Qwen3TTSConfig(PretrainedConfig):

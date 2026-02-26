@@ -407,6 +407,10 @@ class CodePredictorGraph:
     - torch.argmax instead of torch.multinomial (deterministic, graph-safe)
     - All steps unrolled inside a single torch.cuda.CUDAGraph context
 
+    The number of AR steps is driven by ``config.num_code_groups`` (e.g. 16 for
+    all current Qwen3-TTS variants). Future variants with a different codebook
+    count will work automatically as long as their config sets the correct value.
+
     NOTE: argmax is greedy/deterministic; the eager fallback uses multinomial
     sampling (stochastic). This is a quality trade-off in exchange for speed.
     """
@@ -426,7 +430,7 @@ class CodePredictorGraph:
         self.batch_size = batch_size
 
         cfg = code_predictor.config
-        self.num_groups = int(cfg.num_code_groups)  # e.g. 16
+        self.num_groups = int(cfg.num_code_groups)  # all shapes/loops derive from this
         self.max_seq = self.num_groups  # positions 0 .. num_groups-1
         self.num_layers = len(self.model.layers)
 
@@ -588,8 +592,13 @@ class CodePredictorGraph:
     # Capture & run
     # ------------------------------------------------------------------
 
-    def capture(self, num_warmup: int = 3) -> None:
-        """Warm up then capture the AR loop as a CUDA graph."""
+    def capture(self, num_warmup: int = 3) -> bool:
+        """Warm up then capture the AR loop as a CUDA graph.
+
+        Returns True on success, False if capture fails (e.g. OOM or an
+        unsupported operation). On failure the graph is left uncaptured and
+        forward() will fall through to the eager path.
+        """
         import gc
 
         logger.info(
@@ -599,24 +608,37 @@ class CodePredictorGraph:
             self.max_seq,
         )
 
-        # Warmup on a side stream to avoid polluting the default stream
-        warmup_stream = torch.cuda.Stream()
-        warmup_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(warmup_stream):
-            for _ in range(num_warmup):
-                self._reset_kv_caches()
+        try:
+            # Warmup on a side stream to avoid polluting the default stream
+            warmup_stream = torch.cuda.Stream()
+            warmup_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warmup_stream):
+                for _ in range(num_warmup):
+                    self._reset_kv_caches()
+                    self._full_loop()
+            torch.cuda.current_stream().wait_stream(warmup_stream)
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            self._graph = torch.cuda.CUDAGraph()
+            self._reset_kv_caches()
+            with torch.cuda.graph(self._graph):
                 self._full_loop()
-        torch.cuda.current_stream().wait_stream(warmup_stream)
 
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        self._graph = torch.cuda.CUDAGraph()
-        self._reset_kv_caches()
-        with torch.cuda.graph(self._graph):
-            self._full_loop()
+        except Exception as e:
+            logger.warning(
+                "CodePredictorGraph: capture failed for batch_size=%d (%s: %s). "
+                "Falling back to eager mode for this batch size.",
+                self.batch_size,
+                type(e).__name__,
+                e,
+            )
+            self._graph = None
+            return False
 
         logger.info("CodePredictorGraph: capture complete.")
+        return True
 
     def run(
         self,
@@ -697,13 +719,12 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         else:
             self.small_to_mtp_projection = nn.Identity()
 
-        # Sampling parameters (temperature + top_k).
-        self.temperature = 0.9
-        self.logits_processors = LogitsProcessorList(
-            [
-                TopKLogitsWarper(top_k=50),
-            ]
-        )
+        # Default sampling parameters — read from talker_config so they can be
+        # overridden per-deployment without touching model code.
+        # The CUDA graph path always uses these static defaults (baked at capture
+        # time). The eager path accepts per-call overrides via forward().
+        self.temperature = float(getattr(talker_config, "code_predictor_temperature", 0.9))
+        self.top_k = int(getattr(talker_config, "code_predictor_top_k", 50))
 
         # Populated by setup_graph(): maps batch_size → CodePredictorGraph.
         self._graphs: dict[int, CodePredictorGraph] = {}
@@ -732,13 +753,17 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             loaded.add(name)
         return loaded
 
-    def setup_graph(self, batch_sizes: tuple[int, ...] = (1,)) -> None:
-        """Build and capture CodePredictorGraphs for the given batch sizes.
+    def setup_graph(self, max_batch_size: int = 1) -> None:
+        """Build and capture CodePredictorGraphs up to *max_batch_size*.
 
         Called once by OmniGPUModelRunner.load_model() when CUDA graphs are
-        enabled. After this, forward() dispatches to the smallest captured graph
-        whose batch_size >= bsz, padding inputs as needed.
+        enabled. Captures one graph per power-of-two batch size up to
+        max_batch_size (plus max_batch_size itself if it is not a power of two).
+        After this, forward() dispatches to the smallest captured graph whose
+        batch_size >= bsz, padding inputs as needed.
         """
+        import math
+
         params = list(self.parameters())
         if not params:
             logger.warning("CodePredictorGraph: no parameters, skipping capture.")
@@ -746,27 +771,40 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         device = params[0].device
         dtype = params[0].dtype
         talker_hidden_size = int(self.talker_config.hidden_size)
-        for bs in sorted(set(batch_sizes)):
+
+        bs_cap = max(max_batch_size, 1)
+        n = int(math.log2(bs_cap)) + 1
+        batch_sizes_set = {2**i for i in range(n)}
+        batch_sizes_set.add(bs_cap)  # cover non-power-of-two caps
+
+        for bs in sorted(batch_sizes_set):
             g = CodePredictorGraph(self, talker_hidden_size, device, dtype, batch_size=bs)
-            g.capture()
-            self._graphs[bs] = g
+            if g.capture():
+                self._graphs[bs] = g
 
     def forward(
         self,
         layer0_code: torch.Tensor,
         layer0_embed: torch.Tensor,
         last_talker_hidden: torch.Tensor,
+        temperature: float | None = None,
+        top_k: int | None = None,
     ) -> torch.Tensor:
         """Full autoregressive prediction of residual codebooks 1..Q-1.
 
-        Dispatches to CodePredictorGraph (argmax, CUDA graph) for batch_size=1
-        when a graph has been captured via setup_graph(). Falls back to the
-        original eager path (multinomial sampling) otherwise.
+        Dispatches to CodePredictorGraph (argmax, CUDA graph) when a graph has
+        been captured via setup_graph() and bsz fits within a captured size.
+        Falls back to the eager path (multinomial sampling) otherwise.
 
         Args:
             layer0_code: [B, 1] first-layer codec token ids.
             layer0_embed: [B, 1, H] embedding of layer0_code (talker hidden space).
             last_talker_hidden: [B, 1, H] hidden state from the talker.
+            temperature: sampling temperature for the eager path. If None,
+                uses self.temperature (from config). Ignored by the CUDA graph
+                path which always uses the value baked in at capture time.
+            top_k: top-k filtering for the eager path. If None, uses
+                self.top_k (from config). Ignored by the CUDA graph path.
 
         Returns:
             audio_codes: [B, Q] all codebook tokens (layer0 + residuals).
@@ -778,6 +816,11 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             for bs in sorted(self._graphs):
                 if bs >= bsz:
                     return self._graphs[bs].run(layer0_code, layer0_embed, last_talker_hidden, actual_bsz=bsz)
+
+        # Eager path — apply per-call overrides if provided
+        eff_temperature = temperature if temperature is not None else self.temperature
+        eff_top_k = top_k if top_k is not None else self.top_k
+        logits_processors = LogitsProcessorList([TopKLogitsWarper(top_k=eff_top_k)])
 
         num_groups = int(self.config.num_code_groups)
 
@@ -800,8 +843,8 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             logits = self.lm_head[layer_idx](hidden_state[:, -1:, :])
 
             # Sample (temperature + top_k)
-            scaled = logits[:, -1] / self.temperature
-            scaled = self.logits_processors(None, scaled)
+            scaled = logits[:, -1] / eff_temperature
+            scaled = logits_processors(None, scaled)
             probs = F.softmax(scaled, dim=-1)
             code = torch.multinomial(probs, num_samples=1)  # [B, 1]
             all_codes.append(code)
