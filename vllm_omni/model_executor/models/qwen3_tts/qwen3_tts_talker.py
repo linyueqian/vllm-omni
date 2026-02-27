@@ -628,7 +628,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             self._tokenizer = AutoTokenizer.from_pretrained(
                 self.model_path,
                 trust_remote_code=True,
-                fix_mistral_regex=True,
                 use_fast=True,
             )
             self._tokenizer.padding_side = "left"

@@ -256,7 +256,20 @@ class Qwen3TTSTokenizerV2DecoderRotatoryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        if self.rope_type in ROPE_INIT_FUNCTIONS:
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        else:
+            # 'default' was removed from ROPE_INIT_FUNCTIONS in transformers>=5.x;
+            # implement it inline: standard sinusoidal RoPE, no scaling.
+            def _default_rope_init(config, device=None, seq_len=None, layer_type=None):
+                head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+                inv_freq = 1.0 / (
+                    config.rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
+                )
+                return inv_freq, 1.0
+
+            self.rope_init_fn = _default_rope_init
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
