@@ -48,6 +48,22 @@ from .configuration_qwen3_tts_tokenizer_v2 import (
 logger = logging.get_logger(__name__)
 
 
+def _default_rope_init(config, device=None, seq_len=None, layer_type=None):
+    """Vanilla sinusoidal RoPE (no scaling).
+
+    transformers>=5.0 removed the 'default' entry from
+    ``ROPE_INIT_FUNCTIONS`` (see ``modeling_rope_utils.py`` in
+    huggingface/transformers), but the speech tokenizer config still
+    declares ``rope_type="default"``. This reimplements the original
+    behaviour.
+    """
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    inv_freq = 1.0 / (
+        config.rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
+    )
+    return inv_freq, 1.0
+
+
 @dataclass
 @auto_docstring
 class Qwen3TTSTokenizerV2EncoderOutput(ModelOutput):
@@ -260,16 +276,6 @@ class Qwen3TTSTokenizerV2DecoderRotatoryEmbedding(nn.Module):
         if self.rope_type in ROPE_INIT_FUNCTIONS:
             self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
         elif self.rope_type == "default":
-            # transformers>=5.x removed 'default' from ROPE_INIT_FUNCTIONS; the
-            # speech tokenizer config uses vanilla sinusoidal RoPE (no scaling),
-            # so implement it inline here.
-            def _default_rope_init(config, device=None, seq_len=None, layer_type=None):
-                head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-                inv_freq = 1.0 / (
-                    config.rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
-                )
-                return inv_freq, 1.0
-
             self.rope_init_fn = _default_rope_init
         else:
             raise ValueError(
