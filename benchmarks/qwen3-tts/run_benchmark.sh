@@ -126,7 +126,7 @@ start_server() {
     local max_wait=300
     local waited=0
     while [ ${waited} -lt ${max_wait} ]; do
-        if curl -s "http://127.0.0.1:${PORT}/v1/models" > /dev/null 2>&1; then
+        if curl -sf "http://127.0.0.1:${PORT}/v1/models" > /dev/null 2>&1; then
             echo "  Server is ready! (waited ${waited}s)"
             return 0
         fi

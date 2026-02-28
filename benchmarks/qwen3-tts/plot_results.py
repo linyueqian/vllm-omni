@@ -46,10 +46,11 @@ def plot_comparison(
     """Generate comparison bar charts."""
     n_configs = len(all_results)
 
-    # Collect concurrency levels from first config
-    concurrencies = sorted(set(r["concurrency"] for r in all_results[0]))
+    # Collect concurrency levels present in ALL configs (skip missing data)
+    all_concurrencies = [set(r["concurrency"] for r in results) for results in all_results]
+    concurrencies = sorted(set.union(*all_concurrencies))
 
-    # Build data arrays
+    # Build data arrays, using None for missing concurrency levels
     ttfp_data = {label: [] for label in labels}
     e2e_data = {label: [] for label in labels}
     rtf_data = {label: [] for label in labels}
@@ -58,11 +59,11 @@ def plot_comparison(
     for results, label in zip(all_results, labels):
         conc_map = {r["concurrency"]: r for r in results}
         for c in concurrencies:
-            r = conc_map.get(c, {})
-            ttfp_data[label].append(r.get("mean_ttfp_ms", 0))
-            e2e_data[label].append(r.get("mean_e2e_ms", 0))
-            rtf_data[label].append(r.get("mean_rtf", 0))
-            throughput_data[label].append(r.get("audio_throughput", 0))
+            r = conc_map.get(c)
+            ttfp_data[label].append(r["mean_ttfp_ms"] if r else None)
+            e2e_data[label].append(r["mean_e2e_ms"] if r else None)
+            rtf_data[label].append(r["mean_rtf"] if r else None)
+            throughput_data[label].append(r["audio_throughput"] if r else None)
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(f"{title_prefix} Performance Benchmark", fontsize=16, fontweight="bold")
@@ -79,14 +80,18 @@ def plot_comparison(
     def plot_metric(ax, data_dict, ylabel, title, fmt=".1f"):
         bars = []
         for i, (label, values) in enumerate(data_dict.items()):
-            bar = ax.bar(x + offsets[i], values, width, label=label, color=colors[i % len(colors)], alpha=0.85)
+            # Replace None with 0 for plotting, but track which are missing
+            plot_values = [v if v is not None else 0 for v in values]
+            color = colors[i % len(colors)]
+            bar = ax.bar(x + offsets[i], plot_values, width, label=label, color=color, alpha=0.85)
             bars.append(bar)
-            # Add value labels on bars
+            # Add value labels on bars (skip None/missing data)
+            max_val = max((v for v in values if v is not None), default=1)
             for rect, val in zip(bar, values):
-                if val > 0:
+                if val is not None and val > 0:
                     ax.text(
                         rect.get_x() + rect.get_width() / 2,
-                        rect.get_height() + max(values) * 0.02,
+                        rect.get_height() + max_val * 0.02,
                         f"{val:{fmt}}",
                         ha="center",
                         va="bottom",
