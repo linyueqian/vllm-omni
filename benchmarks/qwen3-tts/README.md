@@ -14,7 +14,7 @@ pip install qwen_tts  # for HF baseline
 Run the full benchmark (vllm-omni + HF baseline) with a single command:
 
 ```bash
-cd benchmarks/qwen3_tts_bench
+cd benchmarks/qwen3-tts
 bash run_benchmark.sh
 ```
 
@@ -33,7 +33,7 @@ bash run_benchmark.sh --hf-only
 MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice bash run_benchmark.sh --async-only
 
 # Use batch_size=4 config for higher throughput
-STAGE_CONFIG=configs/qwen3_tts_bs4.yaml bash run_benchmark.sh --async-only
+STAGE_CONFIG=vllm_omni/configs/qwen3_tts_bs4.yaml bash run_benchmark.sh --async-only
 
 # Custom GPU, prompt count, concurrency levels
 GPU_DEVICE=1 NUM_PROMPTS=20 CONCURRENCY="1 4" bash run_benchmark.sh
@@ -47,14 +47,14 @@ GPU_DEVICE=1 NUM_PROMPTS=20 CONCURRENCY="1 4" bash run_benchmark.sh
 CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main serve \
     "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice" \
     --omni --host 127.0.0.1 --port 8000 \
-    --stage-configs-path benchmarks/qwen3_tts_bench/configs/qwen3_tts_bs1.yaml \
+    --stage-configs-path benchmarks/qwen3-tts/vllm_omni/configs/qwen3_tts_bs1.yaml \
     --trust-remote-code
 ```
 
 ### 2) Run online serving benchmark
 
 ```bash
-python bench_tts_serve.py \
+python vllm_omni/bench_tts_serve.py \
     --port 8000 \
     --num-prompts 50 \
     --max-concurrency 1 4 10 \
@@ -65,7 +65,7 @@ python bench_tts_serve.py \
 ### 3) Run HuggingFace baseline
 
 ```bash
-python bench_tts_hf.py \
+python transformers/bench_tts_hf.py \
     --model "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice" \
     --num-prompts 50 \
     --gpu-device 0 \
@@ -85,8 +85,8 @@ python plot_results.py \
 
 | Config | Batch Size | Description |
 |--------|:----------:|-------------|
-| `configs/qwen3_tts_bs1.yaml` | 1 | Single-request processing (lower latency) |
-| `configs/qwen3_tts_bs4.yaml` | 4 | Concurrent request processing (higher throughput) |
+| `vllm_omni/configs/qwen3_tts_bs1.yaml` | 1 | Single-request processing (lower latency) |
+| `vllm_omni/configs/qwen3_tts_bs4.yaml` | 4 | Concurrent request processing (higher throughput) |
 
 Both configs use a 2-stage pipeline (Talker -> Code2Wav) with `async_chunk` streaming enabled. The `SharedMemoryConnector` streams codec frames (25-frame chunks with 25-frame context overlap) between stages.
 

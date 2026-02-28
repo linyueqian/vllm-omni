@@ -24,7 +24,7 @@
 #   MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice bash run_benchmark.sh --async-only
 #
 #   # Use batch_size=4 config:
-#   STAGE_CONFIG=configs/qwen3_tts_bs4.yaml bash run_benchmark.sh --async-only
+#   STAGE_CONFIG=vllm_omni/configs/qwen3_tts_bs4.yaml bash run_benchmark.sh --async-only
 #
 # Environment variables:
 #   GPU_DEVICE       - GPU index to use (default: 0)
@@ -50,7 +50,7 @@ PORT="${PORT:-8000}"
 GPU_MEM_TALKER="${GPU_MEM_TALKER:-0.3}"
 GPU_MEM_CODE2WAV="${GPU_MEM_CODE2WAV:-0.2}"
 NUM_WARMUPS="${NUM_WARMUPS:-3}"
-STAGE_CONFIG="${STAGE_CONFIG:-configs/qwen3_tts_bs1.yaml}"
+STAGE_CONFIG="${STAGE_CONFIG:-vllm_omni/configs/qwen3_tts_bs1.yaml}"
 RESULT_DIR="${SCRIPT_DIR}/results"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
@@ -188,7 +188,7 @@ run_bench() {
     done
 
     cd "${PROJECT_ROOT}"
-    python "${SCRIPT_DIR}/bench_tts_serve.py" \
+    python "${SCRIPT_DIR}/vllm_omni/bench_tts_serve.py" \
         --host 127.0.0.1 \
         --port "${PORT}" \
         --num-prompts "${NUM_PROMPTS}" \
@@ -216,7 +216,7 @@ if [ "${RUN_HF}" = true ]; then
     echo "============================================================"
 
     cd "${PROJECT_ROOT}"
-    python "${SCRIPT_DIR}/bench_tts_hf.py" \
+    python "${SCRIPT_DIR}/transformers/bench_tts_hf.py" \
         --model "${MODEL}" \
         --num-prompts "${NUM_PROMPTS}" \
         --num-warmups "${NUM_WARMUPS}" \
