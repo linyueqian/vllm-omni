@@ -104,11 +104,9 @@ class Qwen3TTSModelForGeneration(nn.Module):
         self._enable_decoder_cudagraph()
 
     def _enable_decoder_cudagraph(self):
-        # Respect --enforce-eager flag
-        model_cfg = getattr(self.vllm_config, "model_config", None)
-        if model_cfg and getattr(model_cfg, "enforce_eager", False):
-            logger.info("CUDA Graph not enabled: --enforce-eager is set")
-            return
+        # Decoder CUDA graph is independent of the engine-level CUDA graph.
+        # enforce_eager only controls the vLLM engine graph capture, not the
+        # speech tokenizer decoder's own CUDA graph wrapper.
         try:
             inner_model = getattr(self.model, "model", None)
             if inner_model is None or not hasattr(inner_model, "speech_tokenizer"):

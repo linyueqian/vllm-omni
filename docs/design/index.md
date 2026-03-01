@@ -10,6 +10,7 @@ This section contains design documents and architecture specifications for vLLM-
 
 - [Disaggregated Inference](feature/disaggregated_inference.md)
 - [Ray-based Execution](feature/ray_based_execution.md)
+- [Qwen3-TTS Performance](feature/qwen3_tts_performance.md)
 
 ## Module Design Documents
 
