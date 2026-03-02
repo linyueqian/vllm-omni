@@ -58,6 +58,7 @@ stage_args:
       hf_config_name: talker_config
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk
     engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
     # final_output: true
     # final_output_type: text
     default_sampling_params:
@@ -89,6 +90,7 @@ stage_args:
       max_num_batched_tokens: 51200 # [TODO] if max_num_batch_tokens < max_batch_size * 800, there will be precision problem.
       hf_config_name: thinker_config
     engine_input_source: [1]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
     final_output: true
     final_output_type: audio
     default_sampling_params:
