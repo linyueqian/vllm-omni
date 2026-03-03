@@ -372,10 +372,11 @@ class AsyncOmni(OmniBase):
                     request_id,
                     _req_start_ts.get(request_id, _wall_start_ts),
                 )
+                metrics.log_stage_timing_line(request_id, self.async_chunk)
 
                 logger.debug(f"[{self._name}] All requests completed")
                 # Summarize and print stats
-                metrics.build_and_log_summary()
+                metrics.build_and_log_summary(async_chunk_enabled=self.async_chunk)
             except Exception as e:
                 logger.exception(f"[{self._name}] Request {request_id} Failed to finalized/build/log summary: {e}")
             finally:

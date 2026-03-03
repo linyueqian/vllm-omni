@@ -20,6 +20,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors,
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.async_chunk_profile import async_chunk_timer
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -1160,7 +1161,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             # collect additional_information (tensor/list) for prefill portion only
             decode_req_ids = []
             if self.vllm_config.model_config.async_chunk:
-                self._update_additional_information(scheduler_output)
+                with async_chunk_timer("gpu_runner_update_additional_info", extra=""):
+                    self._update_additional_information(scheduler_output)
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
 
@@ -1175,9 +1177,15 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 # call the custom process function
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
-                req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                    input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
-                )
+                if self.vllm_config.model_config.async_chunk:
+                    with async_chunk_timer("gpu_runner_preprocess_per_req", extra=f"req={req_id[:8] if isinstance(req_id, str) else req_id}"):
+                        req_input_ids, req_embeds, update_dict = self.model.preprocess(
+                            input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
+                        )
+                else:
+                    req_input_ids, req_embeds, update_dict = self.model.preprocess(
+                        input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
+                    )
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
                         (input_ids.shape[0], req_embeds.shape[-1]),
@@ -1205,7 +1213,11 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             # run talker mtp decode
             if hasattr(self.model, "talker_mtp"):
-                self._talker_mtp_forward(decode_req_ids, inputs_embeds)
+                if self.vllm_config.model_config.async_chunk and decode_req_ids:
+                    with async_chunk_timer("gpu_runner_talker_mtp_forward", extra=f"n={len(decode_req_ids)}"):
+                        self._talker_mtp_forward(decode_req_ids, inputs_embeds)
+                else:
+                    self._talker_mtp_forward(decode_req_ids, inputs_embeds)
 
         return (
             input_ids,

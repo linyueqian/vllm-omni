@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict
 from collections.abc import Callable
@@ -461,7 +462,25 @@ class OrchestratorAggregator:
         )
         self.e2e_events.append(per_req_record)
 
-    def build_and_log_summary(self) -> dict[str, Any]:
+    def _stage_timing_log_enabled(self) -> bool:
+        return os.environ.get("VLLM_OMNI_LOG_STAGE_TIMING", "").strip().lower() in ("1", "true", "yes")
+
+    def log_stage_timing_line(self, req_id: Any, async_chunk_enabled: bool) -> None:
+        """Log one line per request with per-stage gen time for async_chunk on/off comparison."""
+        if not self._stage_timing_log_enabled():
+            return
+        rid_key = str(req_id)
+        acc = self.accumulated_gen_time_ms.get(rid_key, {})
+        stage_ms = [acc.get(i, 0.0) for i in range(self.num_stages)]
+        # Tag so you can grep: [STAGE_TIMING] async_chunk=0|1 req_id=... Thinker_ms= Talker_ms= Code2Wav_ms=
+        names = ("Thinker", "Talker", "Code2Wav") if self.num_stages >= 3 else tuple(f"stage{i}" for i in range(self.num_stages))
+        parts = [f"async_chunk={1 if async_chunk_enabled else 0}", f"req_id={rid_key[:20]}"]
+        for i, name in enumerate(names):
+            if i < len(stage_ms):
+                parts.append(f"{name}_ms={stage_ms[i]:.2f}")
+        logger.info("[STAGE_TIMING] %s", " ".join(parts))
+
+    def build_and_log_summary(self, async_chunk_enabled: bool | None = None) -> dict[str, Any]:
         if not self.log_stats:
             return {}
         wall_time_ms = max(0.0, (self.last_finish_ts - self.wall_start_ts) * 1000.0)
@@ -503,6 +522,28 @@ class OrchestratorAggregator:
                 "\n%s",
                 _format_table("Overall Summary", overall_summary, overall_fields),
             )
+
+        # Per-stage timing summary for async_chunk on/off comparison
+        if self._stage_timing_log_enabled() and async_chunk_enabled is not None and self.e2e_count > 0:
+            names = ("Thinker", "Talker", "Code2Wav") if self.num_stages >= 3 else [f"stage{i}" for i in range(self.num_stages)]
+            by_stage: list[list[float]] = [[] for _ in range(self.num_stages)]
+            for rid_key, acc in self.accumulated_gen_time_ms.items():
+                if rid_key not in self.e2e_done:
+                    continue
+                for i in range(self.num_stages):
+                    by_stage[i].append(acc.get(i, 0.0))
+            means = [(sum(s) / len(s)) if s else 0.0 for s in by_stage]
+            sums_ = [sum(s) for s in by_stage]
+            parts = [
+                f"[STAGE_TIMING_SUMMARY]",
+                f"async_chunk={1 if async_chunk_enabled else 0}",
+                f"requests={self.e2e_count}",
+            ]
+            for i, name in enumerate(names):
+                if i < len(means):
+                    parts.append(f"{name}_mean_ms={means[i]:.2f}")
+                    parts.append(f"{name}_sum_ms={sums_[i]:.2f}")
+            logger.info(" %s", " ".join(parts))
 
         all_request_ids = sorted(set(self.stage_events.keys()) | {e.request_id for e in self.e2e_events})
 

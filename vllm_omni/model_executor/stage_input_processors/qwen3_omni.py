@@ -11,6 +11,7 @@ from vllm.platforms import current_platform
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.utils.async_chunk_profile import async_chunk_timer
 
 
 def _compute_talker_prompt_ids_length(info, device: torch.device | str = "cuda") -> int:
@@ -88,14 +89,25 @@ def thinker2talker_async_chunk(
     pooling_output: dict[str, Any],
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | None:
     """
     Process thinker outputs to create talker inputs.
     1. thinker's text generation outputs (token IDs + hidden states)
     2. Split hidden states into: prompt embeddings + generated embeddings
     3. Package for talker with additional information
     """
+    with async_chunk_timer("thinker2talker_async_chunk", extra=f"chunk={transfer_manager.put_req_chunk.get(request.external_req_id, 0)}"):
+        return _thinker2talker_async_chunk_impl(
+            transfer_manager, pooling_output, request, is_finished
+        )
 
+
+def _thinker2talker_async_chunk_impl(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any],
+    request: OmniEngineCoreRequest,
+    is_finished: bool = False,
+) -> list[dict[str, Any]] | None:
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
     if chunk_id == 0:
@@ -217,6 +229,18 @@ def talker2code2wav_async_chunk(
     """
     Pooling version.
     """
+    with async_chunk_timer("talker2code2wav_async_chunk", extra=""):
+        return _talker2code2wav_async_chunk_impl(
+            transfer_manager, pooling_output, request, is_finished
+        )
+
+
+def _talker2code2wav_async_chunk_impl(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any],
+    request: OmniEngineCoreRequest,
+    is_finished: bool = False,
+):
     if "code_predictor_codes" not in pooling_output:
         return None
 

@@ -31,6 +31,7 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.async_chunk_profile import async_chunk_timer
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerDummyInputsBuilder,
     Qwen3OmniMoeThinkerMultiModalProcessor,
@@ -471,12 +472,16 @@ class Qwen3OmniMoeForConditionalGeneration(
             talker_codes = talker_codes.expand(1, 16, -1)
 
         if self.vllm_config.model_config.async_chunk:
-            audio_tensors = self.code2wav.chunked_decode_streaming(
-                talker_codes,
-                chunk_size=25,
-                left_context_size=25,
-                seq_token_counts=seq_token_counts,
-            )
+            with async_chunk_timer(
+                "code2wav_chunked_decode_streaming",
+                extra=f"shape={tuple(talker_codes.shape)}",
+            ):
+                audio_tensors = self.code2wav.chunked_decode_streaming(
+                    talker_codes,
+                    chunk_size=25,
+                    left_context_size=25,
+                    seq_token_counts=seq_token_counts,
+                )
         else:
             # Use chunked decode for memory efficiency
             audio_tensors = self.code2wav.chunked_decode(
@@ -565,8 +570,13 @@ class Qwen3OmniMoeForConditionalGeneration(
         """
         Postprocess the talker hidden states.
         """
-        update_dict = {}
-        update_dict["last_talker_hidden"] = hidden_states[-1, :].detach().to("cpu").contiguous()
+        if getattr(self.vllm_config.model_config, "async_chunk", False):
+            with async_chunk_timer("talker_postprocess_cpu_copy", extra=""):
+                update_dict = {}
+                update_dict["last_talker_hidden"] = hidden_states[-1, :].detach().to("cpu").contiguous()
+        else:
+            update_dict = {}
+            update_dict["last_talker_hidden"] = hidden_states[-1, :].detach().to("cpu").contiguous()
         return update_dict
 
     def talker_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):

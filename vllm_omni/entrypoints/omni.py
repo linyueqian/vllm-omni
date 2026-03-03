@@ -1122,6 +1122,7 @@ class Omni(OmniBase):
                                 req_id,
                                 _req_start_ts.get(req_id, _wall_start_ts),
                             )
+                            metrics.log_stage_timing_line(req_id, self.async_chunk)
                     except Exception as e:
                         logger.exception(
                             f"[{self._name}] Finalize request handling error for req {req_id} at stage {stage_id}: {e}",
@@ -1258,7 +1259,7 @@ class Omni(OmniBase):
 
         # Summarize and print stats
         try:
-            metrics.build_and_log_summary()
+            metrics.build_and_log_summary(async_chunk_enabled=self.async_chunk)
         except Exception as e:
             logger.exception(f"[{self._name}] Failed to build/log summary: {e}")
 

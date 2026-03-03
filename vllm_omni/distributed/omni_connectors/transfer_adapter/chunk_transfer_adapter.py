@@ -8,6 +8,8 @@ from typing import Any
 import torch
 from vllm.v1.request import Request, RequestStatus
 
+from vllm_omni.utils.async_chunk_profile import async_chunk_timer
+
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec
 from ..utils.logging import get_connector_logger
@@ -204,12 +206,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         payload_data = None
         if self.custom_process_next_stage_input_func:
             try:
-                payload_data = self.custom_process_next_stage_input_func(
-                    transfer_manager=self,
-                    pooling_output=pooling_output,
-                    request=request,
-                    is_finished=is_finished,
-                )
+                with async_chunk_timer(
+                    "chunk_adapter_custom_process",
+                    extra=f"stage={stage_id} chunk={chunk_id}",
+                ):
+                    payload_data = self.custom_process_next_stage_input_func(
+                        transfer_manager=self,
+                        pooling_output=pooling_output,
+                        request=request,
+                        is_finished=is_finished,
+                    )
 
             except Exception as e:
                 logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
@@ -217,12 +223,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if not payload_data:
             return
 
-        success, size, metadata = self.connector.put(
-            from_stage=str(stage_id),
-            to_stage=str(next_stage_id),
-            put_key=connector_put_key,
-            data=payload_data,
-        )
+        with async_chunk_timer("chunk_adapter_connector_put", extra=f"stage={stage_id}"):
+            success, size, metadata = self.connector.put(
+                from_stage=str(stage_id),
+                to_stage=str(next_stage_id),
+                put_key=connector_put_key,
+                data=payload_data,
+            )
 
         if success:
             self.put_req_chunk[request_id] += 1

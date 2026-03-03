@@ -28,6 +28,8 @@ from vllm.model_executor.models.utils import (  # type: ignore
     WeightsMapper,
 )
 
+from vllm_omni.utils.async_chunk_profile import async_chunk_timer
+
 logger = init_logger(__name__)
 
 
@@ -234,7 +236,11 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
                 single tensor with shape ``[1, waveform_len]``.
         """
         wavs = []
-        batch_wav = self(codes)
+        with async_chunk_timer(
+            "code2wav_forward_streaming",
+            extra=f"shape={tuple(codes.shape)}",
+        ):
+            batch_wav = self(codes)
         if seq_token_counts is not None:
             code_seq_lens = [n // self.config.num_quantizers for n in seq_token_counts]
         else:
