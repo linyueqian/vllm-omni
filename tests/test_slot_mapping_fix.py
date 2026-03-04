@@ -121,8 +121,8 @@ def test_prefill_single_request():
     pos_orig, sm_orig = build_slot_mapping_original(num_reqs, query_lens, seq_lens, bt, block_size)
     pos_fixed, sm_fixed = build_slot_mapping_fixed(num_reqs, query_lens, seq_lens, bt, block_size)
 
-    assert torch.equal(pos_orig, pos_fixed), f"positions differ"
-    assert torch.equal(sm_orig, sm_fixed), f"slot_mapping differ"
+    assert torch.equal(pos_orig, pos_fixed), "positions differ"
+    assert torch.equal(sm_orig, sm_fixed), "slot_mapping differ"
     assert pos_orig.tolist() == [0, 1], f"expected [0,1], got {pos_orig.tolist()}"
     print("PASS: test_prefill_single_request")
 
@@ -138,8 +138,8 @@ def test_batch_decode():
     pos_orig, sm_orig = build_slot_mapping_original(num_reqs, query_lens, seq_lens, bt, block_size)
     pos_fixed, sm_fixed = build_slot_mapping_fixed(num_reqs, query_lens, seq_lens, bt, block_size)
 
-    assert torch.equal(pos_orig, pos_fixed), f"positions differ"
-    assert torch.equal(sm_orig, sm_fixed), f"slot_mapping differ"
+    assert torch.equal(pos_orig, pos_fixed), "positions differ"
+    assert torch.equal(sm_orig, sm_fixed), "slot_mapping differ"
     # positions should be [2, 6, 0, 11]
     assert pos_orig.tolist() == [2, 6, 0, 11], f"expected [2,6,0,11], got {pos_orig.tolist()}"
     print("PASS: test_batch_decode")
@@ -156,8 +156,8 @@ def test_cross_block_boundary():
     pos_orig, sm_orig = build_slot_mapping_original(num_reqs, query_lens, seq_lens, bt, block_size)
     pos_fixed, sm_fixed = build_slot_mapping_fixed(num_reqs, query_lens, seq_lens, bt, block_size)
 
-    assert torch.equal(pos_orig, pos_fixed), f"positions differ"
-    assert torch.equal(sm_orig, sm_fixed), f"slot_mapping differ"
+    assert torch.equal(pos_orig, pos_fixed), "positions differ"
+    assert torch.equal(sm_orig, sm_fixed), "slot_mapping differ"
     # pos 3 → block 0, slot 3; pos 4 → block 1, slot 4; pos 5 → block 1, slot 5
     # block_id for block_idx=0 is bt[0,0]=0, block_idx=1 is bt[0,1]=1
     # slot(3) = 0*4 + 3 = 3
@@ -179,8 +179,8 @@ def test_large_batch():
     pos_orig, sm_orig = build_slot_mapping_original(num_reqs, query_lens, seq_lens, bt, block_size)
     pos_fixed, sm_fixed = build_slot_mapping_fixed(num_reqs, query_lens, seq_lens, bt, block_size)
 
-    assert torch.equal(pos_orig, pos_fixed), f"positions differ"
-    assert torch.equal(sm_orig, sm_fixed), f"slot_mapping differ"
+    assert torch.equal(pos_orig, pos_fixed), "positions differ"
+    assert torch.equal(sm_orig, sm_fixed), "slot_mapping differ"
     print("PASS: test_large_batch")
 
 
@@ -196,8 +196,8 @@ def test_mixed_query_lens():
     pos_orig, sm_orig = build_slot_mapping_original(num_reqs, query_lens, seq_lens, bt, block_size)
     pos_fixed, sm_fixed = build_slot_mapping_fixed(num_reqs, query_lens, seq_lens, bt, block_size)
 
-    assert torch.equal(pos_orig, pos_fixed), f"positions differ"
-    assert torch.equal(sm_orig, sm_fixed), f"slot_mapping differ"
+    assert torch.equal(pos_orig, pos_fixed), "positions differ"
+    assert torch.equal(sm_orig, sm_fixed), "slot_mapping differ"
     # req 0: pos [3]; req 1: pos [0,1]; req 2: pos [7]
     assert pos_orig.tolist() == [3, 0, 1, 7], f"expected [3,0,1,7], got {pos_orig.tolist()}"
     print("PASS: test_mixed_query_lens")
