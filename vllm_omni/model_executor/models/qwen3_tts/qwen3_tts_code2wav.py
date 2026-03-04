@@ -126,9 +126,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                             from .cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
 
                             steady_window = left_frames + chunk_frames
-                            capture_sizes = sorted(
-                                {*CUDAGraphDecoderWrapper.DEFAULT_CAPTURE_SIZES, steady_window}
-                            )
+                            capture_sizes = sorted({*CUDAGraphDecoderWrapper.DEFAULT_CAPTURE_SIZES, steady_window})
                     decoder.enable_cudagraph(capture_sizes=capture_sizes, device=device)
                     logger.info("Code2Wav decoder CUDA Graph enabled")
                 except Exception:
