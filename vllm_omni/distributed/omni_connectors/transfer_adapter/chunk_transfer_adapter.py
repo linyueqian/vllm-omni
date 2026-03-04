@@ -178,19 +178,23 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             req_id: Request ID to update
             payload_data: New payload data to store
         """
-        if req_id not in self.request_payload:
-            self.request_payload[req_id] = payload_data
-            return payload_data
-        origin_payload = self.request_payload[req_id]
-        for key, value in payload_data.items():
-            if key == "finished":
-                continue
-            elif isinstance(value, torch.Tensor) and key in origin_payload:
-                payload_data[key] = torch.cat([origin_payload[key], value], dim=0)
-            elif isinstance(value, list) and key in origin_payload:
-                payload_data[key] = origin_payload[key] + value
+        with async_chunk_timer(
+            "chunk_adapter_update_request_payload",
+            extra=f"req_id={str(req_id)[:12]}",
+        ):
+            if req_id not in self.request_payload:
+                self.request_payload[req_id] = payload_data
+                return payload_data
+            origin_payload = self.request_payload[req_id]
+            for key, value in payload_data.items():
+                if key == "finished":
+                    continue
+                elif isinstance(value, torch.Tensor) and key in origin_payload:
+                    payload_data[key] = torch.cat([origin_payload[key], value], dim=0)
+                elif isinstance(value, list) and key in origin_payload:
+                    payload_data[key] = origin_payload[key] + value
 
-        self.request_payload[req_id] = payload_data
+            self.request_payload[req_id] = payload_data
         return payload_data
 
     def _send_single_request(self, task: dict):

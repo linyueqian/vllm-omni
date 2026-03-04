@@ -1177,15 +1177,9 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 # call the custom process function
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
-                if self.vllm_config.model_config.async_chunk:
-                    with async_chunk_timer("gpu_runner_preprocess_per_req", extra=f"req={req_id[:8] if isinstance(req_id, str) else req_id}"):
-                        req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                            input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
-                        )
-                else:
-                    req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                        input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
-                    )
+                req_input_ids, req_embeds, update_dict = self.model.preprocess(
+                    input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
+                )
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
                         (input_ids.shape[0], req_embeds.shape[-1]),
@@ -1213,11 +1207,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             # run talker mtp decode
             if hasattr(self.model, "talker_mtp"):
-                if self.vllm_config.model_config.async_chunk and decode_req_ids:
-                    with async_chunk_timer("gpu_runner_talker_mtp_forward", extra=f"n={len(decode_req_ids)}"):
-                        self._talker_mtp_forward(decode_req_ids, inputs_embeds)
-                else:
-                    self._talker_mtp_forward(decode_req_ids, inputs_embeds)
+                self._talker_mtp_forward(decode_req_ids, inputs_embeds)
 
         return (
             input_ids,

@@ -23,12 +23,11 @@
 |-----|------|------|
 | `chunk_adapter_custom_process` | `chunk_transfer_adapter._send_single_request` | 调用 thinker2talker / talker2code2wav 做 payload 构建的耗时 |
 | `chunk_adapter_connector_put` | `chunk_transfer_adapter._send_single_request` | `connector.put` 的耗时 |
+| `chunk_adapter_update_request_payload` | `chunk_transfer_adapter._update_request_payload` | 下游合并/更新 request_payload（tensor/list cat）的耗时 |
 | `thinker2talker_async_chunk` | `stage_input_processors.qwen3_omni` | Thinker→Talker 整段 async chunk 处理 |
 | `talker2code2wav_async_chunk` | `stage_input_processors.qwen3_omni` | Talker→Code2Wav 整段 async chunk 处理 |
+| `thinker_decode_to_talker_decode` | `qwen3_omni._thinker_decode_to_talker_decode` | 按 chunk 将 thinker embedding 投影到 talker 的 decode 步 |
 | `gpu_runner_update_additional_info` | `gpu_model_runner._preprocess` | 从 connector 更新 additional_information 的耗时 |
-| `gpu_runner_preprocess_per_req` | `gpu_model_runner._preprocess` | 单次 `model.preprocess`（含 thinker→talker 投影等） |
-| `gpu_runner_talker_mtp_forward` | `gpu_model_runner._preprocess` | Talker MTP 一次 decode 步的 forward |
-| `talker_postprocess_cpu_copy` | `qwen3_omni.talker_postprocess` | last_talker_hidden 的 GPU→CPU 拷贝 |
 | `code2wav_chunked_decode_streaming` | `qwen3_omni.generate_audio` | 整段流式解码（含 code2wav 的多次 forward） |
 | `code2wav_forward_streaming` | `qwen3_omni_code2wav.chunked_decode_streaming` | Code2Wav 单次 `self(codes)` forward |
 

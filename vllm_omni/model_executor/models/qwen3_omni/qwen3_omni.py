@@ -570,13 +570,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         """
         Postprocess the talker hidden states.
         """
-        if getattr(self.vllm_config.model_config, "async_chunk", False):
-            with async_chunk_timer("talker_postprocess_cpu_copy", extra=""):
-                update_dict = {}
-                update_dict["last_talker_hidden"] = hidden_states[-1, :].detach().to("cpu").contiguous()
-        else:
-            update_dict = {}
-            update_dict["last_talker_hidden"] = hidden_states[-1, :].detach().to("cpu").contiguous()
+        update_dict = {}
+        update_dict["last_talker_hidden"] = hidden_states[-1, :].detach().to("cpu").contiguous()
         return update_dict
 
     def talker_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
@@ -864,16 +859,17 @@ class Qwen3OmniMoeForConditionalGeneration(
         Returns:
             (input_ids, input_embeds) for talker
         """
-        thinker_embed = info_dict.get("thinker_embeddings", None)
-        start_index = info_dict.get("num_processed_tokens", 0)
-        if start_index >= thinker_embed.shape[0]:
-            if info_dict.get("finished_flag"):
-                return self.tts_pad_embed.to(device)
-            update_dict["finished_flag"] = True
-            return self.tts_eos_embed.to(device)
+        with async_chunk_timer("thinker_decode_to_talker_decode", extra=""):
+            thinker_embed = info_dict.get("thinker_embeddings", None)
+            start_index = info_dict.get("num_processed_tokens", 0)
+            if start_index >= thinker_embed.shape[0]:
+                if info_dict.get("finished_flag"):
+                    return self.tts_pad_embed.to(device)
+                update_dict["finished_flag"] = True
+                return self.tts_eos_embed.to(device)
 
-        thinker_embed = thinker_embed[start_index : start_index + 1].to(device)
-        return self.talker.text_projection(thinker_embed).to(device)
+            thinker_embed = thinker_embed[start_index : start_index + 1].to(device)
+            return self.talker.text_projection(thinker_embed).to(device)
 
     def talker_preprocess_decode(
         self, input_ids: torch.Tensor, input_embeds: torch.Tensor, update_dict: dict, **info_dict: dict
