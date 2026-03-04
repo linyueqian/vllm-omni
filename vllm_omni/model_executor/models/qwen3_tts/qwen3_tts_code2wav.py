@@ -111,7 +111,25 @@ class Qwen3TTSCode2Wav(nn.Module):
             device = self._module_device(decoder)
             if device.type == "cuda":
                 try:
-                    decoder.enable_cudagraph(device=device)
+                    capture_sizes = None
+                    model_cfg = getattr(self.vllm_config, "model_config", None)
+                    connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+                    extra_cfg = (
+                        connector_cfg.get("extra", connector_cfg)
+                        if isinstance(connector_cfg, dict)
+                        else getattr(connector_cfg, "extra", None)
+                    )
+                    if isinstance(extra_cfg, dict):
+                        chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
+                        left_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
+                        if chunk_frames > 0 and left_frames >= 0:
+                            from .cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
+
+                            steady_window = left_frames + chunk_frames
+                            capture_sizes = sorted(
+                                {*CUDAGraphDecoderWrapper.DEFAULT_CAPTURE_SIZES, steady_window}
+                            )
+                    decoder.enable_cudagraph(capture_sizes=capture_sizes, device=device)
                     logger.info("Code2Wav decoder CUDA Graph enabled")
                 except Exception:
                     logger.warning("Failed to enable CUDA Graph for Code2Wav decoder", exc_info=True)
