@@ -841,12 +841,20 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         return base64.b64decode(b64)
 
     def _load_audio_to_np(self, x: str) -> tuple[np.ndarray, int]:
-        """Load audio from local path or base64 data URI (no network I/O)."""
+        """Load audio from local path, URL, or base64 data URI."""
         import librosa
 
         if self._is_url(x):
-            raise ValueError("ref_audio URLs must be resolved by the serving layer before reaching the model worker.")
-        if self._is_probably_base64(x):
+            from urllib.request import urlopen
+
+            _TIMEOUT_S = 15
+            _MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+            with urlopen(x, timeout=_TIMEOUT_S) as resp:
+                data = resp.read(_MAX_BYTES + 1)
+                if len(data) > _MAX_BYTES:
+                    raise ValueError(f"ref_audio URL exceeds {_MAX_BYTES} bytes")
+            audio, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=False)
+        elif self._is_probably_base64(x):
             wav_bytes = self._decode_base64_to_wav_bytes(x)
             with io.BytesIO(wav_bytes) as f:
                 audio, sr = sf.read(f, dtype="float32", always_2d=False)
