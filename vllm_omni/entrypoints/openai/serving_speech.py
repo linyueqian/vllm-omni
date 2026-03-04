@@ -216,6 +216,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
+        # Infer Base task when ref_audio or ref_text is provided without explicit task_type.
+        if request.task_type is None and (request.ref_audio is not None or request.ref_text is not None):
+            request.task_type = "Base"
         task_type = request.task_type or "CustomVoice"
 
         # Normalize voice to lowercase for case-insensitive matching
@@ -231,8 +234,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return f"Invalid language '{request.language}'. Supported: {', '.join(sorted(_TTS_LANGUAGES))}"
 
         # Validate speaker for CustomVoice task
-        if task_type == "CustomVoice" and request.voice is not None:
-            if self.supported_speakers and request.voice not in self.supported_speakers:
+        if task_type == "CustomVoice":
+            if not self.supported_speakers:
+                return (
+                    "This model does not support CustomVoice task (no speakers configured). "
+                    "Use task_type='Base' with ref_audio/ref_text for voice cloning, "
+                    "or use a CustomVoice model."
+                )
+            if request.voice is not None and request.voice not in self.supported_speakers:
                 return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
 
         # Validate Base task requirements
@@ -246,6 +255,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 or request.ref_audio.startswith("file://")
             ):
                 return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
+            # In-context voice cloning (default) requires non-empty ref_text.
+            # x_vector_only_mode skips in-context and only uses speaker embedding.
+            if not request.x_vector_only_mode:
+                if not request.ref_text or not request.ref_text.strip():
+                    return (
+                        "Base task requires non-empty 'ref_text' (transcript of "
+                        "the reference audio) unless 'x_vector_only_mode' is enabled"
+                    )
 
         # Validate cross-parameter dependencies
         if task_type != "Base":
