@@ -7,7 +7,10 @@ tasks, then runs Omni generation and saves output wav files.
 import asyncio
 import logging
 import os
+import tempfile
+import urllib.request
 from typing import Any, NamedTuple
+from urllib.parse import urlparse
 
 import soundfile as sf
 import torch
@@ -19,6 +22,23 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm_omni import AsyncOmni, Omni
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_audio_path(path_or_url: str) -> str:
+    """If *path_or_url* is a URL, download it to a temp file and return the
+    local path.  Local paths are returned unchanged.
+
+    The offline inference path does not resolve URLs - that is only handled
+    by the online serving layer.  For offline use we must provide a local path.
+    """
+    parsed = urlparse(path_or_url)
+    if parsed.scheme in ("http", "https") and parsed.netloc:
+        suffix = os.path.splitext(parsed.path)[1] or ".wav"
+        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        logger.info("Downloading ref_audio %s -> %s", path_or_url, tmp.name)
+        urllib.request.urlretrieve(path_or_url, tmp.name)
+        return tmp.name
+    return path_or_url
 
 
 class QueryResult(NamedTuple):
@@ -192,8 +212,8 @@ def get_base_query(use_batch_sample: bool = False, mode_tag: str = "icl") -> Que
     """
     task_type = "Base"
     model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-    ref_audio_path_1 = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
-    ref_audio_single = ref_audio_path_1
+    ref_audio_url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
+    ref_audio_single = _resolve_audio_path(ref_audio_url)
     ref_text_single = (
         "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
     )
