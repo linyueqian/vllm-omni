@@ -405,7 +405,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         }
 
         # Save metadata using metadata manager (concurrency safe)
-        success = await self.metadata_manager.create_speaker(voice_name_lower, speaker_data)
+        success = self.metadata_manager.create_speaker(voice_name_lower, speaker_data)
         if not success:
             # Clean up the saved file if metadata creation failed
             try:
