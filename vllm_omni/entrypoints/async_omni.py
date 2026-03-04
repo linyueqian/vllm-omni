@@ -123,6 +123,13 @@ class AsyncOmni(OmniBase):
             self._zmq_ctx,
         )
 
+    async def get_supported_tasks(self) -> set[str]:
+        """Return supported tasks based on the configured stage output modalities."""
+        tasks: set[str] = set()
+        if "text" in self.output_modalities:
+            tasks.add("generate")
+        return tasks
+
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Create default diffusion stage configuration."""
         # TODO: here is different from the Omni class. We should merge the two in the future.
