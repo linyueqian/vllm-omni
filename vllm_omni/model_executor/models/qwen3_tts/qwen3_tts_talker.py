@@ -831,7 +831,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     def _is_url(self, s: str) -> bool:
         try:
             u = urlparse(s)
-            return u.scheme in ("http", "https") and bool(u.netloc)
+            if u.scheme in ("http", "https"):
+                return bool(u.netloc)
+            return u.scheme == "file"
         except Exception:
             return False
 

@@ -240,8 +240,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.ref_audio is None:
                 return "Base task requires 'ref_audio' for voice cloning"
             # Validate ref_audio format
-            if not (request.ref_audio.startswith(("http://", "https://")) or request.ref_audio.startswith("data:")):
-                return "ref_audio must be a URL (http/https) or base64 data URL (data:...)"
+            if not (
+                request.ref_audio.startswith(("http://", "https://"))
+                or request.ref_audio.startswith("data:")
+                or request.ref_audio.startswith("file://")
+            ):
+                return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
 
         # Validate cross-parameter dependencies
         if task_type != "Base":
