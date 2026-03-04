@@ -333,7 +333,10 @@ class Qwen3TTSModel:
         self.processor = processor
         self.generate_defaults = generate_defaults or {}
 
-        # Initialize voice cache manager
+        # Initialize voice cache manager.
+        # Note: this creates its own MetadataManager for the same metadata.json
+        # used by serving_speech.py. Sharing is not possible across model/serving
+        # layers, but file locking in MetadataManager ensures correctness.
         self.voice_cache_manager = VoiceCacheManager()
 
         self.device = getattr(model, "device", None)
