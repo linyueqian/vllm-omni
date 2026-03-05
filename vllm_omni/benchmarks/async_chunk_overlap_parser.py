@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Parse async chunk event logs and compute overlap ratio grouped by Stage.
+
+Example log:
+
+[Stage-2] INFO ... [ASYNC_CHUNK_EVENT] gpu_runner_model_forward start ts_ns=... tid=... | stage=code2wav num_tokens=5312
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -9,6 +19,7 @@ from pathlib import Path
 
 
 EVENT_RE = re.compile(
+    r"\[Stage-(?P<stage>\d+)\].*?"
     r"\[ASYNC_CHUNK_EVENT\]\s+"
     r"(?P<tag>\S+)\s+"
     r"(?P<phase>start|end)\s+"
@@ -30,36 +41,56 @@ class Interval:
         return max(0, self.end_ns - self.start_ns)
 
 
-def _parse_extra(extra: str | None) -> dict[str, str]:
-    if not extra:
-        return {}
-    return {m.group(1): m.group(2) for m in KV_RE.finditer(extra)}
+def _percentile(values: list[int], p: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return float(values[0])
+
+    sorted_vals = sorted(values)
+    pos = (len(sorted_vals) - 1) * p
+
+    lo = int(pos)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+
+    frac = pos - lo
+
+    return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
 
 
-def _merge_intervals(intervals):
+def _merge_intervals(intervals: list[Interval]) -> list[Interval]:
+
     if not intervals:
         return []
 
     intervals = sorted(intervals, key=lambda x: x.start_ns)
-    merged = []
 
-    cur_s, cur_e = intervals[0].start_ns, intervals[0].end_ns
+    merged: list[Interval] = []
+
+    cur_s = intervals[0].start_ns
+    cur_e = intervals[0].end_ns
 
     for iv in intervals[1:]:
+
         if iv.start_ns <= cur_e:
             cur_e = max(cur_e, iv.end_ns)
+
         else:
             merged.append(Interval(cur_s, cur_e))
-            cur_s, cur_e = iv.start_ns, iv.end_ns
+            cur_s = iv.start_ns
+            cur_e = iv.end_ns
 
     merged.append(Interval(cur_s, cur_e))
+
     return merged
 
 
-def _intersect_duration_ns(interval, merged):
+def _intersect_duration_ns(interval: Interval, merged: list[Interval]) -> int:
+
     total = 0
 
     for m in merged:
+
         if m.end_ns <= interval.start_ns:
             continue
 
@@ -75,16 +106,28 @@ def _intersect_duration_ns(interval, merged):
     return total
 
 
+def _ns_to_ms(x: float) -> float:
+    return x / 1_000_000.0
+
+
+def _parse_extra(extra: str | None) -> dict[str, str]:
+
+    if not extra:
+        return {}
+
+    return {m.group(1): m.group(2) for m in KV_RE.finditer(extra)}
+
+
 def parse_events(log_file: Path):
 
     stacks = defaultdict(list)
 
-    # (stage, tag) -> intervals
     intervals = defaultdict(list)
 
     unmatched = 0
 
     with log_file.open("r", encoding="utf-8", errors="replace") as f:
+
         for line in f:
 
             m = EVENT_RE.search(line)
@@ -92,17 +135,22 @@ def parse_events(log_file: Path):
             if not m:
                 continue
 
+            stage = m.group("stage")
             tag = m.group("tag")
             phase = m.group("phase")
+
             ts_ns = int(m.group("ts_ns"))
             tid = m.group("tid")
 
             extra_kv = _parse_extra(m.group("extra"))
-            stage = extra_kv.get("stage", "unknown")
 
-            key = (stage, tag, tid)
+            req_id = extra_kv.get("req_id", "-")
+            chunk = extra_kv.get("chunk", "-")
+
+            key = (stage, tag, tid, req_id, chunk)
 
             if phase == "start":
+
                 stacks[key].append(ts_ns)
 
             else:
@@ -117,9 +165,39 @@ def parse_events(log_file: Path):
                     unmatched += 1
                     continue
 
-                intervals[(stage, tag)].append(Interval(start_ns, ts_ns))
+                intervals[(stage, tag)].append(
+                    Interval(start_ns, ts_ns)
+                )
+
+    for pending in stacks.values():
+        unmatched += len(pending)
 
     return intervals, unmatched
+
+
+def _stats_line(name: str, durations_ns: list[int]) -> str:
+
+    if not durations_ns:
+        return f"{name}: count=0"
+
+    count = len(durations_ns)
+
+    total = sum(durations_ns)
+
+    avg = total / count
+
+    p50 = _percentile(durations_ns, 0.50)
+    p95 = _percentile(durations_ns, 0.95)
+    p99 = _percentile(durations_ns, 0.99)
+
+    return (
+        f"{name}: count={count} "
+        f"total={_ns_to_ms(total):.3f}ms "
+        f"avg={_ns_to_ms(avg):.3f}ms "
+        f"p50={_ns_to_ms(p50):.3f}ms "
+        f"p95={_ns_to_ms(p95):.3f}ms "
+        f"p99={_ns_to_ms(p99):.3f}ms"
+    )
 
 
 def compute_overlap(async_intervals, model_intervals):
@@ -127,7 +205,7 @@ def compute_overlap(async_intervals, model_intervals):
     total_async = sum(i.duration_ns for i in async_intervals)
 
     if total_async <= 0:
-        return 0, 0, 0
+        return 0, 0, 0.0
 
     merged_model = _merge_intervals(model_intervals)
 
@@ -136,68 +214,81 @@ def compute_overlap(async_intervals, model_intervals):
         for i in async_intervals
     )
 
-    return total_async, overlap, overlap / total_async
+    ratio = overlap / total_async
 
-
-def ns_to_ms(x):
-    return x / 1e6
+    return total_async, overlap, ratio
 
 
 def main():
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Compute async overlap grouped by Stage"
+    )
 
-    parser.add_argument("--log-file", required=True)
+    parser.add_argument(
+        "--log-file",
+        required=True,
+        help="Log file path",
+    )
 
     parser.add_argument(
         "--model-tag",
-        default="gpu_runner_model_forward"
+        default="gpu_runner_model_forward",
     )
 
     parser.add_argument(
         "--async-tags",
-        default="chunk_adapter_save_work,chunk_adapter_load_work"
+        default="chunk_adapter_save_work,chunk_adapter_load_work",
     )
 
     args = parser.parse_args()
 
-    async_tags = [t.strip() for t in args.async_tags.split(",")]
+    log_file = Path(args.log_file)
 
-    intervals, unmatched = parse_events(Path(args.log_file))
+    if not log_file.exists():
+        raise FileNotFoundError(log_file)
+
+    async_tags = [
+        t.strip() for t in args.async_tags.split(",") if t.strip()
+    ]
+
+    intervals, unmatched = parse_events(log_file)
 
     stages = sorted({stage for stage, _ in intervals.keys()})
 
     for stage in stages:
 
-        print(f"\n===== Stage: {stage} =====")
+        print(f"\n===== Stage-{stage} =====")
 
         model_intervals = intervals.get((stage, args.model_tag), [])
 
-        for tag in [args.model_tag] + async_tags:
+        print(
+            _stats_line(
+                args.model_tag,
+                [i.duration_ns for i in model_intervals],
+            )
+        )
+
+        for tag in async_tags:
 
             ivs = intervals.get((stage, tag), [])
 
-            total = sum(i.duration_ns for i in ivs)
-
-            count = len(ivs)
-
-            if count == 0:
-                print(f"{tag}: count=0")
-                continue
-
-            avg = total / count
-
             print(
-                f"{tag}: count={count} "
-                f"total={ns_to_ms(total):.3f}ms "
-                f"avg={ns_to_ms(avg):.3f}ms"
+                _stats_line(
+                    tag,
+                    [i.duration_ns for i in ivs],
+                )
             )
 
-        print("Overlap ratios:")
+        print("\nOverlap ratios:")
+
+        all_async = []
 
         for tag in async_tags:
 
             async_intervals = intervals.get((stage, tag), [])
+
+            all_async.extend(async_intervals)
 
             total_async, overlap, ratio = compute_overlap(
                 async_intervals,
@@ -206,11 +297,27 @@ def main():
 
             print(
                 f"- {tag}: "
-                f"{ns_to_ms(overlap):.3f}ms / {ns_to_ms(total_async):.3f}ms "
-                f"=> {ratio:.4f}"
+                f"{_ns_to_ms(overlap):.3f}ms / {_ns_to_ms(total_async):.3f}ms "
+                f"=> overlap_ratio={ratio:.4f}"
             )
 
+        total_async, overlap, ratio = compute_overlap(
+            all_async,
+            model_intervals,
+        )
+
+        print(
+            f"- ALL_ASYNC: "
+            f"{_ns_to_ms(overlap):.3f}ms / {_ns_to_ms(total_async):.3f}ms "
+            f"=> overlap_ratio={ratio:.4f}"
+        )
+
     print(f"\nUnmatched events: {unmatched}")
+
+    if unmatched > 0:
+        print(
+            "Note: unmatched events usually mean missing start/end logs."
+        )
 
 
 if __name__ == "__main__":
