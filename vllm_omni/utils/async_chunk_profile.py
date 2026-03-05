@@ -6,6 +6,7 @@ Then grep logs for [ASYNC_CHUNK_PROFILE] to analyze timings (ms).
 """
 
 import os
+import threading
 import time
 from contextlib import contextmanager
 from typing import Generator
@@ -22,6 +23,26 @@ def log_async_chunk_profile(tag: str, ms: float, extra: str = "") -> None:
     from vllm.logger import init_logger
     logger = init_logger(__name__)
     msg = f"[ASYNC_CHUNK_PROFILE] {tag} {ms:.2f} ms"
+    if extra:
+        msg += f" | {extra}"
+    logger.info(msg)
+
+
+def log_async_chunk_event(tag: str, phase: str, extra: str = "") -> None:
+    """Log an event marker for overlap analysis.
+
+    The timestamp uses time.perf_counter_ns() so start/end events can be
+    correlated across threads in the same process.
+    """
+    if not _profile_enabled():
+        return
+    from vllm.logger import init_logger
+
+    logger = init_logger(__name__)
+    msg = (
+        f"[ASYNC_CHUNK_EVENT] {tag} {phase} "
+        f"ts_ns={time.perf_counter_ns()} tid={threading.get_ident()}"
+    )
     if extra:
         msg += f" | {extra}"
     logger.info(msg)

@@ -20,7 +20,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors,
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.utils.async_chunk_profile import async_chunk_timer
+from vllm_omni.utils.async_chunk_profile import async_chunk_timer, log_async_chunk_event
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -1261,15 +1261,27 @@ class OmniGPUModelRunner(GPUModelRunner):
     ):
         """Inject omni-specific kwargs into forward and cache model output"""
         model_kwargs_extra = self._build_model_kwargs_extra()
+        if input_ids is not None:
+            num_tokens = int(input_ids.shape[0])
+        elif inputs_embeds is not None:
+            num_tokens = int(inputs_embeds.shape[0])
+        else:
+            num_tokens = 0
+        stage_name = getattr(self.model, "model_stage", "unknown")
+        forward_extra = f"stage={stage_name} num_tokens={num_tokens}"
+        log_async_chunk_event("gpu_runner_model_forward", "start", extra=forward_extra)
 
-        model_output = super()._model_forward(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-            **model_kwargs_extra,
-        )
+        try:
+            model_output = super()._model_forward(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+                **model_kwargs_extra,
+            )
+        finally:
+            log_async_chunk_event("gpu_runner_model_forward", "end", extra=forward_extra)
         if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
             model_output = self.model.make_omni_output(model_output, **model_kwargs_extra)
         # Cache model output so later sample_tokens can consume multimodal results.

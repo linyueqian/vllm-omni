@@ -6,6 +6,8 @@ import time
 from collections import deque
 from typing import Any
 
+from vllm_omni.utils.async_chunk_profile import async_chunk_timer
+
 from ..utils.logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
@@ -53,7 +55,11 @@ class OmniTransferAdapterBase:
                 request_id = request.request_id
                 self.request_ids_mapping[request_id] = request.external_req_id
                 try:
-                    is_success = self._poll_single_request(request)
+                    with async_chunk_timer(
+                        "chunk_adapter_recv_loop_work",
+                        extra=f"qlen={len(self._pending_load_reqs)}",
+                    ):
+                        is_success = self._poll_single_request(request)
                     if not is_success:
                         self._pending_load_reqs.append(request)
                 except Exception as e:
@@ -68,7 +74,11 @@ class OmniTransferAdapterBase:
             while self._pending_save_reqs:
                 task = self._pending_save_reqs.popleft()
                 try:
-                    self._send_single_request(task)
+                    with async_chunk_timer(
+                        "chunk_adapter_save_loop_work",
+                        extra=f"qlen={len(self._pending_save_reqs)}",
+                    ):
+                        self._send_single_request(task)
                 except Exception as e:
                     logger.warning(f"Error saving data for {task.get('request_id')}: {e}")
             time.sleep(0.001)

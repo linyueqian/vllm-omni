@@ -23,11 +23,20 @@
 |-----|------|------|
 | `chunk_adapter_custom_process` | `chunk_transfer_adapter._send_single_request` | 调用 thinker2talker / talker2code2wav 做 payload 构建的耗时 |
 | `chunk_adapter_connector_put` | `chunk_transfer_adapter._send_single_request` | `connector.put` 的耗时 |
+| `chunk_adapter_save_enqueue` | `chunk_transfer_adapter.save_async` | save 入队事件（`qlen` 为入队后队列长度） |
+| `chunk_adapter_save_queue_wait` | `chunk_transfer_adapter._send_single_request` | save task 从入队到被后台线程处理的等待时间 |
+| `chunk_adapter_load_enqueue` | `chunk_transfer_adapter.load_async` | load 入队事件（`qlen` 为入队后队列长度） |
+| `chunk_adapter_load_queue_wait` | `chunk_transfer_adapter._poll_single_request` | load request 从入队到成功收包的等待时间 |
+| `chunk_adapter_save_loop_work` | `transfer_adapter.base.save_loop` | save_loop 单任务总工作耗时 |
+| `chunk_adapter_recv_loop_work` | `transfer_adapter.base.recv_loop` | recv_loop 单次 poll 工作耗时 |
 | `chunk_adapter_update_request_payload` | `chunk_transfer_adapter._update_request_payload` | 下游合并/更新 request_payload（tensor/list cat）的耗时 |
 | `thinker2talker_async_chunk` | `stage_input_processors.qwen3_omni` | Thinker→Talker 整段 async chunk 处理 |
 | `talker2code2wav_async_chunk` | `stage_input_processors.qwen3_omni` | Talker→Code2Wav 整段 async chunk 处理 |
 | `thinker_decode_to_talker_decode` | `qwen3_omni._thinker_decode_to_talker_decode` | 按 chunk 将 thinker embedding 投影到 talker 的 decode 步 |
 | `gpu_runner_update_additional_info` | `gpu_model_runner._preprocess` | 从 connector 更新 additional_information 的耗时 |
+| `gpu_runner_model_forward` *(event)* | `gpu_model_runner._model_forward` | execute model 窗口（start/end 事件，用于与 save/load 计算重叠率） |
+| `chunk_adapter_save_work` *(event)* | `chunk_transfer_adapter._send_single_request` | save 任务窗口（start/end 事件） |
+| `chunk_adapter_load_work` *(event)* | `chunk_transfer_adapter._poll_single_request` | load 成功处理窗口（start/end 事件） |
 | `code2wav_chunked_decode_streaming` | `qwen3_omni.generate_audio` | 整段流式解码（含 code2wav 的多次 forward） |
 | `code2wav_forward_streaming` | `qwen3_omni_code2wav.chunked_decode_streaming` | Code2Wav 单次 `self(codes)` forward |
 
@@ -47,6 +56,8 @@ vllm serve ... --stage-configs-path .../qwen3_omni_moe_async_chunk.yaml
 [ASYNC_CHUNK_PROFILE] thinker2talker_async_chunk 12.34 ms | chunk=0
 [ASYNC_CHUNK_PROFILE] chunk_adapter_connector_put 0.56 ms | stage=0
 [ASYNC_CHUNK_PROFILE] code2wav_forward_streaming 45.67 ms | shape=(1, 8, 25)
+[ASYNC_CHUNK_EVENT] gpu_runner_model_forward start ts_ns=... tid=... | stage=talker num_tokens=...
+[ASYNC_CHUNK_EVENT] gpu_runner_model_forward end ts_ns=... tid=... | stage=talker num_tokens=...
 ...
 ```
 
@@ -63,6 +74,15 @@ vllm serve ... --stage-configs-path .../qwen3_omni_moe_async_chunk.yaml
    - `chunk_adapter_connector_put` 高：检查 connector 实现（序列化、共享内存/队列竞争）。
    - `code2wav_forward_streaming` 或 `code2wav_chunked_decode_streaming` 高：考虑 chunk_size、左上下文、或 Code2Wav 模型/内核优化。
    - `gpu_runner_preprocess_per_req` / `talker_postprocess_cpu_copy` 高：减少 CPU↔GPU 拷贝、合并或异步化拷贝。
+4. **重叠率（掩盖率）计算**：
+   - 通过 `[ASYNC_CHUNK_EVENT]` 提取窗口：`gpu_runner_model_forward`（模型窗口）与 `chunk_adapter_save_work` / `chunk_adapter_load_work`（异步窗口）。
+   - 对同一进程内事件，按 `ts_ns` 配对 start/end，得到时间区间 `[start_ns, end_ns]`。
+   - 计算：
+     - `overlap_ns = intersection(async_window, model_window)`（可与多个 model_window 求并集交）
+     - `overlap_ratio = overlap_ns / async_window_ns`
+   - 解释建议：
+     - `overlap_ratio` 高且 `*_queue_wait` 低：save/load 基本被模型计算掩盖；
+     - `overlap_ratio` 下降且 `*_queue_wait` 升高：掩盖变差，异步开销开始泄漏到 E2E。
 
 ## 5. 实现与开关
 
