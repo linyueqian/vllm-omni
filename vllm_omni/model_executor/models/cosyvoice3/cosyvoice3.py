@@ -532,6 +532,13 @@ class CosyVoice3Model(
                     n_timesteps=10,
                 )
                 audio = tts_speech.reshape(-1).to(dtype=torch.float32)
+                if left_context_size > 0 and samples_per_token is None and audio.numel() > 0:
+                    logger.warning_once(
+                        "CosyVoice3 code2wav cannot trim left context because samples_per_token is unavailable: "
+                        "left_context_size=%d sample_rate=%d",
+                        left_context_size,
+                        int(self.config.sample_rate),
+                    )
                 if left_context_size > 0 and samples_per_token is not None and audio.numel() > 0:
                     crop = left_context_size * samples_per_token
                     if crop > 0:
