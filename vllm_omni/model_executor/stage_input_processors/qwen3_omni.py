@@ -283,14 +283,16 @@ def _talker2code2wav_async_chunk_impl(
     transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
     length = len(transfer_manager.code_prompt_token_ids[request_id])
     chunk_length = length % chunk_size
-    if chunk_length != 0 and not is_finished:
-        return None
-
-    context_length = chunk_length if chunk_length != 0 else chunk_size
     if _defer_code_window_enabled(transfer_manager):
-        # Stage-1 only sends newly generated frames; Stage-2 reconstructs
-        # [left_context + new_chunk] to reduce Stage-1 CPU pressure.
+        # Stage-1 only sends delta frames in chunk batches. Stage-2 will
+        # assemble [left_context + delta_chunk] to reduce Stage-1 CPU work.
+        if chunk_length != 0 and not is_finished:
+            return None
+        context_length = chunk_length if chunk_length != 0 else min(chunk_size, length)
         new_frames = transfer_manager.code_prompt_token_ids[request_id][-context_length:]
+        # Clear sent delta frames to avoid unbounded growth on Stage-1.
+        if context_length > 0:
+            del transfer_manager.code_prompt_token_ids[request_id][-context_length:]
         return {
             "code_predictor_new_frames": new_frames,
             "codec_chunk_frames": chunk_size,
@@ -298,6 +300,10 @@ def _talker2code2wav_async_chunk_impl(
             "finished": torch.tensor(is_finished, dtype=torch.bool),
         }
 
+    if chunk_length != 0 and not is_finished:
+        return None
+
+    context_length = chunk_length if chunk_length != 0 else chunk_size
     end_index = min(length, left_context_size + context_length)
     info = {
         "code_predictor_codes": (

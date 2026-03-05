@@ -57,6 +57,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.finished_requests: set[str] = set()
         self.request_payload = {}
         self.code_prompt_token_ids: dict[str, list[list[int]]] = defaultdict(list)
+        self.code_prompt_frame_counts: dict[str, int] = defaultdict(int)
         self.request_ids_mapping: dict[str, str] = {}
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
@@ -110,6 +111,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         request_cache.append(frame)
                     else:
                         request_cache.append(list(frame))
+                self.code_prompt_frame_counts[request_id] += len(new_frames)
 
             chunk_size = int(payload_data.get("codec_chunk_frames", 25))
             left_context_size = int(payload_data.get("codec_left_context_frames", 25))
@@ -117,17 +119,22 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 return []
 
             request_cache = self.code_prompt_token_ids[request_id]
-            length = len(request_cache)
+            total_frames = self.code_prompt_frame_counts[request_id]
             finished = bool(payload_data.get("finished"))
-            if length <= 0:
+            if total_frames <= 0:
                 return [] if finished else None
-            chunk_length = length % chunk_size
+            chunk_length = total_frames % chunk_size
             if chunk_length != 0 and not finished:
                 return None
 
             context_length = chunk_length if chunk_length != 0 else chunk_size
-            end_index = min(length, left_context_size + context_length)
-            return torch.tensor(request_cache[-end_index:]).transpose(0, 1).reshape(-1).tolist()
+            end_index = min(len(request_cache), left_context_size + context_length)
+            prompt_ids = torch.tensor(request_cache[-end_index:]).transpose(0, 1).reshape(-1).tolist()
+            # Keep only required frames for future left-context assembly.
+            max_keep = left_context_size + chunk_size
+            if len(request_cache) > max_keep:
+                del request_cache[: len(request_cache) - max_keep]
+            return prompt_ids
 
         new_ids = payload_data.get("code_predictor_codes", [])
         if isinstance(new_ids, torch.Tensor):
@@ -370,6 +377,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
+        self.code_prompt_frame_counts.pop(external_req_id, None)
 
     ########################################################################
     # Schedule Helper
