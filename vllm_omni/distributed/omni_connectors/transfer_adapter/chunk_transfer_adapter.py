@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import os
 import time
 from collections import defaultdict, deque
 from typing import Any
@@ -78,6 +79,62 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             extra=connector_config.get("extra", {}),
         )
         return OmniConnectorFactory.create_connector(connector_specs)
+
+    def _defer_code_window_on_load_enabled(self) -> bool:
+        raw_cfg = getattr(self.connector, "config", {}) or {}
+        cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+        if isinstance(cfg, dict) and "codec_defer_window_to_load" in cfg:
+            return bool(cfg.get("codec_defer_window_to_load"))
+        env_val = os.environ.get("VLLM_OMNI_ASYNC_CHUNK_DEFER_CODE_WINDOW", "")
+        return env_val.strip().lower() in ("1", "true", "yes")
+
+    def _build_code2wav_prompt_ids(
+        self,
+        payload_data: dict[str, Any],
+        request_id: str,
+    ) -> list[int] | None:
+        """Build code2wav prompt ids from payload.
+
+        Returns None when deferred-window mode needs more frames before emitting.
+        """
+        if self._defer_code_window_on_load_enabled() and "code_predictor_new_frames" in payload_data:
+            new_frames = payload_data.get("code_predictor_new_frames", [])
+            if new_frames:
+                request_cache = self.code_prompt_token_ids[request_id]
+                for frame in new_frames:
+                    if isinstance(frame, torch.Tensor):
+                        request_cache.append(frame.reshape(-1).tolist())
+                    elif hasattr(frame, "_x"):
+                        request_cache.append(list(frame._x))
+                    elif isinstance(frame, list):
+                        request_cache.append(frame)
+                    else:
+                        request_cache.append(list(frame))
+
+            chunk_size = int(payload_data.get("codec_chunk_frames", 25))
+            left_context_size = int(payload_data.get("codec_left_context_frames", 25))
+            if chunk_size <= 0 or left_context_size < 0:
+                return []
+
+            request_cache = self.code_prompt_token_ids[request_id]
+            length = len(request_cache)
+            finished = bool(payload_data.get("finished"))
+            if length <= 0:
+                return [] if finished else None
+            chunk_length = length % chunk_size
+            if chunk_length != 0 and not finished:
+                return None
+
+            context_length = chunk_length if chunk_length != 0 else chunk_size
+            end_index = min(length, left_context_size + context_length)
+            return torch.tensor(request_cache[-end_index:]).transpose(0, 1).reshape(-1).tolist()
+
+        new_ids = payload_data.get("code_predictor_codes", [])
+        if isinstance(new_ids, torch.Tensor):
+            return new_ids.reshape(-1).tolist()
+        if hasattr(new_ids, "_x"):
+            return list(new_ids._x)
+        return new_ids
 
     def load_async(self, request: Request):
         """Register a request for asynchronous chunk retrieval.
@@ -178,7 +235,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     if payload_data.get("finished"):
                         self.finished_requests.add(req_id)
 
-                    new_ids = payload_data.get("code_predictor_codes", [])
+                    new_ids = self._build_code2wav_prompt_ids(payload_data, external_req_id)
+                    if new_ids is None:
+                        return True
                     request.prompt_token_ids = new_ids
                     request.num_computed_tokens = 0
 

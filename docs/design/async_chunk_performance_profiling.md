@@ -88,6 +88,7 @@ vllm serve ... --stage-configs-path .../qwen3_omni_moe_async_chunk.yaml
 
 - 打点逻辑与开关：`vllm_omni.utils.async_chunk_profile`（通过 `VLLM_OMNI_ASYNC_CHUNK_PROFILE=1` 开启）。
 - 未设置或非 1/true/yes 时，仅做一次 `_profile_enabled()` 判断，几乎无性能影响。
+- 可选路径切换开关：`VLLM_OMNI_ASYNC_CHUNK_DEFER_CODE_WINDOW=1`（Talker 仅发送新增帧，Code2Wav 侧在 load 时组装 left-context 窗口）。
 
 ---
 

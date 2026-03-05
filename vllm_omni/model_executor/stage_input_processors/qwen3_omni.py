@@ -3,6 +3,7 @@
 # Copyright 2025 The Qwen team.
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
+import os
 from typing import Any
 
 import torch
@@ -12,6 +13,16 @@ from vllm.platforms import current_platform
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.utils.async_chunk_profile import async_chunk_timer
+
+
+def _defer_code_window_enabled(transfer_manager: Any) -> bool:
+    connector = getattr(transfer_manager, "connector", None)
+    raw_cfg = getattr(connector, "config", {}) or {}
+    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+    if isinstance(cfg, dict) and "codec_defer_window_to_load" in cfg:
+        return bool(cfg.get("codec_defer_window_to_load"))
+    env_val = os.environ.get("VLLM_OMNI_ASYNC_CHUNK_DEFER_CODE_WINDOW", "")
+    return env_val.strip().lower() in ("1", "true", "yes")
 
 
 def _compute_talker_prompt_ids_length(info, device: torch.device | str = "cuda") -> int:
@@ -276,8 +287,18 @@ def _talker2code2wav_async_chunk_impl(
         return None
 
     context_length = chunk_length if chunk_length != 0 else chunk_size
-    end_index = min(length, left_context_size + context_length)
+    if _defer_code_window_enabled(transfer_manager):
+        # Stage-1 only sends newly generated frames; Stage-2 reconstructs
+        # [left_context + new_chunk] to reduce Stage-1 CPU pressure.
+        new_frames = transfer_manager.code_prompt_token_ids[request_id][-context_length:]
+        return {
+            "code_predictor_new_frames": new_frames,
+            "codec_chunk_frames": chunk_size,
+            "codec_left_context_frames": left_context_size,
+            "finished": torch.tensor(is_finished, dtype=torch.bool),
+        }
 
+    end_index = min(length, left_context_size + context_length)
     info = {
         "code_predictor_codes": (
             torch.tensor(transfer_manager.code_prompt_token_ids[request_id][-end_index:])
