@@ -403,23 +403,19 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
     def _setup_compile(self) -> None:
         """Lazily set up torch.compiled model forward for kernel fusion.
 
-        Uses mode="default" (not "reduce-overhead") so that Inductor performs
-        kernel fusion without capturing its own CUDA graphs.  This avoids
-        conflicts with vLLM's CUDAGraphWrapper when enforce_eager=false:
-        only one CUDA graph system (vLLM's) exists, no stream isolation needed.
+        Uses ``mode="default"`` so Inductor performs operator fusion without
+        capturing its own CUDA graphs.  This avoids conflicts with vLLM's
+        ``CUDAGraphWrapper`` which manages CUDA graphs for the main Talker
+        model on the default stream.
         """
         if self._compiled_model_fwd is not None:
             return
-        try:
-            self._compiled_model_fwd = torch.compile(
-                self.model.forward,
-                mode="default",
-                dynamic=True,
-            )
-            logger.info("code_predictor: torch.compile enabled (default, fusion-only)")
-        except Exception as e:
-            logger.warning("code_predictor: torch.compile failed (%s), using eager", e)
-            self._compiled_model_fwd = self.model.forward
+        self._compiled_model_fwd = torch.compile(
+            self.model.forward,
+            mode="default",
+            dynamic=True,
+        )
+        logger.info("code_predictor: torch.compile enabled (mode=default)")
 
     # ------------------------------------------------------------------
     #  Optimized forward: re-prefill + torch.compile + projection cache
