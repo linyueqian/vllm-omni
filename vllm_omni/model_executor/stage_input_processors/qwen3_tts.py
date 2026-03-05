@@ -22,6 +22,9 @@ def talker2code2wav(
         output = talker_output.outputs[0]
         # audio_codes shape: [num_frames, Q] where Q=num_quantizers (16)
         audio_codes = output.multimodal_output["audio_codes"].to(torch.long)
+        # Filter zero-padded frames (EOS/invalid steps), matching _extract_last_frame behavior
+        valid_mask = audio_codes.any(dim=1)
+        audio_codes = audio_codes[valid_mask]
         # Code2Wav expects codebook-major flat: [Q*num_frames]
         codec_codes = audio_codes.transpose(0, 1).cpu().reshape(-1).tolist()
         code2wav_inputs.append(
