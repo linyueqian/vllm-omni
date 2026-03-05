@@ -133,6 +133,22 @@ def test_save_async(build_adapter):
     assert task["is_finished"] is False
 
 
+def test_send_single_request_cleans_up_after_finished_payload(build_adapter, monkeypatch):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-finished", RequestStatus.FINISHED_STOPPED, external_req_id="ext-finished")
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: {"x": [1], "finished": True}
+    cleanup_calls = []
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: cleanup_calls.append((a, kw)))
+
+    adapter._send_single_request({"pooling_output": None, "request": request, "is_finished": True})
+
+    assert len(cleanup_calls) == 1
+    args, _ = cleanup_calls[0]
+    assert args[0] == "req-finished"
+    assert args[1] == "ext-finished"
+
+
 def test_update_request_payload(build_adapter):
     adapter, _ = build_adapter()
 
@@ -411,12 +427,14 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
     assert args[1] == "ext-s1"
 
 
-def test_ar_scheduler_calls_cleanup_on_finished(mocker: MockerFixture):
-    """OmniARScheduler must call adapter.cleanup when request fully finishes."""
+def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerFixture):
+    """OmniARScheduler should enqueue save; adapter cleanup is handled in save thread."""
     cleanup_calls = []
+    save_calls = []
 
     adapter_mock = mocker.MagicMock()
     adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
+    adapter_mock.save_async = lambda *a, **kw: save_calls.append((a, kw))
 
     from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 
@@ -488,7 +506,5 @@ def test_ar_scheduler_calls_cleanup_on_finished(mocker: MockerFixture):
 
     OmniARScheduler.update_from_output(scheduler, scheduler_output, model_runner_output)
 
-    assert len(cleanup_calls) == 1
-    args, _ = cleanup_calls[0]
-    assert args[0] == "req-ar"
-    assert args[1] == "ext-ar"
+    assert len(cleanup_calls) == 0
+    assert len(save_calls) == 1

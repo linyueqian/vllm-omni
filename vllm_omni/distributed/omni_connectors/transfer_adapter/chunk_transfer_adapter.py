@@ -244,6 +244,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if success:
             self.put_req_chunk[external_req_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+            finished_flag = payload_data.get("finished")
+            is_payload_finished = False
+            if isinstance(finished_flag, torch.Tensor):
+                is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())
+            elif finished_flag is not None:
+                is_payload_finished = bool(finished_flag)
+
+            # Reclaim per-request async state only after the terminal payload
+            # has been sent successfully. This avoids cleanup->save races.
+            if is_payload_finished:
+                self.cleanup(request.request_id, request_id)
 
         if is_finished:
             self.cleanup_sender(external_req_id)
