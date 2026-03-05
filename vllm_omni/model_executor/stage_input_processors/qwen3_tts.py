@@ -1,5 +1,7 @@
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
+from __future__ import annotations
+
 from typing import Any
 
 import torch
