@@ -77,6 +77,7 @@ class BenchmarkResult:
     mean_rtf: float = 0.0
     median_rtf: float = 0.0
     std_rtf: float = 0.0
+    p99_rtf: float = 0.0
     # Audio stats
     mean_audio_duration_s: float = 0.0
     total_audio_duration_s: float = 0.0
@@ -233,6 +234,7 @@ async def run_benchmark(
         bench.mean_rtf = float(np.mean(rtfs))
         bench.median_rtf = float(np.median(rtfs))
         bench.std_rtf = float(np.std(rtfs))
+        bench.p99_rtf = float(np.percentile(rtfs, 99))
 
         bench.mean_audio_duration_s = float(np.mean(audio_durs))
         bench.total_audio_duration_s = float(np.sum(audio_durs))
@@ -250,21 +252,42 @@ async def run_benchmark(
             for r in successful
         ]
 
-    # Print summary
-    print(f"\n{'=' * 60}")
-    print(f"  Concurrency: {max_concurrency}  |  Completed: {bench.completed}  |  Failed: {bench.failed}")
-    print(f"  Duration: {duration:.2f}s  |  Throughput: {bench.request_throughput:.2f} req/s")
-    print(
-        f"  {'TTFP (ms):':<25} mean={bench.mean_ttfp_ms:.1f}  median={bench.median_ttfp_ms:.1f}"
-        f"  p90={bench.p90_ttfp_ms:.1f}  p99={bench.p99_ttfp_ms:.1f}"
-    )
-    print(
-        f"  {'E2E (ms):':<25} mean={bench.mean_e2e_ms:.1f}  median={bench.median_e2e_ms:.1f}"
-        f"  p90={bench.p90_e2e_ms:.1f}  p99={bench.p99_e2e_ms:.1f}"
-    )
-    print(f"  {'RTF:':<25} mean={bench.mean_rtf:.3f}  median={bench.median_rtf:.3f}")
-    print(f"  {'Audio throughput:':<25} {bench.audio_throughput:.2f} audio-sec/wall-sec")
-    print(f"{'=' * 60}\n")
+    # Print summary in standardized performance template
+    W = 50
+    print("")
+    print(f"{'=' * W}")
+    print(f"{'Serving Benchmark Result':^{W}}")
+    print(f"{'=' * W}")
+    print(f"{'Successful requests:':<40}{bench.completed:<10}")
+    print(f"{'Failed requests:':<40}{bench.failed:<10}")
+    print(f"{'Maximum request concurrency:':<40}{max_concurrency:<10}")
+    print(f"{'Benchmark duration (s):':<40}{duration:<10.2f}")
+    print(f"{'Request throughput (req/s):':<40}{bench.request_throughput:<10.2f}")
+    print(f"{'-' * W}")
+    print(f"{'End-to-end Latency':^{W}}")
+    print(f"{'-' * W}")
+    print(f"{'Mean E2EL (ms):':<40}{bench.mean_e2e_ms:<10.2f}")
+    print(f"{'Median E2EL (ms):':<40}{bench.median_e2e_ms:<10.2f}")
+    print(f"{'P99 E2EL (ms):':<40}{bench.p99_e2e_ms:<10.2f}")
+    print(f"{'=' * W}")
+    print(f"{'Audio Result':^{W}}")
+    print(f"{'=' * W}")
+    print(f"{'Total audio duration generated (s):':<40}{bench.total_audio_duration_s:<10.2f}")
+    print(f"{'Audio throughput (audio duration/s):':<40}{bench.audio_throughput:<10.2f}")
+    print(f"{'-' * W}")
+    print(f"{'Time to First Packet':^{W}}")
+    print(f"{'-' * W}")
+    print(f"{'Mean AUDIO_TTFP (ms):':<40}{bench.mean_ttfp_ms:<10.2f}")
+    print(f"{'Median AUDIO_TTFP (ms):':<40}{bench.median_ttfp_ms:<10.2f}")
+    print(f"{'P99 AUDIO_TTFP (ms):':<40}{bench.p99_ttfp_ms:<10.2f}")
+    print(f"{'-' * W}")
+    print(f"{'Real Time Factor':^{W}}")
+    print(f"{'-' * W}")
+    print(f"{'Mean AUDIO_RTF:':<40}{bench.mean_rtf:<10.3f}")
+    print(f"{'Median AUDIO_RTF:':<40}{bench.median_rtf:<10.3f}")
+    print(f"{'P99 AUDIO_RTF:':<40}{bench.p99_rtf:<10.3f}")
+    print(f"{'=' * W}")
+    print("")
 
     if failed:
         for r in failed[:3]:
