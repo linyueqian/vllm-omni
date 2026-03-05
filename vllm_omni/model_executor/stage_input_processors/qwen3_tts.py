@@ -1,21 +1,18 @@
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
-from __future__ import annotations
-
 from typing import Any
 
 import torch
-
-from vllm_omni.inputs.data import OmniTokensPrompt
 
 
 def talker2code2wav(
     stage_list: list[Any],
     engine_input_source: list[int],
-    prompt: OmniTokensPrompt | None = None,
+    prompt: Any = None,
     requires_multimodal_data: bool = False,
-) -> list[OmniTokensPrompt]:
+) -> list[Any]:
     """Non-async processor: wait for talker to finish, then pass all codes to code2wav at once."""
+    from vllm_omni.inputs.data import OmniTokensPrompt
     from vllm_omni.model_executor.stage_input_processors.qwen3_omni import _validate_stage_inputs
 
     talker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
