@@ -4,6 +4,35 @@ from typing import Any
 
 import torch
 
+from vllm_omni.inputs.data import OmniTokensPrompt
+
+
+def talker2code2wav(
+    stage_list: list[Any],
+    engine_input_source: list[int],
+    prompt: OmniTokensPrompt | None = None,
+    requires_multimodal_data: bool = False,
+) -> list[OmniTokensPrompt]:
+    """Non-async processor: wait for talker to finish, then pass all codes to code2wav at once."""
+    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import _validate_stage_inputs
+
+    talker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    code2wav_inputs: list[OmniTokensPrompt] = []
+    for talker_output in talker_outputs:
+        output = talker_output.outputs[0]
+        # audio_codes shape: [num_frames, Q] where Q=num_quantizers (16)
+        audio_codes = output.multimodal_output["audio_codes"].to(torch.long)
+        # Code2Wav expects codebook-major flat: [Q*num_frames]
+        codec_codes = audio_codes.transpose(0, 1).cpu().reshape(-1).tolist()
+        code2wav_inputs.append(
+            OmniTokensPrompt(
+                prompt_token_ids=codec_codes,
+                multi_modal_data=None,
+                mm_processor_kwargs=None,
+            )
+        )
+    return code2wav_inputs
+
 
 def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
     audio_codes = pooling_output.get("audio_codes")
