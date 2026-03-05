@@ -4,12 +4,12 @@ import os
 from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
 
-import numpy as np
 import torch
 import torch.nn as nn
 from transformers.feature_extraction_utils import BatchFeature
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal
@@ -305,6 +305,8 @@ class CosyVoice3Model(
             self.code2wav = CosyVoice3Code2Wav(self.config)
             self.model = self.code2wav.flow_model
             self.hift = self.code2wav.hift
+            # Keep additional information synchronized for async_chunk updates.
+            self.enable_update_additional_information = True
 
             # Expose streaming parameters
             self.token_overlap_len = self.code2wav.token_overlap_len
@@ -330,6 +332,43 @@ class CosyVoice3Model(
 
         # Use parent's cache config - critical for PagedAttention to work correctly
         return parent_config.with_hf_config(qwen_hf_config, architectures=["Qwen2Model"])
+
+    @staticmethod
+    def _as_tensor(value: object) -> torch.Tensor | None:
+        """Extract tensor payload from runtime info fields."""
+        if isinstance(value, list):
+            if not value:
+                return None
+            value = value[0]
+        if isinstance(value, torch.Tensor):
+            return value
+        return None
+
+    @staticmethod
+    def _split_request_ids(ids: torch.Tensor, seq_token_counts: list[int] | None = None) -> list[torch.Tensor]:
+        """Split concatenated input_ids into per-request segments."""
+        if seq_token_counts is not None and len(seq_token_counts) > 1:
+            boundaries = [0]
+            for count in seq_token_counts:
+                boundaries.append(boundaries[-1] + int(count))
+            total = ids.numel()
+            return [ids[boundaries[i] : min(boundaries[i + 1], total)] for i in range(len(seq_token_counts))]
+
+        if is_forward_context_available():
+            slices = get_forward_context().ubatch_slices
+            if slices is not None and len(slices) > 1 and not any(hasattr(s, "token_slice") for s in slices):
+                boundaries = [0]
+                for s in slices:
+                    boundaries.append(boundaries[-1] + int(s))
+                return [ids[boundaries[i] : boundaries[i + 1]] for i in range(len(boundaries) - 1)]
+
+        return [ids]
+
+    def _sanitize_codec_tokens(self, req_ids: torch.Tensor) -> torch.Tensor:
+        """Filter non-code tokens before feeding flow token embedding."""
+        vocab_size = int(self.code2wav.input_embedding.num_embeddings)
+        valid_mask = (req_ids >= 0) & (req_ids < vocab_size)
+        return req_ids[valid_mask]
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         if isinstance(hidden_states, OmniOutput):
@@ -380,6 +419,7 @@ class CosyVoice3Model(
             hidden = int(self.config.hidden_size)
             return torch.zeros(
                 (input_ids.shape[0], hidden),
+                device=input_ids.device,
             )
         else:
             raise RuntimeError(f"embed_input_ids is not valid for {self.model_stage}.")
@@ -412,28 +452,93 @@ class CosyVoice3Model(
 
             return OmniOutput(text_hidden_states=hidden_states, multimodal_outputs=multimodal_outputs)
         elif self.model_stage == "cosyvoice3_code2wav":
-            runtime_info = kwargs.get("runtime_additional_information", [])
-            if not runtime_info:
-                length = 30 * 24000
-                audio = np.zeros((length,))
-                return OmniOutput(text_hidden_states=None, multimodal_outputs={"audio": audio})
+            runtime_info = kwargs.get("model_intermediate_buffer")
+            if runtime_info is None:
+                runtime_info = kwargs.get("runtime_additional_information", [])
+            if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
+                logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
 
-            # Remove the last eos token and add batch dimension
-            token = input_ids[..., :-1].unsqueeze(0)
+            seq_token_counts = kwargs.get("seq_token_counts")
+            flat_ids = input_ids.reshape(-1).to(dtype=torch.long)
+            request_ids_list = self._split_request_ids(flat_ids, seq_token_counts)
 
-            # Generate audio using code2wav
-            tts_speech = self.code2wav(
-                token=token,
-                prompt_token=runtime_info[0]["speech_token"][:1],
-                prompt_feat=runtime_info[0]["speech_feat"][:1],
-                embedding=runtime_info[0]["embedding"][:1],
-                n_timesteps=10,
-            )
+            num_reqs = max(1, len(request_ids_list))
+            sample_rate = torch.tensor(int(self.config.sample_rate), dtype=torch.int32)
+            empty_audio = torch.zeros((0,), dtype=torch.float32, device=input_ids.device)
+            audios: list[torch.Tensor] = [empty_audio] * num_reqs
+            srs: list[torch.Tensor] = [sample_rate] * num_reqs
+            samples_per_token: int | None = None
+            try:
+                # Prefer vocoder-derived stride: prod(upsample_rates) * hop_len * token_mel_ratio.
+                hift_cfg = getattr(self.config, "hift", {}) or {}
+                up_rates = list(hift_cfg.get("upsample_rates") or [])
+                hop_len = int((hift_cfg.get("istft_params") or {}).get("hop_len", 0))
+                token_mel_ratio = int(getattr(self.config, "token_mel_ratio", 0))
+                if up_rates and hop_len > 0 and token_mel_ratio > 0:
+                    stride = 1
+                    for u in up_rates:
+                        stride *= int(u)
+                    samples_per_token = stride * hop_len * token_mel_ratio
+                else:
+                    token_hz = int(getattr(self.config, "token_frame_rate", 0))
+                    sr_val = int(self.config.sample_rate)
+                    if token_hz > 0 and sr_val % token_hz == 0:
+                        samples_per_token = sr_val // token_hz
+            except Exception:
+                samples_per_token = None
 
-            return OmniOutput(
-                text_hidden_states=None,
-                multimodal_outputs={"audio": tts_speech, "sr": torch.tensor(22050)},
-            )
+            if not isinstance(runtime_info, list):
+                runtime_info = []
+
+            for idx, req_ids in enumerate(request_ids_list):
+                info = runtime_info[idx] if idx < len(runtime_info) and isinstance(runtime_info[idx], dict) else {}
+                speech_token = self._as_tensor(info.get("speech_token")) if info else None
+                speech_feat = self._as_tensor(info.get("speech_feat")) if info else None
+                embedding = self._as_tensor(info.get("embedding")) if info else None
+                if speech_token is None or speech_feat is None or embedding is None:
+                    if req_ids.numel() > 0 and info and ("left_context_size" in info or "generated_len" in info):
+                        info_keys = ",".join(sorted(info.keys())) if info else ""
+                        logger.warning_once(
+                            "CosyVoice3 code2wav missing prompt conditioning for non-empty codec tokens: "
+                            "raw_len=%d info_keys=%s",
+                            int(req_ids.numel()),
+                            info_keys,
+                        )
+                    continue
+
+                token = self._sanitize_codec_tokens(req_ids)
+                if token.numel() == 0:
+                    if req_ids.numel() > 0:
+                        logger.warning_once(
+                            "CosyVoice3 code2wav received no valid codec tokens after filtering: "
+                            "raw_len=%d raw_range=[%d,%d] vocab_size=%d",
+                            req_ids.numel(),
+                            int(req_ids.min().item()),
+                            int(req_ids.max().item()),
+                            int(self.code2wav.input_embedding.num_embeddings),
+                        )
+                    continue
+                left_context_size = 0
+                try:
+                    left_context_size = max(0, int(info.get("left_context_size", 0))) if info else 0
+                except (TypeError, ValueError):
+                    left_context_size = 0
+
+                tts_speech = self.code2wav(
+                    token=token.unsqueeze(0),
+                    prompt_token=speech_token[:1],
+                    prompt_feat=speech_feat[:1],
+                    embedding=embedding[:1],
+                    n_timesteps=10,
+                )
+                audio = tts_speech.reshape(-1).to(dtype=torch.float32)
+                if left_context_size > 0 and samples_per_token is not None and audio.numel() > 0:
+                    crop = left_context_size * samples_per_token
+                    if crop > 0:
+                        audio = audio[crop:] if crop < audio.numel() else audio[:0]
+                audios[idx] = audio
+
+            return OmniOutput(text_hidden_states=None, multimodal_outputs={"audio": audios, "sr": srs})
         else:
             raise ValueError(f"Unsupported model_stage: {self.model_stage}")
 

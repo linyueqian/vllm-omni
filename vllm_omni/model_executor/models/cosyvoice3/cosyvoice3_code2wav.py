@@ -181,6 +181,7 @@ class CosyVoice3Code2Wav(nn.Module):
 
         # Prepare tokens
         prompt_token = prompt_token.to(device=device)
+        prompt_feat = prompt_feat.to(device=device, dtype=dtype)
         token_len1, token_len2 = prompt_token.shape[1], token.shape[1]
         prompt_token_len = torch.tensor([token_len1], device=device, dtype=torch.int32)
         token_len = torch.tensor([token_len2], device=device, dtype=torch.int32)
@@ -193,9 +194,8 @@ class CosyVoice3Code2Wav(nn.Module):
         mask = (~make_pad_mask(full_token_len)).unsqueeze(-1).to(embedding)
 
         # Token embedding (clamp to valid codebook range; EOS/padding tokens may exceed vocab_size)
-        token_emb = (
-            self.input_embedding(torch.clamp(full_token, min=0, max=self.input_embedding.num_embeddings - 1)) * mask
-        )
+        vocab_size = int(self.input_embedding.num_embeddings)
+        token_emb = self.input_embedding(torch.clamp(full_token, min=0, max=vocab_size - 1)) * mask
 
         # Pre-lookahead processing
         h = self.pre_lookahead_layer(token_emb)
