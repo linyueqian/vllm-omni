@@ -92,7 +92,7 @@ runtime:
         connector_get_max_wait: 300
         codec_chunk_frames: 25
         codec_left_context_frames: 25
-        initial_codec_chunk_frames: 0
+        initial_codec_chunk_frames: 2
 
   edges:
     - from: 0
