@@ -108,3 +108,84 @@ def test_talker2code2wav_async_chunk_emits_eof_when_finished_without_valid_codes
     assert payload is not None
     assert payload["code_predictor_codes"] == []
     assert payload["finished"].item() is True
+
+
+def test_talker2code2wav_async_chunk_does_not_reemit_without_new_tokens():
+    transfer_manager = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        request_payload={},
+        connector=SimpleNamespace(
+            config={
+                "extra": {
+                    "codec_chunk_frames": 2,
+                    "codec_left_context_frames": 2,
+                    "codec_vocab_size": 6561,
+                }
+            }
+        ),
+    )
+    request = SimpleNamespace(
+        external_req_id="rid-stable",
+        output_token_ids=[1, 2],
+        additional_information={},
+        is_finished=lambda: False,
+    )
+
+    payload1 = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        pooling_output=None,
+        request=request,
+        is_finished=False,
+    )
+    payload2 = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        pooling_output=None,
+        request=request,
+        is_finished=False,
+    )
+
+    assert payload1 is not None
+    assert payload1["code_predictor_codes"] == [1, 2]
+    assert payload2 is None
+
+
+def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio():
+    transfer_manager = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        request_payload={},
+        connector=SimpleNamespace(
+            config={
+                "extra": {
+                    "codec_chunk_frames": 2,
+                    "codec_left_context_frames": 2,
+                    "codec_vocab_size": 6561,
+                }
+            }
+        ),
+    )
+    request = SimpleNamespace(
+        external_req_id="rid-tail",
+        output_token_ids=[3, 4],
+        additional_information={},
+        is_finished=lambda: False,
+    )
+
+    payload_stream = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        pooling_output=None,
+        request=request,
+        is_finished=False,
+    )
+    payload_final = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        pooling_output=None,
+        request=request,
+        is_finished=True,
+    )
+
+    assert payload_stream is not None
+    assert payload_stream["finished"].item() is False
+    assert payload_stream["code_predictor_codes"] == [3, 4]
+    assert payload_final is not None
+    assert payload_final["finished"].item() is True
+    assert payload_final["code_predictor_codes"] == []

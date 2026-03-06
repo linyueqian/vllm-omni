@@ -128,12 +128,17 @@ def talker2code2wav_async_chunk(
                 "seen_len": 0,
                 "sent_prompt": False,
                 "emitted_chunks": 0,
+                "emitted_token_len": 0,
+                "terminal_sent": False,
                 "prompt_payload": prompt_payload,
             }
         }
         transfer_manager.request_payload[request_id] = request_state
 
     state = request_state["_cosyvoice3_async_state"]
+    if bool(state.get("terminal_sent", False)):
+        return None
+
     output_token_ids = _ensure_list(getattr(request, "output_token_ids", []))
     seen_len = int(state.get("seen_len", 0))
     new_tokens = output_token_ids[seen_len:] if seen_len < len(output_token_ids) else []
@@ -158,11 +163,26 @@ def talker2code2wav_async_chunk(
         if not state.get("sent_prompt", False):
             payload.update(state.get("prompt_payload", {}))
             state["sent_prompt"] = True
+        state["terminal_sent"] = True
         return payload
 
+    emitted_token_len = int(state.get("emitted_token_len", 0))
     chunk_length = length % chunk_size
-    if chunk_length != 0 and not finished:
-        return None
+    if not finished:
+        if chunk_length != 0:
+            return None
+        if length <= emitted_token_len:
+            return None
+    elif length <= emitted_token_len:
+        payload = {
+            "code_predictor_codes": [],
+            "finished": torch.tensor(True, dtype=torch.bool),
+        }
+        if not state.get("sent_prompt", False):
+            payload.update(state.get("prompt_payload", {}))
+            state["sent_prompt"] = True
+        state["terminal_sent"] = True
+        return payload
 
     context_length = chunk_length if chunk_length != 0 else chunk_size
     end_index = min(length, left_context_size_cfg + context_length)
@@ -178,5 +198,8 @@ def talker2code2wav_async_chunk(
     if not state.get("sent_prompt", False):
         payload.update(state.get("prompt_payload", {}))
         state["sent_prompt"] = True
+    state["emitted_token_len"] = length
+    if finished:
+        state["terminal_sent"] = True
     state["emitted_chunks"] = int(state.get("emitted_chunks", 0)) + 1
     return payload

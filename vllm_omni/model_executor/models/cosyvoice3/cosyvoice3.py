@@ -532,6 +532,11 @@ class CosyVoice3Model(
                     n_timesteps=10,
                 )
                 audio = tts_speech.reshape(-1).to(dtype=torch.float32)
+                token_len = int(token.numel())
+                if samples_per_token is not None and token_len > 0 and audio.numel() > 0:
+                    expected_total = token_len * samples_per_token
+                    if audio.numel() > expected_total:
+                        audio = audio[:expected_total]
                 if left_context_size > 0 and samples_per_token is None and audio.numel() > 0:
                     logger.warning_once(
                         "CosyVoice3 code2wav cannot trim left context because samples_per_token is unavailable: "
@@ -543,6 +548,11 @@ class CosyVoice3Model(
                     crop = left_context_size * samples_per_token
                     if crop > 0:
                         audio = audio[crop:] if crop < audio.numel() else audio[:0]
+                if samples_per_token is not None and token_len > 0 and audio.numel() > 0:
+                    effective_ctx = min(left_context_size, token_len)
+                    expected_after_ctx = (token_len - effective_ctx) * samples_per_token
+                    if audio.numel() > expected_after_ctx:
+                        audio = audio[:expected_after_ctx]
                 audios[idx] = audio
 
             return OmniOutput(text_hidden_states=None, multimodal_outputs={"audio": audios, "sr": srs})
