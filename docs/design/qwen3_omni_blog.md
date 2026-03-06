@@ -13,7 +13,19 @@ vLLM-Omni now supports running this full Qwen3-Omni pipeline end-to-end, and mor
 2. **CUDA Graph** reduces CPU launch overhead and decode-time jitter on stable shapes.
 3. **Async chunk** overlaps compute and communication across stages, improving both TTFP and E2E.
 
-Compared with the baseline, the stacked setup (Batching + CUDA Graph + Async Chunk) achieves:
+Compared with **Hugging Face Transformers** (offline, single request), vLLM-Omni with streaming and the full optimization stack (Batching + CUDA Graph + Async Chunk) delivers much lower latency and higher efficiency:
+
+<table><tr>
+<td><img src="figures/E2EL_s_vllm_omni_vs_transformers.png" alt="E2E Latency: vLLM-Omni vs HF transformers" width="100%"/></td>
+<td><img src="figures/TTFP_s_vllm_omni_vs_transformers.png" alt="TTFP: vLLM-Omni vs HF transformers" width="100%"/></td>
+<td><img src="figures/RTF_vllm_omni_vs_transformers.png" alt="RTF: vLLM-Omni vs HF transformers" width="100%"/></td>
+</tr></table>
+
+- **E2E latency**: 23.78 s (vLLM-Omni) vs 336.10 s (transformers) — **~93%** reduction
+- **Time to first audio (TTFP)**: 0.934 s vs 336.10 s — **~99.7%** reduction
+- **Real-time factor (RTF)**: 0.32 vs 3.776 — **~91%** reduction (~12× faster)
+
+Compared with the baseline (vLLM-Omni without these optimizations), the stacked setup (Batching + CUDA Graph + Async Chunk) achieves:
 
 - **E2E latency (E2EL) reduction**: **~94%** at concurrency 10 (302,722 ms → 17,408 ms); **~77%** at concurrency 1 (37,300 ms → 8,667 ms)
 - **Audio TTFP reduction**: **~99%** at concurrency 10 (302,595 ms → 2,157 ms); **~98%** at concurrency 1 (37,174 ms → 795 ms)
