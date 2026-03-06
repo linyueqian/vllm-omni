@@ -164,8 +164,7 @@
                 "random_output_len": 100,
                 "extra_body": {
                     "voice": "Vivian",
-                    "language": "English",
-                    "response_format": "wav"
+                    "language": "English"
                 },
                 "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
