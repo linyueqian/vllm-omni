@@ -43,6 +43,12 @@ def test_split_request_ids_uses_seq_token_counts():
     assert [c.tolist() for c in chunks] == [[10, 11], [12, 13], [14]]
 
 
+def test_split_request_ids_honors_single_request_seq_token_counts():
+    ids = torch.tensor([10, 11, 12, 13, 14], dtype=torch.long)
+    chunks = CosyVoice3Model._split_request_ids(ids, [3])
+    assert [c.tolist() for c in chunks] == [[10, 11, 12]]
+
+
 def test_sanitize_codec_tokens_filters_out_of_range():
     model = _make_code2wav_model()
     raw = torch.tensor([-1, 0, 3, 4, 99], dtype=torch.long)
@@ -97,3 +103,25 @@ def test_forward_caps_chunk_audio_length_to_token_span():
     # With stride cfg: samples_per_token = 8*5*3*4*2 = 960.
     # total tokens=3, left_context=2 -> expected non-overlap span = 1 token.
     assert out.multimodal_outputs["audio"][0].numel() == 960
+
+
+def test_forward_ignores_single_request_padded_tail_tokens():
+    model = _make_code2wav_model(with_stride_cfg=True, num_samples=10000)
+    runtime_info = [
+        {
+            "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+            "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+            "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
+            "left_context_size": 0,
+        }
+    ]
+
+    out = model.forward(
+        input_ids=torch.tensor([0, 1, 2, 3, 3], dtype=torch.long),
+        positions=torch.tensor([0, 1, 2, 3, 4], dtype=torch.long),
+        model_intermediate_buffer=runtime_info,
+        seq_token_counts=[3],
+    )
+
+    # The padded tail must not contribute to code2wav length.
+    assert out.multimodal_outputs["audio"][0].numel() == 2880

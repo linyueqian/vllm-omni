@@ -347,7 +347,7 @@ class CosyVoice3Model(
     @staticmethod
     def _split_request_ids(ids: torch.Tensor, seq_token_counts: list[int] | None = None) -> list[torch.Tensor]:
         """Split concatenated input_ids into per-request segments."""
-        if seq_token_counts is not None and len(seq_token_counts) > 1:
+        if seq_token_counts is not None:
             boundaries = [0]
             for count in seq_token_counts:
                 boundaries.append(boundaries[-1] + int(count))
