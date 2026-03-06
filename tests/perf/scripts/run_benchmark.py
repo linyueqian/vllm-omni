@@ -72,8 +72,6 @@ def create_test_parameter_mapping(configs: list[dict[str, Any]]) -> dict[str, di
             mapping[test_name] = {
                 "test_name": test_name,
                 "benchmark_params": [],
-                "backend": config["server_params"].get("backend", "openai-chat-omni"),
-                "endpoint": config["server_params"].get("endpoint", "/v1/chat/completions"),
             }
         mapping[test_name]["benchmark_params"].extend(config["benchmark_params"])
     return mapping
@@ -115,8 +113,6 @@ def run_benchmark(
     flow,
     dataset_name: str,
     num_prompt,
-    backend: str = "openai-chat-omni",
-    endpoint: str = "/v1/chat/completions",
 ) -> Any:
     """Run a single benchmark iteration and return the parsed result JSON."""
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -127,10 +123,6 @@ def run_benchmark(
         ["vllm", "bench", "serve", "--omni"]
         + args
         + [
-            "--backend",
-            backend,
-            "--endpoint",
-            endpoint,
             "--save-result",
             "--result-dir",
             os.environ.get("BENCHMARK_DIR", "tests"),
@@ -206,12 +198,9 @@ def benchmark_params(request, omni_server):
     total = len(all_params)
     print(f"\n  Running benchmark {current}/{total} for {test_name}")
 
-    test_mapping = server_to_benchmark_mapping[test_name]
     return {
         "test_name": test_name,
         "params": all_params[param_index],
-        "backend": test_mapping.get("backend", "openai-chat-omni"),
-        "endpoint": test_mapping.get("endpoint", "/v1/chat/completions"),
     }
 
 
@@ -232,8 +221,6 @@ def test_performance_benchmark(omni_server, benchmark_params):
     test_name = benchmark_params["test_name"]
     params = benchmark_params["params"]
     dataset_name = params.get("dataset_name", "")
-    backend = benchmark_params.get("backend", "openai-chat-omni")
-    endpoint = benchmark_params.get("endpoint", "/v1/chat/completions")
 
     host = omni_server.host
     port = omni_server.port
@@ -289,8 +276,6 @@ def test_performance_benchmark(omni_server, benchmark_params):
             flow=qps,
             dataset_name=dataset_name,
             num_prompt=num_prompt,
-            backend=backend,
-            endpoint=endpoint,
         )
         assert_result(result, params, num_prompt=num_prompt)
 
@@ -303,7 +288,5 @@ def test_performance_benchmark(omni_server, benchmark_params):
             flow=concurrency,
             dataset_name=dataset_name,
             num_prompt=num_prompt,
-            backend=backend,
-            endpoint=endpoint,
         )
         assert_result(result, params, num_prompt=num_prompt)
