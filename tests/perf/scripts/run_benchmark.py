@@ -72,6 +72,8 @@ def create_test_parameter_mapping(configs: list[dict[str, Any]]) -> dict[str, di
             mapping[test_name] = {
                 "test_name": test_name,
                 "benchmark_params": [],
+                "backend": config["server_params"].get("backend", "openai-chat-omni"),
+                "endpoint": config["server_params"].get("endpoint", "/v1/chat/completions"),
             }
         mapping[test_name]["benchmark_params"].extend(config["benchmark_params"])
     return mapping
@@ -107,8 +109,16 @@ def omni_server(request):
         print("OmniServer stopped")
 
 
-def run_benchmark(args: list, test_name: str, flow, dataset_name: str, num_prompt) -> Any:
-    """Generate synthetic image with random values."""
+def run_benchmark(
+    args: list,
+    test_name: str,
+    flow,
+    dataset_name: str,
+    num_prompt,
+    backend: str = "openai-chat-omni",
+    endpoint: str = "/v1/chat/completions",
+) -> Any:
+    """Run a single benchmark iteration and return the parsed result JSON."""
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
     result_filename = f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_{current_dt}.json"
     if "--result-filename" in args:
@@ -118,9 +128,9 @@ def run_benchmark(args: list, test_name: str, flow, dataset_name: str, num_promp
         + args
         + [
             "--backend",
-            "openai-chat-omni",
+            backend,
             "--endpoint",
-            "/v1/chat/completions",
+            endpoint,
             "--save-result",
             "--result-dir",
             os.environ.get("BENCHMARK_DIR", "tests"),
@@ -196,7 +206,13 @@ def benchmark_params(request, omni_server):
     total = len(all_params)
     print(f"\n  Running benchmark {current}/{total} for {test_name}")
 
-    return {"test_name": test_name, "params": all_params[param_index]}
+    test_mapping = server_to_benchmark_mapping[test_name]
+    return {
+        "test_name": test_name,
+        "params": all_params[param_index],
+        "backend": test_mapping.get("backend", "openai-chat-omni"),
+        "endpoint": test_mapping.get("endpoint", "/v1/chat/completions"),
+    }
 
 
 def assert_result(result, params, num_prompt):
@@ -216,6 +232,8 @@ def test_performance_benchmark(omni_server, benchmark_params):
     test_name = benchmark_params["test_name"]
     params = benchmark_params["params"]
     dataset_name = params.get("dataset_name", "")
+    backend = benchmark_params.get("backend", "openai-chat-omni")
+    endpoint = benchmark_params.get("endpoint", "/v1/chat/completions")
 
     host = omni_server.host
     port = omni_server.port
@@ -266,7 +284,13 @@ def test_performance_benchmark(omni_server, benchmark_params):
     for qps, num_prompt in zip(qps_list, num_prompt_list):
         args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
         result = run_benchmark(
-            args=args, test_name=test_name, flow=qps, dataset_name=dataset_name, num_prompt=num_prompt
+            args=args,
+            test_name=test_name,
+            flow=qps,
+            dataset_name=dataset_name,
+            num_prompt=num_prompt,
+            backend=backend,
+            endpoint=endpoint,
         )
         assert_result(result, params, num_prompt=num_prompt)
 
@@ -274,6 +298,12 @@ def test_performance_benchmark(omni_server, benchmark_params):
     for concurrency, num_prompt in zip(max_concurrency_list, num_prompt_list):
         args = args + ["--max-concurrency", str(concurrency), "--num-prompts", str(num_prompt), "--request-rate", "inf"]
         result = run_benchmark(
-            args=args, test_name=test_name, flow=concurrency, dataset_name=dataset_name, num_prompt=num_prompt
+            args=args,
+            test_name=test_name,
+            flow=concurrency,
+            dataset_name=dataset_name,
+            num_prompt=num_prompt,
+            backend=backend,
+            endpoint=endpoint,
         )
         assert_result(result, params, num_prompt=num_prompt)
