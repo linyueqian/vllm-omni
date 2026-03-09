@@ -73,7 +73,7 @@ def _sanitize_filename(filename: str) -> str:
     # Remove any path components
     filename = os.path.basename(filename)
     # Replace any non-alphanumeric, underscore, hyphen, or dot with underscore
-    sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", filename)
+    sanitized = re.sub(r"[^a-zA-Z0-9_.\-]", "_", filename)
     # Ensure filename is not empty
     if not sanitized:
         sanitized = "file"

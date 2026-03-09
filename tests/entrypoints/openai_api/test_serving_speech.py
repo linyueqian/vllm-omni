@@ -686,9 +686,11 @@ class TestTTSMethods:
 
         params = speech_server._build_tts_params(req)
 
-        # Verify explicit ref_audio was used, not auto-set one
-        assert "ref_audio" in params
-        assert params["ref_audio"] == ["data:audio/wav;base64,ZXhwbGljaXQ="]
+        # _build_tts_params should NOT auto-set ref_audio when explicit ref_audio
+        # is provided (request.ref_audio is not None skips the auto-set branch).
+        # The explicit ref_audio is resolved later in create_speech() via
+        # _resolve_ref_audio(), not in _build_tts_params().
+        assert "ref_audio" not in params
         # x_vector_only_mode should not be set when explicit ref_audio is provided
         assert "x_vector_only_mode" not in params
 
@@ -739,70 +741,6 @@ class TestTTSMethods:
         result = speech_server._get_uploaded_audio_data("nonexistent")
 
         assert result is None
-
-
-class TestFileValidationFunctions:
-    """Unit tests for file validation helper functions."""
-
-    def test_sanitize_filename(self):
-        """Test _sanitize_filename function."""
-        from vllm_omni.entrypoints.openai.serving_speech import _sanitize_filename
-
-        # Test normal filenames
-        assert _sanitize_filename("test.wav") == "test.wav"
-        assert _sanitize_filename("test-file.mp3") == "test-file.mp3"
-        assert _sanitize_filename("test_file.flac") == "test_file.flac"
-
-        # Test path traversal attempts
-        assert _sanitize_filename("../../../etc/passwd") == "passwd"
-        assert _sanitize_filename("/absolute/path/file.wav") == "file.wav"
-
-        # Test special characters
-        assert _sanitize_filename("file with spaces.wav") == "file_with_spaces.wav"
-        assert _sanitize_filename("file&with&special&chars.wav") == "file_with_special_chars.wav"
-        assert _sanitize_filename("file@with#special$chars%.wav") == "file_with_special_chars_.wav"
-
-        # Test empty filename
-        assert _sanitize_filename("") == "file"
-
-        # Test very long filename
-        long_name = "a" * 300
-        sanitized = _sanitize_filename(long_name)
-        assert len(sanitized) == 255
-        assert sanitized.startswith("a")
-
-    def test_validate_path_within_directory(self, tmp_path):
-        """Test _validate_path_within_directory function."""
-        from vllm_omni.entrypoints.openai.serving_speech import _validate_path_within_directory
-
-        # Create test directory structure
-        base_dir = tmp_path / "uploads"
-        base_dir.mkdir()
-
-        # Valid paths within directory
-        valid_file = base_dir / "test.wav"
-        valid_subdir_file = base_dir / "subdir" / "test.wav"
-        valid_subdir_file.parent.mkdir()
-
-        assert _validate_path_within_directory(valid_file, base_dir) is True
-        assert _validate_path_within_directory(valid_subdir_file, base_dir) is True
-
-        # Invalid paths outside directory
-        outside_file = tmp_path / "outside.wav"
-        assert _validate_path_within_directory(outside_file, base_dir) is False
-
-        # Test with symlink (should fail)
-        if hasattr(os, "symlink"):
-            link_target = tmp_path / "target.wav"
-            link_target.touch()
-            symlink = base_dir / "link.wav"
-            os.symlink(link_target, symlink)
-            # Symlinks to outside should be rejected
-            assert _validate_path_within_directory(symlink, base_dir) is False
-
-        # Test with non-existent file (should still validate path)
-        non_existent = base_dir / "nonexistent.wav"
-        assert _validate_path_within_directory(non_existent, base_dir) is True
 
     def test_max_instructions_length_default(self, speech_server):
         """Test default max instructions length (500) when no config provided."""
@@ -908,6 +846,70 @@ class TestFileValidationFunctions:
         error = server._validate_tts_request(req)
         assert error is not None
         assert "max 10 characters" in error
+
+
+class TestFileValidationFunctions:
+    """Unit tests for file validation helper functions."""
+
+    def test_sanitize_filename(self):
+        """Test _sanitize_filename function."""
+        from vllm_omni.entrypoints.openai.serving_speech import _sanitize_filename
+
+        # Test normal filenames
+        assert _sanitize_filename("test.wav") == "test.wav"
+        assert _sanitize_filename("test-file.mp3") == "test-file.mp3"
+        assert _sanitize_filename("test_file.flac") == "test_file.flac"
+
+        # Test path traversal attempts
+        assert _sanitize_filename("../../../etc/passwd") == "passwd"
+        assert _sanitize_filename("/absolute/path/file.wav") == "file.wav"
+
+        # Test special characters
+        assert _sanitize_filename("file with spaces.wav") == "file_with_spaces.wav"
+        assert _sanitize_filename("file&with&special&chars.wav") == "file_with_special_chars.wav"
+        assert _sanitize_filename("file@with#special$chars%.wav") == "file_with_special_chars_.wav"
+
+        # Test empty filename
+        assert _sanitize_filename("") == "file"
+
+        # Test very long filename
+        long_name = "a" * 300
+        sanitized = _sanitize_filename(long_name)
+        assert len(sanitized) == 255
+        assert sanitized.startswith("a")
+
+    def test_validate_path_within_directory(self, tmp_path):
+        """Test _validate_path_within_directory function."""
+        from vllm_omni.entrypoints.openai.serving_speech import _validate_path_within_directory
+
+        # Create test directory structure
+        base_dir = tmp_path / "uploads"
+        base_dir.mkdir()
+
+        # Valid paths within directory
+        valid_file = base_dir / "test.wav"
+        valid_subdir_file = base_dir / "subdir" / "test.wav"
+        valid_subdir_file.parent.mkdir()
+
+        assert _validate_path_within_directory(valid_file, base_dir) is True
+        assert _validate_path_within_directory(valid_subdir_file, base_dir) is True
+
+        # Invalid paths outside directory
+        outside_file = tmp_path / "outside.wav"
+        assert _validate_path_within_directory(outside_file, base_dir) is False
+
+        # Test with symlink (should fail)
+        if hasattr(os, "symlink"):
+            link_target = tmp_path / "target.wav"
+            link_target.touch()
+            symlink = base_dir / "link.wav"
+            os.symlink(link_target, symlink)
+            # Symlinks to outside should be rejected
+            assert _validate_path_within_directory(symlink, base_dir) is False
+
+        # Test with non-existent file (should still validate path)
+        non_existent = base_dir / "nonexistent.wav"
+        assert _validate_path_within_directory(non_existent, base_dir) is True
 
 
 class TestStreamingProtocolValidation:
