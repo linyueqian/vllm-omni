@@ -33,6 +33,8 @@ Compared with the baseline (vLLM-Omni without these optimizations), the stacked 
 
 *Final = Batching + CUDA Graph + Async Chunk.*
 
+**Benchmark environment:** All performance data and figures in this post were measured on **A100** GPUs at commit **070ea0dd**.
+
 This post walks through each optimization in the same order they are typically enabled in practice, then ends with a deployment playbook you can directly apply.
 
 ---
@@ -93,7 +95,7 @@ So in practice: streaming defines *how* bytes are sent to the client; async chun
 
 ### Results: Batch + CUDA Graph vs. Batch + CUDA Graph + Async Chunk
 
-Stacking assumptions: batching and CUDA Graph enabled; streaming input/output enabled. The figures below compare **without** vs **with** async chunk. Async chunk brings **TTFP down sharply** (e.g. at concurrency 1: 9,693 ms → 795 ms, **~92% reduction**), so users hear the first audio much sooner. E2EL at concurrency 1 also improves (9,817 ms → 8,667 ms). At higher concurrency, E2EL/RTF may trade off slightly for better first-packet latency; the stacked setup still dominates the baseline.
+Stacking assumptions: batching and CUDA Graph enabled; streaming input/output enabled. The figures below compare **without** vs **with** async chunk. Async chunk brings **TTFP down sharply** (e.g. at concurrency 1: 9,693 ms → 795 ms, **~92% reduction**; at concurrency 4: 11,086 ms → 1,098 ms, **~90% reduction**), so users hear the first audio much sooner. E2EL at concurrency 1 also improves (9,817 ms → 8,667 ms); at concurrency 4, E2EL goes from 11,214 ms to 10,838 ms with async chunk. At higher concurrency, E2EL/RTF may trade off slightly for better first-packet latency; the stacked setup still dominates the baseline.
 
 <table><tr>
 <td><img src="figures/Mean_E2EL_ms_Batch_CUDA_Graph_vs_Async_Chunk.png" alt="E2EL: Batch+CG vs +Async Chunk" width="100%"/></td>

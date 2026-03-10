@@ -5,14 +5,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
+from pathlib import Path
 from matplotlib.ticker import FuncFormatter
+
+# Save to blog figures dir with names expected by qwen3_omni_blog.md
+FIG_DIR = Path(__file__).resolve().parent / "docs" / "design" / "figures"
+FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 # =======================
 # 数据
 # =======================
 data = [
     ["Batch + CUDA Graph + Async Chunk",1,8666.5,795.22,0.33],
-    ["Batch + CUDA Graph + Async Chunk",4,11463.45,1184.42,0.43],
+    ["Batch + CUDA Graph + Async Chunk",4,10837.62,1097.88,0.39],
     ["Batch + CUDA Graph + Async Chunk",10,17407.82,2156.9,0.64],
 
     ["Batch",1,36746.06,36617.84,1.4],
@@ -20,7 +25,7 @@ data = [
     ["Batch",10,45076.47,44946.48,1.65],
 
     ["Batch + CUDA Graph",1,9817.34,9692.73,0.36],
-    ["Batch + CUDA Graph",4,11090.13,10961.62,0.41],
+    ["Batch + CUDA Graph",4,11213.57,11086.15,0.41],
     ["Batch + CUDA Graph",10,14576.12,14438.77,0.53],
 
     ["Baseline",1,37300.42,37173.82,1.42],
@@ -142,7 +147,10 @@ for g1, g2 in groups:
 
         plt.tight_layout()
 
-        filename = f"{metric}_{g1.replace(' ','_')}_vs_{g2.replace(' ','_')}.png"
+        # Blog expects exact names: Mean_E2EL_ms_Baseline_vs_Batch.png, etc.
+        metric_key = {"Mean E2EL (ms)": "Mean_E2EL_ms", "Mean AUDIO_TTFP (ms)": "Mean_AUDIO_TTFP_ms", "Mean AUDIO_RTF": "Mean_AUDIO_RTF"}[metric]
+        group_key = {"Baseline": "Baseline_vs_Batch", "Batch": "Batch_vs_Batch_CUDA_Graph", "Batch + CUDA Graph": "Batch_CUDA_Graph_vs_Async_Chunk"}[g1]
+        filename = FIG_DIR / f"{metric_key}_{group_key}.png"
         plt.savefig(filename, dpi=300, bbox_inches="tight")
         plt.close()
 
