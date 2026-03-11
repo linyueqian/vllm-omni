@@ -870,9 +870,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             ref_audio_data = None
             if request.ref_audio is not None:
                 if not request.ref_text or not request.ref_text.strip():
-                    raise ValueError(
-                        "Voice cloning requires 'ref_text' (transcript of the reference audio)"
-                    )
+                    raise ValueError("Voice cloning requires 'ref_text' (transcript of the reference audio)")
                 wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                 ref_audio_data = (wav_list, sr)
             prompt = self._build_fish_speech_prompt(request, ref_audio_data=ref_audio_data)
