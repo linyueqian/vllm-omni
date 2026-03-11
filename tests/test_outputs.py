@@ -14,6 +14,22 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 class TestOmniRequestOutput:
     """Tests for OmniRequestOutput class."""
 
+    def _make_pipeline_request_output(self, mocker: MockerFixture, **overrides):
+        mock_request_output = mocker.Mock()
+        mock_request_output.request_id = "pipeline-123"
+        mock_request_output.prompt_token_ids = None
+        mock_request_output.outputs = []
+        mock_request_output.encoder_prompt_token_ids = None
+        mock_request_output.prompt_logprobs = None
+        mock_request_output.num_cached_tokens = None
+        mock_request_output.kv_transfer_params = None
+        mock_request_output.multimodal_output = None
+
+        for key, value in overrides.items():
+            setattr(mock_request_output, key, value)
+
+        return mock_request_output
+
     def test_from_diffusion(self):
         """Test creating output from diffusion model."""
         images = [Image.new("RGB", (64, 64), color="red")]
@@ -32,15 +48,13 @@ class TestOmniRequestOutput:
 
     def test_from_pipeline(self, mocker: MockerFixture):
         """Test creating output from pipeline stage."""
-        mock_request_output = mocker.Mock()
-        mock_request_output.request_id = "pipeline-123"
-        mock_request_output.prompt_token_ids = [1, 2, 3]
-        mock_request_output.outputs = [mocker.Mock()]
-        mock_request_output.encoder_prompt_token_ids = None
-        mock_request_output.prompt_logprobs = None
-        mock_request_output.num_cached_tokens = 10
-        mock_request_output.kv_transfer_params = None
-        mock_request_output.multimodal_output = {"image": mocker.Mock()}
+        mock_request_output = self._make_pipeline_request_output(
+            mocker,
+            prompt_token_ids=[1, 2, 3],
+            outputs=[mocker.Mock()],
+            num_cached_tokens=10,
+            multimodal_output={"image": mocker.Mock()},
+        )
 
         output = OmniRequestOutput.from_pipeline(
             stage_id=0,
@@ -55,8 +69,7 @@ class TestOmniRequestOutput:
 
     def test_prompt_token_ids_property(self, mocker: MockerFixture):
         """Test prompt_token_ids property for streaming compatibility."""
-        mock_request_output = mocker.Mock()
-        mock_request_output.prompt_token_ids = [1, 2, 3, 4, 5]
+        mock_request_output = self._make_pipeline_request_output(mocker, prompt_token_ids=[1, 2, 3, 4, 5])
 
         output = OmniRequestOutput.from_pipeline(
             stage_id=0,
@@ -78,8 +91,7 @@ class TestOmniRequestOutput:
     def test_outputs_property(self, mocker: MockerFixture):
         """Test outputs property for chat completion compatibility."""
         mock_output = mocker.Mock()
-        mock_request_output = mocker.Mock()
-        mock_request_output.outputs = [mock_output]
+        mock_request_output = self._make_pipeline_request_output(mocker, outputs=[mock_output])
 
         output = OmniRequestOutput.from_pipeline(
             stage_id=0,
@@ -88,6 +100,32 @@ class TestOmniRequestOutput:
         )
 
         assert output.outputs == [mock_output]
+
+    def test_outputs_property_flattens_request_output_list(self, mocker: MockerFixture):
+        """Test outputs property when pipeline request_output is a list."""
+        mock_output_a = mocker.Mock()
+        mock_output_b = mocker.Mock()
+        mock_request_output_a = self._make_pipeline_request_output(
+            mocker,
+            request_id="pipeline-123-a",
+            prompt_token_ids=[1, 2, 3],
+            outputs=[mock_output_a],
+        )
+        mock_request_output_b = self._make_pipeline_request_output(
+            mocker,
+            request_id="pipeline-123-b",
+            prompt_token_ids=[4, 5, 6],
+            outputs=[mock_output_b],
+        )
+
+        output = OmniRequestOutput(
+            stage_id=0,
+            final_output_type="text",
+            request_output=[mock_request_output_a, mock_request_output_b],
+        )
+
+        assert output.outputs == [mock_output_a, mock_output_b]
+        assert output.prompt_token_ids == [1, 2, 3]
 
     def test_outputs_empty_when_no_request_output(self):
         """Test outputs returns empty list when no request_output."""
@@ -100,8 +138,7 @@ class TestOmniRequestOutput:
 
     def test_encoder_prompt_token_ids_property(self, mocker: MockerFixture):
         """Test encoder_prompt_token_ids property."""
-        mock_request_output = mocker.Mock()
-        mock_request_output.encoder_prompt_token_ids = [10, 20, 30]
+        mock_request_output = self._make_pipeline_request_output(mocker, encoder_prompt_token_ids=[10, 20, 30])
 
         output = OmniRequestOutput.from_pipeline(
             stage_id=0,
@@ -113,8 +150,7 @@ class TestOmniRequestOutput:
 
     def test_num_cached_tokens_property(self, mocker: MockerFixture):
         """Test num_cached_tokens property."""
-        mock_request_output = mocker.Mock()
-        mock_request_output.num_cached_tokens = 42
+        mock_request_output = self._make_pipeline_request_output(mocker, num_cached_tokens=42)
 
         output = OmniRequestOutput.from_pipeline(
             stage_id=0,
@@ -126,11 +162,9 @@ class TestOmniRequestOutput:
 
     def test_multimodal_output_property(self, mocker: MockerFixture):
         """Test multimodal_output property."""
-        mock_request_output = mocker.Mock()
         mock_audio = mocker.Mock()
         expected_output = {"audio": mock_audio}
-        mock_request_output.outputs = []
-        mock_request_output.multimodal_output = expected_output
+        mock_request_output = self._make_pipeline_request_output(mocker, multimodal_output=expected_output)
 
         output = OmniRequestOutput.from_pipeline(
             stage_id=0,
@@ -158,8 +192,7 @@ class TestOmniRequestOutput:
 
     def test_to_dict_pipeline(self, mocker: MockerFixture):
         """Test to_dict for pipeline output."""
-        mock_request_output = mocker.Mock()
-        mock_request_output.request_id = "pipeline-123"
+        mock_request_output = self._make_pipeline_request_output(mocker)
 
         output = OmniRequestOutput.from_pipeline(
             stage_id=0,

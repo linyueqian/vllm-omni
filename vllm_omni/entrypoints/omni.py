@@ -444,6 +444,15 @@ class OmniBase:
         engine_args = getattr(stage_args[0], "engine_args", None)
         return bool(getattr(engine_args, "async_chunk", False))
 
+    @staticmethod
+    def _get_stage_model(stage: OmniStage, fallback_model: str) -> str:
+        """Prefer a per-stage model override when present."""
+        engine_args = getattr(stage, "engine_args", None)
+        stage_model = getattr(engine_args, "model", None)
+        if not stage_model and isinstance(engine_args, dict):
+            stage_model = engine_args.get("model")
+        return stage_model or fallback_model
+
     def _start_stages(self, model: str) -> None:
         """Start all stage processes."""
         if self.worker_backend == "ray":
@@ -510,12 +519,14 @@ class OmniBase:
                 )
                 continue
 
+            stage_model = self._get_stage_model(stage, model)
             stage.init_stage_worker(
-                model,
+                stage_model,
                 is_async=self.is_async,
                 shm_threshold_bytes=self._shm_threshold_bytes,
                 ctx=self._ctx if self.worker_backend != "ray" else None,
                 batch_timeout=self.batch_timeout,
+                stage_configs_path=self.config_path,
                 connectors_config=stage_connectors_config,
                 worker_backend=self.worker_backend,
                 ray_placement_group=self._ray_pg,

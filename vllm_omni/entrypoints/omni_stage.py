@@ -496,6 +496,7 @@ class OmniStage:
         shm_threshold_bytes: int = 65536,
         ctx: mp.context.BaseContext | None = None,
         batch_timeout: int = 10,
+        stage_configs_path: str | None = None,
         connectors_config: dict | None = None,
         worker_backend: str = "multi_process",
         ignore_runtime_config: bool = False,
@@ -540,6 +541,7 @@ class OmniStage:
             "stage_id": self.stage_id,
             "engine_args": engine_args,
             "runtime": runtime_cfg,
+            "stage_configs_path": stage_configs_path,
             "shm_threshold_bytes": self._shm_threshold_bytes,
             "connectors_config": connectors_config or {},
             "stage_type": self.stage_type,
@@ -825,6 +827,7 @@ def _stage_worker(
     stage_id = stage_payload["stage_id"]
     engine_args = stage_payload.get("engine_args", {})
     runtime_cfg = stage_payload.get("runtime", {})
+    stage_configs_path = stage_payload.get("stage_configs_path")
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
     connectors_config = stage_payload.get("connectors_config", {})
     stage_type: Literal["llm", "diffusion"] = stage_payload.get("stage_type", "llm")
@@ -896,6 +899,8 @@ def _stage_worker(
         else:
             engine_args = filter_dataclass_kwargs(OmniEngineArgs, engine_args)
             engine_args.pop("model", None)
+            if stage_configs_path is not None:
+                engine_args["stage_configs_path"] = stage_configs_path
             # Default to LLM engine
             stage_engine = OmniLLM(model=model, **engine_args)
 

@@ -21,7 +21,10 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    make_empty_encoder_model_runner_output,
+)
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
@@ -276,9 +279,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
-        # When spec decode is enabled, delay clearing connector metadata
-        # until after draft model runs in sample_tokens.
-        clear_kv_metadata = self.speculative_config is None
+        # When spec decode is enabled, delay connector finalization until
+        # after draft model runs in sample_tokens.
+        defer_finalize = self.speculative_config is not None
         with (
             set_forward_context(
                 attn_metadata,
@@ -291,9 +294,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(
-                scheduler_output, clear_metadata=clear_kv_metadata
-            ) as kv_connector_output,
+            self.maybe_get_kv_connector_output(scheduler_output, defer_finalize=defer_finalize) as kv_connector_output,
         ):
             model_output = self._model_forward(
                 input_ids=input_ids,
@@ -398,6 +399,24 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         return None
 
+    def _postprocess_sampled_token_ids(
+        self,
+        sampled_token_ids: torch.Tensor,
+        *,
+        model_intermediate_buffer: dict[str, dict[str, Any]] | None = None,
+    ) -> torch.Tensor:
+        postprocess = getattr(self.model, "postprocess_sampled_tokens", None)
+        if postprocess is None or sampled_token_ids.numel() == 0:
+            return sampled_token_ids
+        buffer_map = self.model_intermediate_buffer if model_intermediate_buffer is None else model_intermediate_buffer
+        corrected_sampled_token_ids = postprocess(
+            sampled_token_ids=sampled_token_ids,
+            req_ids=self.input_batch.req_ids.copy(),
+            req_id_to_index=self.input_batch.req_id_to_index.copy(),
+            model_intermediate_buffer=buffer_map,
+        )
+        return sampled_token_ids if corrected_sampled_token_ids is None else corrected_sampled_token_ids
+
     @torch.inference_mode()
     def sample_tokens(
         self,
@@ -452,6 +471,31 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
+        if num_scheduled_tokens_np is None:
+            req_ids = self.input_batch.req_ids
+            num_scheduled_tokens_np = np.array(
+                [scheduler_output.num_scheduled_tokens[rid] for rid in req_ids],
+                dtype=np.int32,
+            )
+
+        pending_intermediate_updates = self._collect_additional_information_updates(
+            hidden_states, multimodal_outputs, num_scheduled_tokens_np, scheduler_output
+        )
+        overlay_intermediate_buffer = None
+        postprocess_hook = getattr(self.model, "postprocess_sampled_tokens", None)
+        if pending_intermediate_updates or postprocess_hook is not None:
+            overlay_intermediate_buffer = self._build_overlay_intermediate_buffer(
+                self.input_batch.req_ids.copy(),
+                pending_intermediate_updates,
+            )
+
+        with record_function_or_nullcontext("gpu_model_runner: postprocess_sampled_tokens"):
+            sampler_output.sampled_token_ids = self._postprocess_sampled_token_ids(
+                sampler_output.sampled_token_ids,
+                model_intermediate_buffer=overlay_intermediate_buffer,
+            )
 
         self._draft_token_ids = None
         self._draft_token_req_ids = None
@@ -528,16 +572,23 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 spec_decode_metadata,
             )
 
+        if overlay_intermediate_buffer is not None:
+            self._commit_intermediate_buffer_overlay(
+                overlay_intermediate_buffer,
+                invalid_req_indices=invalid_req_indices,
+                req_ids=self.input_batch.req_ids.copy(),
+            )
+
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
 
-        # Clear KV connector metadata after draft model runs (if spec decode).
+        # Finalize KV connector after draft model runs (if spec decode).
         # This was deferred from target model forward to allow draft model
         # to also save its KV cache.
         if self.speculative_config is not None:
-            self.clear_kv_connector_metadata()
+            self.finalize_kv_connector()
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
@@ -547,19 +598,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
         self.kv_connector_output = None
 
         hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
-        num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
-        if num_scheduled_tokens_np is None:
-            req_ids = self.input_batch.req_ids
-            num_scheduled_tokens_np = np.array(
-                [scheduler_output.num_scheduled_tokens[rid] for rid in req_ids],
-                dtype=np.int32,
-            )
-
-        self._process_additional_information_updates(
-            hidden_states, multimodal_outputs, num_scheduled_tokens_np, scheduler_output
-        )
 
         pooler_output: list[dict[str, object]] = []
+        buffer_payload_keys = tuple(getattr(self.model, "pooler_output_buffer_keys", ()) or ())
+        pooler_buffer_source = overlay_intermediate_buffer or self.model_intermediate_buffer
         for rid in req_ids_output_copy:
             idx = req_id_to_index_output_copy[rid]
             start = int(self.query_start_loc.cpu[idx])
@@ -589,6 +631,27 @@ class GPUARModelRunner(OmniGPUModelRunner):
                         logger.error(f"Error in merge multimodal outputs: {e}")
                 if mm_payload:
                     payload.update(mm_payload)
+            if buffer_payload_keys:
+                req_buffer = pooler_buffer_source.get(rid, {})
+                if isinstance(req_buffer, dict):
+                    for key in buffer_payload_keys:
+                        if key not in req_buffer:
+                            continue
+                        value = req_buffer[key]
+                        if isinstance(value, torch.Tensor):
+                            payload[key] = value.detach().to("cpu").contiguous()
+                        elif isinstance(value, list):
+                            payload[key] = [
+                                item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item
+                                for item in value
+                            ]
+                        elif isinstance(value, tuple):
+                            payload[key] = tuple(
+                                item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item
+                                for item in value
+                            )
+                        else:
+                            payload[key] = value
             pooler_output.append(payload)
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.model_config.enable_return_routed_experts:

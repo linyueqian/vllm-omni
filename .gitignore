@@ -223,6 +223,7 @@ datasets/
 *.csv
 *.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
+!vllm_omni/model_executor/models/cosyvoice3/hf_config/config.json
 *.jsonl
 *.parquet
 

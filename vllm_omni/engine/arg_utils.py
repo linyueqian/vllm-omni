@@ -7,6 +7,9 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.gguf_utils import is_gguf
 
 from vllm_omni.config import OmniModelConfig
+from vllm_omni.model_executor.models.cosyvoice3.hf_config_utils import (
+    resolve_bundled_hf_config_path as _resolve_bundled_hf_config_path,
+)
 from vllm_omni.plugins import load_omni_general_plugins
 
 logger = init_logger(__name__)
@@ -113,6 +116,7 @@ class OmniEngineArgs(EngineArgs):
 
         # register omni models to avoid model not found error
         self._ensure_omni_models_registered()
+        hf_config_path = _resolve_bundled_hf_config_path(self.model_arch, self.hf_config_path)
 
         # Keep compatibility when async args are constructed from partial payloads.
         limit_mm_per_prompt = getattr(self, "limit_mm_per_prompt", {})
@@ -143,7 +147,7 @@ class OmniEngineArgs(EngineArgs):
             # Base ModelConfig fields (matching vLLM's EngineArgs.create_model_config)
             model=self.model,
             model_weights=self.model_weights,
-            hf_config_path=self.hf_config_path,
+            hf_config_path=hf_config_path,
             runner=self.runner,
             convert=self.convert,
             tokenizer=self.tokenizer,
@@ -275,6 +279,7 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
 
         # register omni models to avoid model not found error
         self._ensure_omni_models_registered()
+        hf_config_path = _resolve_bundled_hf_config_path(self.model_arch, self.hf_config_path)
 
         # Keep compatibility when async args are constructed from partial payloads.
         limit_mm_per_prompt = getattr(self, "limit_mm_per_prompt", {})
@@ -305,7 +310,7 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
             # Base ModelConfig fields (matching vLLM's EngineArgs.create_model_config)
             model=self.model,
             model_weights=self.model_weights,
-            hf_config_path=self.hf_config_path,
+            hf_config_path=hf_config_path,
             runner=self.runner,
             convert=self.convert,
             tokenizer=self.tokenizer,

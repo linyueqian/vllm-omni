@@ -57,6 +57,16 @@ _OMNI_MODELS = {
         "cosyvoice3",
         "CosyVoice3Model",
     ),
+    "FunAudioChatForConditionalGeneration": (
+        "funaudiochat",
+        "funaudiochat",
+        "FunAudioChatForConditionalGeneration",
+    ),
+    "FunAudioChatCosyVoice3Code2Wav": (
+        "funaudiochat",
+        "funaudiochat_code2wav",
+        "FunAudioChatCosyVoice3Code2Wav",
+    ),
     "MammothModa2Qwen2ForCausalLM": (
         "mammoth_moda2",
         "mammoth_moda2",

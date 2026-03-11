@@ -76,7 +76,6 @@ class CosyVoice3Code2Wav(nn.Module):
             pre_lookahead_layer=pre_lookahead_layer,
             decoder=decoder,
         )
-
         # Build HiFiGAN vocoder
         f0_predictor = CausalConvRNNF0Predictor(
             num_class=config.hift["f0_predictor"]["num_class"],
