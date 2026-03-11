@@ -68,7 +68,7 @@ def main():
         use_log_scale=True,
     )
     make_chart(
-        "Streaming Latency (TTFP)",
+        "Streaming Latency (TTFP) (Single Request)",
         "Time to First Audio (s)",
         labels,
         [336.10, 0.934],
