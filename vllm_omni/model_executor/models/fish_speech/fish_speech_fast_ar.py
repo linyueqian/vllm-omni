@@ -355,8 +355,11 @@ class FishSpeechFastAR(nn.Module):
         dtype = slow_ar_hidden.dtype
 
         semantic_begin = self.slow_ar_config.semantic_begin_id
+        semantic_end = self.slow_ar_config.semantic_end_id
+        codebook_size = semantic_end - semantic_begin + 1  # 4096
         # Convert vocab-space semantic token to codebook index.
-        semantic_code = semantic_token_id.reshape(bsz) - semantic_begin
+        # Clamp to valid range: im_end or other non-semantic tokens map to 0 (pad).
+        semantic_code = (semantic_token_id.reshape(bsz) - semantic_begin).clamp(min=0, max=codebook_size - 1)
 
         all_codes = torch.empty(bsz, num_cb, dtype=torch.long, device=device)
         all_codes[:, 0] = semantic_code

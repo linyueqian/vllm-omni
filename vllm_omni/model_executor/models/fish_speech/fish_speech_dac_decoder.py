@@ -321,7 +321,7 @@ class FishSpeechDACDecoder(nn.Module):
             codes_bqf = codes_qf.unsqueeze(0)  # [1, num_codebooks, num_frames]
             num_frames = codes_qf.shape[1]
             feature_lengths = torch.tensor([num_frames], device=codes_bqf.device)
-            with torch.cuda.amp.autocast(dtype=torch.float32):
+            with torch.cuda.amp.autocast(enabled=False):
                 wav, audio_lengths = self._codec.decode(codes_bqf, feature_lengths)
             # wav shape: [1, 1, wav_len]
             wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]

@@ -909,6 +909,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
 
         sampling_params_list = self.engine_client.default_sampling_params_list
+
+        # Override Stage-0 max_tokens if caller specified max_new_tokens (Fish Speech).
+        if self._is_fish_speech and request.max_new_tokens is not None and sampling_params_list:
+            import copy
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            sampling_params_list[0].max_tokens = request.max_new_tokens
+
         generator = self.engine_client.generate(
             prompt=prompt,
             request_id=request_id,
