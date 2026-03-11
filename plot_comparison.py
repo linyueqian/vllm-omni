@@ -16,21 +16,21 @@ FIG_DIR.mkdir(parents=True, exist_ok=True)
 # 数据
 # =======================
 data = [
-    ["Batch + CUDA Graph + Async Chunk",1,8666.5,795.22,0.33],
-    ["Batch + CUDA Graph + Async Chunk",4,10837.62,1097.88,0.39],
-    ["Batch + CUDA Graph + Async Chunk",10,17407.82,2156.9,0.64],
+    ["Batch + CUDA Graph + Async Chunk",1,60435.5,1263,0.33],
+    ["Batch + CUDA Graph + Async Chunk",4,90969.2,3174.99,0.43],
+    ["Batch + CUDA Graph + Async Chunk",10,130681.82,12262.39,0.74],
 
-    ["Batch",1,36746.06,36617.84,1.4],
-    ["Batch",4,39559.16,39434.84,1.52],
-    ["Batch",10,45076.47,44946.48,1.65],
+    ["Batch",1,258556.1,258256.7,1.48],
+    ["Batch",4,259586.2,259342.8,1.62],
+    ["Batch",10,262400.45,262157.5,2.18],
 
-    ["Batch + CUDA Graph",1,9817.34,9692.73,0.36],
-    ["Batch + CUDA Graph",4,11213.57,11086.15,0.41],
-    ["Batch + CUDA Graph",10,14576.12,14438.77,0.53],
+    ["Batch + CUDA Graph",1,67381.19,67120.89,0.43],
+    ["Batch + CUDA Graph",4,98981.04,98678.91,0.46],
+    ["Batch + CUDA Graph",10,153351.92,152792.3,0.88],
 
-    ["Baseline",1,37300.42,37173.82,1.42],
-    ["Baseline",4,120200.23,120074.43,4.68],
-    ["Baseline",10,302722.3,302595.15,11.72],
+    ["Baseline",1,325865.36,325517.15,1.52],
+    ["Baseline",4,988038.79,987707.63,6.66],
+    ["Baseline",10,1523135.4,1522803.53,6.94],
 ]
 
 df = pd.DataFrame(
