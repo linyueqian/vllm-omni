@@ -40,7 +40,7 @@ def make_chart(title, ylabel, labels, values, outpath, use_log_scale=False):
         label = f"{v:.2f}" if v < 100 else f"{v:,.0f}"
         y_pos = bar.get_height()
         if use_log_scale and y_pos < ax.get_ylim()[1] / 20:
-            y_pos = y_pos * 1.4  # place label above bar so it's visible
+            y_pos = y_pos * 1.08  # 略高于柱顶，避免数字离柱子太远
         ax.text(
             bar.get_x() + bar.get_width() / 2,
             y_pos,
