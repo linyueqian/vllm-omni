@@ -56,13 +56,14 @@ def make_chart(title, ylabel, labels, values, outpath, use_log_scale=False):
 
 
 def main():
-    labels = ["vLLM-Omni (streaming)", "HF transformers (offline)"]
+    # 左侧：HF transformers，右侧：vLLM-Omni
+    labels = ["HF transformers (offline)", "vLLM-Omni (streaming)"]
 
     make_chart(
         "E2E Latency (Single Request)",
         "End-to-End Latency (s)",
         labels,
-        [23.78, 336.10],
+        [336.10, 23.78],
         FIG_DIR / "E2EL_s_vllm_omni_vs_transformers.png",
         use_log_scale=True,
     )
@@ -70,7 +71,7 @@ def main():
         "Streaming Latency (TTFP)",
         "Time to First Audio (s)",
         labels,
-        [0.934, 336.10],
+        [336.10, 0.934],
         FIG_DIR / "TTFP_s_vllm_omni_vs_transformers.png",
         use_log_scale=True,
     )
@@ -78,7 +79,7 @@ def main():
         "Real-Time Factor (RTF) (Single Request)",
         "Real-Time Factor",
         labels,
-        [0.32, 3.776],
+        [3.776, 0.32],
         FIG_DIR / "RTF_vllm_omni_vs_transformers.png",
     )
     print("All three charts saved to docs/design/figures/")

@@ -47,10 +47,16 @@ def y_formatter_ms(x_val, pos):
     return f"{x_val:.2f}"
 
 
-def make_line_chart(ylabel, data_by_conc, unit_label, outpath, y_formatter=None):
+def make_line_chart(ylabel, data_by_conc, unit_label, outpath, y_formatter=None, use_log_scale=False):
     fig, ax = plt.subplots(figsize=(6, 4))
     all_vals = [v for vals in data_by_conc.values() for v in vals]
-    y_max = max(all_vals) * 1.12
+    if use_log_scale:
+        ax.set_yscale("log")
+        lo, hi = max(1, min(all_vals) * 0.5), max(all_vals) * 2
+        ax.set_ylim(lo, hi)
+    else:
+        y_max = max(all_vals) * 1.12
+        ax.set_ylim(0, y_max)
 
     for idx, conc in enumerate(CONCURRENCIES):
         vals = data_by_conc[conc]
@@ -67,10 +73,9 @@ def make_line_chart(ylabel, data_by_conc, unit_label, outpath, y_formatter=None)
     ax.set_xticklabels(X_LABELS)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_xlabel("Stacked optimization", fontsize=12)
-    if y_formatter:
+    if y_formatter and not use_log_scale:
         ax.yaxis.set_major_formatter(FuncFormatter(y_formatter))
     ax.grid(axis="y", linestyle="--", alpha=0.5)
-    ax.set_ylim(0, y_max)
     ax.legend(loc="upper right", fontsize=9, frameon=True)
     plt.tight_layout()
     plt.savefig(outpath, dpi=300, bbox_inches="tight")
@@ -85,6 +90,7 @@ def main():
         "ms",
         FIG_DIR / "Summary_E2EL_ms_vs_features.png",
         y_formatter=y_formatter_ms,
+        use_log_scale=True,
     )
     make_line_chart(
         "Time to First Audio (ms)",
@@ -92,6 +98,7 @@ def main():
         "ms",
         FIG_DIR / "Summary_TTFP_ms_vs_features.png",
         y_formatter=y_formatter_ms,
+        use_log_scale=True,
     )
     make_line_chart(
         "Real-Time Factor",
