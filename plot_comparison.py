@@ -134,9 +134,11 @@ for g1, g2 in groups:
         plt.xticks(x, [1,4,10])
         plt.xlim(-0.6, 2.6)
 
-        # 图例在下方
+        # 图例在下方；Async Chunk 组显示为 + Streaming Output 与 blog 一致
+        legend_g1 = g1
+        legend_g2 = "Batch + CUDA Graph + Async Chunk + Streaming Output" if g2 == "Batch + CUDA Graph + Async Chunk" else g2
         plt.legend(
-            [g1, g2],
+            [legend_g1, legend_g2],
             loc="upper center",
             bbox_to_anchor=(0.5, -0.18),
             ncol=2,

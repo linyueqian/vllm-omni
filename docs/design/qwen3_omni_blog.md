@@ -27,6 +27,13 @@ Compared with **Hugging Face Transformers** (offline, single request), vLLM-Omni
 
 Compared with the baseline (vLLM-Omni without these optimizations), the stacked setup (Batching + CUDA Graph + Async Chunk + Streaming Output) achieves:
 
+<table><tr>
+<td><img src="figures/Summary_E2EL_ms_vs_features.png" alt="E2EL (ms) vs stacked features" width="100%"/></td>
+<td><img src="figures/Summary_TTFP_ms_vs_features.png" alt="TTFP (ms) vs stacked features" width="100%"/></td>
+<td><img src="figures/Summary_RTF_vs_features.png" alt="RTF vs stacked features" width="100%"/></td>
+</tr></table>
+*X-axis: Baseline → Batch → CUDA Graph → Async Chunk + Streaming Output; each step adds one optimization on top of the previous. Each line is a concurrency level (1, 4, or 10).*
+
 - **E2E latency (E2EL) reduction**: **~91%** at concurrency 10 (1,523,135 ms → 130,682 ms); **~81%** at concurrency 1 (325,865 ms → 60,436 ms)
 - **Audio TTFP reduction**: **~99.2%** at concurrency 10 (1,522,804 ms → 12,262 ms); **~99.6%** at concurrency 1 (325,517 ms → 1,263 ms)
 - **Real-time factor (RTF)**: **~89%** reduction at concurrency 10 (6.94 → 0.74), i.e. **~9×** higher effective throughput; **~78%** at concurrency 1 (1.52 → 0.33)

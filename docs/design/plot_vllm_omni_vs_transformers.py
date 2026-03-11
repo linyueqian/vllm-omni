@@ -4,17 +4,26 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import numpy as np
 from pathlib import Path
 
-# vLLM-Omni blue, HF transformers yellow for clear contrast
-COLORS = ["#1E90FF", "#E6A800"]  # blue, yellow/amber
+# 与 plot_comparison.py 一致
+COLORS = ["#1E90FF", "#32CD32"]
 FIG_DIR = Path(__file__).resolve().parent / "figures"
 FIG_DIR.mkdir(parents=True, exist_ok=True)
+WIDTH = 0.32
+# 两柱间距调小：offset 小则两柱更近
+GAP = 0.04
+OFFSET = WIDTH / 2 + GAP / 2  # ≈0.18，两柱中心距 0.36
 
 
 def make_chart(title, ylabel, labels, values, outpath, use_log_scale=False):
     fig, ax = plt.subplots(figsize=(6, 4))
-    bars = ax.bar(labels, values, color=COLORS, width=0.6, edgecolor="gray", linewidth=0.5)
+    x_pos = np.array([-OFFSET, OFFSET])
+    bars = ax.bar(x_pos, values, width=WIDTH, color=COLORS)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels)
+    ax.set_xlim(-0.5, 0.5)
     ax.set_title(title, fontsize=14, pad=12)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_xlabel("System", fontsize=12)
@@ -38,7 +47,7 @@ def make_chart(title, ylabel, labels, values, outpath, use_log_scale=False):
             label,
             ha="center",
             va="bottom",
-            fontsize=10,
+            fontsize=8,
         )
     plt.tight_layout()
     plt.savefig(outpath, dpi=300, bbox_inches="tight")
