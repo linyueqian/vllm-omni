@@ -86,7 +86,7 @@ This is especially important for multimodal speech generation, where bottlenecks
 
 ### Stage-level batching results (Baseline vs. Batch)
 
-Batching alone greatly reduces E2EL and RTF across all concurrencies (e.g. at concurrency 10, E2EL drops from ~1,523 s to ~262 s; at concurrency 1, from ~326 s to ~259 s).
+Batching alone greatly reduces E2EL and RTF across all concurrencies (e.g. at concurrency 10, E2EL drops from ~1,523 s to ~262 s; at concurrency 1, from ~326 s to ~239 s).
 
 <table><tr>
 <td><img src="figures/Mean_E2EL_ms_Baseline_vs_Batch.png" alt="E2EL: Baseline vs Batch" width="100%"/></td>
@@ -105,7 +105,7 @@ In stage configs, this is typically represented by `enforce_eager: false` for st
 
 ### CUDA Graph results on top of batching
 
-Adding CUDA Graph on the decode path further cuts E2EL and TTFP (e.g. at concurrency 1, E2EL drops from ~259 s to ~67 s; at concurrency 10, from ~262 s to ~153 s) and lowers RTF at every concurrency.
+Adding CUDA Graph on the decode path further cuts E2EL and TTFP (e.g. at concurrency 1, E2EL drops from ~239 s to ~67 s; at concurrency 10, from ~262 s to ~153 s) and lowers RTF at every concurrency.
 
 <table><tr>
 <td><img src="figures/Mean_E2EL_ms_Batch_vs_Batch_CUDA_Graph.png" alt="E2EL: Batch vs Batch + CUDA Graph" width="100%"/></td>
