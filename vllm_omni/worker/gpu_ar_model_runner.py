@@ -417,6 +417,21 @@ class GPUARModelRunner(OmniGPUModelRunner):
         )
         return sampled_token_ids if corrected_sampled_token_ids is None else corrected_sampled_token_ids
 
+    @staticmethod
+    def _normalize_overlay_value(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.detach().to("cpu").contiguous()
+        if isinstance(value, list):
+            return [GPUARModelRunner._normalize_overlay_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(GPUARModelRunner._normalize_overlay_value(item) for item in value)
+        return value
+
+    def _normalize_overlay_update(self, upd: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(upd, dict) or not upd:
+            return {}
+        return {key: self._normalize_overlay_value(value) for key, value in upd.items()}
+
     def _collect_pending_postprocess_updates(
         self,
         hidden_states: torch.Tensor,
@@ -433,7 +448,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     s, e = start_offset, start_offset + sched_tokens
                     hidden_states_slice = hidden_states[s:e]
                     update_dict = self.model.postprocess(hidden_states_slice, **req_infos)
-                    normalized = self._normalize_intermediate_update(update_dict)
+                    normalized = self._normalize_overlay_update(update_dict)
                     if normalized:
                         updates[req_id] = normalized
         except Exception as e:

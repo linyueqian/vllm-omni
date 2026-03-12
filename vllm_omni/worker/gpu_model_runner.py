@@ -1353,41 +1353,31 @@ class OmniGPUModelRunner(GPUModelRunner):
         return model_output
 
     def _update_intermediate_buffer(self, req_id: str, upd: dict) -> None:
-        normalized = self._normalize_intermediate_update(upd)
-        if not normalized:
+        if not isinstance(upd, dict) or not upd:
             return
         req_state = self.requests.get(req_id)
         if req_state is None:
             return
-        # Preserve upstream GPU-resident buffer behavior for models that
-        # explicitly opt in, while keeping normalized CPU values elsewhere.
+        # Check if the model declares keys that should stay on GPU
         gpu_keys: set[str] = set()
         if hasattr(self, "model") and hasattr(self.model, "gpu_resident_buffer_keys"):
             gpu_keys = self.model.gpu_resident_buffer_keys
         existing = self.model_intermediate_buffer.setdefault(req_id, {})
         for key, value in upd.items():
-            if key in gpu_keys and isinstance(value, torch.Tensor):
-                existing[key] = value.detach().clone()
+            if isinstance(value, torch.Tensor):
+                if key in gpu_keys:
+                    existing[key] = value.detach().clone()
+                else:
+                    existing[key] = value.detach().to("cpu").contiguous()
+            elif isinstance(value, list):
+                existing[key] = [
+                    (item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item) for item in value
+                ]
             else:
-                existing[key] = normalized[key]
+                existing[key] = value
         # Backward compatible: mirror to old setattr location
         setattr(req_state, "additional_information_cpu", existing)
 
     def _merge_additional_information_update(self, req_id, upd):
         logger.warning_once("_merge_additional_information_update is deprecated, use _update_intermediate_buffer")
         return self._update_intermediate_buffer(req_id, upd)
-
-    @staticmethod
-    def _normalize_intermediate_update_value(value: Any) -> Any:
-        if isinstance(value, torch.Tensor):
-            return value.detach().to("cpu").contiguous()
-        if isinstance(value, list):
-            return [OmniGPUModelRunner._normalize_intermediate_update_value(item) for item in value]
-        if isinstance(value, tuple):
-            return tuple(OmniGPUModelRunner._normalize_intermediate_update_value(item) for item in value)
-        return value
-
-    def _normalize_intermediate_update(self, upd: dict[str, Any] | None) -> dict[str, Any]:
-        if not isinstance(upd, dict) or not upd:
-            return {}
-        return {k: self._normalize_intermediate_update_value(v) for k, v in upd.items()}
