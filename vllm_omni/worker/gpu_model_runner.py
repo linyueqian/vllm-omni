@@ -1250,6 +1250,12 @@ class OmniGPUModelRunner(GPUModelRunner):
             # collect additional_information (tensor/list) for prefill portion only
             decode_req_ids = []
             preprocess_results: list[dict[str, Any]] = []
+            preprocess_input_ids = input_ids
+            if preprocess_input_ids is None:
+                # Multimodal stages can enter preprocess with embed-only inputs,
+                # but model-local preprocess may still require the raw token ids
+                # for the scheduled span.
+                preprocess_input_ids = self.input_ids.gpu[:num_input_tokens]
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
 
@@ -1265,7 +1271,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # call the custom process function
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                    input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
+                    input_ids=preprocess_input_ids[s:e],
+                    input_embeds=embed_slice,
+                    **req_infos,
                 )
                 preprocess_results.append(
                     {
@@ -1313,7 +1321,11 @@ class OmniGPUModelRunner(GPUModelRunner):
                     assert resolved_req_embeds_item is not None
                     seg_len = min(span_len, resolved_req_embeds_item.shape[0])
                     inputs_embeds[s : s + seg_len] = resolved_req_embeds_item[:seg_len]
-                if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == span_len:
+                if (
+                    input_ids is not None
+                    and isinstance(req_input_ids, torch.Tensor)
+                    and req_input_ids.numel() == span_len
+                ):
                     input_ids[s : s + span_len] = req_input_ids
 
             # run talker mtp decode

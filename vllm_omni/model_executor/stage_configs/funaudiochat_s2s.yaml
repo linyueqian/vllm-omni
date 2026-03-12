@@ -23,9 +23,9 @@ stage_args:
     final_output_type: text
     is_comprehension: true
     default_sampling_params:
-      temperature: 0.8
-      top_p: 0.9
-      top_k: 0
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
       repetition_penalty: 1.2
       max_tokens: 2048
       stop_token_ids: [151645]

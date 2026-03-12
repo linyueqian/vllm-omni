@@ -63,7 +63,6 @@ _CURRENT_INPUT_TOKEN_ID_KEY = "funaudiochat_current_input_token_id"
 _FORCE_AUDIO_BOS_KEY = "funaudiochat_force_audio_bos_pending"
 _FINISH_SPEECH_KEY = "funaudiochat_finish_speech"
 _GENERATE_SPEECH_KEY = "funaudiochat_generate_speech"
-_RAW_TEXT_TOKEN_ID_KEY = "funaudiochat_raw_text_token_id"
 _SPEECH_IDS_KEY = "funaudiochat_speech_ids"
 _TEXT_INPUT_IDS_KEY = "funaudiochat_text_input_ids"
 _TEXT_SEQ_LEN_KEY = "funaudiochat_text_seq_len"
@@ -73,7 +72,7 @@ _TEXT_SEQ_LEN_KEY = "funaudiochat_text_seq_len"
 class FunAudioChatForConditionalGeneration(_NativeFunAudioChatBase, SupportsMultiModal):
     supports_multimodal_raw_input_only = True
     supports_multimodal = True
-    requires_raw_input_tokens = True
+    requires_raw_input_tokens = False
     input_modalities = "audio"
     pooler_output_buffer_keys = ("audio_token_ids",)
 
@@ -408,6 +407,7 @@ class FunAudioChatForConditionalGeneration(_NativeFunAudioChatBase, SupportsMult
         input_embeds: torch.Tensor | None,
         **info_dict: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        del input_embeds
         if not self._batch_preprocess_in_progress:
             self._batch_req_infos = []
             self._batch_sidecar_results = []
@@ -416,9 +416,8 @@ class FunAudioChatForConditionalGeneration(_NativeFunAudioChatBase, SupportsMult
 
         span_len = int(input_ids.shape[0])
         device = input_ids.device
-        req_embeds = input_embeds
-        if req_embeds is None and span_len > 1:
-            req_embeds = self.get_language_model().embed_input_ids(input_ids.reshape(-1))
+        text_embeds = self.get_language_model().embed_input_ids(input_ids.reshape(-1))
+        req_embeds = text_embeds
 
         generate_speech = bool(info_dict.get(_GENERATE_SPEECH_KEY, False))
         force_audio_bos_pending = bool(info_dict.get(_FORCE_AUDIO_BOS_KEY, self.sp_gen_kwargs["force_text_abos"]))
@@ -429,7 +428,7 @@ class FunAudioChatForConditionalGeneration(_NativeFunAudioChatBase, SupportsMult
         )
 
         if span_len == 1:
-            current_text_embed = self.get_language_model().embed_input_ids(input_ids.reshape(-1)).reshape(1, -1)
+            current_text_embed = text_embeds.reshape(1, -1)
             if generate_speech and speech_ids.shape[-1] >= int(self.config.audio_config.group_size):
                 last_group = speech_ids[:, -int(self.config.audio_config.group_size) :]
                 audio_features = self.audio_tower(last_group.to(device=device, dtype=torch.long))
@@ -474,12 +473,10 @@ class FunAudioChatForConditionalGeneration(_NativeFunAudioChatBase, SupportsMult
             self._batch_preprocess_in_progress = False
             return None
 
-        raw_argmax_token_ids = torch.argmax(logits, dim=-1).detach().to("cpu")
         self._batch_sidecar_results = []
         for idx, req_info in enumerate(self._batch_req_infos):
             force_audio_bos_pending = bool(req_info.get(_FORCE_AUDIO_BOS_KEY, False))
             speech_active = bool(req_info.get(_GENERATE_SPEECH_KEY, False))
-            raw_text_token_id = int(raw_argmax_token_ids[idx].item())
 
             sidecar_result = {
                 _AUDIO_TOKEN_IDS_KEY: self._empty_audio_token_ids(hidden_states.device).to("cpu"),
@@ -488,7 +485,6 @@ class FunAudioChatForConditionalGeneration(_NativeFunAudioChatBase, SupportsMult
                 _FORCE_AUDIO_BOS_KEY: force_audio_bos_pending,
                 _FINISH_SPEECH_KEY: False,
                 _GENERATE_SPEECH_KEY: speech_active,
-                _RAW_TEXT_TOKEN_ID_KEY: raw_text_token_id,
                 _SPEECH_IDS_KEY: req_info.get(_SPEECH_IDS_KEY),
                 "audio_token_ids": self._empty_audio_token_ids(hidden_states.device).to("cpu"),
             }
@@ -559,7 +555,6 @@ class FunAudioChatForConditionalGeneration(_NativeFunAudioChatBase, SupportsMult
             _FORCE_AUDIO_BOS_KEY: sidecar_result[_FORCE_AUDIO_BOS_KEY],
             _FINISH_SPEECH_KEY: sidecar_result[_FINISH_SPEECH_KEY],
             _GENERATE_SPEECH_KEY: sidecar_result[_GENERATE_SPEECH_KEY],
-            _RAW_TEXT_TOKEN_ID_KEY: sidecar_result[_RAW_TEXT_TOKEN_ID_KEY],
             _SPEECH_IDS_KEY: sidecar_result[_SPEECH_IDS_KEY],
             "audio_token_ids": sidecar_result["audio_token_ids"],
         }
@@ -592,16 +587,12 @@ class FunAudioChatForConditionalGeneration(_NativeFunAudioChatBase, SupportsMult
 
             token_slot = updated_token_ids[idx] if updated_token_ids.ndim == 1 else updated_token_ids[idx, 0]
             original_token_id = int(token_slot.item())
-            sampled_token_id = original_token_id
-            raw_text_token_id = req_buffer.get(_RAW_TEXT_TOKEN_ID_KEY)
-            if self.sp_gen_kwargs["text_greedy"] and raw_text_token_id is not None:
-                sampled_token_id = int(raw_text_token_id)
             speech_active = bool(req_buffer.get(_GENERATE_SPEECH_KEY, False))
             force_audio_bos_pending = bool(req_buffer.get(_FORCE_AUDIO_BOS_KEY, False))
             finish_speech = bool(req_buffer.pop(_FINISH_SPEECH_KEY, False))
 
             final_token_id, next_speech_active, next_force_audio_bos_pending = self._resolve_next_speech_state(
-                sampled_token_id=sampled_token_id,
+                sampled_token_id=original_token_id,
                 generate_speech=speech_active,
                 finish_speech=finish_speech,
                 force_audio_bos_pending=force_audio_bos_pending,

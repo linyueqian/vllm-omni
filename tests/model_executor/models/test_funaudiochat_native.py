@@ -224,7 +224,6 @@ def test_postprocess_sampled_tokens_updates_buffer_from_final_sampled_token():
             fac_mod._GENERATE_SPEECH_KEY: False,
             fac_mod._FORCE_AUDIO_BOS_KEY: False,
             fac_mod._FINISH_SPEECH_KEY: False,
-            fac_mod._RAW_TEXT_TOKEN_ID_KEY: 42,
         }
     }
 
@@ -249,7 +248,6 @@ def test_postprocess_sampled_tokens_force_text_abos_overrides_sampled_token():
             fac_mod._GENERATE_SPEECH_KEY: False,
             fac_mod._FORCE_AUDIO_BOS_KEY: True,
             fac_mod._FINISH_SPEECH_KEY: False,
-            fac_mod._RAW_TEXT_TOKEN_ID_KEY: 7,
         }
     }
 
@@ -262,55 +260,6 @@ def test_postprocess_sampled_tokens_force_text_abos_overrides_sampled_token():
 
     assert updated.tolist() == [42]
     assert model_intermediate_buffer["req0"][fac_mod._GENERATE_SPEECH_KEY] is True
-    assert model_intermediate_buffer["req0"][fac_mod._FORCE_AUDIO_BOS_KEY] is False
-
-
-def test_postprocess_sampled_tokens_uses_raw_argmax_when_text_greedy_is_enabled():
-    model = _make_model_stub()
-    sampled_token_ids = torch.tensor([7], dtype=torch.long)
-    model_intermediate_buffer = {
-        "req0": {
-            fac_mod._GENERATE_SPEECH_KEY: False,
-            fac_mod._FORCE_AUDIO_BOS_KEY: False,
-            fac_mod._FINISH_SPEECH_KEY: False,
-            fac_mod._RAW_TEXT_TOKEN_ID_KEY: 42,
-        }
-    }
-
-    updated = model.postprocess_sampled_tokens(
-        sampled_token_ids=sampled_token_ids,
-        req_ids=["req0"],
-        req_id_to_index={"req0": 0},
-        model_intermediate_buffer=model_intermediate_buffer,
-    )
-
-    assert updated.tolist() == [42]
-    assert model_intermediate_buffer["req0"][fac_mod._GENERATE_SPEECH_KEY] is True
-    assert model_intermediate_buffer["req0"][fac_mod._FORCE_AUDIO_BOS_KEY] is False
-
-
-def test_postprocess_sampled_tokens_respects_sampled_token_when_text_greedy_disabled():
-    model = _make_model_stub()
-    model.sp_gen_kwargs["text_greedy"] = False
-    sampled_token_ids = torch.tensor([7], dtype=torch.long)
-    model_intermediate_buffer = {
-        "req0": {
-            fac_mod._GENERATE_SPEECH_KEY: False,
-            fac_mod._FORCE_AUDIO_BOS_KEY: False,
-            fac_mod._FINISH_SPEECH_KEY: False,
-            fac_mod._RAW_TEXT_TOKEN_ID_KEY: 42,
-        }
-    }
-
-    updated = model.postprocess_sampled_tokens(
-        sampled_token_ids=sampled_token_ids,
-        req_ids=["req0"],
-        req_id_to_index={"req0": 0},
-        model_intermediate_buffer=model_intermediate_buffer,
-    )
-
-    assert updated.tolist() == [7]
-    assert model_intermediate_buffer["req0"][fac_mod._GENERATE_SPEECH_KEY] is False
     assert model_intermediate_buffer["req0"][fac_mod._FORCE_AUDIO_BOS_KEY] is False
 
 
@@ -322,7 +271,6 @@ def test_postprocess_sampled_tokens_overwrites_emitted_token_to_audio_eos_on_fin
             fac_mod._GENERATE_SPEECH_KEY: True,
             fac_mod._FORCE_AUDIO_BOS_KEY: False,
             fac_mod._FINISH_SPEECH_KEY: True,
-            fac_mod._RAW_TEXT_TOKEN_ID_KEY: 7,
         }
     }
 
@@ -347,7 +295,6 @@ def test_postprocess_sampled_tokens_noops_for_spec_decode_shapes():
             fac_mod._GENERATE_SPEECH_KEY: False,
             fac_mod._FORCE_AUDIO_BOS_KEY: True,
             fac_mod._FINISH_SPEECH_KEY: False,
-            fac_mod._RAW_TEXT_TOKEN_ID_KEY: 42,
         }
     }
 
@@ -383,7 +330,7 @@ def test_chunked_prefill_preprocess_keeps_speech_inactive():
     assert torch.equal(second_update["audio_token_ids"], torch.full((1, 5), -1, dtype=torch.long))
 
 
-def test_preprocess_single_token_text_decode_keeps_input_id_path():
+def test_preprocess_single_token_text_decode_returns_text_embeddings():
     model = _make_model_stub()
 
     _, req_embeds, _ = model.preprocess(
@@ -391,10 +338,10 @@ def test_preprocess_single_token_text_decode_keeps_input_id_path():
         input_embeds=None,
     )
 
-    assert req_embeds is None
+    assert torch.equal(req_embeds, torch.zeros((1, 4), dtype=torch.float32))
 
 
-def test_preprocess_first_speech_step_without_codec_history_keeps_input_id_path():
+def test_preprocess_first_speech_step_without_codec_history_returns_text_embeddings():
     model = _make_model_stub()
 
     _, req_embeds, _ = model.preprocess(
@@ -406,7 +353,7 @@ def test_preprocess_first_speech_step_without_codec_history_keeps_input_id_path(
         },
     )
 
-    assert req_embeds is None
+    assert torch.equal(req_embeds, torch.zeros((1, 4), dtype=torch.float32))
 
 
 def test_preprocess_active_speech_with_codec_history_blends_audio_features():
@@ -468,7 +415,6 @@ def test_postprocess_prefill_warmup_updates_cache_without_emitting_audio():
             fac_mod._FORCE_AUDIO_BOS_KEY: True,
             fac_mod._FINISH_SPEECH_KEY: False,
             fac_mod._GENERATE_SPEECH_KEY: False,
-            fac_mod._RAW_TEXT_TOKEN_ID_KEY: 1,
             fac_mod._SPEECH_IDS_KEY: torch.empty((1, 0), dtype=torch.long),
             "_run_prefill_crq_warmup": True,
             "_prefill_input_ids": torch.tensor([1, 2, 3], dtype=torch.long),
