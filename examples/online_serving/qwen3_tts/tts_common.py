@@ -263,17 +263,19 @@ def stream_pcm_chunks_ws(ws_url: str, text: str, config: dict):
         ws.send(json.dumps({"type": "input.text", "text": text.strip()}))
         ws.send(json.dumps({"type": "input.done"}))
 
-        # Receive audio chunks
+        # Receive audio chunks (buffer leftover bytes across frames)
+        leftover = b""
         while True:
             message = ws.recv()
 
             if isinstance(message, bytes):
                 if len(message) == 0:
                     continue
-                # Ensure even byte count for int16
-                usable = len(message) - (len(message) % 2)
+                raw = leftover + message
+                usable = len(raw) - (len(raw) % 2)
+                leftover = raw[usable:]
                 if usable > 0:
-                    yield np.frombuffer(message[:usable], dtype=np.int16).copy()
+                    yield np.frombuffer(raw[:usable], dtype=np.int16).copy()
             else:
                 msg = json.loads(message)
                 msg_type = msg.get("type")
