@@ -417,6 +417,76 @@ class GPUARModelRunner(OmniGPUModelRunner):
         )
         return sampled_token_ids if corrected_sampled_token_ids is None else corrected_sampled_token_ids
 
+    def _collect_pending_postprocess_updates(
+        self,
+        hidden_states: torch.Tensor,
+        multimodal_outputs: object,
+        num_scheduled_tokens_np: np.ndarray,
+    ) -> dict[str, dict[str, Any]]:
+        updates: dict[str, dict[str, Any]] = {}
+        try:
+            if hasattr(self.model, "has_postprocess") and self.model.has_postprocess:
+                for req_index, req_id in enumerate(self.input_batch.req_ids):
+                    req_infos = self.model_intermediate_buffer.get(req_id, {})
+                    start_offset = int(self.query_start_loc.cpu[req_index])
+                    sched_tokens = int(num_scheduled_tokens_np[req_index])
+                    s, e = start_offset, start_offset + sched_tokens
+                    hidden_states_slice = hidden_states[s:e]
+                    update_dict = self.model.postprocess(hidden_states_slice, **req_infos)
+                    normalized = self._normalize_intermediate_update(update_dict)
+                    if normalized:
+                        updates[req_id] = normalized
+        except Exception as e:
+            logger.error(
+                f"Error merging for requests:{self.input_batch.req_ids} "
+                f"additional information update: {e}, with the multimodal_outputs "
+                f"as {multimodal_outputs}"
+            )
+            import traceback
+
+            traceback.print_exc()
+        return updates
+
+    def _collect_additional_information_updates(
+        self,
+        hidden_states: torch.Tensor,
+        multimodal_outputs: object,
+        num_scheduled_tokens_np: np.ndarray,
+        scheduler_output: SchedulerOutput | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        del scheduler_output
+        return self._collect_pending_postprocess_updates(
+            hidden_states,
+            multimodal_outputs,
+            num_scheduled_tokens_np,
+        )
+
+    def _build_overlay_intermediate_buffer_local(
+        self,
+        pending_updates: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        overlay_buffer: dict[str, dict[str, Any]] = {}
+        for req_id in self.input_batch.req_ids:
+            merged = dict(self.model_intermediate_buffer.get(req_id, {}))
+            if req_id in pending_updates:
+                merged.update(pending_updates[req_id])
+            overlay_buffer[req_id] = merged
+        return overlay_buffer
+
+    def _commit_overlay_intermediate_buffer_local(
+        self,
+        overlay_buffer: dict[str, dict[str, Any]],
+        *,
+        invalid_req_indices: list[int] | None = None,
+    ) -> None:
+        invalid_index_set = set(invalid_req_indices or [])
+        for req_index, req_id in enumerate(self.input_batch.req_ids):
+            if req_index in invalid_index_set:
+                continue
+            update_dict = overlay_buffer.get(req_id, {})
+            if update_dict:
+                self._update_intermediate_buffer(req_id, update_dict)
+
     @torch.inference_mode()
     def sample_tokens(
         self,
@@ -486,10 +556,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         overlay_intermediate_buffer = None
         postprocess_hook = getattr(self.model, "postprocess_sampled_tokens", None)
         if pending_intermediate_updates or postprocess_hook is not None:
-            overlay_intermediate_buffer = self._build_overlay_intermediate_buffer(
-                self.input_batch.req_ids.copy(),
-                pending_intermediate_updates,
-            )
+            overlay_intermediate_buffer = self._build_overlay_intermediate_buffer_local(pending_intermediate_updates)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess_sampled_tokens"):
             sampler_output.sampled_token_ids = self._postprocess_sampled_token_ids(
@@ -573,10 +640,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
             )
 
         if overlay_intermediate_buffer is not None:
-            self._commit_intermediate_buffer_overlay(
+            self._commit_overlay_intermediate_buffer_local(
                 overlay_intermediate_buffer,
                 invalid_req_indices=invalid_req_indices,
-                req_ids=self.input_batch.req_ids.copy(),
             )
 
         if propose_drafts_after_bookkeeping:

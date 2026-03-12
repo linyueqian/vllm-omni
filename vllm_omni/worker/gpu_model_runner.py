@@ -1006,26 +1006,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
     ) -> None:
         """Process model-provided per-request updates and merge into model_intermediate_buffer."""
-        updates = self._collect_additional_information_updates(
-            hidden_states,
-            multimodal_outputs,
-            num_scheduled_tokens_np,
-            scheduler_output,
-        )
-        if not updates:
-            return
-        overlay_buffer = self._build_overlay_intermediate_buffer(list(updates), updates)
-        self._commit_intermediate_buffer_overlay(overlay_buffer, req_ids=list(updates))
-
-    def _collect_additional_information_updates(
-        self,
-        hidden_states: torch.Tensor,
-        multimodal_outputs: object,
-        num_scheduled_tokens_np: np.ndarray,
-        scheduler_output: "SchedulerOutput",
-    ) -> dict[str, dict[str, Any]]:
-        """Collect model-provided per-request updates without mutating runtime state."""
-        updates: dict[str, dict[str, Any]] = {}
         try:
             # execute the custom postprocess function
             # TODO(Peiqi): do we have a more elegant way to do this?
@@ -1038,9 +1018,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     # only consider to store data into update dict.
                     hidden_states_slice = hidden_states[s:e]
                     update_dict = self.model.postprocess(hidden_states_slice, **req_infos)
-                    normalized = self._normalize_intermediate_update(update_dict)
-                    if normalized:
-                        updates[req_id] = normalized
+                    self._update_intermediate_buffer(req_id, update_dict)
         except Exception as e:
             logger.error(
                 f"Error merging for requests:{self.input_batch.req_ids} "
@@ -1050,7 +1028,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             import traceback
 
             traceback.print_exc()
-        return updates
 
     def _collect_additional_information_for_prefill(
         self,
@@ -1249,7 +1226,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
             decode_req_ids = []
-            preprocess_results: list[dict[str, Any]] = []
             preprocess_input_ids = input_ids
             if preprocess_input_ids is None:
                 # Multimodal stages can enter preprocess with embed-only inputs,
@@ -1275,41 +1251,17 @@ class OmniGPUModelRunner(GPUModelRunner):
                     input_embeds=embed_slice,
                     **req_infos,
                 )
-                preprocess_results.append(
-                    {
-                        "req_id": req_id,
-                        "start": s,
-                        "end": e,
-                        "span_len": span_len,
-                        "req_input_ids": req_input_ids,
-                        "req_embeds": req_embeds,
-                        "update_dict": update_dict,
-                    }
-                )
-
-            inputs_embeds, resolved_req_embeds = self._resolve_preprocess_batch_inputs_embeds(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                preprocess_results=preprocess_results,
-            )
-
-            for result, resolved_req_embeds_item in zip(preprocess_results, resolved_req_embeds, strict=False):
-                req_id = result["req_id"]
-                s = result["start"]
-                span_len = result["span_len"]
-                req_input_ids = result["req_input_ids"]
-                update_dict = result["update_dict"]
+                if req_embeds is None:
+                    raise RuntimeError(
+                        "Model preprocess must return req_embeds when has_preprocess=True, "
+                        f"but got None for request {req_id}."
+                    )
 
                 if hasattr(self.model, "talker_mtp") and span_len == 1:
-                    if resolved_req_embeds_item is None:
-                        raise RuntimeError(
-                            "talker_mtp requires preprocess embeddings for decode steps, "
-                            f"but model.preprocess returned req_embeds=None for request {req_id}."
-                        )
                     last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
                     decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
                     self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
-                    self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(resolved_req_embeds_item)
+                    self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
                     self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
                     self.text_step.gpu[decode_slice].copy_(text_step)
                     decode_req_ids.append(req_id)
@@ -1317,10 +1269,11 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # TODO(Peiqi): the merge stage could move out from the critical path
                 self._merge_additional_information_update(req_id, update_dict)
 
+                if inputs_embeds is None:
+                    inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
                 if inputs_embeds is not None:
-                    assert resolved_req_embeds_item is not None
-                    seg_len = min(span_len, resolved_req_embeds_item.shape[0])
-                    inputs_embeds[s : s + seg_len] = resolved_req_embeds_item[:seg_len]
+                    seg_len = min(span_len, req_embeds.shape[0])
+                    inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
                 if (
                     input_ids is not None
                     and isinstance(req_input_ids, torch.Tensor)
@@ -1438,93 +1391,3 @@ class OmniGPUModelRunner(GPUModelRunner):
         if not isinstance(upd, dict) or not upd:
             return {}
         return {k: self._normalize_intermediate_update_value(v) for k, v in upd.items()}
-
-    def _embed_input_ids_for_preprocess(
-        self,
-        input_ids: torch.Tensor,
-        *,
-        like: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        flat_input_ids = input_ids.reshape(-1)
-
-        embed_input_ids = getattr(self.model, "embed_input_ids", None)
-        if callable(embed_input_ids):
-            req_embeds = embed_input_ids(input_ids=flat_input_ids)
-        else:
-            get_language_model = getattr(self.model, "get_language_model", None)
-            language_model = get_language_model() if callable(get_language_model) else None
-            lm_embed_input_ids = getattr(language_model, "embed_input_ids", None)
-            if callable(lm_embed_input_ids):
-                req_embeds = lm_embed_input_ids(flat_input_ids)
-            else:
-                get_input_embeddings = getattr(self.model, "get_input_embeddings", None)
-                if not callable(get_input_embeddings):
-                    raise RuntimeError(
-                        "Model preprocess returned req_embeds=None, but the runner "
-                        "could not resolve a token embedding function."
-                    )
-                req_embeds = get_input_embeddings()(flat_input_ids)
-
-        if req_embeds.ndim == 1:
-            req_embeds = req_embeds.unsqueeze(0)
-        elif req_embeds.ndim > 2:
-            req_embeds = req_embeds.reshape(-1, req_embeds.shape[-1])
-
-        if like is not None:
-            req_embeds = req_embeds.to(device=like.device, dtype=like.dtype)
-        return req_embeds
-
-    def _resolve_preprocess_batch_inputs_embeds(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        inputs_embeds: torch.Tensor | None,
-        preprocess_results: list[dict[str, Any]],
-    ) -> tuple[torch.Tensor | None, list[torch.Tensor | None]]:
-        if not any(result["req_embeds"] is not None for result in preprocess_results):
-            return None, [None] * len(preprocess_results)
-
-        batch_inputs_embeds = inputs_embeds
-        if batch_inputs_embeds is None:
-            batch_inputs_embeds = self.inputs_embeds.gpu[: input_ids.shape[0]]
-
-        resolved_req_embeds: list[torch.Tensor | None] = []
-        for result in preprocess_results:
-            req_embeds = result["req_embeds"]
-            if req_embeds is None:
-                req_embeds = self._embed_input_ids_for_preprocess(
-                    result["req_input_ids"],
-                    like=batch_inputs_embeds[result["start"] : result["end"]],
-                )
-            resolved_req_embeds.append(req_embeds)
-
-        return batch_inputs_embeds, resolved_req_embeds
-
-    def _build_overlay_intermediate_buffer(
-        self,
-        req_ids: list[str],
-        pending_updates: dict[str, dict[str, Any]] | None = None,
-    ) -> dict[str, dict[str, Any]]:
-        overlay_buffer: dict[str, dict[str, Any]] = {}
-        for req_id in req_ids:
-            merged = dict(self.model_intermediate_buffer.get(req_id, {}))
-            if pending_updates and req_id in pending_updates:
-                merged.update(pending_updates[req_id])
-            overlay_buffer[req_id] = merged
-        return overlay_buffer
-
-    def _commit_intermediate_buffer_overlay(
-        self,
-        overlay_buffer: dict[str, dict[str, Any]],
-        *,
-        invalid_req_indices: list[int] | None = None,
-        req_ids: list[str] | None = None,
-    ) -> None:
-        if not overlay_buffer:
-            return
-        req_ids = req_ids or list(self.input_batch.req_ids)
-        invalid_index_set = set(invalid_req_indices or [])
-        for req_index, req_id in enumerate(req_ids):
-            if req_index in invalid_index_set:
-                continue
-            self._update_intermediate_buffer(req_id, overlay_buffer.get(req_id, {}))
