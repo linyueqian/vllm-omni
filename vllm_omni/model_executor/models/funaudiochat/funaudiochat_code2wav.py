@@ -145,7 +145,9 @@ class FunAudioChatCosyVoice3Code2Wav(nn.Module):
             raw_id_batches = [torch.empty((0,), dtype=torch.long)]
 
         token_batches = [
-            raw_ids.reshape(1, -1).to(dtype=torch.long, device=self.vllm_config.device_config.device).clamp_(
+            raw_ids.reshape(1, -1)
+            .to(dtype=torch.long, device=self.vllm_config.device_config.device)
+            .clamp_(
                 min=0,
                 max=self._max_codec_token_id,
             )

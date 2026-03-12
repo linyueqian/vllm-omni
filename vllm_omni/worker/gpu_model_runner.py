@@ -1158,15 +1158,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             model_kwargs = self._init_model_kwargs()
             input_ids = self.input_ids.gpu[:num_input_tokens]
         elif getattr(self.model, "has_preprocess", False):
-            # Raw-token preprocess stages should see input_ids first, then
-            # materialize embeddings back into the pre-allocated buffer before
-            # the final forward.
             input_ids = self.input_ids.gpu[:num_input_tokens]
-            inputs_embeds = (
-                None
-                if getattr(self.model, "requires_raw_input_tokens", False)
-                else self.inputs_embeds.gpu[:num_input_tokens]
-            )
+            inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
             model_kwargs = self._init_model_kwargs()
         else:
             # For text-only models, we use token ids as input.
@@ -1251,10 +1244,11 @@ class OmniGPUModelRunner(GPUModelRunner):
                     input_embeds=embed_slice,
                     **req_infos,
                 )
-                if req_embeds is None:
-                    raise RuntimeError(
-                        "Model preprocess must return req_embeds when has_preprocess=True, "
-                        f"but got None for request {req_id}."
+                if inputs_embeds is None:
+                    inputs_embeds = torch.empty(
+                        (preprocess_input_ids.shape[0], req_embeds.shape[-1]),
+                        device=req_embeds.device,
+                        dtype=req_embeds.dtype,
                     )
 
                 if hasattr(self.model, "talker_mtp") and span_len == 1:
@@ -1269,17 +1263,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # TODO(Peiqi): the merge stage could move out from the critical path
                 self._merge_additional_information_update(req_id, update_dict)
 
-                if inputs_embeds is None:
-                    inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
-                if inputs_embeds is not None:
-                    seg_len = min(span_len, req_embeds.shape[0])
-                    inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
+                seg_len = min(span_len, req_embeds.shape[0])
+                inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
                 if (
                     input_ids is not None
                     and isinstance(req_input_ids, torch.Tensor)
-                    and req_input_ids.numel() == span_len
+                    and req_input_ids.numel() == seg_len
                 ):
-                    input_ids[s : s + span_len] = req_input_ids
+                    input_ids[s : s + seg_len] = req_input_ids
 
             # run talker mtp decode
             if hasattr(self.model, "talker_mtp"):
@@ -1363,18 +1354,18 @@ class OmniGPUModelRunner(GPUModelRunner):
         if hasattr(self, "model") and hasattr(self.model, "gpu_resident_buffer_keys"):
             gpu_keys = self.model.gpu_resident_buffer_keys
         existing = self.model_intermediate_buffer.setdefault(req_id, {})
-        for key, value in upd.items():
-            if isinstance(value, torch.Tensor):
-                if key in gpu_keys:
-                    existing[key] = value.detach().clone()
+        for k, v in upd.items():
+            if isinstance(v, torch.Tensor):
+                if k in gpu_keys:
+                    existing[k] = v.detach().clone()
                 else:
-                    existing[key] = value.detach().to("cpu").contiguous()
-            elif isinstance(value, list):
-                existing[key] = [
-                    (item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item) for item in value
+                    existing[k] = v.detach().to("cpu").contiguous()
+            elif isinstance(v, list):
+                existing[k] = [
+                    (item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item) for item in v
                 ]
             else:
-                existing[key] = value
+                existing[k] = v
         # Backward compatible: mirror to old setattr location
         setattr(req_state, "additional_information_cpu", existing)
 

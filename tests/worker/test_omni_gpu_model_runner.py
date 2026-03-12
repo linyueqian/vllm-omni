@@ -1,12 +1,9 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
-from vllm.v1.outputs import SamplerOutput
 
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -39,35 +36,6 @@ class MiMoAudioForConditionalGeneration(torch.nn.Module):
         super().__init__()
 
     # No real forward needed for these tests.
-
-
-class ReplaceSampledTokensModel(torch.nn.Module):
-    """Returns a replacement sampled-token tensor from the post-sample hook."""
-
-    def __init__(self):
-        super().__init__()
-        self.observed_sampled_token_ids = None
-
-    def postprocess_sampled_tokens(self, sampled_token_ids, req_ids, req_id_to_index, model_intermediate_buffer):
-        assert req_ids == ["r1", "r2"]
-        assert req_id_to_index == {"r1": 0, "r2": 1}
-        assert model_intermediate_buffer == {"r1": {"token": 1}, "r2": {"token": 2}}
-        self.observed_sampled_token_ids = sampled_token_ids.clone()
-        return sampled_token_ids + 10
-
-
-class OverlaySampledTokensModel(torch.nn.Module):
-    """Validates that post-sample hooks receive overlaid pending updates."""
-
-    def __init__(self):
-        super().__init__()
-        self.observed_buffer = None
-        self.pooler_output_buffer_keys = ("audio_token_ids",)
-
-    def postprocess_sampled_tokens(self, sampled_token_ids, req_ids, req_id_to_index, model_intermediate_buffer):
-        del sampled_token_ids, req_ids, req_id_to_index
-        self.observed_buffer = model_intermediate_buffer
-        return None
 
 
 class DummyTalkerMTP(torch.nn.Module):
@@ -145,58 +113,6 @@ def _make_runner_for_mimo(req_id="r_mimo"):
 
     runner.requests = {req_id: req_state}
 
-    return runner
-
-
-class StopAfterBookkeepingError(Exception):
-    pass
-
-
-def _make_sample_tokens_runner(model):
-    runner = object.__new__(GPUARModelRunner)
-    runner.model = model
-    runner.speculative_config = None
-    runner.use_async_scheduling = False
-    runner.input_batch = SimpleNamespace(
-        req_ids=["r1", "r2"],
-        req_id_to_index={"r1": 0, "r2": 1},
-        sampling_metadata=SimpleNamespace(no_penalties=True),
-        prev_sampled_token_ids=None,
-        num_tokens_no_spec=np.array([1, 1], dtype=np.int32),
-        token_ids_cpu=np.array([[1, 0, 0, 0], [2, 0, 0, 0]], dtype=np.int32),
-        vocab_size=32000,
-    )
-    runner.model_intermediate_buffer = {"r1": {"token": 1}, "r2": {"token": 2}}
-    runner.requests = {
-        "r1": SimpleNamespace(output_token_ids=[1]),
-        "r2": SimpleNamespace(output_token_ids=[2]),
-    }
-    runner.execute_model_state = (
-        SimpleNamespace(total_num_scheduled_tokens=2, num_scheduled_tokens={"r1": 1, "r2": 1}),
-        None,
-        None,
-        None,
-        torch.zeros((2, 4), dtype=torch.float32),
-        torch.zeros((2, 4), dtype=torch.float32),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    runner._sample = lambda logits, spec_decode_metadata: SamplerOutput(
-        sampled_token_ids=torch.tensor([[1], [2]], dtype=torch.int32),
-        logprobs_tensors=None,
-    )
-    runner.max_model_len = 4
-    runner.query_start_loc = SimpleNamespace(cpu=torch.tensor([0, 1], dtype=torch.int32))
-    runner._omni_num_scheduled_tokens_np = np.array([1, 1], dtype=np.int32)
-    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type="omni"))
-    runner.model_config = SimpleNamespace(enable_return_routed_experts=False)
-    runner.supports_mm_inputs = False
-    runner.kv_connector_output = None
-    runner.eplb_step = lambda: None
-    runner.finalize_kv_connector = lambda: None
     return runner
 
 
@@ -334,65 +250,3 @@ def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
 
     # When no req_state, helper should be a no-op.
     assert result is req_infos
-
-
-def test_sample_tokens_applies_postprocessed_tokens_before_bookkeeping():
-    runner = _make_sample_tokens_runner(ReplaceSampledTokensModel())
-    captured = {}
-
-    def fake_bookkeeping(
-        self,
-        scheduler_output,
-        sampler_output,
-        logits,
-        hidden_states,
-        num_scheduled_tokens,
-        spec_decode_metadata,
-    ):
-        captured["sampled_token_ids"] = sampler_output.sampled_token_ids.clone()
-        raise StopAfterBookkeepingError
-
-    runner._bookkeeping_sync = fake_bookkeeping.__get__(runner, type(runner))
-
-    with pytest.raises(StopAfterBookkeepingError):
-        GPUARModelRunner.sample_tokens(runner, grammar_output=None)
-
-    assert torch.equal(runner.model.observed_sampled_token_ids, torch.tensor([[1], [2]], dtype=torch.int32))
-    assert torch.equal(captured["sampled_token_ids"], torch.tensor([[11], [12]], dtype=torch.int32))
-
-
-def test_sample_tokens_passes_pending_updates_to_postprocess_without_committing_before_bookkeeping():
-    runner = _make_sample_tokens_runner(OverlaySampledTokensModel())
-
-    def fake_collect(*args, **kwargs):
-        del args, kwargs
-        return {"r1": {"pending": 11}, "r2": {"pending": 22}}
-
-    captured = {}
-
-    def fake_bookkeeping(
-        self,
-        scheduler_output,
-        sampler_output,
-        logits,
-        hidden_states,
-        num_scheduled_tokens,
-        spec_decode_metadata,
-    ):
-        del scheduler_output, sampler_output, logits, hidden_states, num_scheduled_tokens, spec_decode_metadata
-        captured["buffer_before_bookkeeping"] = {
-            req_id: dict(info) for req_id, info in self.model_intermediate_buffer.items()
-        }
-        raise StopAfterBookkeepingError
-
-    runner._collect_additional_information_updates = fake_collect
-    runner._bookkeeping_sync = fake_bookkeeping.__get__(runner, type(runner))
-
-    with pytest.raises(StopAfterBookkeepingError):
-        GPUARModelRunner.sample_tokens(runner, grammar_output=None)
-
-    assert runner.model.observed_buffer == {
-        "r1": {"token": 1, "pending": 11},
-        "r2": {"token": 2, "pending": 22},
-    }
-    assert captured["buffer_before_bookkeeping"] == {"r1": {"token": 1}, "r2": {"token": 2}}

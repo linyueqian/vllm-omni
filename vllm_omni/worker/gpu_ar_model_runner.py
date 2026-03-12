@@ -462,20 +462,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
             traceback.print_exc()
         return updates
 
-    def _collect_additional_information_updates(
-        self,
-        hidden_states: torch.Tensor,
-        multimodal_outputs: object,
-        num_scheduled_tokens_np: np.ndarray,
-        scheduler_output: SchedulerOutput | None = None,
-    ) -> dict[str, dict[str, Any]]:
-        del scheduler_output
-        return self._collect_pending_postprocess_updates(
-            hidden_states,
-            multimodal_outputs,
-            num_scheduled_tokens_np,
-        )
-
     def _build_overlay_intermediate_buffer_local(
         self,
         pending_updates: dict[str, dict[str, Any]],
@@ -565,8 +551,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 dtype=np.int32,
             )
 
-        pending_intermediate_updates = self._collect_additional_information_updates(
-            hidden_states, multimodal_outputs, num_scheduled_tokens_np, scheduler_output
+        pending_intermediate_updates = self._collect_pending_postprocess_updates(
+            hidden_states,
+            multimodal_outputs,
+            num_scheduled_tokens_np,
         )
         overlay_intermediate_buffer = None
         postprocess_hook = getattr(self.model, "postprocess_sampled_tokens", None)
