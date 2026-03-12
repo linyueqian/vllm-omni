@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import logging
+import time
 from collections.abc import Generator
 
 import gradio as gr
@@ -31,19 +32,22 @@ from tts_common import (
     TASK_TYPES,
     add_common_args,
     build_payload,
+    build_ws_config,
     fetch_voices,
     stream_pcm_chunks,
+    stream_pcm_chunks_ws,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def make_tts_generator(api_base: str):
+def make_tts_generator(api_base: str, stats: dict):
     """Create a generator function for FastRTC's mode='receive'.
 
     FastRTC calls this with the additional_inputs values whenever the user
     clicks "Start Stream". It must be a synchronous generator yielding
-    (sample_rate, int16_ndarray) tuples.
+    (sample_rate, int16_ndarray) tuples. Timing stats are written to the
+    shared `stats` dict so the UI can poll them.
     """
 
     def tts_generate(
@@ -55,36 +59,117 @@ def make_tts_generator(api_base: str):
         ref_audio_url: str,
         ref_text: str,
         x_vector_only: bool,
+        transport: str,
     ) -> Generator[tuple[int, np.ndarray], None, None]:
         if not text or not text.strip():
             return
 
-        payload = build_payload(
-            text,
-            task_type,
-            voice,
-            language,
-            instructions,
-            ref_audio=None,  # WebRTC UI doesn't support file upload
-            ref_audio_url=ref_audio_url,
-            ref_text=ref_text,
-            x_vector_only=x_vector_only,
-            stream=True,
+        stats.update(
+            {
+                "transport": transport,
+                "t_start": time.time(),
+                "ttfp": None,
+                "total_time": None,
+                "chunks": 0,
+                "total_samples": 0,
+                "done": False,
+                "error": None,
+            }
         )
 
+        t0 = time.time()
+        chunk_count = 0
+        total_samples = 0
+
         try:
-            for samples in stream_pcm_chunks(api_base, payload):
+            if transport == "WebSocket":
+                ws_url = api_base.replace("http://", "ws://").replace("https://", "wss://")
+                ws_url = f"{ws_url}/v1/audio/speech/stream"
+                config = build_ws_config(
+                    task_type,
+                    voice,
+                    language,
+                    instructions,
+                    ref_audio=None,
+                    ref_audio_url=ref_audio_url,
+                    ref_text=ref_text,
+                    x_vector_only=x_vector_only,
+                )
+                pcm_iter = stream_pcm_chunks_ws(ws_url, text, config)
+            else:
+                payload = build_payload(
+                    text,
+                    task_type,
+                    voice,
+                    language,
+                    instructions,
+                    ref_audio=None,
+                    ref_audio_url=ref_audio_url,
+                    ref_text=ref_text,
+                    x_vector_only=x_vector_only,
+                    stream=True,
+                )
+                pcm_iter = stream_pcm_chunks(api_base, payload)
+
+            for samples in pcm_iter:
+                chunk_count += 1
+                total_samples += len(samples)
+                if chunk_count == 1:
+                    stats["ttfp"] = time.time() - t0
+                stats["chunks"] = chunk_count
+                stats["total_samples"] = total_samples
                 yield (PCM_SAMPLE_RATE, samples)
-        except Exception:
+
+        except Exception as e:
+            stats["error"] = str(e)
             logger.exception("TTS streaming error")
+        finally:
+            stats["total_time"] = time.time() - t0
+            stats["done"] = True
 
     return tts_generate
+
+
+def _format_stats(stats: dict) -> str:
+    """Format the stats dict into a readable string."""
+    if not stats or "t_start" not in stats:
+        return "*No generation yet.*"
+    transport = stats.get("transport", "?")
+    ttfp = stats.get("ttfp")
+    total_time = stats.get("total_time")
+    chunks = stats.get("chunks", 0)
+    total_samples = stats.get("total_samples", 0)
+    done = stats.get("done", False)
+    error = stats.get("error")
+
+    audio_dur = total_samples / PCM_SAMPLE_RATE if total_samples else 0
+    elapsed = total_time if done else time.time() - stats["t_start"]
+
+    lines = [f"**Transport:** {transport}"]
+    if ttfp is not None:
+        lines.append(f"**TTFP:** {ttfp * 1000:.0f} ms")
+    else:
+        lines.append("**TTFP:** waiting...")
+    lines.append(f"**Chunks:** {chunks}")
+    lines.append(f"**Audio:** {audio_dur:.2f}s")
+    if done:
+        lines.append(f"**Total time:** {elapsed:.2f}s")
+        if audio_dur > 0 and elapsed > 0:
+            rtf = elapsed / audio_dur
+            lines.append(f"**RTF:** {rtf:.2f}x")
+            lines.append(f"**Throughput:** {1 / rtf:.2f}x realtime")
+        if error:
+            lines.append(f"**Error:** {error}")
+    else:
+        lines.append(f"**Elapsed:** {elapsed:.1f}s (generating...)")
+    return "\n\n".join(lines)
 
 
 def build_interface(api_base: str):
     """Build a custom Gradio Blocks UI matching gradio_demo.py layout."""
     voices = fetch_voices(api_base)
-    handler = make_tts_generator(api_base)
+    stats: dict = {}
+    handler = make_tts_generator(api_base, stats)
 
     css = """
     #generate-btn button { width: 100%; }
@@ -124,6 +209,7 @@ def build_interface(api_base: str):
                     value=voices[0] if voices else None,
                     label="Speaker",
                     visible=True,
+                    allow_custom_value=True,
                 )
 
                 instructions = gr.Textbox(
@@ -156,6 +242,16 @@ def build_interface(api_base: str):
                     info=("Skip reference transcript, use speaker embedding only (lower quality)"),
                 )
 
+                transport = gr.Radio(
+                    choices=["HTTP", "WebSocket"],
+                    value="HTTP",
+                    label="Streaming Transport",
+                    info=(
+                        "HTTP: continuous stream, best for complete text. "
+                        "WebSocket: sentence-level via /v1/audio/speech/stream."
+                    ),
+                )
+
                 generate_btn = gr.Button(
                     "Generate Speech",
                     variant="primary",
@@ -170,6 +266,11 @@ def build_interface(api_base: str):
                     mode="receive",
                     modality="audio",
                 )
+                stats_display = gr.Markdown(
+                    value="*No generation yet.*",
+                    label="Streaming Stats",
+                )
+                timer = gr.Timer(value=0.5, active=False)
                 gr.Markdown(
                     "### Task Types\n"
                     "- **CustomVoice**: Use a predefined speaker "
@@ -228,6 +329,22 @@ def build_interface(api_base: str):
             ],
         )
 
+        # Stats polling: timer updates the display every 0.5s
+        def poll_stats():
+            text = _format_stats(stats)
+            # Stop timer once generation is done
+            if stats.get("done", False):
+                return text, gr.Timer(active=False)
+            return text, gr.Timer(active=True)
+
+        timer.tick(fn=poll_stats, outputs=[stats_display, timer])
+
+        # Start timer when generate is clicked
+        generate_btn.click(
+            fn=lambda: (gr.Timer(active=True), "*Starting...*"),
+            outputs=[timer, stats_display],
+        )
+
         # Wire up WebRTC streaming
         all_inputs = [
             text_input,
@@ -238,6 +355,7 @@ def build_interface(api_base: str):
             ref_audio_url,
             ref_text,
             x_vector_only,
+            transport,
         ]
 
         webrtc_output.stream(

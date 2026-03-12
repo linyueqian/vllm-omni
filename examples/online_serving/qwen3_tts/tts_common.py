@@ -2,6 +2,7 @@
 
 import base64
 import io
+import json
 
 import gradio as gr
 import httpx
@@ -39,7 +40,9 @@ def fetch_voices(api_base: str) -> list[str]:
             )
         if resp.status_code == 200:
             data = resp.json()
-            return data.get("voices", ["Vivian", "Ryan"])
+            voices = data.get("voices") or []
+            if voices:
+                return voices
     except Exception:
         pass
     return ["Vivian", "Ryan"]
@@ -190,6 +193,94 @@ def stream_pcm_chunks(api_base: str, payload: dict):
                 if usable == 0:
                     continue
                 yield np.frombuffer(raw[:usable], dtype=np.int16).copy()
+
+
+def build_ws_config(
+    task_type: str,
+    voice: str,
+    language: str,
+    instructions: str,
+    ref_audio: tuple | None,
+    ref_audio_url: str,
+    ref_text: str,
+    x_vector_only: bool,
+) -> dict:
+    """Build the WebSocket session config dict."""
+    config: dict = {
+        "response_format": "pcm",
+        "stream_audio": True,
+    }
+    if task_type:
+        config["task_type"] = task_type
+    if language:
+        config["language"] = language
+
+    if task_type == "CustomVoice":
+        if voice:
+            config["voice"] = voice
+        if instructions and instructions.strip():
+            config["instructions"] = instructions.strip()
+    elif task_type == "VoiceDesign":
+        if not instructions or not instructions.strip():
+            raise gr.Error("VoiceDesign task requires voice style instructions.")
+        config["instructions"] = instructions.strip()
+    elif task_type == "Base":
+        ref_audio_url_stripped = ref_audio_url.strip() if ref_audio_url else ""
+        if ref_audio_url_stripped:
+            config["ref_audio"] = ref_audio_url_stripped
+        elif ref_audio is not None:
+            config["ref_audio"] = encode_audio_to_base64(ref_audio)
+        else:
+            raise gr.Error("Base (voice clone) task requires reference audio.")
+        if ref_text and ref_text.strip():
+            config["ref_text"] = ref_text.strip()
+        if x_vector_only:
+            config["x_vector_only_mode"] = True
+
+    return config
+
+
+def stream_pcm_chunks_ws(ws_url: str, text: str, config: dict):
+    """Stream raw PCM bytes over WebSocket, yielding int16 numpy arrays.
+
+    Uses the /v1/audio/speech/stream endpoint with stream_audio=True.
+    """
+    from websockets.sync.client import connect
+
+    if not text or not text.strip():
+        raise gr.Error("Please enter text to synthesize.")
+
+    with connect(
+        ws_url,
+        additional_headers={"Authorization": "Bearer EMPTY"},
+        close_timeout=10,
+        max_size=2**24,
+    ) as ws:
+        # Send session config
+        ws.send(json.dumps({"type": "session.config", **config}))
+
+        # Send full text
+        ws.send(json.dumps({"type": "input.text", "text": text.strip()}))
+        ws.send(json.dumps({"type": "input.done"}))
+
+        # Receive audio chunks
+        while True:
+            message = ws.recv()
+
+            if isinstance(message, bytes):
+                if len(message) == 0:
+                    continue
+                # Ensure even byte count for int16
+                usable = len(message) - (len(message) % 2)
+                if usable > 0:
+                    yield np.frombuffer(message[:usable], dtype=np.int16).copy()
+            else:
+                msg = json.loads(message)
+                msg_type = msg.get("type")
+                if msg_type == "session.done":
+                    break
+                elif msg_type == "error":
+                    raise gr.Error(f"WebSocket error: {msg.get('message', 'unknown')}")
 
 
 def add_common_args(parser):
