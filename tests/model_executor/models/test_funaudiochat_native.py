@@ -240,6 +240,30 @@ def test_postprocess_sampled_tokens_updates_buffer_from_final_sampled_token():
     assert fac_mod._FINISH_SPEECH_KEY not in model_intermediate_buffer["req0"]
 
 
+def test_postprocess_sampled_tokens_preserves_regular_sampler_token():
+    model = _make_model_stub()
+    sampled_token_ids = torch.tensor([7], dtype=torch.long)
+    model_intermediate_buffer = {
+        "req0": {
+            fac_mod._GENERATE_SPEECH_KEY: False,
+            fac_mod._FORCE_AUDIO_BOS_KEY: False,
+            fac_mod._FINISH_SPEECH_KEY: False,
+        }
+    }
+
+    updated = model.postprocess_sampled_tokens(
+        sampled_token_ids=sampled_token_ids,
+        req_ids=["req0"],
+        req_id_to_index={"req0": 0},
+        model_intermediate_buffer=model_intermediate_buffer,
+    )
+
+    assert updated.tolist() == [7]
+    assert model_intermediate_buffer["req0"][fac_mod._GENERATE_SPEECH_KEY] is False
+    assert model_intermediate_buffer["req0"][fac_mod._FORCE_AUDIO_BOS_KEY] is False
+    assert fac_mod._FINISH_SPEECH_KEY not in model_intermediate_buffer["req0"]
+
+
 def test_postprocess_sampled_tokens_force_text_abos_overrides_sampled_token():
     model = _make_model_stub()
     sampled_token_ids = torch.tensor([7], dtype=torch.long)
