@@ -160,7 +160,7 @@ class FishSpeechDACDecoder(nn.Module):
         ids = input_ids.reshape(-1).to(dtype=torch.long)
         request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
 
-        parsed: list[tuple[int, int]] = []
+        parsed_ctx_frames: list[int] = []
         valid_codes_qf: list[torch.Tensor] = []
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
@@ -173,7 +173,7 @@ class FishSpeechDACDecoder(nn.Module):
 
         for i, req_ids in enumerate(request_ids_list):
             if req_ids.numel() < 1:
-                parsed.append((0, 0))
+                parsed_ctx_frames.append(0)
                 continue
             ctx_frames = left_context_size[i]
             flat = req_ids
@@ -185,11 +185,11 @@ class FishSpeechDACDecoder(nn.Module):
                         n,
                         q,
                     )
-                parsed.append((0, 0))
+                parsed_ctx_frames.append(0)
                 continue
             frames = n // q
             codes_qf = flat.reshape(q, frames)
-            parsed.append((ctx_frames, frames))
+            parsed_ctx_frames.append(ctx_frames)
             valid_codes_qf.append(codes_qf)
             valid_indices.append(i)
 
@@ -219,23 +219,33 @@ class FishSpeechDACDecoder(nn.Module):
             except Exception:
                 pass
 
-        # Decode each request individually.
-        wav_tensors: list[torch.Tensor] = []
-        for codes_qf in valid_codes_qf:
-            codes_bqf = codes_qf.unsqueeze(0)  # [1, num_codebooks, num_frames]
-            num_frames = codes_qf.shape[1]
-            feature_lengths = torch.tensor([num_frames], device=codes_bqf.device)
-            with torch.cuda.amp.autocast(enabled=False):
-                wav, audio_lengths = self._codec.decode(codes_bqf, feature_lengths)
-            # wav shape: [1, 1, wav_len]
-            wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
+        feature_lengths = torch.tensor(
+            [codes_qf.shape[1] for codes_qf in valid_codes_qf],
+            device=valid_codes_qf[0].device,
+            dtype=torch.long,
+        )
+        max_frames = int(feature_lengths.max().item())
+        batch_size = len(valid_codes_qf)
+
+        codes_bqf = torch.zeros(
+            (batch_size, q, max_frames),
+            device=valid_codes_qf[0].device,
+            dtype=torch.long,
+        )
+        for i, codes_qf in enumerate(valid_codes_qf):
+            frame_count = int(feature_lengths[i].item())
+            codes_bqf[i, :, :frame_count] = codes_qf
+
+        with torch.cuda.amp.autocast(enabled=False):
+            wav_batch, audio_lengths = self._codec.decode(codes_bqf, feature_lengths)
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
 
         for j, idx in enumerate(valid_indices):
-            ctx_frames, actual_frames = parsed[idx]
-            wav = wav_tensors[j]
+            ctx_frames = parsed_ctx_frames[idx]
+            audio_len = int(audio_lengths[j].item()) if audio_lengths.numel() > j else int(wav_batch.shape[-1])
+            wav = wav_batch[j, 0, :audio_len]
             # Trim context frames (left overlap for streaming).
             if ctx_frames > 0:
                 cut = ctx_frames * self._hop_length

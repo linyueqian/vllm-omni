@@ -190,6 +190,7 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         self.has_postprocess = True
         self.mtp_hidden_size = int(self.text_config.hidden_size)
         self.talker_mtp_output_key = "audio_codes"
+        self.gpu_resident_buffer_keys: set[str] = {"last_slow_ar_hidden"}
 
         # Qwen3 transformer backbone.
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
@@ -415,8 +416,8 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         # --- Decode: span_len == 1 ---
         dev = input_ids.device
 
-        last_hidden_cpu = info_dict.get("last_slow_ar_hidden")
-        if not isinstance(last_hidden_cpu, torch.Tensor):
+        last_hidden = info_dict.get("last_slow_ar_hidden")
+        if not isinstance(last_hidden, torch.Tensor):
             # First decode step after prefill -- just embed the token directly.
             logger.warning(
                 "preprocess decode: last_slow_ar_hidden not found (keys=%s), "
@@ -437,7 +438,7 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
 
         info_update = {
             "mtp_inputs": (
-                last_hidden_cpu.to(device=dev, dtype=torch.bfloat16).reshape(1, -1),
+                last_hidden.to(device=dev, dtype=torch.bfloat16).reshape(1, -1),
                 torch.zeros(1, self.text_config.hidden_size, device=dev, dtype=torch.bfloat16),
             ),
         }
@@ -447,7 +448,7 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         if hidden_states.numel() == 0:
             logger.debug("postprocess: empty hidden_states")
             return {}
-        last = hidden_states[-1, :].detach().to("cpu").contiguous()
+        last = hidden_states[-1, :].detach().contiguous()
         logger.debug("postprocess: saved last_slow_ar_hidden shape=%s", tuple(last.shape))
         return {"last_slow_ar_hidden": last}
 
@@ -665,5 +666,14 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
                 truncated += 1
         if truncated:
             logger.info("Truncated %d RoPE cos_sin_cache buffers to bf16 precision", truncated)
+
+        try:
+            self.fast_ar.warmup_compile(
+                device=self.codebook_embeddings.weight.device,
+                dtype=torch.bfloat16,
+                batch_sizes=(1,),
+            )
+        except Exception as exc:
+            logger.warning("Fish Speech Fast AR compile warmup failed: %s", exc)
 
         return loaded_params

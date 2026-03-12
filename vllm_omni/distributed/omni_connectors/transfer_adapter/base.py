@@ -33,6 +33,8 @@ class OmniTransferAdapterBase:
         self._finished_save_reqs = set()
 
         self.stop_event = threading.Event()
+        self._load_cv = threading.Condition()
+        self._save_cv = threading.Condition()
 
         self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
         self.recv_thread.start()
@@ -47,31 +49,67 @@ class OmniTransferAdapterBase:
     def recv_loop(self):
         """Loop to poll for incoming data."""
         while not self.stop_event.is_set():
-            # Iterate over a snapshot of pending requests
-            while self._pending_load_reqs:
-                request = self._pending_load_reqs.popleft()
+            with self._load_cv:
+                while not self._pending_load_reqs and not self.stop_event.is_set():
+                    self._load_cv.wait(timeout=0.1)
+                if self.stop_event.is_set():
+                    return
+                pending = [self._pending_load_reqs.popleft() for _ in range(len(self._pending_load_reqs))]
+
+            requeue = []
+            made_progress = False
+            for request in pending:
                 request_id = request.request_id
                 self.request_ids_mapping[request_id] = request.external_req_id
                 try:
                     is_success = self._poll_single_request(request)
                     if not is_success:
-                        self._pending_load_reqs.append(request)
+                        requeue.append(request)
+                    else:
+                        made_progress = True
                 except Exception as e:
-                    self._pending_load_reqs.append(request)
+                    requeue.append(request)
                     logger.warning(f"Error receiving data for {request_id}: {e}")
 
-            time.sleep(0.001)
+            if requeue:
+                with self._load_cv:
+                    self._pending_load_reqs.extend(requeue)
+            if requeue and not made_progress:
+                self.stop_event.wait(timeout=0.001)
 
     def save_loop(self):
         """Loop to send outgoing data."""
         while not self.stop_event.is_set():
-            while self._pending_save_reqs:
-                task = self._pending_save_reqs.popleft()
+            with self._save_cv:
+                while not self._pending_save_reqs and not self.stop_event.is_set():
+                    self._save_cv.wait(timeout=0.1)
+                if self.stop_event.is_set():
+                    return
+                pending = [self._pending_save_reqs.popleft() for _ in range(len(self._pending_save_reqs))]
+
+            for task in pending:
                 try:
                     self._send_single_request(task)
                 except Exception as e:
                     logger.warning(f"Error saving data for {task.get('request_id')}: {e}")
-            time.sleep(0.001)
+
+    def _enqueue_load_request(self, request: Any) -> None:
+        self._ensure_queue_sync()
+        with self._load_cv:
+            self._pending_load_reqs.append(request)
+            self._load_cv.notify()
+
+    def _enqueue_save_task(self, task: Any) -> None:
+        self._ensure_queue_sync()
+        with self._save_cv:
+            self._pending_save_reqs.append(task)
+            self._save_cv.notify()
+
+    def _ensure_queue_sync(self) -> None:
+        if not hasattr(self, "_load_cv"):
+            self._load_cv = threading.Condition()
+        if not hasattr(self, "_save_cv"):
+            self._save_cv = threading.Condition()
 
     def _poll_single_request(self, *args, **kwargs):
         """Poll connector for a single request task.

@@ -52,7 +52,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.get_req_chunk: dict[str, int] = defaultdict(int)
         self.finished_requests: set[str] = set()
         self.request_payload = {}
-        self.code_prompt_token_ids: dict[str, list[list[int]]] = defaultdict(list)
+        self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
@@ -94,7 +94,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
         if not hasattr(request, "additional_information"):
             request.additional_information = None
-        self._pending_load_reqs.append(request)
+        self._enqueue_load_request(request)
 
     def save_async(
         self,
@@ -115,7 +115,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "request": request,
             "is_finished": request.is_finished(),
         }
-        self._pending_save_reqs.append(task)
+        self._enqueue_save_task(task)
 
     def _poll_single_request(self, request: Request):
         stage_id = self.connector.stage_id
