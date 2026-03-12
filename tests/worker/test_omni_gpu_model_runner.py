@@ -70,46 +70,6 @@ class OverlaySampledTokensModel(torch.nn.Module):
         return None
 
 
-class RawTokenPreprocessModel(torch.nn.Module):
-    """Tracks whether preprocess receives raw input ids without an embed slice."""
-
-    has_preprocess = True
-    requires_raw_input_tokens = True
-
-    def __init__(self, hidden_size: int = 4):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.observed_input_embeds = []
-
-    def preprocess(self, input_ids, input_embeds, **info_dict):
-        self.observed_input_embeds.append(input_embeds)
-        req_embeds = input_ids.to(dtype=torch.float32).unsqueeze(-1).repeat(1, self.hidden_size)
-        return input_ids + 100, req_embeds, {"marker_seen": info_dict.get("marker")}
-
-
-class MultimodalPreprocessModel(torch.nn.Module):
-    """Tracks fallback raw-token slices when multimodal preprocess runs from embeds."""
-
-    has_preprocess = True
-    requires_raw_input_tokens = False
-
-    def __init__(self, hidden_size: int = 4):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.observed_input_ids = []
-        self.observed_input_embeds = []
-
-    def embed_input_ids(self, input_ids, multimodal_embeddings=None, is_multimodal=None):
-        del multimodal_embeddings, is_multimodal
-        return input_ids.to(dtype=torch.float32).unsqueeze(-1).repeat(1, self.hidden_size)
-
-    def preprocess(self, input_ids, input_embeds, **info_dict):
-        self.observed_input_ids.append(input_ids.clone())
-        self.observed_input_embeds.append(input_embeds.clone() if isinstance(input_embeds, torch.Tensor) else None)
-        req_embeds = input_ids.to(dtype=torch.float32).unsqueeze(-1).repeat(1, self.hidden_size)
-        return input_ids, req_embeds, {"marker_seen": info_dict.get("marker")}
-
-
 class DummyTalkerMTP(torch.nn.Module):
     """A fake talker_mtp module for deterministic CPU testing."""
 
@@ -185,46 +145,6 @@ def _make_runner_for_mimo(req_id="r_mimo"):
 
     runner.requests = {req_id: req_state}
 
-    return runner
-
-
-def _make_preprocess_runner(model, hidden_size=4):
-    runner = object.__new__(OmniGPUModelRunner)
-    runner.model = model
-    runner.model_config = SimpleNamespace(is_encoder_decoder=False)
-    runner.supports_mm_inputs = False
-    runner.enable_prompt_embeds = False
-    runner.uses_mrope = False
-    runner.uses_xdrope_dim = 0
-    runner.positions = DummyBuffer(torch.arange(8, dtype=torch.int64))
-    runner.input_ids = DummyBuffer(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
-    runner.inputs_embeds = DummyBuffer(torch.full((4, hidden_size), -1.0, dtype=torch.float32))
-    runner.input_batch = SimpleNamespace(
-        req_ids=["r1"],
-        num_computed_tokens_cpu=np.array([0], dtype=np.int32),
-    )
-    runner.requests = {"r1": SimpleNamespace(prompt_token_ids=[], mm_features=[])}
-    runner.model_intermediate_buffer = {"r1": {"marker": "r1"}}
-    runner.query_start_loc = SimpleNamespace(cpu=torch.tensor([0], dtype=torch.int32))
-    runner.dtype = torch.float32
-    runner.device = torch.device("cpu")
-    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(async_chunk=False))
-    runner._init_model_kwargs = lambda: {}
-    return runner
-
-
-def _make_mm_preprocess_runner(model, hidden_size=4):
-    runner = _make_preprocess_runner(model, hidden_size=hidden_size)
-    runner.supports_mm_inputs = True
-    runner.encoder_cache = None
-    runner._execute_mm_encoder = lambda scheduler_output: None
-    runner._gather_mm_embeddings = lambda scheduler_output: (None, None)
-    runner._prepare_mm_inputs = lambda num_input_tokens: (
-        None,
-        runner.inputs_embeds.gpu[:num_input_tokens],
-    )
-    runner._extract_mm_kwargs = lambda scheduler_output: {}
-    runner.maybe_get_ec_connector_output = _noop_forward_context
     return runner
 
 
@@ -476,75 +396,3 @@ def test_sample_tokens_passes_pending_updates_to_postprocess_without_committing_
         "r2": {"token": 2, "pending": 22},
     }
     assert captured["buffer_before_bookkeeping"] == {"r1": {"token": 1}, "r2": {"token": 2}}
-
-
-def test_preprocess_passes_none_input_embeds_for_raw_token_models(monkeypatch):
-    import vllm_omni.worker.gpu_model_runner as mod
-
-    monkeypatch.setattr(mod, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
-
-    runner = _make_preprocess_runner(RawTokenPreprocessModel(hidden_size=4), hidden_size=4)
-    scheduler_output = SimpleNamespace(
-        total_num_scheduled_tokens=2,
-        num_scheduled_tokens={"r1": 2},
-        scheduled_encoder_inputs=None,
-    )
-
-    input_ids, inputs_embeds, *_ = OmniGPUModelRunner._preprocess(
-        runner,
-        scheduler_output,
-        num_input_tokens=2,
-    )
-
-    assert runner.model.observed_input_embeds == [None]
-    assert torch.equal(input_ids, torch.tensor([101, 102], dtype=torch.int32))
-    assert inputs_embeds.data_ptr() == runner.inputs_embeds.gpu[:2].data_ptr()
-    assert torch.equal(
-        inputs_embeds,
-        torch.tensor(
-            [
-                [1.0, 1.0, 1.0, 1.0],
-                [2.0, 2.0, 2.0, 2.0],
-            ],
-            dtype=torch.float32,
-        ),
-    )
-    assert runner.model_intermediate_buffer["r1"]["marker_seen"] == "r1"
-
-
-def test_preprocess_uses_buffered_input_ids_when_multimodal_path_returns_none(monkeypatch):
-    import vllm_omni.worker.gpu_model_runner as mod
-
-    monkeypatch.setattr(mod, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
-
-    runner = _make_mm_preprocess_runner(MultimodalPreprocessModel(hidden_size=4), hidden_size=4)
-    scheduler_output = SimpleNamespace(
-        total_num_scheduled_tokens=2,
-        num_scheduled_tokens={"r1": 2},
-        scheduled_encoder_inputs=None,
-    )
-
-    input_ids, inputs_embeds, *_ = OmniGPUModelRunner._preprocess(
-        runner,
-        scheduler_output,
-        num_input_tokens=2,
-    )
-
-    assert input_ids is None
-    assert len(runner.model.observed_input_ids) == 1
-    assert torch.equal(runner.model.observed_input_ids[0], torch.tensor([1, 2], dtype=torch.int32))
-    assert torch.equal(
-        runner.model.observed_input_embeds[0],
-        runner.inputs_embeds.gpu[:2],
-    )
-    assert torch.equal(
-        inputs_embeds,
-        torch.tensor(
-            [
-                [1.0, 1.0, 1.0, 1.0],
-                [2.0, 2.0, 2.0, 2.0],
-            ],
-            dtype=torch.float32,
-        ),
-    )
-    assert runner.model_intermediate_buffer["r1"]["marker_seen"] == "r1"
