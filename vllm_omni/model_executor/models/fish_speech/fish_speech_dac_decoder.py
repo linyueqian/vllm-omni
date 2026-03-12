@@ -21,28 +21,15 @@ from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.fish_speech.dac_utils import (
+    DAC_HOP_LENGTH,
+    DAC_NUM_CODEBOOKS,
+    DAC_SAMPLE_RATE,
+    build_dac_codec,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
-
-# Default DAC codec config matching s2-pro's modded_dac_vq.yaml.
-_DEFAULT_DAC_CONFIG = {
-    "sample_rate": 44100,
-    "encoder_dim": 64,
-    "encoder_rates": [2, 4, 8, 8],
-    "decoder_dim": 1536,
-    "decoder_rates": [8, 8, 4, 2],
-    "encoder_transformer_layers": [0, 0, 0, 4],
-    "decoder_transformer_layers": [4, 0, 0, 0],
-}
-
-# Total hop length = product of encoder_rates * product of downsample_factor.
-# encoder_rates: 2*4*8*8 = 512, downsample: 2*2 = 4 => total = 2048
-# The DAC model confirms this: frame_length = hop_length * 4 = 512 * 4 = 2048.
-# audio_lengths = feature_lengths * frame_length in DAC.decode().
-_DAC_HOP_LENGTH = 2048  # 512 (decoder upsample) * 4 (quantizer upsample)
-_DAC_SAMPLE_RATE = 44100
-_DAC_NUM_CODEBOOKS = 10  # 1 semantic + 9 residual
 
 
 class FishSpeechDACDecoder(nn.Module):
@@ -66,9 +53,9 @@ class FishSpeechDACDecoder(nn.Module):
         self.requires_raw_input_tokens = True
 
         self._codec: nn.Module | None = None
-        self._num_codebooks: int = _DAC_NUM_CODEBOOKS
-        self._output_sample_rate: int = _DAC_SAMPLE_RATE
-        self._hop_length: int = _DAC_HOP_LENGTH
+        self._num_codebooks: int = DAC_NUM_CODEBOOKS
+        self._output_sample_rate: int = DAC_SAMPLE_RATE
+        self._hop_length: int = DAC_HOP_LENGTH
         self._logged_codec_stats = False
 
     def _ensure_codec_loaded(self) -> None:
@@ -92,90 +79,7 @@ class FishSpeechDACDecoder(nn.Module):
                 f"codec.pth not found at {codec_path}. Make sure the Fish Speech S2 Pro model includes codec.pth."
             )
 
-        try:
-            from fish_speech.models.dac.modded_dac import (
-                DAC,
-                ModelArgs,
-                WindowLimitedTransformer,
-            )
-            from fish_speech.models.dac.rvq import DownsampleResidualVectorQuantize
-        except ImportError:
-            raise ImportError(
-                "The 'fish-speech' package is required for the DAC codec decoder. "
-                "Install it with: pip install fish-speech"
-            )
-
-        # Build DAC model from known config (matching s2-pro's codec.pth).
-        # The transformer_general_config is a factory called by EncoderBlock /
-        # DecoderBlock with overrides (n_layer, n_head, dim, intermediate_size).
-        # We provide a base config with block_size large enough for the encoder
-        # (16384) -- each block overrides dim/n_head/etc. at construction time.
-        base_transformer_kwargs = dict(
-            block_size=16384,
-            n_local_heads=-1,
-            head_dim=64,
-            rope_base=10000,
-            norm_eps=1e-5,
-            dropout_rate=0.0,
-            attn_dropout_rate=0.0,
-            channels_first=True,
-        )
-
-        def _make_transformer_config(**kw):
-            merged = {**base_transformer_kwargs, **kw}
-            return ModelArgs(**merged)
-
-        # Quantizer pre/post modules use block_size=4096.
-        quantizer_transformer_config = ModelArgs(
-            block_size=4096,
-            n_layer=8,
-            n_head=16,
-            dim=1024,
-            intermediate_size=3072,
-            n_local_heads=-1,
-            head_dim=64,
-            rope_base=10000,
-            norm_eps=1e-5,
-            dropout_rate=0.0,
-            attn_dropout_rate=0.0,
-            channels_first=True,
-        )
-        post_module = WindowLimitedTransformer(
-            causal=True,
-            window_size=128,
-            input_dim=1024,
-            config=quantizer_transformer_config,
-        )
-        pre_module = WindowLimitedTransformer(
-            causal=True,
-            window_size=128,
-            input_dim=1024,
-            config=quantizer_transformer_config,
-        )
-        quantizer = DownsampleResidualVectorQuantize(
-            input_dim=1024,
-            n_codebooks=9,
-            codebook_size=1024,
-            codebook_dim=8,
-            quantizer_dropout=0.0,
-            downsample_factor=[2, 2],
-            post_module=post_module,
-            pre_module=pre_module,
-            semantic_codebook_size=4096,
-        )
-
-        codec = DAC(
-            encoder_dim=64,
-            encoder_rates=[2, 4, 8, 8],
-            decoder_dim=1536,
-            decoder_rates=[8, 8, 4, 2],
-            quantizer=quantizer,
-            sample_rate=44100,
-            causal=True,
-            encoder_transformer_layers=[0, 0, 0, 4],
-            decoder_transformer_layers=[4, 0, 0, 0],
-            transformer_general_config=_make_transformer_config,
-        )
+        codec = build_dac_codec()
 
         # Load weights.
         state_dict = torch.load(codec_path, map_location="cpu", weights_only=True)
