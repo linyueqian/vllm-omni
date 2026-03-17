@@ -146,7 +146,12 @@ def auto_configure(
         device_stages.setdefault(s["device"], []).append(i)
 
     for device, indices in device_stages.items():
-        gpu_id = int(device)
+        # Handle multi-device strings like "0,1,2,3" (tensor-parallel).
+        # Use the first device for memory query; skip auto-sizing if invalid.
+        try:
+            gpu_id = int(device.split(",")[0])
+        except ValueError:
+            continue
         if gpu_id >= len(gpus):
             continue
         gpu = gpus[gpu_id]
@@ -200,17 +205,19 @@ def interactive_configure(config: dict, stages: list[dict], gpus: list[dict]) ->
     for s in stages:
         print(f"  Stage {s['stage_id']} ({s['model_stage']}, {s['worker_type']}):")
 
-        # Device
+        # Device (accepts single id or comma-separated like "0,1,2")
         default_dev = s["device"]
         while True:
             dev = input(f"    GPU device [{default_dev}]: ").strip() or default_dev
-            if dev in gpu_ids:
+            dev_ids = [d.strip() for d in dev.split(",")]
+            if all(d in gpu_ids for d in dev_ids):
                 s["device"] = dev
                 break
-            print(f"    Invalid. Choose from: {', '.join(gpu_ids)}")
+            print(f"    Invalid. Choose from: {', '.join(gpu_ids)} (comma-separated for multi-GPU)")
 
-        # GPU memory
-        gpu = gpus[int(s["device"])]
+        # GPU memory (use first device for memory query)
+        first_dev = int(s["device"].split(",")[0])
+        gpu = gpus[first_dev]
         same_device = sum(1 for st in stages if st["device"] == s["device"])
         suggested = round((gpu["free_gib"] - 1.5) / same_device / gpu["total_gib"], 3)
         suggested = max(suggested, 0.04)
