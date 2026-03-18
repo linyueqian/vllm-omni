@@ -23,7 +23,6 @@ import argparse
 import io
 import json
 import logging
-import os
 
 import gradio as gr
 import httpx
@@ -86,37 +85,37 @@ registerProcessor('tts-playback-processor', TTSPlaybackProcessor);
 
 # ── Player HTML (container with metric cards) ────────────────────────
 PLAYER_HTML = """
-<div id="tts-player" style="padding:20px; border:1px solid #e0e0e0; border-radius:12px; background:linear-gradient(135deg,#f5f8ff,#edf2ff); min-height:80px;">
-  <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px;">
+<div id="tts-player">
+  <div style="display:flex; align-items:center; gap:10px;">
     <div id="tts-status-dot" style="width:10px;height:10px;border-radius:50%;background:#ccc;flex-shrink:0;"></div>
     <span id="tts-status" style="font-weight:600;font-size:1.05em;">Ready</span>
     <button id="tts-stop-btn" onclick="window.ttsStop()"
       style="display:none; margin-left:auto; padding:5px 16px; border-radius:6px; border:1px solid #EF5552;
              background:#fff; color:#EF5552; cursor:pointer; font-size:0.85em; transition:all 0.15s;">Stop</button>
   </div>
-  <div id="tts-metrics" style="display:none; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:12px;">
-    <div style="background:#fff;border-radius:8px;padding:10px 12px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+  <div id="tts-metrics" style="display:none; grid-template-columns:repeat(4,1fr); gap:10px; margin-top:12px;">
+    <div style="background:#f8f9fa;border-radius:6px;padding:8px 10px;text-align:center;">
       <div style="font-size:0.7em;text-transform:uppercase;color:#888;letter-spacing:0.5px;margin-bottom:2px;">TTFP</div>
-      <div id="tts-m-ttfp" style="font-size:1.3em;font-weight:700;color:#333;">—</div>
+      <div id="tts-m-ttfp" style="font-size:1.2em;font-weight:700;color:#333;">—</div>
     </div>
-    <div style="background:#fff;border-radius:8px;padding:10px 12px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+    <div style="background:#f8f9fa;border-radius:6px;padding:8px 10px;text-align:center;">
       <div style="font-size:0.7em;text-transform:uppercase;color:#888;letter-spacing:0.5px;margin-bottom:2px;">RTF</div>
-      <div id="tts-m-rtf" style="font-size:1.3em;font-weight:700;color:#333;">—</div>
+      <div id="tts-m-rtf" style="font-size:1.2em;font-weight:700;color:#333;">—</div>
     </div>
-    <div style="background:#fff;border-radius:8px;padding:10px 12px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+    <div style="background:#f8f9fa;border-radius:6px;padding:8px 10px;text-align:center;">
       <div style="font-size:0.7em;text-transform:uppercase;color:#888;letter-spacing:0.5px;margin-bottom:2px;">Audio</div>
-      <div id="tts-m-dur" style="font-size:1.3em;font-weight:700;color:#333;">—</div>
+      <div id="tts-m-dur" style="font-size:1.2em;font-weight:700;color:#333;">—</div>
     </div>
-    <div style="background:#fff;border-radius:8px;padding:10px 12px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+    <div style="background:#f8f9fa;border-radius:6px;padding:8px 10px;text-align:center;">
       <div style="font-size:0.7em;text-transform:uppercase;color:#888;letter-spacing:0.5px;margin-bottom:2px;">Speed</div>
-      <div id="tts-m-speed" style="font-size:1.3em;font-weight:700;color:#333;">—</div>
+      <div id="tts-m-speed" style="font-size:1.2em;font-weight:700;color:#333;">—</div>
     </div>
   </div>
-  <div id="tts-rtf-bar-wrap" style="display:none; background:#e8ecf1; border-radius:6px; height:22px; overflow:hidden; position:relative;">
-    <div id="tts-rtf-bar" style="height:100%; border-radius:6px; transition:width 0.3s ease, background 0.3s ease; width:0%;"></div>
+  <div id="tts-rtf-bar-wrap" style="display:none; background:#e8ecf1; border-radius:4px; height:20px; overflow:hidden; position:relative; margin-top:10px;">
+    <div id="tts-rtf-bar" style="height:100%; border-radius:4px; transition:width 0.3s ease, background 0.3s ease; width:0%;"></div>
     <span id="tts-rtf-label" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:0.75em;font-weight:600;color:#444;"></span>
   </div>
-  <div id="tts-elapsed" style="display:none; margin-top:8px; font-size:0.8em; color:#999; text-align:right;"></div>
+  <div id="tts-elapsed" style="display:none; margin-top:6px; font-size:0.8em; color:#999; text-align:right;"></div>
 </div>
 """
 
@@ -386,11 +385,6 @@ def create_app(api_base: str):
 
     css = """
     #generate-btn button { width: 100%; }
-    .task-info { padding: 8px 12px; border-radius: 6px; background: #f0f4ff; margin-bottom: 8px; }
-    button.primary { background: #4A90D9 !important; border-color: #4A90D9 !important; }
-    button.primary:hover { background: #3a7bc8 !important; border-color: #3a7bc8 !important; }
-    .gradio-container .gr-button-primary { background: #4A90D9 !important; border-color: #4A90D9 !important; }
-    .gradio-container .gr-button-primary:hover { background: #3a7bc8 !important; border-color: #3a7bc8 !important; }
     """
 
     theme = gr.themes.Default(
@@ -415,8 +409,20 @@ def create_app(api_base: str):
         js=_build_player_js(PCM_SAMPLE_RATE),
         theme=theme,
     ) as demo:
-        gr.Markdown("# Qwen3-TTS Online Serving Demo")
-        gr.Markdown(f"**Server:** `{api_base}`")
+        gr.HTML(f"""
+        <div style="display:flex; align-items:center; gap:16px; margin-bottom:8px;">
+          <img src="https://raw.githubusercontent.com/vllm-project/vllm-omni/main/docs/source/logos/vllm-omni-logo.png"
+               alt="vLLM-Omni" style="height:42px;">
+          <div>
+            <h1 style="margin:0; font-size:1.5em;">Qwen3-TTS Streaming Demo</h1>
+            <span style="font-size:0.85em; color:#666;">
+              Served by <a href="https://github.com/vllm-project/vllm-omni" target="_blank"
+              style="color:#4A90D9; text-decoration:none; font-weight:600;">vLLM-Omni</a>
+              &nbsp;&middot;&nbsp; <code style="background:#eef2f7; padding:2px 6px; border-radius:4px; font-size:0.9em;">{api_base}</code>
+            </span>
+          </div>
+        </div>
+        """)
 
         with gr.Row():
             with gr.Column(scale=3):
@@ -441,7 +447,7 @@ def create_app(api_base: str):
                 voice = gr.Dropdown(
                     choices=voices,
                     value=voices[0] if voices else None,
-                    label="Speaker",
+                    label="speaker",
                     visible=True,
                     allow_custom_value=True,
                 )
@@ -501,12 +507,20 @@ def create_app(api_base: str):
                         scale=1,
                     )
 
-                generate_btn = gr.Button(
-                    "Generate Speech",
-                    variant="primary",
-                    size="lg",
-                    elem_id="generate-btn",
-                )
+                with gr.Row():
+                    generate_btn = gr.Button(
+                        "Generate Speech",
+                        variant="primary",
+                        size="lg",
+                        elem_id="generate-btn",
+                        scale=3,
+                    )
+                    reset_btn = gr.Button(
+                        "Reset",
+                        variant="secondary",
+                        size="lg",
+                        scale=1,
+                    )
 
             with gr.Column(scale=2):
                 player_html = gr.HTML(value=PLAYER_HTML, visible=True)
@@ -516,39 +530,103 @@ def create_app(api_base: str):
                     autoplay=True,
                     visible=False,
                 )
-                gr.Markdown(
-                    "### Task Types\n"
-                    "- **CustomVoice**: Predefined speaker with optional style\n"
-                    "- **VoiceDesign**: Describe voice in natural language\n"
-                    "- **Base**: Clone from reference audio (upload or URL)"
-                )
-                logo_path = os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    "..",
-                    "..",
-                    "..",
-                    "docs",
-                    "source",
-                    "logos",
-                    "vllm-omni-logo.png",
-                )
-                if os.path.exists(logo_path):
-                    gr.Image(
-                        value=logo_path,
-                        show_label=False,
-                        show_download_button=False,
-                        container=False,
-                        height=50,
+                with gr.Group(visible=True) as examples_cv:
+                    gr.Examples(
+                        examples=[
+                            [
+                                "Have you ever wondered what it would be like to travel through time and visit ancient civilizations? The possibilities are endless, from witnessing the construction of the pyramids to experiencing the Renaissance firsthand.",
+                                "Ryan",
+                                "English",
+                                "",
+                            ],
+                            [
+                                "其实我真的有发现，我是一个特别善于观察别人情绪的人。比如说在一个聚会上，我总能第一时间察觉到谁不太开心，然后想办法让大家都能融入到欢乐的氛围中来。",
+                                "Vivian",
+                                "Chinese",
+                                "用特别愤怒的语气说",
+                            ],
+                            [
+                                "It was a dark and stormy night when the old lighthouse keeper heard a knock at the door. He set down his cup of tea, adjusted his glasses, and walked slowly toward the entrance.",
+                                "Aiden",
+                                "English",
+                                "Speak in a mysterious, suspenseful tone",
+                            ],
+                        ],
+                        inputs=[text_input, voice, language, instructions],
+                        label="Examples — click to try",
                     )
+                with gr.Group(visible=False) as examples_vd:
+                    gr.Examples(
+                        examples=[
+                            [
+                                "It's in the top drawer... wait, it's empty? No way, that's impossible! I'm sure I put it there! Someone must have moved it while I was gone.",
+                                "English",
+                                "Speak in an incredulous tone, but with a hint of panic beginning to creep into your voice.",
+                            ],
+                            [
+                                "哥哥，你回来啦，人家等了你好久好久了，要抱抱！你去哪里了呀，都不跟人家说一声，人家好担心你哦。",
+                                "Chinese",
+                                "体现撒娇稚嫩的萝莉女声，音调偏高且起伏明显，营造出黏人、做作又刻意卖萌的听觉效果。",
+                            ],
+                        ],
+                        inputs=[text_input, language, instructions],
+                        label="Examples — click to try",
+                    )
+                with gr.Group(visible=False) as examples_base:
+                    gr.Examples(
+                        examples=[
+                            [
+                                "Good one. Okay, fine, I'm just gonna leave this sock monkey here. Goodbye. I hope you enjoy the rest of your evening and have a wonderful time.",
+                                "English",
+                                "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav",
+                                "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you.",
+                            ],
+                            [
+                                "其实我真的有发现，我是一个特别善于观察别人情绪的人。比如说在一个聚会上，我总能第一时间察觉到谁不太开心。",
+                                "Chinese",
+                                "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav",
+                                "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you.",
+                            ],
+                        ],
+                        inputs=[text_input, language, ref_audio_url, ref_text],
+                        label="Examples — click to try",
+                    )
+                gr.HTML("""
+                <div style="text-align:center; padding:8px 0; margin-top:4px;">
+                  <a href="https://github.com/vllm-project/vllm-omni" target="_blank">
+                    <img src="https://raw.githubusercontent.com/vllm-project/vllm-omni/main/docs/source/logos/vllm-omni-logo.png"
+                         alt="vLLM-Omni" style="height:28px; opacity:0.7;">
+                  </a>
+                </div>
+                """)
 
         # Hidden textbox to pass payload from Python → JavaScript
         hidden_payload = gr.Textbox(visible=False, elem_id="tts-payload")
 
         # ── Event wiring ─────────────────────────────────────────
+        def on_task_change(tt):
+            base = on_task_type_change(tt)
+            # base returns (voice, instructions, ref_audio, ref_audio_url, ref_text, x_vector_only)
+            return base + (
+                gr.update(visible=(tt == "CustomVoice")),
+                gr.update(visible=(tt == "VoiceDesign")),
+                gr.update(visible=(tt == "Base")),
+            )
+
         task_type.change(
-            fn=on_task_type_change,
+            fn=on_task_change,
             inputs=[task_type],
-            outputs=[voice, instructions, ref_audio, ref_audio_url, ref_text, x_vector_only],
+            outputs=[
+                voice,
+                instructions,
+                ref_audio,
+                ref_audio_url,
+                ref_text,
+                x_vector_only,
+                examples_cv,
+                examples_vd,
+                examples_base,
+            ],
         )
 
         def on_stream_change(stream: bool):
@@ -570,6 +648,20 @@ def create_app(api_base: str):
             fn=on_stream_change,
             inputs=[stream_checkbox],
             outputs=[response_format, speed, player_html, audio_output],
+        )
+
+        def on_reset():
+            return (
+                "",  # text
+                None,  # audio_output
+                "",  # hidden_payload
+                PLAYER_HTML,  # reset player
+            )
+
+        reset_btn.click(
+            fn=on_reset,
+            outputs=[text_input, audio_output, hidden_payload, player_html],
+            js="() => { if (window.ttsStop) window.ttsStop(); }",
         )
 
         all_inputs = [
