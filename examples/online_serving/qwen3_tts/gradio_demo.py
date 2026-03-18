@@ -23,6 +23,7 @@ import argparse
 import io
 import json
 import logging
+import os
 
 import gradio as gr
 import httpx
@@ -521,6 +522,24 @@ def create_app(api_base: str):
                     "- **VoiceDesign**: Describe voice in natural language\n"
                     "- **Base**: Clone from reference audio (upload or URL)"
                 )
+                logo_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "..",
+                    "..",
+                    "..",
+                    "docs",
+                    "source",
+                    "logos",
+                    "vllm-omni-logo.png",
+                )
+                if os.path.exists(logo_path):
+                    gr.Image(
+                        value=logo_path,
+                        show_label=False,
+                        show_download_button=False,
+                        container=False,
+                        height=50,
+                    )
 
         # Hidden textbox to pass payload from Python → JavaScript
         hidden_payload = gr.Textbox(visible=False, elem_id="tts-payload")
