@@ -37,7 +37,6 @@ from tts_common import (
     add_common_args,
     build_payload,
     fetch_voices,
-    on_task_type_change,
 )
 
 logger = logging.getLogger(__name__)
@@ -206,7 +205,13 @@ def _build_player_js(sample_rate: int) -> str:
         try {{ await init(); if (ctx.state === 'suspended') await ctx.resume(); }}
         catch (e) {{ const s = document.getElementById('tts-status'); if (s) s.textContent = 'Audio init error: ' + e.message; return; }}
 
+        // Abort previous request and clear worklet buffer
+        if (abort) abort.abort();
         node.port.postMessage({{ type: 'clear' }});
+        // Wait for worklet to process clear before sending new data
+        await new Promise(r => setTimeout(r, 50));
+        node.port.postMessage({{ type: 'clear' }});
+
         gen = true;
         st = {{ t0: performance.now(), chunks: 0, samples: 0, ttfp: null }};
         setStatus('Connecting...', '#4A90D9');
@@ -225,6 +230,7 @@ def _build_player_js(sample_rate: int) -> str:
         abort = new AbortController();
 
         try {{
+            console.log('fetch payload:', JSON.stringify({{input: payload.input?.slice(0,30), task: payload.task_type, has_ref: !!payload.ref_audio, stream: payload.stream}}));
             const r = await fetch('/proxy/v1/audio/speech', {{
                 method: 'POST',
                 headers: {{ 'Content-Type': 'application/json' }},
@@ -345,12 +351,38 @@ def create_app(api_base: str):
     """Create the FastAPI app with streaming proxy + Gradio UI."""
     fastapi_app = FastAPI()
 
+    # Server-side payload store (avoids sending large base64 through Gradio textbox)
+    _pending_payloads: dict[str, dict] = {}
+
     # ── Streaming proxy (same-origin, no CORS issues) ────────────
     @fastapi_app.post("/proxy/v1/audio/speech")
     async def proxy_speech(request: Request):
         body = await request.json()
-        client = httpx.AsyncClient(timeout=300)
+        # Check if this is a request ID referencing a stored payload
+        req_id = body.get("_req_id")
+        if req_id and req_id in _pending_payloads:
+            body = _pending_payloads.pop(req_id)
+        # Pre-download ref_audio URL so TTFP only measures synthesis time
+        ref = body.get("ref_audio", "")
+        if isinstance(ref, str) and ref.startswith("http"):
+            try:
+                async with httpx.AsyncClient(timeout=30) as dl:
+                    r = await dl.get(ref)
+                    r.raise_for_status()
+                    import base64
+
+                    b64 = base64.b64encode(r.content).decode()
+                    ct = r.headers.get("content-type", "audio/wav")
+                    body["ref_audio"] = f"data:{ct};base64,{b64}"
+                    logger.info("Pre-downloaded ref_audio: %d bytes", len(r.content))
+            except Exception:
+                logger.exception("Failed to pre-download ref_audio, passing URL as-is")
+        logger.info(
+            "Proxy request: %s",
+            {k: (f"<{len(str(v))} chars>" if k == "ref_audio" else v) for k, v in body.items()},
+        )
         try:
+            client = httpx.AsyncClient(timeout=300)
             resp = await client.send(
                 client.build_request(
                     "POST",
@@ -361,20 +393,27 @@ def create_app(api_base: str):
                 stream=True,
             )
         except Exception as exc:
+            logger.exception("Proxy connection error")
             await client.aclose()
             return Response(content=str(exc), status_code=502)
 
         if resp.status_code != 200:
             content = await resp.aread()
+            logger.error("Proxy upstream error %d: %s", resp.status_code, content[:200])
             await resp.aclose()
             await client.aclose()
             return Response(content=content, status_code=resp.status_code)
 
         async def relay():
+            total = 0
             try:
                 async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
                     yield chunk
+            except Exception:
+                logger.exception("Proxy relay error after %d bytes", total)
             finally:
+                logger.info("Proxy relay done: %d bytes", total)
                 await resp.aclose()
                 await client.aclose()
 
@@ -385,6 +424,7 @@ def create_app(api_base: str):
 
     css = """
     #generate-btn button { width: 100%; }
+    #streaming-player { border: 1px solid var(--border-color-primary) !important; border-radius: var(--block-radius) !important; padding: var(--block-padding) !important; }
     """
 
     theme = gr.themes.Default(
@@ -458,30 +498,27 @@ def create_app(api_base: str):
                     visible=True,
                     info="Optional style/emotion instructions",
                 )
-                ref_audio = gr.Audio(
-                    label="Reference Audio (upload for voice cloning)",
-                    type="numpy",
-                    sources=["upload", "microphone"],
-                    visible=False,
-                )
-                ref_audio_url = gr.Textbox(
-                    label="Reference Audio URL",
-                    placeholder="https://example.com/reference.wav",
-                    lines=1,
-                    visible=False,
-                )
-                ref_text = gr.Textbox(
-                    label="Reference Audio Transcript",
-                    placeholder="Transcript of reference audio (optional, improves quality)",
-                    lines=2,
-                    visible=False,
-                )
-                x_vector_only = gr.Checkbox(
-                    label="Use x-vector only",
-                    value=False,
-                    visible=False,
-                    info="Skip reference transcript, use speaker embedding only",
-                )
+                with gr.Column(visible=False) as ref_group:
+                    ref_audio = gr.Audio(
+                        label="Reference Audio (upload for voice cloning)",
+                        type="numpy",
+                        sources=["upload", "microphone"],
+                    )
+                    ref_audio_url = gr.Textbox(
+                        label="Reference Audio URL",
+                        placeholder="https://example.com/reference.wav",
+                        lines=1,
+                    )
+                    ref_text = gr.Textbox(
+                        label="Reference Audio Transcript",
+                        placeholder="Transcript of reference audio (optional, improves quality)",
+                        lines=2,
+                    )
+                    x_vector_only = gr.Checkbox(
+                        label="Use x-vector only",
+                        value=False,
+                        info="Skip reference transcript, use speaker embedding only",
+                    )
 
                 with gr.Row():
                     response_format = gr.Dropdown(
@@ -523,39 +560,44 @@ def create_app(api_base: str):
                     )
 
             with gr.Column(scale=2):
-                player_html = gr.HTML(value=PLAYER_HTML, visible=True)
+                player_html = gr.HTML(
+                    value=PLAYER_HTML,
+                    visible=True,
+                    label="streaming player",
+                    elem_id="streaming-player",
+                )
                 audio_output = gr.Audio(
-                    label="Generated Audio",
+                    label="generated audio",
                     interactive=False,
                     autoplay=True,
                     visible=False,
                 )
-                with gr.Group(visible=True) as examples_cv:
+                with gr.Column(visible=True) as examples_cv:
                     gr.Examples(
                         examples=[
                             [
                                 "Have you ever wondered what it would be like to travel through time and visit ancient civilizations? The possibilities are endless, from witnessing the construction of the pyramids to experiencing the Renaissance firsthand.",
-                                "Ryan",
+                                "ryan",
                                 "English",
                                 "",
                             ],
                             [
                                 "其实我真的有发现，我是一个特别善于观察别人情绪的人。比如说在一个聚会上，我总能第一时间察觉到谁不太开心，然后想办法让大家都能融入到欢乐的氛围中来。",
-                                "Vivian",
+                                "vivian",
                                 "Chinese",
                                 "用特别愤怒的语气说",
                             ],
                             [
                                 "It was a dark and stormy night when the old lighthouse keeper heard a knock at the door. He set down his cup of tea, adjusted his glasses, and walked slowly toward the entrance.",
-                                "Aiden",
+                                "aiden",
                                 "English",
                                 "Speak in a mysterious, suspenseful tone",
                             ],
                         ],
                         inputs=[text_input, voice, language, instructions],
-                        label="Examples — click to try",
+                        label="examples",
                     )
-                with gr.Group(visible=False) as examples_vd:
+                with gr.Column(visible=False) as examples_vd:
                     gr.Examples(
                         examples=[
                             [
@@ -570,9 +612,9 @@ def create_app(api_base: str):
                             ],
                         ],
                         inputs=[text_input, language, instructions],
-                        label="Examples — click to try",
+                        label="examples",
                     )
-                with gr.Group(visible=False) as examples_base:
+                with gr.Column(visible=False) as examples_base:
                     gr.Examples(
                         examples=[
                             [
@@ -589,7 +631,7 @@ def create_app(api_base: str):
                             ],
                         ],
                         inputs=[text_input, language, ref_audio_url, ref_text],
-                        label="Examples — click to try",
+                        label="examples",
                     )
                 gr.HTML("""
                 <div style="text-align:center; padding:8px 0; margin-top:4px;">
@@ -605,12 +647,19 @@ def create_app(api_base: str):
 
         # ── Event wiring ─────────────────────────────────────────
         def on_task_change(tt):
-            base = on_task_type_change(tt)
-            # base returns (voice, instructions, ref_audio, ref_audio_url, ref_text, x_vector_only)
-            return base + (
-                gr.update(visible=(tt == "CustomVoice")),
-                gr.update(visible=(tt == "VoiceDesign")),
-                gr.update(visible=(tt == "Base")),
+            is_cv = tt == "CustomVoice"
+            is_vd = tt == "VoiceDesign"
+            is_base = tt == "Base"
+            return (
+                gr.update(visible=is_cv),  # voice
+                gr.update(
+                    visible=(is_cv or is_vd),
+                    info="Required: describe the voice style" if is_vd else "Optional style/emotion instructions",
+                ),  # instructions
+                gr.update(visible=is_base),  # ref_group
+                gr.update(visible=is_cv),  # examples_cv
+                gr.update(visible=is_vd),  # examples_vd
+                gr.update(visible=is_base),  # examples_base
             )
 
         task_type.change(
@@ -619,10 +668,7 @@ def create_app(api_base: str):
             outputs=[
                 voice,
                 instructions,
-                ref_audio,
-                ref_audio_url,
-                ref_text,
-                x_vector_only,
+                ref_group,
                 examples_cv,
                 examples_vd,
                 examples_base,
@@ -680,21 +726,44 @@ def create_app(api_base: str):
 
         def on_generate(stream_enabled, *args):
             if stream_enabled:
+                import time as _time
+
                 text, task_type_v, voice_v, lang_v, instr_v, ref_a, ref_url, ref_t, xvec, _fmt, _spd = args
+                # For streaming, use URL for ref_audio (base64 is too large
+                # for the Gradio textbox → JS → fetch pipeline).
+                # If user uploaded audio but no URL, encode and store server-side.
+                if ref_a is not None and not (ref_url and ref_url.strip()):
+                    req_id = f"req-{int(_time.time() * 1000)}"
+                    full_payload = build_payload(
+                        text,
+                        task_type_v,
+                        voice_v,
+                        lang_v,
+                        instr_v,
+                        ref_a,
+                        ref_url,
+                        ref_t,
+                        xvec,
+                        stream=True,
+                    )
+                    _pending_payloads[req_id] = full_payload
+                    browser_payload = {"_req_id": req_id, "_nonce": int(_time.time() * 1000)}
+                    return json.dumps(browser_payload), gr.update()
+
+                # URL-only path: payload is small, pass directly to browser
                 payload = build_payload(
                     text,
                     task_type_v,
                     voice_v,
                     lang_v,
                     instr_v,
-                    ref_a,
+                    None,
                     ref_url,
                     ref_t,
                     xvec,
                     stream=True,
                 )
-                # Add timestamp so repeated identical requests still trigger change
-                payload["_nonce"] = int(__import__("time").time() * 1000)
+                payload["_nonce"] = int(_time.time() * 1000)
                 return json.dumps(payload), gr.update()
             else:
                 audio = generate_speech(api_base, *args)
@@ -704,12 +773,10 @@ def create_app(api_base: str):
             fn=on_generate,
             inputs=[stream_checkbox] + all_inputs,
             outputs=[hidden_payload, audio_output],
-        )
-
-        # When hidden_payload changes, trigger JavaScript streaming
-        hidden_payload.change(
-            fn=None,
+        ).then(
+            fn=lambda p: p,
             inputs=[hidden_payload],
+            outputs=[hidden_payload],
             js="(p) => { if (p && p.trim()) { const d = JSON.parse(p); delete d._nonce; window.ttsGenerate(d); } return p; }",
         )
 
