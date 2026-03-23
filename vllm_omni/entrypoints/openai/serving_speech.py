@@ -1041,9 +1041,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         streaming needs per-chunk delta slicing; non-streaming needs full concatenation.
         """
         mm = getattr(res, "multimodal_output", None)
+        ro = None
         if not mm:
             ro = getattr(res, "request_output", None)
             mm = getattr(ro, "multimodal_output", None) if ro else None
+        if not mm:
+            if ro is None:
+                ro = getattr(res, "request_output", None)
+            outputs = getattr(ro, "outputs", None) if ro else None
+            if outputs:
+                for completion_output in outputs:
+                    completion_mm = getattr(completion_output, "multimodal_output", None)
+                    if completion_mm:
+                        mm = completion_mm
+                        break
         if not mm:
             return None, None
         key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
