@@ -5,8 +5,7 @@ from __future__ import annotations
 
 import importlib
 import json
-from collections.abc import Iterable
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
@@ -45,7 +44,10 @@ def load_prismaudio_state_dict(checkpoint_path: str | PathLike[str]) -> dict[str
     if checkpoint_path.endswith(".safetensors"):
         raw_state = load_safetensors_file(checkpoint_path)
     else:
-        raw_state = torch.load(checkpoint_path, map_location="cpu")
+        try:
+            raw_state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            raw_state = torch.load(checkpoint_path, map_location="cpu")
 
     if not isinstance(raw_state, dict):
         raise TypeError(
@@ -74,6 +76,25 @@ def _strip_prefix_from_state_dict(
     return {name[prefix_len:]: tensor for name, tensor in state_dict.items() if name.startswith(prefix)}
 
 
+def _strip_common_checkpoint_prefixes(
+    state_dict: dict[str, torch.Tensor],
+    prefixes: tuple[str, ...],
+) -> dict[str, torch.Tensor]:
+    stripped_state_dict: dict[str, torch.Tensor] = {}
+    for name, tensor in state_dict.items():
+        stripped_name = name
+        prefix_stripped = True
+        while prefix_stripped:
+            prefix_stripped = False
+            for prefix in prefixes:
+                if stripped_name.startswith(prefix):
+                    stripped_name = stripped_name[len(prefix) :]
+                    prefix_stripped = True
+                    break
+        stripped_state_dict[stripped_name] = tensor
+    return stripped_state_dict
+
+
 def load_module_from_prismaudio_checkpoint(
     module: nn.Module,
     checkpoint_path: str | PathLike[str],
@@ -82,7 +103,8 @@ def load_module_from_prismaudio_checkpoint(
     strict: bool = False,
 ) -> PrismAudioCheckpointLoadReport:
     state_dict = load_prismaudio_state_dict(checkpoint_path)
-    filtered_state_dict = _strip_prefix_from_state_dict(state_dict, prefix)
+    prefix_chain = tuple(p for p in (prefix, "module.", "model.") if p)
+    filtered_state_dict = _strip_common_checkpoint_prefixes(state_dict, prefix_chain)
 
     incompatible = module.load_state_dict(filtered_state_dict, strict=strict)
     loaded_keys = sorted(set(filtered_state_dict) - set(incompatible.unexpected_keys))
@@ -112,12 +134,13 @@ def sample_discrete_euler(
 
 
 class PrismAudioPipeline(nn.Module, SupportAudioOutput):
-    """Minimal PrismAudio request-contract shell.
+    """PrismAudio pipeline with request validation, sampling, and audio decode.
 
-    This first integration stage matches the official PrismAudio inference
-    contract where precomputed conditioning features are loaded before the
-    diffusion model runs. Sampling and waveform decode are intentionally left
-    for follow-up changes once the request plumbing is reviewed.
+    This integration stage matches the official PrismAudio inference contract
+    where precomputed conditioning features are loaded before diffusion runs.
+    The pipeline can drive a minimal injected-component sampling and waveform
+    decode flow, but it does not yet assemble the full checkpoint-backed model
+    graph on its own.
     """
 
     support_audio_output = True
@@ -164,16 +187,15 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
 
     def _build_runtime_config(self, od_config: OmniDiffusionConfig) -> PrismAudioRuntimeConfig:
         raw_model_config = self._load_prismaudio_model_config(od_config)
-        model_section = raw_model_config.get("model", {}) if isinstance(raw_model_config.get("model"), Mapping) else {}
-        pretransform = model_section.get("pretransform", {}) if isinstance(model_section.get("pretransform"), Mapping) else {}
-        pretransform_config = (
-            pretransform.get("config", {}) if isinstance(pretransform.get("config"), Mapping) else {}
-        )
+        model_value = raw_model_config.get("model", {})
+        model_section = model_value if isinstance(model_value, Mapping) else {}
+        pretransform_value = model_section.get("pretransform", {})
+        pretransform = pretransform_value if isinstance(pretransform_value, Mapping) else {}
+        pretransform_config_value = pretransform.get("config", {})
+        pretransform_config = pretransform_config_value if isinstance(pretransform_config_value, Mapping) else {}
         sample_rate = int(raw_model_config.get("sample_rate", 44100))
         audio_channels = int(raw_model_config.get("audio_channels", 2))
-        latent_channels = int(
-            model_section.get("io_channels", pretransform_config.get("latent_dim", 64))
-        )
+        latent_channels = int(model_section.get("io_channels", pretransform_config.get("latent_dim", 64)))
         return PrismAudioRuntimeConfig(
             sample_rate=sample_rate,
             audio_channels=audio_channels,
@@ -246,8 +268,7 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
             return {}
         if not isinstance(prompt, Mapping):
             raise TypeError(
-                "PrismAudioPipeline expects each prompt to be a string or mapping "
-                f"but received {type(prompt)!r}."
+                f"PrismAudioPipeline expects each prompt to be a string or mapping but received {type(prompt)!r}."
             )
 
         additional_information = prompt.get("additional_information", {})
@@ -275,7 +296,10 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
         if num_inference_steps is None:
             num_inference_steps = self.default_num_inference_steps
 
-        cfg_scale = extra_args.get("cfg_scale", self.default_cfg_scale)
+        if req.sampling_params.guidance_scale_provided:
+            cfg_scale = req.sampling_params.guidance_scale
+        else:
+            cfg_scale = extra_args.get("cfg_scale", self.default_cfg_scale)
         return {
             "num_inference_steps": int(num_inference_steps),
             "cfg_scale": float(cfg_scale),
@@ -386,8 +410,7 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
                 )
             if report.missing_keys:
                 raise ValueError(
-                    "PrismAudioPipeline runtime VAE checkpoint is missing required weights: "
-                    f"{report.missing_keys!r}."
+                    f"PrismAudioPipeline runtime VAE checkpoint is missing required weights: {report.missing_keys!r}."
                 )
             loaded_keys.update(f"vae.{key}" for key in report.loaded_keys)
 

@@ -141,6 +141,21 @@ def test_prismaudio_pipeline_reads_sampling_extra_args():
     }
 
 
+def test_prismaudio_pipeline_prefers_request_guidance_scale():
+    model_cls = DiffusionModelRegistry._try_load_model_cls("PrismAudioPipeline")
+    pipeline = model_cls(transformer=nn.Identity(), vae=nn.Identity())
+    req = _make_request()
+    req.sampling_params.guidance_scale = 7.25
+    req.sampling_params.guidance_scale_provided = True
+
+    sampling_args = pipeline._parse_sampling_args(req)
+
+    assert sampling_args == {
+        "num_inference_steps": req.sampling_params.num_inference_steps or 24,
+        "cfg_scale": 7.25,
+    }
+
+
 def test_prismaudio_checkpoint_loader_supports_raw_state_dict(tmp_path):
     from vllm_omni.diffusion.models.prismaudio.pipeline_prismaudio import load_prismaudio_state_dict
 
@@ -152,6 +167,46 @@ def test_prismaudio_checkpoint_loader_supports_raw_state_dict(tmp_path):
 
     assert list(actual) == ["weight"]
     assert torch.equal(actual["weight"], expected["weight"])
+
+
+@pytest.mark.parametrize("prefix", ["module.", "model."])
+def test_prismaudio_checkpoint_loader_strips_common_wrapper_prefixes(prefix, tmp_path):
+    from vllm_omni.diffusion.models.prismaudio.pipeline_prismaudio import load_module_from_prismaudio_checkpoint
+
+    ckpt_path = tmp_path / "wrapped.ckpt"
+    module = nn.Linear(2, 2, bias=False)
+    expected_weight = torch.randn_like(module.weight)
+    torch.save({f"{prefix}weight": expected_weight}, ckpt_path)
+
+    report = load_module_from_prismaudio_checkpoint(module, ckpt_path)
+
+    assert torch.equal(module.weight, expected_weight)
+    assert report.missing_keys == []
+    assert report.unexpected_keys == []
+
+
+def test_prismaudio_checkpoint_loader_uses_weights_only_for_torch_load(monkeypatch, tmp_path):
+    from vllm_omni.diffusion.models.prismaudio.pipeline_prismaudio import load_prismaudio_state_dict
+
+    ckpt_path = tmp_path / "prismaudio.ckpt"
+    ckpt_path.write_bytes(b"placeholder")
+    captured: dict[str, object] = {}
+
+    def _fake_torch_load(path, *args, **kwargs):
+        captured["path"] = path
+        captured["kwargs"] = dict(kwargs)
+        return {"weight": torch.randn(2, 2)}
+
+    monkeypatch.setattr(torch, "load", _fake_torch_load)
+
+    actual = load_prismaudio_state_dict(ckpt_path)
+
+    assert list(actual) == ["weight"]
+    assert captured["path"] == str(ckpt_path)
+    assert captured["kwargs"] == {
+        "map_location": "cpu",
+        "weights_only": True,
+    }
 
 
 def test_prismaudio_checkpoint_loader_supports_nested_state_dict(tmp_path):
