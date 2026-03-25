@@ -72,6 +72,11 @@ _DIFFUSION_MODELS = {
         "pipeline_stable_audio",
         "StableAudioPipeline",
     ),
+    "PrismAudioPipeline": (
+        "prismaudio",
+        "pipeline_prismaudio",
+        "PrismAudioPipeline",
+    ),
     "WanImageToVideoPipeline": (
         "wan2_2",
         "pipeline_wan2_2_i2v",
