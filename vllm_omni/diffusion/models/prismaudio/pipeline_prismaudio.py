@@ -5,13 +5,17 @@ from __future__ import annotations
 
 import importlib
 import json
+import sys
+import types
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 from safetensors.torch import load_file as load_safetensors_file
 from torch import nn
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -20,6 +24,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 
 @dataclass
@@ -103,7 +108,11 @@ def load_module_from_prismaudio_checkpoint(
     strict: bool = False,
 ) -> PrismAudioCheckpointLoadReport:
     state_dict = load_prismaudio_state_dict(checkpoint_path)
-    prefix_chain = tuple(p for p in (prefix, "module.", "model.") if p)
+    module_state_keys = tuple(module.state_dict().keys())
+    preserve_model_prefix = any(name.startswith("model.") for name in module_state_keys)
+    prefix_chain = tuple(p for p in (prefix, "module.") if p)
+    if not preserve_model_prefix:
+        prefix_chain = (*prefix_chain, "model.")
     filtered_state_dict = _strip_common_checkpoint_prefixes(state_dict, prefix_chain)
 
     incompatible = module.load_state_dict(filtered_state_dict, strict=strict)
@@ -144,6 +153,7 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
     """
 
     support_audio_output = True
+    supports_step_execution = True
     required_feature_names = ("video_features", "text_features", "sync_features")
     default_num_inference_steps = 24
     default_cfg_scale = 5.0
@@ -216,6 +226,14 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
 
         if self.transformer is None:
             model_factory = self._resolve_factory_spec(factories.get("model_factory"))
+            if (
+                model_factory is None
+                and factories.get("transformer_factory") is None
+                and factories.get("vae_factory") is None
+                and isinstance(runtime_config.raw_model_config, Mapping)
+                and runtime_config.raw_model_config.get("model_type") is not None
+            ):
+                model_factory = self._get_default_official_model_factory()
             if model_factory is not None:
                 wrapper = self._call_factory_spec(model_factory, runtime_config)
                 if isinstance(wrapper, nn.Module):
@@ -252,14 +270,123 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
             return getattr(importlib.import_module(module_name), attr_name)
         return resolve_obj_by_qualname(spec)
 
+    def _get_default_official_model_factory(self) -> Mapping[str, Any] | None:
+        try:
+            official_models_module = importlib.import_module("PrismAudio.models")
+        except ModuleNotFoundError:
+            return None
+
+        official_builder = getattr(official_models_module, "create_model_from_config", None)
+        if not callable(official_builder):
+            return None
+        return {
+            "callable": official_builder,
+            "input": "raw_model_config",
+            "source": "official_default_builder",
+        }
+
     def _call_factory_spec(self, spec: Any, runtime_config: PrismAudioRuntimeConfig) -> Any:
         if isinstance(spec, Mapping):
             factory_callable = spec["callable"]
             factory_input = spec.get("input", "runtime_config")
-            if factory_input == "runtime_config":
-                return factory_callable(runtime_config)
-            if factory_input == "raw_model_config":
-                return factory_callable(runtime_config.raw_model_config or {})
+            restore_numpy_aliases: dict[str, Any] = {}
+            original_wandb_module = None
+            original_lightning_modules: dict[str, Any] = {}
+            if spec.get("source") == "official_default_builder":
+                if not hasattr(np, "float_"):
+                    restore_numpy_aliases["float_"] = None
+                    np.float_ = np.float64
+                if not hasattr(np, "complex_"):
+                    restore_numpy_aliases["complex_"] = None
+                    np.complex_ = np.complex128
+                original_wandb_module = sys.modules.get("wandb")
+                wandb_stub = types.ModuleType("wandb")
+
+                class _WandbAudio:
+                    def __init__(self, *args: Any, **kwargs: Any) -> None:
+                        self.args = args
+                        self.kwargs = kwargs
+
+                class _WandbImage:
+                    def __init__(self, *args: Any, **kwargs: Any) -> None:
+                        self.args = args
+                        self.kwargs = kwargs
+
+                class _WandbTable:
+                    def __init__(self, *args: Any, **kwargs: Any) -> None:
+                        self.args = args
+                        self.kwargs = kwargs
+
+                class _WandbObject3D:
+                    def __init__(self, *args: Any, **kwargs: Any) -> None:
+                        self.args = args
+                        self.kwargs = kwargs
+
+                wandb_stub.__codex_prismaudio_stub__ = True
+                wandb_stub.Audio = _WandbAudio
+                wandb_stub.Image = _WandbImage
+                wandb_stub.Table = _WandbTable
+                wandb_stub.Object3D = _WandbObject3D
+                sys.modules["wandb"] = wandb_stub
+
+                for module_name in ("lightning", "lightning.pytorch", "lightning.pytorch.loggers"):
+                    original_lightning_modules[module_name] = sys.modules.get(module_name)
+
+                lightning_module = types.ModuleType("lightning")
+                lightning_pytorch_module = types.ModuleType("lightning.pytorch")
+                lightning_loggers_module = types.ModuleType("lightning.pytorch.loggers")
+
+                class _LightningWandbLogger:
+                    pass
+
+                class _LightningCometLogger:
+                    pass
+
+                class _LightningTensorBoardLogger:
+                    pass
+
+                lightning_loggers_module.WandbLogger = _LightningWandbLogger
+                lightning_loggers_module.CometLogger = _LightningCometLogger
+                lightning_loggers_module.TensorBoardLogger = _LightningTensorBoardLogger
+                lightning_pytorch_module.loggers = lightning_loggers_module
+                lightning_module.pytorch = lightning_pytorch_module
+
+                sys.modules["lightning"] = lightning_module
+                sys.modules["lightning.pytorch"] = lightning_pytorch_module
+                sys.modules["lightning.pytorch.loggers"] = lightning_loggers_module
+            try:
+                if factory_input == "runtime_config":
+                    return factory_callable(runtime_config)
+                if factory_input == "raw_model_config":
+                    return factory_callable(runtime_config.raw_model_config or {})
+            except ModuleNotFoundError as exc:
+                if spec.get("source") == "official_default_builder":
+                    raise ModuleNotFoundError(
+                        "The official PrismAudio builder is importable but cannot construct the model because "
+                        f"a required dependency is missing: {exc}. Install the upstream PrismAudio runtime "
+                        "dependencies before using the default builder path."
+                    ) from exc
+            except AttributeError as exc:
+                if spec.get("source") == "official_default_builder" and "np.float_" in str(exc):
+                    raise RuntimeError(
+                        "The official PrismAudio builder hit a NumPy 2.x compatibility issue "
+                        f"while constructing the model: {exc}. Use a NumPy version compatible with the "
+                        "upstream PrismAudio stack, or patch the upstream dependency to avoid `np.float_`."
+                    ) from exc
+            finally:
+                if spec.get("source") == "official_default_builder":
+                    if original_wandb_module is None:
+                        sys.modules.pop("wandb", None)
+                    else:
+                        sys.modules["wandb"] = original_wandb_module
+                    for module_name, original_module in original_lightning_modules.items():
+                        if original_module is None:
+                            sys.modules.pop(module_name, None)
+                        else:
+                            sys.modules[module_name] = original_module
+                if restore_numpy_aliases:
+                    for alias_name in restore_numpy_aliases:
+                        delattr(np, alias_name)
             raise ValueError(f"Unsupported PrismAudio factory input mode: {factory_input!r}.")
         return spec(runtime_config)
 
@@ -291,13 +418,16 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
                 )
 
     def _parse_sampling_args(self, req: OmniDiffusionRequest) -> dict[str, float | int]:
-        extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
-        num_inference_steps = extra_args.get("num_inference_steps", req.sampling_params.num_inference_steps)
+        return self._parse_sampling_args_from_sampling(req.sampling_params)
+
+    def _parse_sampling_args_from_sampling(self, sampling_params: Any) -> dict[str, float | int]:
+        extra_args = getattr(sampling_params, "extra_args", {}) or {}
+        num_inference_steps = extra_args.get("num_inference_steps", sampling_params.num_inference_steps)
         if num_inference_steps is None:
             num_inference_steps = self.default_num_inference_steps
 
-        if req.sampling_params.guidance_scale_provided:
-            cfg_scale = req.sampling_params.guidance_scale
+        if sampling_params.guidance_scale_provided:
+            cfg_scale = sampling_params.guidance_scale
         else:
             cfg_scale = extra_args.get("cfg_scale", self.default_cfg_scale)
         return {
@@ -305,21 +435,88 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
             "cfg_scale": float(cfg_scale),
         }
 
-    def _prepare_latents(self, req: OmniDiffusionRequest) -> torch.Tensor:
-        extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+    def _infer_runtime_latent_shape(self, batch_size: int) -> tuple[int, int, int] | None:
+        runtime_config = self.runtime_config
+        if runtime_config is None:
+            return None
+
+        latent_channels = runtime_config.latent_channels
+        raw_model_config = runtime_config.raw_model_config or {}
+        model_value = raw_model_config.get("model", {})
+        model_section = model_value if isinstance(model_value, Mapping) else {}
+        pretransform_value = model_section.get("pretransform", {})
+        pretransform = pretransform_value if isinstance(pretransform_value, Mapping) else {}
+        pretransform_config_value = pretransform.get("config", {})
+        pretransform_config = pretransform_config_value if isinstance(pretransform_config_value, Mapping) else {}
+        diffusion_value = model_section.get("diffusion", {})
+        diffusion_section = diffusion_value if isinstance(diffusion_value, Mapping) else {}
+        diffusion_config_value = diffusion_section.get("config", {})
+        diffusion_config = diffusion_config_value if isinstance(diffusion_config_value, Mapping) else {}
+
+        latent_seq_len = diffusion_config.get("latent_seq_len")
+        if latent_seq_len is None:
+            sample_size = raw_model_config.get("sample_size")
+            downsampling_ratio = pretransform_config.get("downsampling_ratio")
+            if sample_size is not None and downsampling_ratio:
+                latent_seq_len = round(float(sample_size) / float(downsampling_ratio))
+
+        if latent_seq_len is None:
+            return None
+
+        return (batch_size, latent_channels, int(latent_seq_len))
+
+    def _get_runtime_latent_device_dtype(self) -> tuple[torch.device, torch.dtype]:
+        for module in (self.transformer, self.vae):
+            if not isinstance(module, nn.Module):
+                continue
+            parameter = next(module.parameters(), None)
+            if parameter is not None:
+                return parameter.device, parameter.dtype
+            buffer = next(module.buffers(), None)
+            if buffer is not None:
+                return buffer.device, buffer.dtype
+        return torch.device("cpu"), torch.float32
+
+    def _resolve_sampling_generator(
+        self,
+        sampling_params: Any,
+        *,
+        device: torch.device,
+    ) -> torch.Generator | list[torch.Generator] | None:
+        generator = getattr(sampling_params, "generator", None)
+        if generator is not None:
+            return generator
+
+        seed = getattr(sampling_params, "seed", None)
+        if seed is None:
+            return None
+
+        generator_device = getattr(sampling_params, "generator_device", None) or device.type
+        return torch.Generator(device=generator_device).manual_seed(seed)
+
+    def _prepare_latents_from_sampling(self, prompts: list[Any], sampling_params: Any) -> torch.Tensor:
+        extra_args = getattr(sampling_params, "extra_args", {}) or {}
         latents = extra_args.get("latents")
         if latents is None:
-            latents = req.sampling_params.latents
+            latents = sampling_params.latents
         if latents is None:
-            latents = req.sampling_params.audio_latents
+            latents = sampling_params.audio_latents
         if latents is None:
-            raise ValueError(
-                "PrismAudioPipeline requires initial `latents` for the current injected-component "
-                "execution path. Real checkpoint-backed latent initialization is not implemented yet."
-            )
+            inferred_latent_shape = self._infer_runtime_latent_shape(len(prompts))
+            if inferred_latent_shape is None:
+                raise ValueError(
+                    "PrismAudioPipeline requires initial `latents` for the current execution path, or a runtime "
+                    "config that can infer latent shape from PrismAudio model metadata."
+                )
+            device, dtype = self._get_runtime_latent_device_dtype()
+            generator = self._resolve_sampling_generator(sampling_params, device=device)
+            latents = randn_tensor(inferred_latent_shape, generator=generator, device=device, dtype=dtype)
         if not isinstance(latents, torch.Tensor):
             raise TypeError(f"PrismAudioPipeline expected `latents` to be a torch.Tensor, got {type(latents)!r}.")
         return latents
+
+    def _prepare_latents(self, req: OmniDiffusionRequest) -> torch.Tensor:
+        return self._prepare_latents_from_sampling(req.prompts, req.sampling_params)
 
     def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
         if self.vae is None:
@@ -353,15 +550,42 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
         get_conditioning_inputs = getattr(self.transformer, "get_conditioning_inputs", None)
         inner_model = getattr(self.transformer, "model", None)
         if callable(conditioner) and callable(get_conditioning_inputs) and isinstance(inner_model, nn.Module):
-            conditioning_tensors = conditioner((dict(conditioning),), device)
+            conditioning_tensors = conditioner((self._normalize_conditioning_for_official_wrapper(conditioning),), device)
             sampling_conditioning = dict(get_conditioning_inputs(conditioning_tensors))
             return inner_model, sampling_conditioning
 
+        def _move_to_device(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                return value.to(device=device)
+            if isinstance(value, tuple):
+                return tuple(_move_to_device(item) for item in value)
+            if isinstance(value, list):
+                return [_move_to_device(item) for item in value]
+            if isinstance(value, Mapping):
+                return {key: _move_to_device(item) for key, item in value.items()}
+            return value
+
         return self.transformer, {
-            "video_features": conditioning["video_features"],
-            "text_features": conditioning["text_features"],
-            "sync_features": conditioning["sync_features"],
+            "video_features": _move_to_device(conditioning["video_features"]),
+            "text_features": _move_to_device(conditioning["text_features"]),
+            "sync_features": _move_to_device(conditioning["sync_features"]),
         }
+
+    def _normalize_conditioning_for_official_wrapper(self, conditioning: Mapping[str, Any]) -> dict[str, Any]:
+        def _normalize(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                if value.ndim > 1 and value.shape[0] == 1:
+                    return value[0]
+                return value
+            if isinstance(value, tuple):
+                return tuple(_normalize(item) for item in value)
+            if isinstance(value, list):
+                return [_normalize(item) for item in value]
+            if isinstance(value, Mapping):
+                return {key: _normalize(item) for key, item in value.items()}
+            return value
+
+        return {key: _normalize(value) for key, value in conditioning.items()}
 
     def _load_runtime_checkpoint_weights(self) -> set[str]:
         runtime_config = self.runtime_config
@@ -385,15 +609,21 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
                 self.transformer,
                 runtime_config.transformer_checkpoint_path,
             )
+            transformer_missing_keys = list(report.missing_keys)
+            transformer_pretransform = getattr(self.transformer, "pretransform", None)
+            if isinstance(transformer_pretransform, nn.Module) and self.vae is transformer_pretransform:
+                transformer_missing_keys = [
+                    key for key in transformer_missing_keys if not key.startswith("pretransform.")
+                ]
             if not report.loaded_keys:
                 raise ValueError(
                     "PrismAudioPipeline loaded no matching weights for the runtime transformer checkpoint "
                     f"{runtime_config.transformer_checkpoint_path!r}."
                 )
-            if report.missing_keys:
+            if transformer_missing_keys:
                 raise ValueError(
                     "PrismAudioPipeline runtime transformer checkpoint is missing required weights: "
-                    f"{report.missing_keys!r}."
+                    f"{transformer_missing_keys!r}."
                 )
             loaded_keys.update(f"transformer.{key}" for key in report.loaded_keys)
 
@@ -421,6 +651,73 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
         loaded_keys = loader.load_weights(weights)
         loaded_keys.update(self._load_runtime_checkpoint_weights())
         return loaded_keys
+
+    def prepare_encode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionRequestState:
+        prompts = state.prompts or []
+        if not prompts:
+            raise ValueError("PrismAudioPipeline requires at least one prompt.")
+        if len(prompts) != 1:
+            raise ValueError(
+                "PrismAudioPipeline currently supports exactly one prompt per request. "
+                "Batching multiple prompt-specific conditioning payloads is not implemented yet."
+            )
+
+        conditioning = self._get_additional_information(prompts[0])
+        self._validate_required_features(conditioning)
+        sampling_args = self._parse_sampling_args_from_sampling(state.sampling)
+        latents = self._prepare_latents_from_sampling(prompts, state.sampling)
+        sampling_model, sampling_conditioning = self._get_sampling_model_and_conditioning(
+            conditioning,
+            device=latents.device,
+        )
+
+        full_timesteps = torch.linspace(
+            1.0,
+            0.0,
+            int(sampling_args["num_inference_steps"]) + 1,
+            device=latents.device,
+            dtype=latents.dtype,
+        )
+        state.latents = latents
+        state.timesteps = full_timesteps[:-1]
+        state.step_index = 0
+        state.extra["next_timesteps"] = full_timesteps[1:]
+        state.extra["sampling_model"] = sampling_model
+        state.extra["sampling_conditioning"] = sampling_conditioning
+        state.extra["cfg_scale"] = float(sampling_args["cfg_scale"])
+        return state
+
+    def denoise_step(self, state: DiffusionRequestState, **kwargs: Any) -> torch.Tensor | None:
+        timestep = state.current_timestep
+        if timestep is None:
+            return None
+        assert state.latents is not None
+        sampling_model = state.extra["sampling_model"]
+        sampling_conditioning = state.extra["sampling_conditioning"]
+        t_for_model = timestep * torch.ones((state.latents.shape[0],), dtype=state.latents.dtype, device=state.latents.device)
+        return sampling_model(
+            state.latents,
+            t_for_model,
+            **sampling_conditioning,
+            cfg_scale=state.extra["cfg_scale"],
+            batch_cfg=True,
+        )
+
+    def step_scheduler(self, state: DiffusionRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
+        assert state.latents is not None
+        timestep = state.current_timestep
+        if timestep is None:
+            return
+        next_timesteps = state.extra["next_timesteps"]
+        next_timestep = next_timesteps[state.step_index]
+        dt = next_timestep - timestep
+        state.latents = state.latents + dt * noise_pred
+        state.step_index += 1
+
+    def post_decode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionOutput:
+        assert state.latents is not None
+        audio = self._decode_latents(state.latents)
+        return DiffusionOutput(output=audio)
 
     def forward(self, req: OmniDiffusionRequest, *args: Any, **kwargs: Any) -> DiffusionOutput:
         if not req.prompts:
