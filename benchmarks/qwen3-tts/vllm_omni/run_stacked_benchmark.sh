@@ -83,8 +83,8 @@ stop_server() {
     fi
     echo "  Stopping server (PID ${SERVER_PID})..."
 
-    # Try graceful kill first
-    kill "$SERVER_PID" 2>/dev/null || true
+    # Kill entire process group (negative PID)
+    kill -- -"$SERVER_PID" 2>/dev/null || kill "$SERVER_PID" 2>/dev/null || true
     # Wait up to 15s for it to exit
     for _ in $(seq 1 15); do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -96,15 +96,18 @@ stop_server() {
     # Force kill if still alive
     if kill -0 "$SERVER_PID" 2>/dev/null; then
         echo "  Server did not stop gracefully, force killing..."
-        kill -9 "$SERVER_PID" 2>/dev/null || true
+        kill -9 -- -"$SERVER_PID" 2>/dev/null || kill -9 "$SERVER_PID" 2>/dev/null || true
     fi
 
-    # Also kill any leaked child processes on the same GPU
+    # Kill leaked VLLM child processes (EngineCore, Worker) spawned by this server
     pgrep -f "vllm-omni serve.*--port ${PORT}" | xargs kill -9 2>/dev/null || true
+    pgrep -P "$SERVER_PID" 2>/dev/null | xargs kill -9 2>/dev/null || true
+    # Kill any VLLM processes started after our server PID
+    pgrep -f "VLLM::" -u "$(whoami)" --newer "$SERVER_PID" 2>/dev/null | xargs kill -9 2>/dev/null || true
 
     wait "$SERVER_PID" 2>/dev/null || true
     SERVER_PID=""
-    sleep 5
+    sleep 8
 }
 
 cleanup() {
@@ -148,7 +151,7 @@ for i in "${!CONFIG_ORDER[@]}"; do
 
     # Start server
     echo "  Starting server..."
-    CUDA_VISIBLE_DEVICES=${GPU_DEVICE} vllm-omni serve "${MODEL}" \
+    setsid env CUDA_VISIBLE_DEVICES=${GPU_DEVICE} vllm-omni serve "${MODEL}" \
         --stage-configs-path "${yaml}" \
         --host 0.0.0.0 --port "${PORT}" \
         --trust-remote-code --omni \
