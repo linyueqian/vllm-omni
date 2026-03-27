@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 
 from .factory import OmniConnectorFactory
 from .utils.config import ConnectorSpec
+from .utils.kv_utils import normalize_layer_kv
 
 logger = init_logger(__name__)
 
@@ -200,8 +201,12 @@ class OmniKVTransferManager:
                     logger.warning(f"Request {req_id} has no block IDs, skipping")
                     continue
 
+                custom_metadata = data.get("custom_metadata")
+
                 # Extract KV cache from GPU blocks -> CPU tensors
-                kv_data = self._extract_kv_cache(req_id, block_ids, seq_len, kv_caches, block_size, cache_dtype)
+                kv_data = self._extract_kv_cache(
+                    req_id, block_ids, seq_len, kv_caches, block_size, cache_dtype, custom_metadata
+                )
                 if kv_data:
                     # Resolve global request ID if available
                     transfer_req_id = request_id_resolver(req_id) if request_id_resolver else req_id
@@ -224,6 +229,7 @@ class OmniKVTransferManager:
         kv_caches: list[LayerKV],
         block_size: int,
         cache_dtype: str,
+        custom_metadata: dict[str, Any] | None = None,
     ) -> KVCacheTransferData | None:
         """Extract KV cache from GPU blocks for a single request.
 
@@ -234,6 +240,7 @@ class OmniKVTransferManager:
             kv_caches: List of KV cache (tensor or tuple) per layer
             block_size: Size of each cache block
             cache_dtype: Data type of the cache
+            custom_metadata: Optional custom metadata to include
 
         Note: If key/value block counts differ, extraction uses only the overlapping
         block range. Extra key/value blocks are ignored, so returned KV may be partial.
@@ -246,7 +253,7 @@ class OmniKVTransferManager:
         value_cache: list[torch.Tensor | None] = [None] * num_layers
 
         for layer_idx, layer_kv in enumerate(kv_caches):
-            kv_pair = self._normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=layer_idx)
+            kv_pair = normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=layer_idx)
             if kv_pair is None:
                 continue
             key_blocks, value_blocks = kv_pair
@@ -289,56 +296,9 @@ class OmniKVTransferManager:
                 "num_layers": num_layers,
                 "dtype": str(cache_dtype),
                 "seq_len": seq_len,
+                **(custom_metadata or {}),
             },
         )
-
-    def _normalize_layer_kv(
-        self,
-        layer_kv: LayerKV,
-        req_id: str,
-        layer_idx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Normalize one layer KV cache to a `(key_blocks, value_blocks)` tuple.
-
-        Args:
-            layer_kv: The raw KV cache (tensor or tuple) for the layer
-            req_id: Request ID for logging
-            layer_idx: Layer index for logging
-
-        Returns:
-            Tuple of (key_blocks, value_blocks) if valid, None otherwise
-        """
-        if isinstance(layer_kv, torch.Tensor):
-            if layer_kv.ndim < 3 or layer_kv.shape[0] != 2:
-                logger.warning(
-                    f"Layer {layer_idx} for request {req_id} has invalid stacked KV shape: "
-                    f"expected [2, blocks, block_size, ...], got {tuple(layer_kv.shape)}"
-                )
-                return None
-            key_blocks = layer_kv[0]
-            value_blocks = layer_kv[1]
-        elif isinstance(layer_kv, tuple):
-            if len(layer_kv) != 2:
-                logger.warning(
-                    f"Layer {layer_idx} for request {req_id} has KV pair length {len(layer_kv)} (expected 2)"
-                )
-                return None
-            key_blocks, value_blocks = layer_kv
-            if not isinstance(key_blocks, torch.Tensor) or not isinstance(value_blocks, torch.Tensor):
-                logger.warning(f"Layer {layer_idx} for request {req_id} has non-tensor KV pair entries")
-                return None
-        else:
-            logger.warning(f"Layer {layer_idx} for request {req_id} has unsupported KV type {type(layer_kv).__name__}")
-            return None
-        # ensure key/value blocks are at least 2D for block indexing
-        if key_blocks.ndim < 2 or value_blocks.ndim < 2:
-            logger.warning(
-                f"Layer {layer_idx} for request {req_id} has invalid KV block shape: "
-                f"got key={tuple(key_blocks.shape)} value={tuple(value_blocks.shape)}"
-            )
-            return None
-
-        return key_blocks, value_blocks
 
     def _transfer_kv_cache(self, kv_data: KVCacheTransferData, transfer_req_id: str) -> None:
         """Transfer KV cache data to downstream stage via OmniConnector.
@@ -496,6 +456,8 @@ class OmniKVTransferManager:
 
         if "metadata" in data:
             req.kv_metadata = data["metadata"]
+            if hasattr(req, "sampling_params") and req.sampling_params is not None:
+                req.sampling_params.kv_metadata = data["metadata"]
 
     # Legacy compatibility method
     def receive_kv_cache(self, req: Any, target_device: torch.device | None = None) -> bool:
@@ -569,3 +531,93 @@ class OmniKVTransferManager:
                 logger.exception("Failed to collect CFG KV caches for %s", request_id)
 
         return primary_ok
+
+    def receive_multi_kv_cache_distributed(
+        self,
+        req: Any,
+        cfg_kv_collect_func: Callable | None = None,
+        target_device: torch.device | None = None,
+    ) -> bool:
+        """Broadcast-aware wrapper around :meth:`receive_multi_kv_cache`.
+
+        SharedMemory connector is single-reader: once rank 0 consumes the
+        segment it is deleted.  For multi-GPU stages (e.g. sequence-parallel)
+        only rank 0 receives; the result is then broadcast to every other
+        rank via the world process-group.
+
+        For single-worker stages this is equivalent to calling
+        :meth:`receive_multi_kv_cache` directly.
+        """
+        from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+
+        world = get_world_group()
+
+        if world.world_size <= 1:
+            return self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
+
+        # --- rank 0: receive to CPU (needed for pickle-based broadcast) ---
+        if world.rank_in_group == 0:
+            self.receive_multi_kv_cache(req, cfg_kv_collect_func, torch.device("cpu"))
+
+            kv_payload: dict[str, object] = {}
+            for attr in ("past_key_values", "kv_metadata"):
+                val = getattr(req, attr, None)
+                if val is not None:
+                    kv_payload[attr] = val
+
+            if hasattr(req, "sampling_params") and req.sampling_params is not None:
+                for key in list(vars(req.sampling_params).keys()):
+                    if (key.startswith("cfg_") and key.endswith("_past_key_values")) or key in (
+                        "past_key_values",
+                        "kv_metadata",
+                    ):
+                        val = getattr(req.sampling_params, key, None)
+                        if val is not None:
+                            kv_payload[f"sp.{key}"] = val
+
+            payload_list = [kv_payload]
+            # Use broadcast_object_list (pickle-based) instead of broadcast_tensor_dict
+            # because the KV cache is a heterogeneous nested structure (NaiveCache objects
+            # with metadata + tensors), not a flat tensor dict.  This runs once before
+            # the denoising loop so the serialization cost is negligible.
+            torch.distributed.broadcast_object_list(payload_list, src=world.ranks[0], group=world.cpu_group)
+            kv_payload = payload_list[0]
+        else:
+            payload_list: list[dict[str, object] | None] = [None]
+            torch.distributed.broadcast_object_list(payload_list, src=world.ranks[0], group=world.cpu_group)
+            kv_payload = payload_list[0]
+
+        # --- apply on ALL ranks (rank 0 also needs CPU→GPU move) ---
+        if not kv_payload:
+            return False
+
+        for attr in ("past_key_values", "kv_metadata"):
+            val = kv_payload.get(attr)
+            if val is not None:
+                if target_device is not None:
+                    val = _move_to_device(val, target_device)
+                setattr(req, attr, val)
+
+        if hasattr(req, "sampling_params") and req.sampling_params is not None:
+            for key, val in kv_payload.items():
+                if key.startswith("sp."):
+                    if target_device is not None:
+                        val = _move_to_device(val, target_device)
+                    setattr(req.sampling_params, key[3:], val)
+
+        return True
+
+
+def _move_to_device(obj: object, device: torch.device) -> object:
+    """Recursively move tensors inside a KV cache object to *device*."""
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device).contiguous() if obj.device != device else obj
+    if hasattr(obj, "__dict__"):
+        for k, v in vars(obj).items():
+            setattr(obj, k, _move_to_device(v, device))
+        return obj
+    if isinstance(obj, dict):
+        return {k: _move_to_device(v, device) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_move_to_device(v, device) for v in obj]
+    return obj

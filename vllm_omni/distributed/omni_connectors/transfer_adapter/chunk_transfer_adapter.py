@@ -2,15 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
-import os
-import time
 from collections import defaultdict, deque
 from typing import Any
 
 import torch
 from vllm.v1.request import Request, RequestStatus
-
-from vllm_omni.utils.async_chunk_profile import async_chunk_timer, log_async_chunk_event, log_async_chunk_profile
 
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec
@@ -43,7 +39,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.connector = self.create_connector(model_config)
         super().__init__(model_config)
-        self.model_mode = getattr(model_config, "worker_type", "ar")
+        self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
         self.custom_process_next_stage_input_func = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
@@ -56,8 +52,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.get_req_chunk: dict[str, int] = defaultdict(int)
         self.finished_requests: set[str] = set()
         self.request_payload = {}
-        self.code_prompt_token_ids: dict[str, list[list[int]]] = defaultdict(list)
-        self.code_prompt_frame_counts: dict[str, int] = defaultdict(int)
+        self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
@@ -81,68 +76,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
         return OmniConnectorFactory.create_connector(connector_specs)
 
-    def _defer_code_window_on_load_enabled(self) -> bool:
-        raw_cfg = getattr(self.connector, "config", {}) or {}
-        cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
-        if isinstance(cfg, dict) and "codec_defer_window_to_load" in cfg:
-            return bool(cfg.get("codec_defer_window_to_load"))
-        env_val = os.environ.get("VLLM_OMNI_ASYNC_CHUNK_DEFER_CODE_WINDOW", "")
-        return env_val.strip().lower() in ("1", "true", "yes")
-
-    def _build_code2wav_prompt_ids(
-        self,
-        payload_data: dict[str, Any],
-        request_id: str,
-    ) -> list[int] | None:
-        """Build code2wav prompt ids from payload.
-
-        Returns None when deferred-window mode needs more frames before emitting.
-        """
-        if self._defer_code_window_on_load_enabled() and "code_predictor_new_frames" in payload_data:
-            new_frames = payload_data.get("code_predictor_new_frames", [])
-            if new_frames:
-                request_cache = self.code_prompt_token_ids[request_id]
-                for frame in new_frames:
-                    if isinstance(frame, torch.Tensor):
-                        request_cache.append(frame.reshape(-1).tolist())
-                    elif hasattr(frame, "_x"):
-                        request_cache.append(list(frame._x))
-                    elif isinstance(frame, list):
-                        request_cache.append(frame)
-                    else:
-                        request_cache.append(list(frame))
-                self.code_prompt_frame_counts[request_id] += len(new_frames)
-
-            chunk_size = int(payload_data.get("codec_chunk_frames", 25))
-            left_context_size = int(payload_data.get("codec_left_context_frames", 25))
-            if chunk_size <= 0 or left_context_size < 0:
-                return []
-
-            request_cache = self.code_prompt_token_ids[request_id]
-            total_frames = self.code_prompt_frame_counts[request_id]
-            finished = bool(payload_data.get("finished"))
-            if total_frames <= 0:
-                return [] if finished else None
-            chunk_length = total_frames % chunk_size
-            if chunk_length != 0 and not finished:
-                return None
-
-            context_length = chunk_length if chunk_length != 0 else chunk_size
-            end_index = min(len(request_cache), left_context_size + context_length)
-            prompt_ids = torch.tensor(request_cache[-end_index:]).transpose(0, 1).reshape(-1).tolist()
-            # Keep only required frames for future left-context assembly.
-            max_keep = left_context_size + chunk_size
-            if len(request_cache) > max_keep:
-                del request_cache[: len(request_cache) - max_keep]
-            return prompt_ids
-
-        new_ids = payload_data.get("code_predictor_codes", [])
-        if isinstance(new_ids, torch.Tensor):
-            return new_ids.reshape(-1).tolist()
-        if hasattr(new_ids, "_x"):
-            return list(new_ids._x)
-        return new_ids
-
     def load_async(self, request: Request):
         """Register a request for asynchronous chunk retrieval.
 
@@ -161,13 +94,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
         if not hasattr(request, "additional_information"):
             request.additional_information = None
-        request._async_chunk_load_enqueue_ts = time.perf_counter()
+        self._cancelled_load_reqs.discard(request.request_id)
         self._pending_load_reqs.append(request)
-        log_async_chunk_profile(
-            "chunk_adapter_load_enqueue",
-            0.0,
-            extra=f"stage={stage_id} qlen={len(self._pending_load_reqs)}",
-        )
+        with self._recv_cond:
+            self._recv_cond.notify()
 
     def save_async(
         self,
@@ -187,14 +117,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "pooling_output": pooling_output,
             "request": request,
             "is_finished": request.is_finished(),
-            "enqueue_ts": time.perf_counter(),
         }
         self._pending_save_reqs.append(task)
-        log_async_chunk_profile(
-            "chunk_adapter_save_enqueue",
-            0.0,
-            extra=f"stage={self.connector.stage_id} qlen={len(self._pending_save_reqs)}",
-        )
+        with self._save_cond:
+            self._save_cond.notify()
 
     def _poll_single_request(self, request: Request):
         stage_id = self.connector.stage_id
@@ -220,46 +146,35 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         payload_data, size = result
 
         if payload_data:
-            enqueue_ts = getattr(request, "_async_chunk_load_enqueue_ts", None)
-            if enqueue_ts is not None:
-                log_async_chunk_profile(
-                    "chunk_adapter_load_queue_wait",
-                    (time.perf_counter() - enqueue_ts) * 1000,
-                    extra=f"stage={stage_id} req_id={str(req_id)[:12]} chunk={chunk_id}",
-                )
-            load_extra = f"stage={stage_id} req_id={str(req_id)[:12]} chunk={chunk_id}"
-            log_async_chunk_event("chunk_adapter_load_work", "start", extra=load_extra)
             # Update connector state
-            try:
-                self.get_req_chunk[req_id] += 1
+            self.get_req_chunk[req_id] += 1
 
-                if self.model_mode == "ar":
-                    self._update_request_payload(external_req_id, payload_data)
-                    request.additional_information = payload_data
-                    if payload_data.get("finished"):
-                        self.finished_requests.add(req_id)
-                else:
-                    if payload_data.get("finished"):
-                        self.finished_requests.add(req_id)
+            if self.model_mode == "ar":
+                self._update_request_payload(external_req_id, payload_data)
+                request.additional_information = payload_data
+                if payload_data.get("finished"):
+                    self.finished_requests.add(req_id)
+            else:
+                if payload_data.get("finished"):
+                    self.finished_requests.add(req_id)
 
-                    new_ids = self._build_code2wav_prompt_ids(payload_data, external_req_id)
-                    if new_ids is None:
-                        return True
-                    request.prompt_token_ids = new_ids
-                    request.num_computed_tokens = 0
+                new_ids = payload_data.get("code_predictor_codes", [])
+                request.prompt_token_ids = new_ids
+                # Pass additional fields (like left_context_size) to the request
+                # Only pass chunk context metadata in additional_information
+                request.additional_information = {}
+                if "left_context_size" in payload_data:
+                    request.additional_information["left_context_size"] = payload_data["left_context_size"]
+                request.num_computed_tokens = 0
 
-                    # Empty chunk with more data expected: keep polling.
-                    if not new_ids and not payload_data.get("finished"):
-                        return True
+                # Empty chunk with more data expected: keep polling.
+                if not new_ids and not payload_data.get("finished"):
+                    return True
 
-                # Mark as finished for consumption
-                self._finished_load_reqs.add(req_id)
-                if hasattr(request, "_async_chunk_load_enqueue_ts"):
-                    delattr(request, "_async_chunk_load_enqueue_ts")
-                logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
-                return True
-            finally:
-                log_async_chunk_event("chunk_adapter_load_work", "end", extra=load_extra)
+            # Mark as finished for consumption
+            self._finished_load_reqs.add(req_id)
+            logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
+            return True
 
         return False
 
@@ -271,23 +186,22 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             req_id: Request ID to update
             payload_data: New payload data to store
         """
-        with async_chunk_timer(
-            "chunk_adapter_update_request_payload",
-            extra=f"req_id={str(req_id)[:12]}",
-        ):
-            if req_id not in self.request_payload:
-                self.request_payload[req_id] = payload_data
-                return payload_data
-            origin_payload = self.request_payload[req_id]
-            for key, value in payload_data.items():
-                if key == "finished":
-                    continue
-                elif isinstance(value, torch.Tensor) and key in origin_payload:
-                    payload_data[key] = torch.cat([origin_payload[key], value], dim=0)
-                elif isinstance(value, list) and key in origin_payload:
-                    payload_data[key] = origin_payload[key] + value
-
+        if req_id not in self.request_payload:
             self.request_payload[req_id] = payload_data
+            return payload_data
+        origin_payload = self.request_payload[req_id]
+        override_keys = payload_data.pop("override_keys", [])
+        for key, value in payload_data.items():
+            if key == "finished":
+                continue
+            elif key in override_keys:
+                payload_data[key] = value
+            elif isinstance(value, torch.Tensor) and key in origin_payload:
+                payload_data[key] = torch.cat([origin_payload[key], value], dim=0)
+            elif isinstance(value, list) and key in origin_payload:
+                payload_data[key] = origin_payload[key] + value
+
+        self.request_payload[req_id] = payload_data
         return payload_data
 
     def _send_single_request(self, task: dict):
@@ -298,51 +212,40 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         next_stage_id = stage_id + 1
         request_id = request.external_req_id
         chunk_id = self.put_req_chunk[request_id]
-        enqueue_ts = task.get("enqueue_ts")
-        if enqueue_ts is not None:
-            log_async_chunk_profile(
-                "chunk_adapter_save_queue_wait",
-                (time.perf_counter() - enqueue_ts) * 1000,
-                extra=f"stage={stage_id} req_id={str(request_id)[:12]} chunk={chunk_id}",
-            )
         connector_put_key = f"{request_id}_{stage_id}_{chunk_id}"
-        save_extra = f"stage={stage_id} req_id={str(request_id)[:12]} chunk={chunk_id}"
-        log_async_chunk_event("chunk_adapter_save_work", "start", extra=save_extra)
         # Process payload in save_loop thread
         payload_data = None
-        try:
-            if self.custom_process_next_stage_input_func:
-                try:
-                    with async_chunk_timer(
-                        "chunk_adapter_custom_process",
-                        extra=f"stage={stage_id} chunk={chunk_id}",
-                    ):
-                        payload_data = self.custom_process_next_stage_input_func(
-                            transfer_manager=self,
-                            pooling_output=pooling_output,
-                            request=request,
-                            is_finished=is_finished,
-                        )
-
-                except Exception as e:
-                    logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
-
-            if not payload_data:
-                return
-
-            with async_chunk_timer("chunk_adapter_connector_put", extra=f"stage={stage_id}"):
-                success, size, metadata = self.connector.put(
-                    from_stage=str(stage_id),
-                    to_stage=str(next_stage_id),
-                    put_key=connector_put_key,
-                    data=payload_data,
+        if self.custom_process_next_stage_input_func:
+            try:
+                payload_data = self.custom_process_next_stage_input_func(
+                    transfer_manager=self,
+                    pooling_output=pooling_output,
+                    request=request,
+                    is_finished=is_finished,
                 )
 
-            if success:
-                self.put_req_chunk[request_id] += 1
-                logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
-        finally:
-            log_async_chunk_event("chunk_adapter_save_work", "end", extra=save_extra)
+            except Exception as e:
+                logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+
+        if not payload_data:
+            return
+
+        success, size, metadata = self.connector.put(
+            from_stage=str(stage_id),
+            to_stage=str(next_stage_id),
+            put_key=connector_put_key,
+            data=payload_data,
+        )
+
+        if success:
+            self.put_req_chunk[request_id] += 1
+            logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+
+        if is_finished:
+            self.code_prompt_token_ids.pop(request_id, None)
+            cached_ic = getattr(self, "_cached_ic", None)
+            if cached_ic is not None:
+                cached_ic.pop(request_id, None)
 
     ########################################################################
     # Cleanup
@@ -370,14 +273,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
 
-        remaining = deque(r for r in self._pending_load_reqs if getattr(r, "request_id", None) != request_id)
-        self._pending_load_reqs = remaining
+        self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
 
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
-        self.code_prompt_frame_counts.pop(external_req_id, None)
+
+        cached_ic = getattr(self, "_cached_ic", None)
+        if cached_ic is not None:
+            cached_ic.pop(external_req_id, None)
 
     ########################################################################
     # Schedule Helper
@@ -401,6 +306,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
         while len(running_queue) > self.scheduler_max_num_seqs:
             request = running_queue.pop()
+            request.status = RequestStatus.PREEMPTED
             waiting_queue.prepend_requests([request])
 
     def restore_queues(self, waiting_queue: Any, running_queue: list[Request]) -> None:

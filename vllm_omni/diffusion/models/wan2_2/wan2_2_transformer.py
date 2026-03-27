@@ -221,7 +221,7 @@ class WanRotaryPosEmbed(nn.Module):
         freqs_cos = torch.cat([freqs_cos_f, freqs_cos_h, freqs_cos_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
         freqs_sin = torch.cat([freqs_sin_f, freqs_sin_h, freqs_sin_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
 
-        return freqs_cos, freqs_sin
+        return freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
 
 
 class WanImageEmbedding(nn.Module):
@@ -965,13 +965,17 @@ class WanTransformer3DModel(nn.Module):
         """
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
-        # Stacked params mapping for self-attention QKV fusion
+        # Stacked params mapping for self-attention QKV fusion.
+        # Format: (param_name, shard_name, shard_id)
+        # Note: Only fuse attn1 (self-attention), NOT attn2 (cross-attention)
         stacked_params_mapping = [
             # self-attention QKV fusion
             (".attn1.to_qkv", ".attn1.to_q", "q"),
             (".attn1.to_qkv", ".attn1.to_k", "k"),
             (".attn1.to_qkv", ".attn1.to_v", "v"),
         ]
+        # Expose packed shard mappings for LoRA handling of fused projections.
+        self.stacked_params_mapping = stacked_params_mapping
 
         # Remap scale_shift_table to new module location
         weight_name_remapping = {
