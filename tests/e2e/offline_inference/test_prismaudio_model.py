@@ -3,13 +3,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pytest
@@ -30,7 +28,9 @@ if str(REPO_ROOT) not in sys.path:
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
-_DEFAULT_VENDOR_CONFIG = Path("/home/chen/vendor/ThinkSound-prismaudio/PrismAudio/configs/model_configs/prismaudio.json")
+_DEFAULT_VENDOR_CONFIG = Path(
+    "/home/chen/vendor/ThinkSound-prismaudio/PrismAudio/configs/model_configs/prismaudio.json"
+)
 _ENV_TRANSFORMER_CKPT = "PRISMAUDIO_E2E_TRANSFORMER_CKPT"
 _ENV_VAE_CKPT = "PRISMAUDIO_E2E_VAE_CKPT"
 _ENV_FEATURES = "PRISMAUDIO_E2E_FEATURES"

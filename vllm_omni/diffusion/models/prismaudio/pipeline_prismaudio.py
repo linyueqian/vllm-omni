@@ -556,7 +556,9 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
         get_conditioning_inputs = getattr(self.transformer, "get_conditioning_inputs", None)
         inner_model = getattr(self.transformer, "model", None)
         if callable(conditioner) and callable(get_conditioning_inputs) and isinstance(inner_model, nn.Module):
-            conditioning_tensors = conditioner((self._normalize_conditioning_for_official_wrapper(conditioning),), device)
+            conditioning_tensors = conditioner(
+                (self._normalize_conditioning_for_official_wrapper(conditioning),), device
+            )
             sampling_conditioning = dict(get_conditioning_inputs(conditioning_tensors))
             return inner_model, sampling_conditioning
 
@@ -700,7 +702,9 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
         assert state.latents is not None
         sampling_model = state.extra["sampling_model"]
         sampling_conditioning = state.extra["sampling_conditioning"]
-        t_for_model = timestep * torch.ones((state.latents.shape[0],), dtype=state.latents.dtype, device=state.latents.device)
+        t_for_model = timestep * torch.ones(
+            (state.latents.shape[0],), dtype=state.latents.dtype, device=state.latents.device
+        )
         return sampling_model(
             state.latents,
             t_for_model,

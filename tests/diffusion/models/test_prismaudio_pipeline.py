@@ -1294,8 +1294,8 @@ def test_prismaudio_pipeline_surfaces_missing_dependency_from_default_official_b
 
 
 def test_prismaudio_pipeline_patches_numpy_scalar_aliases_for_default_official_builder(monkeypatch):
-    import PrismAudio.models as official_models
     import numpy as np
+    import PrismAudio.models as official_models
 
     seen: dict[str, object] = {}
 
@@ -1333,8 +1333,9 @@ def test_prismaudio_pipeline_patches_numpy_scalar_aliases_for_default_official_b
 
 
 def test_prismaudio_pipeline_stubs_wandb_for_default_official_builder(monkeypatch):
-    import PrismAudio.models as official_models
     import sys
+
+    import PrismAudio.models as official_models
 
     seen: dict[str, object] = {}
 
@@ -1378,8 +1379,9 @@ def test_prismaudio_pipeline_stubs_wandb_for_default_official_builder(monkeypatc
 
 
 def test_prismaudio_pipeline_stubs_lightning_loggers_for_default_official_builder(monkeypatch):
-    import PrismAudio.models as official_models
     import sys
+
+    import PrismAudio.models as official_models
 
     seen: dict[str, object] = {}
 
