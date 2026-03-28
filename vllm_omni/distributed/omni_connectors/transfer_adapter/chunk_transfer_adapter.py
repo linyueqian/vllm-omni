@@ -254,10 +254,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Reclaim per-request async state only after the terminal payload
             # has been sent successfully. This avoids cleanup->save races.
             if is_payload_finished:
-                self.cleanup(request.request_id, request_id)
+                self.cleanup(request.request_id, external_req_id)
 
         if is_finished:
-            self.cleanup_sender(external_req_id)
+            self.code_prompt_token_ids.pop(external_req_id, None)
+            cached_ic = getattr(self, "_cached_ic", None)
+            if cached_ic is not None:
+                cached_ic.pop(external_req_id, None)
 
     ########################################################################
     # Cleanup
