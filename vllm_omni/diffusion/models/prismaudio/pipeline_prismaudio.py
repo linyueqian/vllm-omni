@@ -116,6 +116,12 @@ def load_module_from_prismaudio_checkpoint(
     filtered_state_dict = _strip_common_checkpoint_prefixes(state_dict, prefix_chain)
 
     incompatible = module.load_state_dict(filtered_state_dict, strict=strict)
+    if incompatible is None:
+        return PrismAudioCheckpointLoadReport(
+            missing_keys=[],
+            unexpected_keys=[],
+            loaded_keys=sorted(filtered_state_dict.keys()),
+        )
     loaded_keys = sorted(set(filtered_state_dict) - set(incompatible.unexpected_keys))
     return PrismAudioCheckpointLoadReport(
         missing_keys=sorted(list(incompatible.missing_keys)),
