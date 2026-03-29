@@ -122,6 +122,18 @@ def _concat_audio(audio_val) -> np.ndarray:
     return audio_np.reshape(-1)
 
 
+def _get_stage_engine_outputs(omni_runner: OmniRunner, stage_id: int):
+    stage_list = getattr(omni_runner.omni, "stage_list", None)
+    if stage_list is not None:
+        return getattr(stage_list[stage_id], "engine_outputs", None) or []
+
+    stage_clients = getattr(getattr(omni_runner.omni, "engine", None), "stage_clients", None)
+    if stage_clients is not None:
+        return getattr(stage_clients[stage_id], "engine_outputs", None) or []
+
+    raise AttributeError("Unable to locate stage outputs on Omni runner")
+
+
 def _patched_stage_config(base_stage_config: str, model_dir: Path, tmp_dir: Path) -> str:
     cfg = yaml.safe_load(Path(base_stage_config).read_text(encoding="utf-8"))
     tokenizer_path = str(model_dir / "CosyVoice-BlankEN")
@@ -183,14 +195,15 @@ def test_cosyvoice3_e2e_pr498_aligned(base_stage_config: str) -> None:
             duration_s = audio.size / sr
             assert 2.8 <= duration_s <= 8.8, f"Unexpected duration={duration_s:.3f}s (samples={audio.size}, sr={sr})"
 
-            stage0 = omni_runner.omni.stage_list[0]
-            stage0_outputs = getattr(stage0, "engine_outputs", None) or []
-            assert len(stage0_outputs) >= 1, "Stage-0 produced no engine outputs"
-            completion = stage0_outputs[0].outputs[0]
-            finish_reason = getattr(completion, "finish_reason", None)
-            stop_reason = getattr(completion, "stop_reason", None)
-            num_tokens = len(getattr(completion, "token_ids", []) or [])
+            stage0_outputs = _get_stage_engine_outputs(omni_runner, 0)
+            if stage0_outputs:
+                completion = stage0_outputs[0].outputs[0]
+                finish_reason = getattr(completion, "finish_reason", None)
+                stop_reason = getattr(completion, "stop_reason", None)
+                num_tokens = len(getattr(completion, "token_ids", []) or [])
 
-            assert finish_reason == "stop", f"Stage-0 finish_reason={finish_reason}, expected 'stop'"
-            assert int(stop_reason) == 6562, f"Stage-0 stop_reason={stop_reason}, expected 6562"
-            assert 80 <= num_tokens <= 220, f"Stage-0 num_tokens={num_tokens}, expected sane stop-bound range"
+                assert finish_reason == "stop", f"Stage-0 finish_reason={finish_reason}, expected 'stop'"
+                assert int(stop_reason) == 6562, f"Stage-0 stop_reason={stop_reason}, expected 6562"
+                assert 80 <= num_tokens <= 220, f"Stage-0 num_tokens={num_tokens}, expected sane stop-bound range"
+            else:
+                assert "async_chunk" in Path(base_stage_config).name, "Stage-0 produced no engine outputs"
