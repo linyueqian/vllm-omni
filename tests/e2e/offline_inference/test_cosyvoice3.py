@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Offline E2E smoke test for CosyVoice3 (text + prompt audio -> audio).
+Offline E2E smoke test for CosyVoice3 zero-shot reference inference.
 
-This test is aligned with the PR #498 reproduction defaults documented in AGENTS.md:
-- temperature=1.0, top_p=0.8, top_k=25, repetition_penalty=2.0
-- stop_token_ids=[6562]
-- min_tokens/max_tokens derived from text length via CosyVoice3Config ratios
+This test uses the official upstream zero-shot prompt text/audio pair and
+verifies a stable reference recipe:
+- config-derived top_p/top_k and token-length ratios
+- model EOS token as the stop token
+- a conservative repetition penalty to avoid degenerate loops
 """
 
 from __future__ import annotations
@@ -33,13 +34,14 @@ from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokeni
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 MODEL_DIR_ENV = "VLLM_OMNI_COSYVOICE3_MODEL_DIR"
 
-_PROMPT_WAV_URL = "https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav"
-
-PROMPT_TEXT = "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。"
-SYNTH_TEXT = (
+REFERENCE_PROMPT_WAV_URL = "https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav"
+REFERENCE_PROMPT_TEXT = "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。"
+REFERENCE_SYNTH_TEXT = (
     "CosyVoice is undergoing a comprehensive upgrade, providing more accurate, "
     "stable, faster, and better voice generation capabilities."
 )
+REFERENCE_STAGE0_TEMPERATURE = 1.0
+REFERENCE_STAGE0_REPETITION_PENALTY = 2.0
 
 
 def _stage_config(name: str) -> str:
@@ -53,8 +55,8 @@ STAGE_CONFIGS = [
 
 
 @functools.lru_cache(maxsize=1)
-def _load_prompt_wav() -> tuple[np.ndarray, int]:
-    with urlopen(_PROMPT_WAV_URL, timeout=30) as resp:
+def _load_reference_prompt_wav() -> tuple[np.ndarray, int]:
+    with urlopen(REFERENCE_PROMPT_WAV_URL, timeout=30) as resp:
         data = resp.read()
     audio, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=False)
     if isinstance(audio, np.ndarray) and audio.ndim > 1:
@@ -70,8 +72,10 @@ def _resolve_model_dir() -> Path:
     return Path(snapshot_download(MODEL, allow_patterns=["*"]))
 
 
-def _aligned_stage0_sampling(*, text: str) -> SamplingParams:
+def _reference_zero_shot_stage0_sampling(*, text: str) -> SamplingParams:
     config = CosyVoice3Config()
+    sampling_cfg = config.llm.get("sampling", {})
+    eos_token_id = int(config.llm["eos_token_id"])
     model_dir = _resolve_model_dir()
     tokenizer = get_qwen_tokenizer(
         token_path=str(model_dir / config.qwen_pretrain_path),
@@ -80,11 +84,11 @@ def _aligned_stage0_sampling(*, text: str) -> SamplingParams:
     )
     text_len = max(1, len(tokenizer.encode(text, allowed_special=config.allowed_special)))
     return SamplingParams(
-        temperature=1.0,
-        top_p=0.8,
-        top_k=25,
-        repetition_penalty=2.0,
-        stop_token_ids=[6562],
+        temperature=REFERENCE_STAGE0_TEMPERATURE,
+        top_p=float(sampling_cfg.get("top_p", 0.8)),
+        top_k=int(sampling_cfg.get("top_k", 25)),
+        repetition_penalty=REFERENCE_STAGE0_REPETITION_PENALTY,
+        stop_token_ids=[eos_token_id],
         min_tokens=int(text_len * config.min_token_text_ratio),
         max_tokens=int(text_len * config.max_token_text_ratio),
     )
@@ -147,13 +151,13 @@ def _patched_stage_config(base_stage_config: str, model_dir: Path, tmp_dir: Path
     return str(out_path)
 
 
-def _build_raw_inputs(prompt_audio: tuple[np.ndarray, int]) -> list[dict[str, object]]:
+def _build_reference_inputs(prompt_audio: tuple[np.ndarray, int]) -> list[dict[str, object]]:
     return [
         {
-            "prompt": SYNTH_TEXT,
+            "prompt": REFERENCE_SYNTH_TEXT,
             "multi_modal_data": {"audio": prompt_audio},
             "modalities": ["audio"],
-            "mm_processor_kwargs": {"prompt_text": PROMPT_TEXT},
+            "mm_processor_kwargs": {"prompt_text": REFERENCE_PROMPT_TEXT},
         }
     ]
 
@@ -162,10 +166,11 @@ def _build_raw_inputs(prompt_audio: tuple[np.ndarray, int]) -> list[dict[str, ob
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("base_stage_config", STAGE_CONFIGS)
-def test_cosyvoice3_e2e_pr498_aligned(base_stage_config: str) -> None:
-    """CosyVoice3 offline E2E: verify stop behavior and audio duration is sane."""
-    prompt_audio, prompt_sr = _load_prompt_wav()
+def test_cosyvoice3_offline_reference_zero_shot(base_stage_config: str) -> None:
+    """CosyVoice3 zero-shot reference inference should stop cleanly and produce sane audio."""
+    prompt_audio, prompt_sr = _load_reference_prompt_wav()
     model_dir = _resolve_model_dir()
+    expected_stop_token = int(CosyVoice3Config().llm["eos_token_id"])
 
     with tempfile.TemporaryDirectory(prefix="cv3-e2e-") as tmp:
         stage_config = _patched_stage_config(base_stage_config, model_dir, Path(tmp))
@@ -173,9 +178,11 @@ def test_cosyvoice3_e2e_pr498_aligned(base_stage_config: str) -> None:
             str(model_dir), seed=42, stage_configs_path=stage_config, stage_init_timeout=300
         ) as omni_runner:
             sampling_params_list = omni_runner.get_default_sampling_params_list()
-            sampling_params_list[0] = _aligned_stage0_sampling(text=SYNTH_TEXT)
+            sampling_params_list[0] = _reference_zero_shot_stage0_sampling(text=REFERENCE_SYNTH_TEXT)
 
-            outputs = omni_runner.omni.generate(_build_raw_inputs((prompt_audio, prompt_sr)), sampling_params_list)
+            outputs = omni_runner.omni.generate(
+                _build_reference_inputs((prompt_audio, prompt_sr)), sampling_params_list
+            )
 
             assert outputs, "No outputs returned"
             audio_mm = outputs[0].multimodal_output
@@ -203,7 +210,9 @@ def test_cosyvoice3_e2e_pr498_aligned(base_stage_config: str) -> None:
                 num_tokens = len(getattr(completion, "token_ids", []) or [])
 
                 assert finish_reason == "stop", f"Stage-0 finish_reason={finish_reason}, expected 'stop'"
-                assert int(stop_reason) == 6562, f"Stage-0 stop_reason={stop_reason}, expected 6562"
+                assert int(stop_reason) == expected_stop_token, (
+                    f"Stage-0 stop_reason={stop_reason}, expected {expected_stop_token}"
+                )
                 assert 80 <= num_tokens <= 220, f"Stage-0 num_tokens={num_tokens}, expected sane stop-bound range"
             else:
                 assert "async_chunk" in Path(base_stage_config).name, "Stage-0 produced no engine outputs"
