@@ -222,6 +222,94 @@ def test_prismaudio_pipeline_requires_sync_features():
         pipeline.forward(req)
 
 
+def test_prismaudio_pipeline_rejects_non_tensor_features():
+    model_cls = DiffusionModelRegistry._try_load_model_cls("PrismAudioPipeline")
+    od_config = OmniDiffusionConfig(
+        model="prismaudio",
+        model_class_name="PrismAudioPipeline",
+        model_config={
+            "prismaudio_model_config": _make_minimal_official_prismaudio_model_config(),
+        },
+    )
+    pipeline = model_cls(od_config=od_config, transformer=nn.Identity(), vae=nn.Identity())
+    req = _make_request(
+        additional_information={
+            "video_features": [[1.0, 2.0]],
+            "text_features": torch.randn(1, 32, 128),
+            "sync_features": torch.randn(1, 216, 128),
+        }
+    )
+
+    with pytest.raises(TypeError, match="video_features"):
+        pipeline.forward(req)
+
+
+def test_prismaudio_pipeline_rejects_invalid_feature_rank():
+    model_cls = DiffusionModelRegistry._try_load_model_cls("PrismAudioPipeline")
+    od_config = OmniDiffusionConfig(
+        model="prismaudio",
+        model_class_name="PrismAudioPipeline",
+        model_config={
+            "prismaudio_model_config": _make_minimal_official_prismaudio_model_config(),
+        },
+    )
+    pipeline = model_cls(od_config=od_config, transformer=nn.Identity(), vae=nn.Identity())
+    req = _make_request(
+        additional_information={
+            "video_features": torch.randn(128),
+            "text_features": torch.randn(1, 32, 128),
+            "sync_features": torch.randn(1, 216, 128),
+        }
+    )
+
+    with pytest.raises(ValueError, match="video_features"):
+        pipeline.forward(req)
+
+
+def test_prismaudio_pipeline_rejects_invalid_feature_width():
+    model_cls = DiffusionModelRegistry._try_load_model_cls("PrismAudioPipeline")
+    od_config = OmniDiffusionConfig(
+        model="prismaudio",
+        model_class_name="PrismAudioPipeline",
+        model_config={
+            "prismaudio_model_config": _make_minimal_official_prismaudio_model_config(),
+        },
+    )
+    pipeline = model_cls(od_config=od_config, transformer=nn.Identity(), vae=nn.Identity())
+    req = _make_request(
+        additional_information={
+            "video_features": torch.randn(1, 10, 64),
+            "text_features": torch.randn(1, 32, 128),
+            "sync_features": torch.randn(1, 216, 128),
+        }
+    )
+
+    with pytest.raises(ValueError, match="video_features"):
+        pipeline.forward(req)
+
+
+def test_prismaudio_pipeline_rejects_non_floating_features():
+    model_cls = DiffusionModelRegistry._try_load_model_cls("PrismAudioPipeline")
+    od_config = OmniDiffusionConfig(
+        model="prismaudio",
+        model_class_name="PrismAudioPipeline",
+        model_config={
+            "prismaudio_model_config": _make_minimal_official_prismaudio_model_config(),
+        },
+    )
+    pipeline = model_cls(od_config=od_config, transformer=nn.Identity(), vae=nn.Identity())
+    req = _make_request(
+        additional_information={
+            "video_features": torch.ones(1, 10, 128, dtype=torch.int64),
+            "text_features": torch.randn(1, 32, 128),
+            "sync_features": torch.randn(1, 216, 128),
+        }
+    )
+
+    with pytest.raises(TypeError, match="video_features"):
+        pipeline.forward(req)
+
+
 def test_prismaudio_pipeline_reads_sampling_extra_args():
     model_cls = DiffusionModelRegistry._try_load_model_cls("PrismAudioPipeline")
     pipeline = model_cls(transformer=nn.Identity(), vae=nn.Identity())
@@ -237,6 +325,44 @@ def test_prismaudio_pipeline_reads_sampling_extra_args():
     assert sampling_args == {
         "num_inference_steps": 24,
         "cfg_scale": 5.0,
+    }
+
+
+def test_prismaudio_pipeline_default_official_builder_does_not_patch_sys_modules(monkeypatch):
+    import sys
+    import types
+
+    observed_modules = {}
+
+    def _create_model_from_config(raw_model_config):
+        observed_modules["wandb"] = "wandb" in sys.modules
+        observed_modules["lightning"] = "lightning" in sys.modules
+        raise ModuleNotFoundError("No module named 'lightning'")
+
+    prismaudio_module = types.ModuleType("PrismAudio")
+    prismaudio_models_module = types.ModuleType("PrismAudio.models")
+    prismaudio_models_module.create_model_from_config = _create_model_from_config
+    prismaudio_module.models = prismaudio_models_module
+    monkeypatch.setitem(sys.modules, "PrismAudio", prismaudio_module)
+    monkeypatch.setitem(sys.modules, "PrismAudio.models", prismaudio_models_module)
+    monkeypatch.delitem(sys.modules, "wandb", raising=False)
+    monkeypatch.delitem(sys.modules, "lightning", raising=False)
+
+    model_cls = DiffusionModelRegistry._try_load_model_cls("PrismAudioPipeline")
+    od_config = OmniDiffusionConfig(
+        model="prismaudio",
+        model_class_name="PrismAudioPipeline",
+        model_config={
+            "prismaudio_model_config": _make_minimal_official_prismaudio_model_config(),
+        },
+    )
+
+    with pytest.raises(ModuleNotFoundError, match="required dependency is missing"):
+        model_cls(od_config=od_config)
+
+    assert observed_modules == {
+        "wandb": False,
+        "lightning": False,
     }
 
 
@@ -1293,20 +1419,15 @@ def test_prismaudio_pipeline_surfaces_missing_dependency_from_default_official_b
         model_cls(od_config=od_config)
 
 
-def test_prismaudio_pipeline_patches_numpy_scalar_aliases_for_default_official_builder(monkeypatch):
+def test_prismaudio_pipeline_surfaces_numpy_compatibility_error_from_default_official_builder(monkeypatch):
     import numpy as np
     import PrismAudio.models as official_models
 
-    seen: dict[str, object] = {}
-
     monkeypatch.delattr(np, "float_", raising=False)
 
-    class _OfficialWrapper(nn.Module):
-        pass
-
     def _builder(_raw_model_config):
-        seen["float_"] = np.float_
-        return _OfficialWrapper()
+        _ = np.float_
+        raise AssertionError("unreachable")
 
     monkeypatch.setattr(official_models, "create_model_from_config", _builder)
 
@@ -1326,103 +1447,8 @@ def test_prismaudio_pipeline_patches_numpy_scalar_aliases_for_default_official_b
     )
 
     model_cls = DiffusionModelRegistry._try_load_model_cls("PrismAudioPipeline")
-    pipeline = model_cls(od_config=od_config)
-
-    assert seen["float_"] is np.float64
-    assert isinstance(pipeline.transformer, _OfficialWrapper)
-
-
-def test_prismaudio_pipeline_stubs_wandb_for_default_official_builder(monkeypatch):
-    import sys
-
-    import PrismAudio.models as official_models
-
-    seen: dict[str, object] = {}
-
-    class _OfficialWrapper(nn.Module):
-        pass
-
-    def _builder(_raw_model_config):
-        import wandb
-        from wandb import Audio, Image
-
-        seen["wandb_module"] = wandb
-        seen["audio_cls"] = Audio
-        seen["image_cls"] = Image
-        return _OfficialWrapper()
-
-    monkeypatch.setattr(official_models, "create_model_from_config", _builder)
-    monkeypatch.delitem(sys.modules, "wandb", raising=False)
-
-    od_config = OmniDiffusionConfig(
-        model="prismaudio",
-        model_class_name="PrismAudioPipeline",
-        model_config={
-            "prismaudio_model_config": {
-                "model_type": "diffusion_cond",
-                "sample_rate": 44100,
-                "audio_channels": 2,
-                "model": {
-                    "io_channels": 64,
-                },
-            },
-        },
-    )
-
-    model_cls = DiffusionModelRegistry._try_load_model_cls("PrismAudioPipeline")
-    pipeline = model_cls(od_config=od_config)
-
-    assert getattr(seen["wandb_module"], "__codex_prismaudio_stub__", False) is True
-    assert seen["audio_cls"].__name__ == "_WandbAudio"
-    assert seen["image_cls"].__name__ == "_WandbImage"
-    assert isinstance(pipeline.transformer, _OfficialWrapper)
-
-
-def test_prismaudio_pipeline_stubs_lightning_loggers_for_default_official_builder(monkeypatch):
-    import sys
-
-    import PrismAudio.models as official_models
-
-    seen: dict[str, object] = {}
-
-    class _OfficialWrapper(nn.Module):
-        pass
-
-    def _builder(_raw_model_config):
-        from lightning.pytorch.loggers import CometLogger, TensorBoardLogger, WandbLogger
-
-        seen["wandb_logger_cls"] = WandbLogger
-        seen["comet_logger_cls"] = CometLogger
-        seen["tensorboard_logger_cls"] = TensorBoardLogger
-        return _OfficialWrapper()
-
-    monkeypatch.setattr(official_models, "create_model_from_config", _builder)
-    monkeypatch.delitem(sys.modules, "lightning", raising=False)
-    monkeypatch.delitem(sys.modules, "lightning.pytorch", raising=False)
-    monkeypatch.delitem(sys.modules, "lightning.pytorch.loggers", raising=False)
-
-    od_config = OmniDiffusionConfig(
-        model="prismaudio",
-        model_class_name="PrismAudioPipeline",
-        model_config={
-            "prismaudio_model_config": {
-                "model_type": "diffusion_cond",
-                "sample_rate": 44100,
-                "audio_channels": 2,
-                "model": {
-                    "io_channels": 64,
-                },
-            },
-        },
-    )
-
-    model_cls = DiffusionModelRegistry._try_load_model_cls("PrismAudioPipeline")
-    pipeline = model_cls(od_config=od_config)
-
-    assert seen["wandb_logger_cls"].__name__ == "_LightningWandbLogger"
-    assert seen["comet_logger_cls"].__name__ == "_LightningCometLogger"
-    assert seen["tensorboard_logger_cls"].__name__ == "_LightningTensorBoardLogger"
-    assert isinstance(pipeline.transformer, _OfficialWrapper)
+    with pytest.raises(RuntimeError, match="NumPy 2.x compatibility issue"):
+        model_cls(od_config=od_config)
 
 
 def test_prismaudio_pipeline_load_weights_reads_runtime_checkpoint_paths(tmp_path):
@@ -1842,6 +1868,18 @@ def test_prismaudio_pipeline_load_weights_rejects_runtime_checkpoint_without_mat
         pipeline.load_weights([])
 
 
+def _build_real_official_pipeline_or_skip(od_config: OmniDiffusionConfig):
+    model_cls = DiffusionModelRegistry._try_load_model_cls("PrismAudioPipeline")
+    try:
+        return model_cls(od_config=od_config)
+    except ModuleNotFoundError as exc:
+        pytest.skip(f"official PrismAudio builder dependency missing in test env: {exc}")
+    except RuntimeError as exc:
+        if "NumPy 2.x compatibility issue" in str(exc):
+            pytest.skip(str(exc))
+        raise
+
+
 def test_prismaudio_pipeline_can_construct_real_official_builder_when_available():
     pytest.importorskip("PrismAudio.models")
 
@@ -1909,8 +1947,7 @@ def test_prismaudio_pipeline_can_construct_real_official_builder_when_available(
         },
     )
 
-    model_cls = DiffusionModelRegistry._try_load_model_cls("PrismAudioPipeline")
-    pipeline = model_cls(od_config=od_config)
+    pipeline = _build_real_official_pipeline_or_skip(od_config)
 
     assert type(pipeline.transformer).__module__.startswith("PrismAudio.models.")
     assert type(pipeline.transformer).__name__ == "ConditionedDiffusionModelWrapper"
@@ -1995,8 +2032,7 @@ def test_prismaudio_pipeline_can_run_real_official_builder_with_fake_vae_when_av
         },
     )
 
-    model_cls = DiffusionModelRegistry._try_load_model_cls("PrismAudioPipeline")
-    pipeline = model_cls(od_config=od_config)
+    pipeline = _build_real_official_pipeline_or_skip(od_config)
     pipeline.vae = _FakeVAE()
     req = _make_request(
         additional_information={
@@ -2026,8 +2062,7 @@ def test_prismaudio_pipeline_can_construct_real_official_pretransform_when_avail
         },
     )
 
-    model_cls = DiffusionModelRegistry._try_load_model_cls("PrismAudioPipeline")
-    pipeline = model_cls(od_config=od_config)
+    pipeline = _build_real_official_pipeline_or_skip(od_config)
 
     assert type(pipeline.transformer).__module__.startswith("PrismAudio.models.")
     assert type(pipeline.vae).__module__.startswith("PrismAudio.models.")
@@ -2047,8 +2082,7 @@ def test_prismaudio_pipeline_can_run_real_official_pretransform_decode_when_avai
         },
     )
 
-    model_cls = DiffusionModelRegistry._try_load_model_cls("PrismAudioPipeline")
-    pipeline = model_cls(od_config=od_config)
+    pipeline = _build_real_official_pipeline_or_skip(od_config)
     req = _make_request(
         additional_information={
             "video_features": torch.randn(1, 10, 128),

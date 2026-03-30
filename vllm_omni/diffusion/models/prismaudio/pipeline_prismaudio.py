@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import importlib
 import json
-import sys
-import types
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from os import PathLike
@@ -184,6 +182,21 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
             self._maybe_initialize_components_from_config()
 
     def _load_prismaudio_model_config(self, od_config: OmniDiffusionConfig) -> dict[str, Any]:
+        """Load the official PrismAudio model config.
+
+        Supported inputs, in precedence order:
+        1. ``od_config.model_config["prismaudio_model_config"]`` inline dict
+        2. ``od_config.model_config["prismaudio_model_config_path"]`` JSON file path
+        3. ``od_config.model`` when it directly points to a ``.json`` file
+
+        Example:
+            od_config.model_config = {
+                "prismaudio_model_config_path": "/path/to/prismaudio.json",
+            }
+
+        The JSON/dict must preserve the upstream official builder schema, e.g.
+        ``{"model_type": "diffusion_cond", "model": {...}}``.
+        """
         inline_model_config = dict(getattr(od_config, "model_config", {}) or {})
         raw_model_config = inline_model_config.get("prismaudio_model_config")
         if isinstance(raw_model_config, Mapping):
@@ -295,71 +308,6 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
         if isinstance(spec, Mapping):
             factory_callable = spec["callable"]
             factory_input = spec.get("input", "runtime_config")
-            restore_numpy_aliases: dict[str, Any] = {}
-            original_wandb_module = None
-            original_lightning_modules: dict[str, Any] = {}
-            if spec.get("source") == "official_default_builder":
-                if not hasattr(np, "float_"):
-                    restore_numpy_aliases["float_"] = None
-                    np.float_ = np.float64
-                if not hasattr(np, "complex_"):
-                    restore_numpy_aliases["complex_"] = None
-                    np.complex_ = np.complex128
-                original_wandb_module = sys.modules.get("wandb")
-                wandb_stub = types.ModuleType("wandb")
-
-                class _WandbAudio:
-                    def __init__(self, *args: Any, **kwargs: Any) -> None:
-                        self.args = args
-                        self.kwargs = kwargs
-
-                class _WandbImage:
-                    def __init__(self, *args: Any, **kwargs: Any) -> None:
-                        self.args = args
-                        self.kwargs = kwargs
-
-                class _WandbTable:
-                    def __init__(self, *args: Any, **kwargs: Any) -> None:
-                        self.args = args
-                        self.kwargs = kwargs
-
-                class _WandbObject3D:
-                    def __init__(self, *args: Any, **kwargs: Any) -> None:
-                        self.args = args
-                        self.kwargs = kwargs
-
-                wandb_stub.__codex_prismaudio_stub__ = True
-                wandb_stub.Audio = _WandbAudio
-                wandb_stub.Image = _WandbImage
-                wandb_stub.Table = _WandbTable
-                wandb_stub.Object3D = _WandbObject3D
-                sys.modules["wandb"] = wandb_stub
-
-                for module_name in ("lightning", "lightning.pytorch", "lightning.pytorch.loggers"):
-                    original_lightning_modules[module_name] = sys.modules.get(module_name)
-
-                lightning_module = types.ModuleType("lightning")
-                lightning_pytorch_module = types.ModuleType("lightning.pytorch")
-                lightning_loggers_module = types.ModuleType("lightning.pytorch.loggers")
-
-                class _LightningWandbLogger:
-                    pass
-
-                class _LightningCometLogger:
-                    pass
-
-                class _LightningTensorBoardLogger:
-                    pass
-
-                lightning_loggers_module.WandbLogger = _LightningWandbLogger
-                lightning_loggers_module.CometLogger = _LightningCometLogger
-                lightning_loggers_module.TensorBoardLogger = _LightningTensorBoardLogger
-                lightning_pytorch_module.loggers = lightning_loggers_module
-                lightning_module.pytorch = lightning_pytorch_module
-
-                sys.modules["lightning"] = lightning_module
-                sys.modules["lightning.pytorch"] = lightning_pytorch_module
-                sys.modules["lightning.pytorch.loggers"] = lightning_loggers_module
             try:
                 if factory_input == "runtime_config":
                     return factory_callable(runtime_config)
@@ -379,20 +327,6 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
                         f"while constructing the model: {exc}. Use a NumPy version compatible with the "
                         "upstream PrismAudio stack, or patch the upstream dependency to avoid `np.float_`."
                     ) from exc
-            finally:
-                if spec.get("source") == "official_default_builder":
-                    if original_wandb_module is None:
-                        sys.modules.pop("wandb", None)
-                    else:
-                        sys.modules["wandb"] = original_wandb_module
-                    for module_name, original_module in original_lightning_modules.items():
-                        if original_module is None:
-                            sys.modules.pop(module_name, None)
-                        else:
-                            sys.modules[module_name] = original_module
-                if restore_numpy_aliases:
-                    for alias_name in restore_numpy_aliases:
-                        delattr(np, alias_name)
             raise ValueError(f"Unsupported PrismAudio factory input mode: {factory_input!r}.")
         return spec(runtime_config)
 
@@ -415,13 +349,84 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
         return dict(additional_information)
 
     def _validate_required_features(self, additional_information: Mapping[str, Any]) -> None:
+        expected_feature_dims = self._get_expected_feature_dims()
         for feature_name in self.required_feature_names:
-            if additional_information.get(feature_name) is None:
+            feature_value = additional_information.get(feature_name)
+            if feature_value is None:
                 raise ValueError(
                     f"PrismAudioPipeline requires precomputed `{feature_name}` in "
                     "`prompt.additional_information`. End-to-end video preprocessing "
                     "is not implemented in this integration stage."
                 )
+            self._validate_feature_tensor(
+                feature_name,
+                feature_value,
+                expected_feature_dims.get(feature_name),
+            )
+
+    def _get_expected_feature_dims(self) -> dict[str, int]:
+        runtime_config = self.runtime_config
+        raw_model_config = runtime_config.raw_model_config if runtime_config is not None else None
+        if not isinstance(raw_model_config, Mapping):
+            return {}
+
+        model_section = raw_model_config.get("model", {})
+        if not isinstance(model_section, Mapping):
+            return {}
+
+        conditioning_section = model_section.get("conditioning", {})
+        if not isinstance(conditioning_section, Mapping):
+            return {}
+
+        feature_dims: dict[str, int] = {}
+        for item in conditioning_section.get("configs", []):
+            if not isinstance(item, Mapping):
+                continue
+            feature_name = item.get("id")
+            feature_config = item.get("config", {})
+            if not isinstance(feature_name, str) or not isinstance(feature_config, Mapping):
+                continue
+            feature_dim = feature_config.get("dim")
+            if isinstance(feature_dim, int):
+                feature_dims[feature_name] = feature_dim
+        return feature_dims
+
+    def _validate_feature_tensor(
+        self,
+        feature_name: str,
+        feature_value: Any,
+        expected_width: int | None,
+    ) -> None:
+        if not isinstance(feature_value, torch.Tensor):
+            raise TypeError(
+                f"PrismAudioPipeline expects `{feature_name}` to be a torch.Tensor, "
+                f"but received {type(feature_value)!r}."
+            )
+        if not torch.is_floating_point(feature_value):
+            raise TypeError(
+                f"PrismAudioPipeline expects `{feature_name}` to use a floating-point dtype, "
+                f"but received {feature_value.dtype}."
+            )
+        if feature_value.ndim not in (2, 3):
+            raise ValueError(
+                f"PrismAudioPipeline expects `{feature_name}` to have rank 2 or 3, "
+                f"but received shape {tuple(feature_value.shape)}."
+            )
+        if feature_value.ndim == 3 and feature_value.shape[0] != 1:
+            raise ValueError(
+                f"PrismAudioPipeline currently supports exactly one prompt, so `{feature_name}` "
+                f"may only use a leading batch dimension of 1; received shape {tuple(feature_value.shape)}."
+            )
+        if feature_value.shape[-1] <= 0:
+            raise ValueError(
+                f"PrismAudioPipeline expects `{feature_name}` to have a positive trailing feature dimension, "
+                f"but received shape {tuple(feature_value.shape)}."
+            )
+        if expected_width is not None and feature_value.shape[-1] != expected_width:
+            raise ValueError(
+                f"PrismAudioPipeline expects `{feature_name}` to have trailing dimension {expected_width}, "
+                f"but received shape {tuple(feature_value.shape)}."
+            )
 
     def _parse_sampling_args(self, req: OmniDiffusionRequest) -> dict[str, float | int]:
         return self._parse_sampling_args_from_sampling(req.sampling_params)

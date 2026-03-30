@@ -26,11 +26,6 @@ if str(REPO_ROOT) not in sys.path:
 
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
-
-
-_DEFAULT_VENDOR_CONFIG = Path(
-    "/home/chen/vendor/ThinkSound-prismaudio/PrismAudio/configs/model_configs/prismaudio.json"
-)
 _ENV_TRANSFORMER_CKPT = "PRISMAUDIO_E2E_TRANSFORMER_CKPT"
 _ENV_VAE_CKPT = "PRISMAUDIO_E2E_VAE_CKPT"
 _ENV_FEATURES = "PRISMAUDIO_E2E_FEATURES"
@@ -60,12 +55,7 @@ def _resolve_prismaudio_config_path() -> Path:
             pytest.skip(f"{_ENV_CONFIG} points to a missing path: {path}")
         return path
 
-    if not _DEFAULT_VENDOR_CONFIG.exists():
-        pytest.skip(
-            f"Default vendored PrismAudio config is missing at {_DEFAULT_VENDOR_CONFIG}; "
-            f"set {_ENV_CONFIG} to a valid official config path."
-        )
-    return _DEFAULT_VENDOR_CONFIG
+    pytest.skip(f"{_ENV_CONFIG} is not set; skipping PrismAudio real-model e2e smoke test.")
 
 
 def _load_conditioning_fixture(path: Path) -> dict[str, torch.Tensor]:
@@ -73,7 +63,10 @@ def _load_conditioning_fixture(path: Path) -> dict[str, torch.Tensor]:
         npz_data = np.load(path, allow_pickle=True)
         raw_data = {key: npz_data[key] for key in npz_data.files}
     else:
-        raw_data = torch.load(path, map_location="cpu", weights_only=False)
+        try:
+            raw_data = torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            raw_data = torch.load(path, map_location="cpu")
 
     if not isinstance(raw_data, dict):
         raise TypeError(f"PrismAudio conditioning fixture must decode to a dict, got {type(raw_data)!r}.")
@@ -121,6 +114,13 @@ def _make_local_prismaudio_model_dir(tmp_path: Path, official_config_path: Path)
 
 def _resolve_dtype() -> str:
     return os.environ.get(_ENV_DTYPE, "bfloat16")
+
+
+def test_prismaudio_e2e_config_path_is_env_driven(monkeypatch) -> None:
+    monkeypatch.delenv(_ENV_CONFIG, raising=False)
+
+    with pytest.raises(pytest.skip.Exception, match=_ENV_CONFIG):
+        _resolve_prismaudio_config_path()
 
 
 @pytest.mark.asyncio
