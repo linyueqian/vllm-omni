@@ -292,4 +292,3 @@ Example successful smoke result from local development:
 
 - The current offline smoke path is the recommended reviewer-facing validation path for checkpoint-backed PrismAudio integration.
 - If the upstream official builder environment is incomplete, related tests skip or fail with explicit dependency / NumPy compatibility errors rather than silently patching imports.
-
