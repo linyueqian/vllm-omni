@@ -578,8 +578,7 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
 
     def _has_required_features(self, additional_information: Mapping[str, Any]) -> bool:
         return all(
-            additional_information.get(feature_name) is not None
-            for feature_name in self._get_required_feature_names()
+            additional_information.get(feature_name) is not None for feature_name in self._get_required_feature_names()
         )
 
     def _get_required_feature_names(self) -> tuple[str, ...]:
@@ -852,9 +851,7 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
         assert self.feature_extractor is not None
         required_feature_names = self._get_required_feature_names()
         required_feature_set = set(required_feature_names)
-        is_mm_conditioning = bool(
-            {"metaclip_features", "metaclip_text_features", "t5_features"} & required_feature_set
-        )
+        is_mm_conditioning = bool({"metaclip_features", "metaclip_text_features", "t5_features"} & required_feature_set)
 
         captions: list[str] = []
         prompt_text_captions: list[str] = []
@@ -868,15 +865,15 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
                 )
 
             clip_missing = (
-                additional_information.get("clip_chunk") is None
-                and additional_information.get("clip_video") is None
+                additional_information.get("clip_chunk") is None and additional_information.get("clip_video") is None
             )
             sync_missing = (
-                additional_information.get("sync_chunk") is None
-                and additional_information.get("sync_video") is None
+                additional_information.get("sync_chunk") is None and additional_information.get("sync_video") is None
             )
             if self.video_preprocessor_factory is not None and (clip_missing or sync_missing):
-                additional_information = self._build_prompt_inputs_from_video_preprocessor(prompt, additional_information)
+                additional_information = self._build_prompt_inputs_from_video_preprocessor(
+                    prompt, additional_information
+                )
 
             prompt_text = prompt if isinstance(prompt, str) else prompt.get("prompt")
             caption = additional_information.get("caption_cot") or prompt_text
@@ -1054,8 +1051,7 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
             return torch.stack([_move_to_device(feature_tensor) for feature_tensor in feature_tensors], dim=0)
 
         stacked_conditioning = {
-            feature_name: _stack_feature_batch(feature_name)
-            for feature_name in self._get_required_feature_names()
+            feature_name: _stack_feature_batch(feature_name) for feature_name in self._get_required_feature_names()
         }
         return self.transformer, stacked_conditioning
 
