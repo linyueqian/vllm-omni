@@ -323,6 +323,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanPipeline": "get_wan22_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
     "LTX2ImageToVideoPipeline": "get_ltx2_post_process_func",
+    "PrismAudioPipeline": "get_prismaudio_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",

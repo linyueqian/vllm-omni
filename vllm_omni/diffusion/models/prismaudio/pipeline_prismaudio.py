@@ -68,6 +68,55 @@ def load_prismaudio_state_dict(checkpoint_path: str | PathLike[str]) -> dict[str
     return state_dict
 
 
+def get_prismaudio_post_process_func(
+    od_config: OmniDiffusionConfig,
+):
+    def post_process_func(
+        audio: torch.Tensor,
+        output_type: str = "np",
+    ):
+        if output_type in {"latent", "pt"}:
+            return audio
+        return audio.detach().cpu().float().numpy()
+
+    return post_process_func
+
+
+def load_prismaudio_conditioning_data(conditioning_path: str | PathLike[str]) -> dict[str, Any]:
+    conditioning_path = str(conditioning_path)
+    path = Path(conditioning_path)
+    if not path.exists():
+        raise ValueError(f"PrismAudioPipeline received `conditioning_path` pointing to a missing file: {path!r}.")
+
+    if path.suffix == ".npz":
+        npz_data = np.load(path, allow_pickle=True)
+        raw_data: Any = {key: npz_data[key] for key in npz_data.files}
+    else:
+        try:
+            raw_data = torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            raw_data = torch.load(path, map_location="cpu")
+
+    if not isinstance(raw_data, dict):
+        raise TypeError(
+            f"PrismAudio conditioning data at {conditioning_path!r} must deserialize to a dict, "
+            f"but received {type(raw_data)!r}."
+        )
+
+    normalized: dict[str, Any] = {}
+    for key, value in raw_data.items():
+        if isinstance(value, np.ndarray):
+            if np.issubdtype(value.dtype, np.number) or np.issubdtype(value.dtype, np.bool_):
+                normalized[key] = torch.from_numpy(value)
+            elif value.ndim == 0:
+                normalized[key] = value.item()
+            else:
+                normalized[key] = value.tolist()
+        else:
+            normalized[key] = value
+    return normalized
+
+
 def _strip_prefix_from_state_dict(
     state_dict: dict[str, torch.Tensor],
     prefix: str | None = None,
@@ -158,6 +207,7 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
 
     support_audio_output = True
     supports_step_execution = True
+    skip_default_dummy_run = True
     required_feature_names = ("video_features", "text_features", "sync_features")
     default_num_inference_steps = 24
     default_cfg_scale = 5.0
@@ -176,9 +226,14 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
         self.vae = vae
         self.prefix = prefix
         self.runtime_config: PrismAudioRuntimeConfig | None = None
+        self.conditioning_factory: Any = None
+        self.video_preprocessor_factory: Any = None
+        self.feature_extractor: Any = None
 
         if self.od_config is not None:
             self.runtime_config = self._build_runtime_config(self.od_config)
+            self.conditioning_factory = self._resolve_conditioning_factory_spec()
+            self.video_preprocessor_factory = self._resolve_video_preprocessor_factory_spec()
             self._maybe_initialize_components_from_config()
 
     def _load_prismaudio_model_config(self, od_config: OmniDiffusionConfig) -> dict[str, Any]:
@@ -271,6 +326,11 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
             if vae_factory is not None:
                 self.vae = self._call_factory_spec(vae_factory, runtime_config)
 
+        if self.feature_extractor is None:
+            feature_extractor_factory = self._resolve_factory_spec(factories.get("feature_extractor_factory"))
+            if feature_extractor_factory is not None:
+                self.feature_extractor = self._call_factory_spec(feature_extractor_factory, runtime_config)
+
     def _resolve_factory_spec(self, spec: Any) -> Any:
         if isinstance(spec, Mapping):
             path = spec.get("path")
@@ -288,6 +348,139 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
             module_name, attr_name = spec.split(":", 1)
             return getattr(importlib.import_module(module_name), attr_name)
         return resolve_obj_by_qualname(spec)
+
+    def _resolve_conditioning_factory_spec(self) -> Any:
+        if self.od_config is None:
+            return None
+        factories = getattr(self.od_config, "model_config", {}) or {}
+        spec = factories.get("conditioning_factory")
+        resolved = self._resolve_factory_spec(spec)
+        if isinstance(resolved, Mapping):
+            return {
+                **resolved,
+                "input": resolved.get("input", "prompt_and_runtime_config"),
+            }
+        if callable(resolved):
+            return {
+                "callable": resolved,
+                "input": "prompt_and_runtime_config",
+            }
+        return None
+
+    def _resolve_video_preprocessor_factory_spec(self) -> Any:
+        if self.od_config is None:
+            return None
+        factories = getattr(self.od_config, "model_config", {}) or {}
+        spec = factories.get("video_preprocessor_factory")
+        resolved = self._resolve_factory_spec(spec)
+        if isinstance(resolved, Mapping):
+            return {
+                **resolved,
+                "input": resolved.get("input", "prompt_and_runtime_config"),
+            }
+        if callable(resolved):
+            return {
+                "callable": resolved,
+                "input": "prompt_and_runtime_config",
+            }
+        return None
+
+    def _build_default_official_feature_extractor(self) -> Any:
+        if self.od_config is None or self.runtime_config is None:
+            return None
+
+        factories = getattr(self.od_config, "model_config", {}) or {}
+        feature_extractor_config = factories.get("feature_extractor_config")
+        if not isinstance(feature_extractor_config, Mapping):
+            return None
+
+        path = feature_extractor_config.get("path")
+        if path is not None:
+            feature_extractor_ctor = self._resolve_factory_spec(path)
+        else:
+            default_module = "data_utils.v2a_utils.feature_utils_288"
+            raw_model_config = self.runtime_config.raw_model_config or {}
+            if raw_model_config.get("model_type") == "mm_diffusion_cond":
+                default_module = "data_utils.v2a_utils.feature_utils_224"
+            module_name = str(feature_extractor_config.get("module", default_module))
+            class_name = str(feature_extractor_config.get("class_name", "FeaturesUtils"))
+            try:
+                feature_extractor_ctor = getattr(importlib.import_module(module_name), class_name)
+            except ModuleNotFoundError as exc:
+                raise ModuleNotFoundError(
+                    "The official PrismAudio feature extractor cannot be imported because a required dependency "
+                    f"is missing: {exc}. Install the upstream PrismAudio preprocessing runtime before using "
+                    "the default feature extractor builder path."
+                ) from exc
+
+        kwargs = {
+            "vae_ckpt": feature_extractor_config.get("vae_ckpt"),
+            "vae_config": feature_extractor_config.get("vae_config"),
+            "synchformer_ckpt": feature_extractor_config.get("synchformer_ckpt"),
+            "enable_conditions": feature_extractor_config.get("enable_conditions", True),
+            "need_vae_encoder": feature_extractor_config.get("need_vae_encoder", True),
+        }
+        try:
+            return feature_extractor_ctor(**kwargs)
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "The official PrismAudio feature extractor cannot be constructed because a required dependency "
+                f"is missing: {exc}. Install the upstream PrismAudio preprocessing runtime before using "
+                "the default feature extractor builder path."
+            ) from exc
+
+    def _build_default_official_video_preprocessor(self) -> Any:
+        if self.od_config is None or self.runtime_config is None:
+            return None
+
+        factories = getattr(self.od_config, "model_config", {}) or {}
+        video_preprocessor_config = factories.get("video_preprocessor_config")
+        if not isinstance(video_preprocessor_config, Mapping):
+            return None
+
+        path = video_preprocessor_config.get("path")
+        if path is not None:
+            extractor_callable = self._resolve_factory_spec(path)
+        else:
+            module_name = str(video_preprocessor_config.get("module", "app"))
+            function_name = str(video_preprocessor_config.get("function", "extract_video_frames"))
+            try:
+                extractor_callable = getattr(importlib.import_module(module_name), function_name)
+            except ModuleNotFoundError as exc:
+                raise ModuleNotFoundError(
+                    "The official PrismAudio video preprocessor cannot be imported because a required dependency "
+                    f"is missing: {exc}. Install the upstream PrismAudio preprocessing runtime before using "
+                    "the default video preprocessor builder path."
+                ) from exc
+
+        def _wrapped(prompt: Any, runtime_config: PrismAudioRuntimeConfig) -> dict[str, Any]:
+            additional_information = self._get_additional_information(prompt)
+            video_path = (
+                additional_information.get("video_path")
+                or additional_information.get("path")
+                or additional_information.get("input_video")
+            )
+            if not isinstance(video_path, (str, PathLike)):
+                raise ValueError(
+                    "PrismAudioPipeline video preprocessing requires `video_path` in prompt.additional_information."
+                )
+            try:
+                clip_chunk, sync_chunk, _duration = extractor_callable(str(video_path))
+            except ModuleNotFoundError as exc:
+                raise ModuleNotFoundError(
+                    "The official PrismAudio video preprocessor cannot be constructed because a required dependency "
+                    f"is missing: {exc}. Install the upstream PrismAudio preprocessing runtime before using "
+                    "the default video preprocessor builder path."
+                ) from exc
+            return {
+                "clip_chunk": clip_chunk,
+                "sync_chunk": sync_chunk,
+            }
+
+        return {
+            "callable": _wrapped,
+            "input": "prompt_and_runtime_config",
+        }
 
     def _get_default_official_model_factory(self) -> Mapping[str, Any] | None:
         try:
@@ -346,11 +539,30 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
                 "PrismAudioPipeline expects prompt.additional_information to be a mapping "
                 f"but received {type(additional_information)!r}."
             )
-        return dict(additional_information)
+        additional_information_dict = dict(additional_information)
+        conditioning_path = (
+            additional_information_dict.get("conditioning_path")
+            or additional_information_dict.get("features_path")
+            or additional_information_dict.get("feature_path")
+        )
+        if conditioning_path is None:
+            return additional_information_dict
+        if not isinstance(conditioning_path, (str, PathLike)):
+            raise TypeError(
+                "PrismAudioPipeline expects `conditioning_path` to be a string-like filesystem path, "
+                f"but received {type(conditioning_path)!r}."
+            )
+
+        loaded_conditioning = load_prismaudio_conditioning_data(conditioning_path)
+        merged_conditioning = dict(loaded_conditioning)
+        for key, value in additional_information_dict.items():
+            if key not in {"conditioning_path", "features_path", "feature_path"}:
+                merged_conditioning[key] = value
+        return merged_conditioning
 
     def _validate_required_features(self, additional_information: Mapping[str, Any]) -> None:
         expected_feature_dims = self._get_expected_feature_dims()
-        for feature_name in self.required_feature_names:
+        for feature_name in self._get_required_feature_names():
             feature_value = additional_information.get(feature_name)
             if feature_value is None:
                 raise ValueError(
@@ -363,6 +575,76 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
                 feature_value,
                 expected_feature_dims.get(feature_name),
             )
+
+    def _has_required_features(self, additional_information: Mapping[str, Any]) -> bool:
+        return all(
+            additional_information.get(feature_name) is not None
+            for feature_name in self._get_required_feature_names()
+        )
+
+    def _get_required_feature_names(self) -> tuple[str, ...]:
+        expected_feature_dims = self._get_expected_feature_dims()
+        if expected_feature_dims:
+            return tuple(expected_feature_dims.keys())
+        return self.required_feature_names
+
+    def _build_conditioning_from_factory(
+        self,
+        prompt: Any,
+        additional_information: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        spec = self.conditioning_factory
+        runtime_config = self.runtime_config
+        if spec is None or runtime_config is None:
+            return dict(additional_information)
+
+        factory_callable = spec["callable"]
+        factory_input = spec.get("input", "prompt_and_runtime_config")
+        if factory_input == "prompt_and_runtime_config":
+            built = factory_callable(prompt, runtime_config)
+        elif factory_input == "additional_information_and_runtime_config":
+            built = factory_callable(dict(additional_information), runtime_config)
+        else:
+            raise ValueError(f"Unsupported PrismAudio conditioning factory input mode: {factory_input!r}.")
+
+        if not isinstance(built, Mapping):
+            raise TypeError(
+                "PrismAudio conditioning factory must return a mapping containing the required feature tensors, "
+                f"but received {type(built)!r}."
+            )
+
+        merged = dict(additional_information)
+        merged.update(dict(built))
+        return merged
+
+    def _build_prompt_inputs_from_video_preprocessor(
+        self,
+        prompt: Any,
+        additional_information: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        spec = self.video_preprocessor_factory
+        runtime_config = self.runtime_config
+        if spec is None or runtime_config is None:
+            return dict(additional_information)
+
+        factory_callable = spec["callable"]
+        factory_input = spec.get("input", "prompt_and_runtime_config")
+        if factory_input == "prompt_and_runtime_config":
+            built = factory_callable(prompt, runtime_config)
+        elif factory_input == "additional_information_and_runtime_config":
+            built = factory_callable(dict(additional_information), runtime_config)
+        else:
+            raise ValueError(f"Unsupported PrismAudio video preprocessor input mode: {factory_input!r}.")
+
+        if not isinstance(built, Mapping):
+            raise TypeError(
+                "PrismAudio video preprocessor must return a mapping containing prompt-local inputs such as "
+                f"`clip_chunk` and `sync_chunk`, but received {type(built)!r}."
+            )
+
+        merged = dict(additional_information)
+        merged.update(dict(built))
+        return merged
 
     def _get_expected_feature_dims(self) -> dict[str, int]:
         runtime_config = self.runtime_config
@@ -414,8 +696,8 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
             )
         if feature_value.ndim == 3 and feature_value.shape[0] != 1:
             raise ValueError(
-                f"PrismAudioPipeline currently supports exactly one prompt, so `{feature_name}` "
-                f"may only use a leading batch dimension of 1; received shape {tuple(feature_value.shape)}."
+                f"PrismAudioPipeline batches prompts at the request level, so each per-prompt `{feature_name}` "
+                f"tensor may only use a leading batch dimension of 1; received shape {tuple(feature_value.shape)}."
             )
         if feature_value.shape[-1] <= 0:
             raise ValueError(
@@ -529,6 +811,170 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
     def _prepare_latents(self, req: OmniDiffusionRequest) -> torch.Tensor:
         return self._prepare_latents_from_sampling(req.prompts, req.sampling_params)
 
+    def _collect_prompt_conditioning(self, prompts: list[Any]) -> list[dict[str, Any]]:
+        if not prompts:
+            raise ValueError("PrismAudioPipeline requires at least one prompt.")
+
+        conditioning_batch = [self._get_additional_information(prompt) for prompt in prompts]
+        if all(self._has_required_features(item) for item in conditioning_batch):
+            for additional_information in conditioning_batch:
+                self._validate_required_features(additional_information)
+            return conditioning_batch
+
+        if self.conditioning_factory is not None:
+            built_batch: list[dict[str, Any]] = []
+            for prompt, additional_information in zip(prompts, conditioning_batch, strict=False):
+                if not self._has_required_features(additional_information):
+                    additional_information = self._build_conditioning_from_factory(prompt, additional_information)
+                self._validate_required_features(additional_information)
+                built_batch.append(additional_information)
+            return built_batch
+
+        if self.video_preprocessor_factory is None:
+            self.video_preprocessor_factory = self._build_default_official_video_preprocessor()
+        if self.feature_extractor is None:
+            self.feature_extractor = self._build_default_official_feature_extractor()
+        if self.feature_extractor is not None:
+            built_batch = self._build_conditioning_batch_from_feature_extractor(prompts, conditioning_batch)
+            for additional_information in built_batch:
+                self._validate_required_features(additional_information)
+            return built_batch
+
+        for additional_information in conditioning_batch:
+            self._validate_required_features(additional_information)
+        return conditioning_batch
+
+    def _build_conditioning_batch_from_feature_extractor(
+        self,
+        prompts: list[Any],
+        conditioning_batch: list[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        assert self.feature_extractor is not None
+        required_feature_names = self._get_required_feature_names()
+        required_feature_set = set(required_feature_names)
+        is_mm_conditioning = bool(
+            {"metaclip_features", "metaclip_text_features", "t5_features"} & required_feature_set
+        )
+
+        captions: list[str] = []
+        prompt_text_captions: list[str] = []
+        clip_chunks: list[torch.Tensor] = []
+        sync_chunks: list[torch.Tensor] = []
+        for prompt, additional_information in zip(prompts, conditioning_batch, strict=False):
+            if self._has_required_features(additional_information):
+                raise ValueError(
+                    "PrismAudioPipeline cannot mix direct feature tensors with feature-extractor inputs in the "
+                    "same request."
+                )
+
+            clip_missing = (
+                additional_information.get("clip_chunk") is None
+                and additional_information.get("clip_video") is None
+            )
+            sync_missing = (
+                additional_information.get("sync_chunk") is None
+                and additional_information.get("sync_video") is None
+            )
+            if self.video_preprocessor_factory is not None and (clip_missing or sync_missing):
+                additional_information = self._build_prompt_inputs_from_video_preprocessor(prompt, additional_information)
+
+            prompt_text = prompt if isinstance(prompt, str) else prompt.get("prompt")
+            caption = additional_information.get("caption_cot") or prompt_text
+            if not isinstance(caption, str) or not caption:
+                raise ValueError(
+                    "PrismAudioPipeline feature extraction requires `caption_cot` or a non-empty prompt string."
+                )
+            prompt_text_caption = additional_information.get("caption") or prompt_text or caption
+            if not isinstance(prompt_text_caption, str) or not prompt_text_caption:
+                prompt_text_caption = caption
+
+            clip_chunk = additional_information.get("clip_chunk")
+            if clip_chunk is None:
+                clip_chunk = additional_information.get("clip_video")
+            if clip_chunk is None:
+                raise ValueError(
+                    "PrismAudioPipeline feature extraction requires `clip_chunk` in prompt.additional_information."
+                )
+            sync_chunk = additional_information.get("sync_chunk")
+            if sync_chunk is None:
+                sync_chunk = additional_information.get("sync_video")
+            if sync_chunk is None:
+                raise ValueError(
+                    "PrismAudioPipeline feature extraction requires `sync_chunk` in prompt.additional_information."
+                )
+
+            def _as_tensor(value: Any, field_name: str) -> torch.Tensor:
+                if isinstance(value, np.ndarray):
+                    return torch.from_numpy(value)
+                if isinstance(value, torch.Tensor):
+                    return value
+                raise TypeError(
+                    f"PrismAudioPipeline expects `{field_name}` to be a torch.Tensor or numpy.ndarray, "
+                    f"but received {type(value)!r}."
+                )
+
+            captions.append(caption)
+            prompt_text_captions.append(prompt_text_caption)
+            clip_chunks.append(_as_tensor(clip_chunk, "clip_chunk"))
+            sync_chunks.append(_as_tensor(sync_chunk, "sync_chunk"))
+
+        clip_input = torch.stack(clip_chunks, dim=0)
+        sync_input = torch.stack(sync_chunks, dim=0)
+
+        def _index_feature_batch(value: Any, index: int, field_name: str) -> torch.Tensor:
+            if isinstance(value, np.ndarray):
+                value = torch.from_numpy(value)
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(
+                    f"PrismAudioPipeline feature extractor output `{field_name}` must be a tensor-like batch, "
+                    f"but received {type(value)!r}."
+                )
+            return value[index]
+
+        extracted_batches: dict[str, Any]
+        if is_mm_conditioning:
+            clip_features = self.feature_extractor.encode_video_with_clip(clip_input)
+            text_outputs = self.feature_extractor.encode_text(prompt_text_captions)
+            if isinstance(text_outputs, tuple):
+                metaclip_global_text_features, metaclip_text_features = text_outputs
+            else:
+                metaclip_global_text_features = text_outputs
+                metaclip_text_features = text_outputs
+            t5_features = self.feature_extractor.encode_t5_text(captions)
+            sync_features = self.feature_extractor.encode_video_with_sync(sync_input)
+            extracted_batches = {
+                "metaclip_features": clip_features,
+                "metaclip_text_features": metaclip_text_features,
+                "metaclip_global_text_features": metaclip_global_text_features,
+                "t5_features": t5_features,
+                "sync_features": sync_features,
+            }
+        else:
+            text_features = self.feature_extractor.encode_t5_text(captions)
+            video_feat, frame_embed, _, text_feat = self.feature_extractor.encode_video_and_text_with_videoprism(
+                clip_input,
+                captions,
+            )
+            sync_features = self.feature_extractor.encode_video_with_sync(sync_input)
+            extracted_batches = {
+                "video_features": frame_embed,
+                "text_features": text_features,
+                "sync_features": sync_features,
+                "global_video_features": video_feat,
+                "global_text_features": text_feat,
+            }
+
+        built_batch: list[dict[str, Any]] = []
+        for index, additional_information in enumerate(conditioning_batch):
+            merged = dict(additional_information)
+            for feature_name, feature_batch in extracted_batches.items():
+                if feature_batch is None:
+                    continue
+                merged[feature_name] = _index_feature_batch(feature_batch, index, feature_name)
+            built_batch.append(merged)
+
+        return built_batch
+
     def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
         if self.vae is None:
             raise NotImplementedError("PrismAudioPipeline requires a VAE module before decoding latents.")
@@ -550,19 +996,31 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
 
     def _get_sampling_model_and_conditioning(
         self,
-        conditioning: Mapping[str, Any],
+        conditioning: Mapping[str, Any] | list[Mapping[str, Any]],
         *,
         device: torch.device,
     ) -> tuple[nn.Module, dict[str, Any]]:
         if self.transformer is None:
             raise NotImplementedError("PrismAudioPipeline requires a transformer module before sampling latents.")
 
+        if isinstance(conditioning, Mapping):
+            conditioning_batch = [conditioning]
+        else:
+            conditioning_batch = list(conditioning)
+        if not conditioning_batch:
+            raise ValueError("PrismAudioPipeline requires at least one conditioning payload.")
+
         conditioner = getattr(self.transformer, "conditioner", None)
         get_conditioning_inputs = getattr(self.transformer, "get_conditioning_inputs", None)
         inner_model = getattr(self.transformer, "model", None)
         if callable(conditioner) and callable(get_conditioning_inputs) and isinstance(inner_model, nn.Module):
+            _runtime_device, runtime_dtype = self._get_runtime_latent_device_dtype()
             conditioning_tensors = conditioner(
-                (self._normalize_conditioning_for_official_wrapper(conditioning),), device
+                tuple(
+                    self._normalize_conditioning_for_official_wrapper(item, runtime_dtype=runtime_dtype)
+                    for item in conditioning_batch
+                ),
+                device,
             )
             sampling_conditioning = dict(get_conditioning_inputs(conditioning_tensors))
             return inner_model, sampling_conditioning
@@ -578,17 +1036,41 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
                 return {key: _move_to_device(item) for key, item in value.items()}
             return value
 
-        return self.transformer, {
-            "video_features": _move_to_device(conditioning["video_features"]),
-            "text_features": _move_to_device(conditioning["text_features"]),
-            "sync_features": _move_to_device(conditioning["sync_features"]),
-        }
+        def _normalize_feature_for_batch(value: Any) -> torch.Tensor:
+            assert isinstance(value, torch.Tensor)
+            if value.ndim == 3:
+                return value[0]
+            return value
 
-    def _normalize_conditioning_for_official_wrapper(self, conditioning: Mapping[str, Any]) -> dict[str, Any]:
+        def _stack_feature_batch(feature_name: str) -> torch.Tensor:
+            feature_tensors = [_normalize_feature_for_batch(item[feature_name]) for item in conditioning_batch]
+            first_shape = tuple(feature_tensors[0].shape)
+            for feature_tensor in feature_tensors[1:]:
+                if tuple(feature_tensor.shape) != first_shape:
+                    raise ValueError(
+                        f"PrismAudioPipeline expects all prompt-local `{feature_name}` tensors to share the same "
+                        f"shape before batching; received {[tuple(t.shape) for t in feature_tensors]!r}."
+                    )
+            return torch.stack([_move_to_device(feature_tensor) for feature_tensor in feature_tensors], dim=0)
+
+        stacked_conditioning = {
+            feature_name: _stack_feature_batch(feature_name)
+            for feature_name in self._get_required_feature_names()
+        }
+        return self.transformer, stacked_conditioning
+
+    def _normalize_conditioning_for_official_wrapper(
+        self,
+        conditioning: Mapping[str, Any],
+        *,
+        runtime_dtype: torch.dtype | None = None,
+    ) -> dict[str, Any]:
         def _normalize(value: Any) -> Any:
             if isinstance(value, torch.Tensor):
                 if value.ndim > 1 and value.shape[0] == 1:
-                    return value[0]
+                    value = value[0]
+                if runtime_dtype is not None and torch.is_floating_point(value):
+                    return value.to(dtype=runtime_dtype)
                 return value
             if isinstance(value, tuple):
                 return tuple(_normalize(item) for item in value)
@@ -667,20 +1149,11 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
 
     def prepare_encode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionRequestState:
         prompts = state.prompts or []
-        if not prompts:
-            raise ValueError("PrismAudioPipeline requires at least one prompt.")
-        if len(prompts) != 1:
-            raise ValueError(
-                "PrismAudioPipeline currently supports exactly one prompt per request. "
-                "Batching multiple prompt-specific conditioning payloads is not implemented yet."
-            )
-
-        conditioning = self._get_additional_information(prompts[0])
-        self._validate_required_features(conditioning)
+        conditioning_batch = self._collect_prompt_conditioning(prompts)
         sampling_args = self._parse_sampling_args_from_sampling(state.sampling)
         latents = self._prepare_latents_from_sampling(prompts, state.sampling)
         sampling_model, sampling_conditioning = self._get_sampling_model_and_conditioning(
-            conditioning,
+            conditioning_batch,
             device=latents.device,
         )
 
@@ -735,26 +1208,11 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
         return DiffusionOutput(output=audio)
 
     def forward(self, req: OmniDiffusionRequest, *args: Any, **kwargs: Any) -> DiffusionOutput:
-        if not req.prompts:
-            raise ValueError("PrismAudioPipeline requires at least one prompt.")
-        if len(req.prompts) != 1:
-            raise ValueError(
-                "PrismAudioPipeline currently supports exactly one prompt per request. "
-                "Batching multiple prompt-specific conditioning payloads is not implemented yet."
-            )
-
-        conditioning: dict[str, Any] | None = None
-        for prompt in req.prompts:
-            additional_information = self._get_additional_information(prompt)
-            self._validate_required_features(additional_information)
-            if conditioning is None:
-                conditioning = additional_information
-
+        conditioning_batch = self._collect_prompt_conditioning(req.prompts)
         sampling_args = self._parse_sampling_args(req)
-        assert conditioning is not None
         latents = self._prepare_latents(req)
         sampling_model, sampling_conditioning = self._get_sampling_model_and_conditioning(
-            conditioning,
+            conditioning_batch,
             device=latents.device,
         )
         sampled_latents = sample_discrete_euler(
