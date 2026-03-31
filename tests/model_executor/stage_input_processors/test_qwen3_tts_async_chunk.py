@@ -16,6 +16,8 @@ from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
     talker2code2wav_async_chunk,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 _FRAME = [1, 2, 3, 4]
 _Q = len(_FRAME)
 
@@ -176,7 +178,9 @@ def test_ic_load_change_mid_request():
     p3 = _call(tm, "r", n_frames=49)
     assert p3 is not None
 
-    # A *new* request under high load gets IC=16
+    # A *new* request under high load gets IC=16 (not IC=2).
+    # Frame 2 would emit under IC=2 but must hold under IC=16.
+    assert _call(tm, "new_req", n_frames=2) is None
     p4 = _call(tm, "new_req", n_frames=16)
     assert p4 is not None
 
