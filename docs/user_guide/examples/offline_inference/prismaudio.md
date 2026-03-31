@@ -1,5 +1,8 @@
 # PrismAudio Offline Inference
 
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/prismaudio>.
+
+
 PrismAudio support in `vllm-omni` currently targets the first integration scope:
 
 - input: precomputed `video_features`, `text_features`, and `sync_features`
@@ -226,7 +229,7 @@ before sampling.
 
 The repo contains an env-driven Prismaudio e2e smoke test:
 
-[`tests/e2e/offline_inference/test_prismaudio_model.py`](../../../tests/e2e/offline_inference/test_prismaudio_model.py)
+`tests/e2e/offline_inference/test_prismaudio_model.py`
 
 Required environment variables:
 
@@ -289,3 +292,4 @@ Example successful smoke result from local development:
 
 - The current offline smoke path is the recommended reviewer-facing validation path for checkpoint-backed PrismAudio integration.
 - If the upstream official builder environment is incomplete, related tests skip or fail with explicit dependency / NumPy compatibility errors rather than silently patching imports.
+
