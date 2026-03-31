@@ -29,6 +29,10 @@ from fastrtc import Stream
 from PIL import Image
 from websocket import create_connection
 
+# NOTE: Global frame buffer -- this demo is single-user only.
+# FastRTC's Stream handler has no access to Gradio session state,
+# so per-session isolation isn't possible with the current API.
+# Bind to localhost (not 0.0.0.0) in production or use SSH tunneling.
 frame_buffer: list[np.ndarray] = []
 frame_lock = threading.Lock()
 MAX_FRAMES = 64
@@ -191,7 +195,7 @@ def main():
 
     ws_url = f"ws://{args.host}:{args.port}/v1/video/chat/stream"
     demo = build_demo(ws_url, args.model)
-    demo.launch(server_name="0.0.0.0", server_port=args.demo_port)
+    demo.launch(server_name="127.0.0.1", server_port=args.demo_port)
 
 
 if __name__ == "__main__":
