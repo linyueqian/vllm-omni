@@ -280,7 +280,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
             record_function_or_nullcontext("Forward"),
-            self.maybe_get_kv_connector_output(scheduler_output, defer_finalize=defer_finalize) as kv_connector_output,
+            self.maybe_get_kv_connector_output(
+                scheduler_output, clear_metadata=not defer_finalize
+            ) as kv_connector_output,
         ):
             outputs = self._run_generation_model(
                 input_ids=input_ids,

@@ -410,6 +410,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor | IntermediateTensors:
+        # SpeechBridge: skip expensive forward at non-anchor decode steps
+        sb = getattr(self, "_sb_bridge", None)
+        if sb is not None and sb.skip_forward and sb.is_skip_step and input_ids.shape[0] == 1:
+            bridge_hidden = sb.get_bridge_prediction()
+            sb._forward_was_skipped = True
+            return bridge_hidden.to(device=input_ids.device, dtype=torch.bfloat16).unsqueeze(0)
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(
@@ -640,6 +646,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if hidden_states.numel() == 0:
             return {}
         last = hidden_states[-1, :].detach().to("cpu").contiguous()
+        # SpeechBridge: record hidden state for feature collection
+        if hasattr(self, "_sb_recorder") and self._sb_recorder is not None:
+            if hidden_states.shape[0] == 1:
+                self._sb_recorder.record_hidden_state(last)
+        # SpeechBridge: at skipped decode steps, replace hidden with bridge prediction
+        if hasattr(self, "_sb_bridge") and self._sb_bridge is not None:
+            if hidden_states.shape[0] == 1:
+                last = self._sb_bridge.on_postprocess(last)
         return {"last_talker_hidden": last}
 
     # -------------------- prompt construction helpers --------------------
@@ -1555,6 +1569,28 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 self.speaker_encoder = Qwen3TTSSpeakerEncoder(self.config.speaker_encoder_config)
             loaded |= loader.load_weights(speaker_weights, mapper=self.hf_to_vllm_mapper)
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
+
+        # SpeechBridge: initialize feature recorder if collection is enabled
+        collect_dir = os.environ.get("SPEECHBRIDGE_COLLECT_DIR")
+        if collect_dir:
+            from vllm_omni.speechbridge_recorder import SpeechBridgeRecorder
+
+            self._sb_recorder = SpeechBridgeRecorder(collect_dir)
+            logger.info("[SpeechBridge] Feature collection enabled -> %s", collect_dir)
+        else:
+            self._sb_recorder = None
+
+        # SpeechBridge: initialize bridge inference if checkpoint is provided
+        bridge_ckpt = os.environ.get("SPEECHBRIDGE_CHECKPOINT")
+        if bridge_ckpt:
+            from vllm_omni.speechbridge_inference import SpeechBridgeInference
+
+            skip_freq = int(os.environ.get("SPEECHBRIDGE_SKIP_FREQ", "3"))
+            self._sb_bridge = SpeechBridgeInference(bridge_ckpt, skip_frequency=skip_freq)
+            logger.info("[SpeechBridge] Bridge inference enabled (freq=%d)", skip_freq)
+        else:
+            self._sb_bridge = None
+
         return loaded
 
     # -------------------- GPU-side MTP fast-path --------------------
@@ -1607,4 +1643,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             embeds.append(self.code_predictor.get_input_embeddings()[i](residual_ids_t[:, i : i + 1]))
         summed = torch.cat(embeds, dim=1).sum(1, keepdim=True)  # [B,1,H]
         inputs_embeds_out = (summed + text_step).reshape(bsz, -1)
-        return inputs_embeds_out, audio_codes.to(dtype=torch.long)
+        audio_codes_out = audio_codes.to(dtype=torch.long)
+        # SpeechBridge: record codec codes for feature collection
+        if hasattr(self, "_sb_recorder") and self._sb_recorder is not None:
+            self._sb_recorder.record_codec_codes(audio_codes_out[0].detach().cpu())
+        # SpeechBridge: track codec codes for bridge conditioning
+        if hasattr(self, "_sb_bridge") and self._sb_bridge is not None:
+            self._sb_bridge.on_codec_codes(audio_codes_out[0])
+        return inputs_embeds_out, audio_codes_out

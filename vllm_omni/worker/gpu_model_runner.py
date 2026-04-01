@@ -233,6 +233,23 @@ class OmniGPUModelRunner(GPUModelRunner):
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        # SpeechBridge: save features for finished requests before cleanup
+        sb_recorder = getattr(self.model, "_sb_recorder", None) if hasattr(self, "model") else None
+        if sb_recorder is not None:
+            for req_id in scheduler_output.finished_req_ids:
+                info = self.model_intermediate_buffer.get(req_id, {})
+                text = info.get("text", "")
+                sb_recorder.save_utterance(req_id, text)
+
+        # SpeechBridge: save DAgger pairs for finished requests, reset for new requests
+        sb_bridge = getattr(self.model, "_sb_bridge", None) if hasattr(self, "model") else None
+        if sb_bridge is not None:
+            for req_id in scheduler_output.finished_req_ids:
+                sb_bridge.save_dagger_data(req_id)
+                sb_bridge.log_stats()
+            if scheduler_output.scheduled_new_reqs:
+                sb_bridge.on_new_request()
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)

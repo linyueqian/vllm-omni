@@ -294,7 +294,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(scheduler_output, defer_finalize=defer_finalize) as kv_connector_output,
+            self.maybe_get_kv_connector_output(
+                scheduler_output, clear_metadata=not defer_finalize
+            ) as kv_connector_output,
         ):
             model_output = self._model_forward(
                 input_ids=input_ids,
