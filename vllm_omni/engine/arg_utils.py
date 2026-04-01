@@ -1,5 +1,6 @@
 import argparse
 import dataclasses
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,6 +29,14 @@ def _register_omni_hf_configs() -> None:
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
         return
 
+    # Register with both transformers AutoConfig and vLLM's config registry
+    # so models with empty/missing config.json (e.g. CosyVoice3) can be
+    # resolved when model_type is injected via hf_overrides.
+    try:
+        from vllm.transformers_utils.config import _CONFIG_REGISTRY
+    except ImportError:
+        _CONFIG_REGISTRY = None
+
     for model_type, config_cls in [
         ("qwen3_tts", Qwen3TTSConfig),
         ("cosyvoice3", CosyVoice3Config),
@@ -38,6 +47,8 @@ def _register_omni_hf_configs() -> None:
         except ValueError:
             # Already registered elsewhere; ignore.
             pass
+        if _CONFIG_REGISTRY is not None and model_type not in _CONFIG_REGISTRY:
+            _CONFIG_REGISTRY[model_type] = config_cls
 
 
 def register_omni_models_to_vllm():
@@ -127,11 +138,56 @@ class OmniEngineArgs(EngineArgs):
 
         # If model_arch is specified, inject it into hf_overrides so vLLM can
         # resolve the architecture even when config.json lacks 'architectures'.
+        # Also inject model_type so AutoConfig can resolve the correct config
+        # class for models with empty or missing config.json (e.g. CosyVoice3).
         if self.model_arch:
             if self.hf_overrides is None:
                 self.hf_overrides = {}
             if isinstance(self.hf_overrides, dict):
                 self.hf_overrides.setdefault("architectures", [self.model_arch])
+                # Derive model_type from known arch→model_type mappings.
+                # This must use the actual HF model_type (from config classes),
+                # not the registry folder name which can differ.
+                if "model_type" not in self.hf_overrides:
+                    _ARCH_TO_MODEL_TYPE = {
+                        "CosyVoice3Model": "cosyvoice3",
+                    }
+                    model_type = _ARCH_TO_MODEL_TYPE.get(self.model_arch)
+                    if model_type is not None:
+                        self.hf_overrides.setdefault("model_type", model_type)
+
+        # Auto-detect tokenizer for models that store it in a subdirectory
+        # rather than the root (e.g. CosyVoice3 uses CosyVoice-BlankEN/).
+        if not self.tokenizer and self.model:
+            model_path = self.model
+            if os.path.isdir(model_path) and not os.path.isfile(os.path.join(model_path, "tokenizer_config.json")):
+                for subfolder in sorted(os.listdir(model_path)):
+                    candidate = os.path.join(model_path, subfolder)
+                    if os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "tokenizer_config.json")):
+                        self.tokenizer = candidate
+                        logger.info("Auto-detected tokenizer at %s", candidate)
+                        break
+            elif not os.path.isdir(model_path):
+                # For HF model IDs, check known tokenizer subfolder mappings
+                _TOKENIZER_SUBFOLDER_MAP = {
+                    "CosyVoice3Model": "CosyVoice-BlankEN",
+                }
+                subfolder = _TOKENIZER_SUBFOLDER_MAP.get(self.model_arch)
+                if subfolder:
+                    # Download just the tokenizer files from the subfolder
+                    try:
+                        from huggingface_hub import snapshot_download
+
+                        local_dir = snapshot_download(
+                            model_path,
+                            allow_patterns=[f"{subfolder}/*"],
+                        )
+                        candidate = os.path.join(local_dir, subfolder)
+                        if os.path.isdir(candidate):
+                            self.tokenizer = candidate
+                            logger.info("Downloaded tokenizer from %s/%s", model_path, subfolder)
+                    except Exception as e:
+                        logger.warning("Failed to download tokenizer subfolder: %s", e)
 
         # Build the vLLM config first, then use it to create the Omni config.
         model_config = super().create_model_config()
