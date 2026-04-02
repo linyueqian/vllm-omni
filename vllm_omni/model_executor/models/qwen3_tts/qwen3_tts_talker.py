@@ -1116,9 +1116,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if preprocessor_config_path is None:
             raise ValueError(f"{self.model_path}/speech_tokenizer/preprocessor_config.json not found")
         speech_tokenizer_dir = os.path.dirname(speech_tokenizer_path)
+        # Use float32 for the speech tokenizer encoder to avoid bfloat16
+        # precision loss in VQ codebook lookups.  bf16 causes ~50% of encoded
+        # reference-audio codes to differ from the float32 baseline, which
+        # corrupts the talker prompt and prevents stop-token generation.
         tok = Qwen3TTSTokenizer.from_pretrained(
             speech_tokenizer_dir,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float32,
         )
         # Prefer GPU for encoder if available; otherwise keep CPU.
         dev = next(self.parameters()).device
