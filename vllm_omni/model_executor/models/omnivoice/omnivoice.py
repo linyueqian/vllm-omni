@@ -345,16 +345,12 @@ class OmniVoiceModel(
         runtime_info = kwargs.get("runtime_additional_information", [])
 
         if not runtime_info:
-            # Dummy output for profiling — must return non-None hidden states
-            # for vLLM v1 model runner compatibility
-            dummy_hidden = torch.zeros(
+            # Profiling / dummy run — return a plain tensor (not OmniOutput)
+            # so the v1 model runner's _dummy_run can index into it.
+            return torch.zeros(
                 (input_ids.shape[0], self.config.llm_hidden_size),
                 device=input_ids.device,
                 dtype=torch.float32,
-            )
-            return OmniOutput(
-                text_hidden_states=dummy_hidden,
-                multimodal_outputs={"audio_tokens": torch.zeros(1, 8, 100, dtype=torch.long, device=input_ids.device)},
             )
 
         info = runtime_info[0]
@@ -465,15 +461,11 @@ class OmniVoiceModel(
         runtime_info = kwargs.get("runtime_additional_information", [])
 
         if not runtime_info:
-            # Dummy output for profiling
-            dummy_hidden = torch.zeros(
+            # Profiling / dummy run — return plain tensor for v1 runner compat
+            return torch.zeros(
                 (input_ids.shape[0], self.config.llm_hidden_size),
                 device=input_ids.device,
                 dtype=torch.float32,
-            )
-            return OmniOutput(
-                text_hidden_states=dummy_hidden,
-                multimodal_outputs={"audio": np.zeros((10 * self.config.sample_rate,))},
             )
 
         info = runtime_info[0]
