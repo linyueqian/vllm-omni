@@ -13,6 +13,17 @@ from vllm_omni.plugins import load_omni_general_plugins
 
 logger = init_logger(__name__)
 
+# Maps model architecture names to their HuggingFace model_type values.
+# Used when auto-injecting hf_overrides for models with missing config.json.
+_ARCH_TO_MODEL_TYPE: dict[str, str] = {
+    "CosyVoice3Model": "cosyvoice3",
+}
+
+# Maps model architecture names to tokenizer subfolder paths within HF repos.
+_TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
+    "CosyVoice3Model": "CosyVoice-BlankEN",
+}
+
 
 def _register_omni_hf_configs() -> None:
     try:
@@ -145,13 +156,7 @@ class OmniEngineArgs(EngineArgs):
                 self.hf_overrides = {}
             if isinstance(self.hf_overrides, dict):
                 self.hf_overrides.setdefault("architectures", [self.model_arch])
-                # Derive model_type from known arch→model_type mappings.
-                # This must use the actual HF model_type (from config classes),
-                # not the registry folder name which can differ.
                 if "model_type" not in self.hf_overrides:
-                    _ARCH_TO_MODEL_TYPE = {
-                        "CosyVoice3Model": "cosyvoice3",
-                    }
                     model_type = _ARCH_TO_MODEL_TYPE.get(self.model_arch)
                     if model_type is not None:
                         self.hf_overrides.setdefault("model_type", model_type)
@@ -168,10 +173,6 @@ class OmniEngineArgs(EngineArgs):
                         logger.info("Auto-detected tokenizer at %s", candidate)
                         break
             elif not os.path.isdir(model_path):
-                # For HF model IDs, check known tokenizer subfolder mappings
-                _TOKENIZER_SUBFOLDER_MAP = {
-                    "CosyVoice3Model": "CosyVoice-BlankEN",
-                }
                 subfolder = _TOKENIZER_SUBFOLDER_MAP.get(self.model_arch)
                 if subfolder:
                     # Download just the tokenizer files from the subfolder
@@ -180,7 +181,13 @@ class OmniEngineArgs(EngineArgs):
 
                         local_dir = snapshot_download(
                             model_path,
-                            allow_patterns=[f"{subfolder}/*"],
+                            allow_patterns=[
+                                f"{subfolder}/tokenizer*",
+                                f"{subfolder}/special_tokens*",
+                                f"{subfolder}/vocab*",
+                                f"{subfolder}/merges*",
+                                f"{subfolder}/added_tokens*",
+                            ],
                         )
                         candidate = os.path.join(local_dir, subfolder)
                         if os.path.isdir(candidate):

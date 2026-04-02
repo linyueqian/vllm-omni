@@ -141,7 +141,9 @@ def mel_filters(device, n_mels: int) -> torch.Tensor:
         try:
             import urllib.request
 
-            urllib.request.urlretrieve(source_url, filters_path)
+            with urllib.request.urlopen(source_url, timeout=30) as resp:
+                with open(filters_path, "wb") as f_out:
+                    f_out.write(resp.read())
             logger.info("Downloaded mel_filters.npz from %s", source_url)
         except Exception as e:
             raise FileNotFoundError(
