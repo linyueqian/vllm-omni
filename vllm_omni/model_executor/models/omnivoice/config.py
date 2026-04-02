@@ -14,7 +14,7 @@ class OmniVoiceConfig(PretrainedConfig):
 
     model_type = "omnivoice"
 
-    def get_text_config(self):
+    def get_text_config(self, **kwargs):
         """Return self so vLLM uses our top-level config (which has
         num_attention_heads etc.) instead of trying to extract a sub-config."""
         return self

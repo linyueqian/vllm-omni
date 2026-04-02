@@ -1208,6 +1208,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 ref_audio_data = (wav_list, sr)
             prompt = self._build_fish_speech_prompt(request, ref_audio_data=ref_audio_data)
             tts_params = {}
+        elif self._tts_model_type == "omnivoice":
+            tts_params = {"text": [request.input], "raw_text": [request.input]}
+            ph_len = max(len(request.input), 10)
+            prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
         elif self._is_tts:
             validation_error = self._validate_tts_request(request)
             if validation_error:
@@ -1216,9 +1220,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if self._tts_model_type == "voxtral_tts":
                 prompt = await self._build_voxtral_prompt(request)
                 tts_params = {}
-            elif self._tts_model_type == "omnivoice":
-                tts_params = {}
-                prompt = {"prompt": request.input}
             else:
                 tts_params = self._build_tts_params(request)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)

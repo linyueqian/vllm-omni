@@ -19,8 +19,6 @@ from transformers.feature_extraction_utils import BatchFeature
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMultiModal
-from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalDataDict,
     MultiModalFieldConfig,
@@ -276,22 +274,14 @@ class OmniVoiceDummyInputsBuilder(BaseDummyInputsBuilder[OmniVoiceMultiModalProc
 # ---------------------------------------------------------------------------
 
 
-@MULTIMODAL_REGISTRY.register_processor(
-    OmniVoiceMultiModalProcessor,
-    info=OmniVoiceMultiModalProcessingInfo,
-    dummy_inputs=OmniVoiceDummyInputsBuilder,
-)
 class OmniVoiceModel(
     nn.Module,
-    SupportsMultiModal,
 ):
     """OmniVoice model for vLLM-Omni two-stage pipeline.
 
     Routes to generator (Stage 0) or decoder (Stage 1) based on model_stage.
     """
 
-    supports_multimodal_raw_input_only = True
-    supports_multimodal = True
     requires_raw_input_tokens = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -355,15 +345,16 @@ class OmniVoiceModel(
         runtime_info = kwargs.get("runtime_additional_information", [])
 
         if not runtime_info:
-            # Dummy output for profiling
-            dummy_tokens = torch.zeros(
-                (1, self.config.num_audio_codebook, 100),
-                dtype=torch.long,
+            # Dummy output for profiling — must return non-None hidden states
+            # for vLLM v1 model runner compatibility
+            dummy_hidden = torch.zeros(
+                (input_ids.shape[0], self.config.llm_hidden_size),
                 device=input_ids.device,
+                dtype=torch.float32,
             )
             return OmniOutput(
-                text_hidden_states=None,
-                multimodal_outputs={"audio_tokens": dummy_tokens},
+                text_hidden_states=dummy_hidden,
+                multimodal_outputs={"audio_tokens": torch.zeros(1, 8, 100, dtype=torch.long, device=input_ids.device)},
             )
 
         info = runtime_info[0]
@@ -475,11 +466,14 @@ class OmniVoiceModel(
 
         if not runtime_info:
             # Dummy output for profiling
-            length = 10 * self.config.sample_rate
-            audio = np.zeros((length,))
+            dummy_hidden = torch.zeros(
+                (input_ids.shape[0], self.config.llm_hidden_size),
+                device=input_ids.device,
+                dtype=torch.float32,
+            )
             return OmniOutput(
-                text_hidden_states=None,
-                multimodal_outputs={"audio": audio},
+                text_hidden_states=dummy_hidden,
+                multimodal_outputs={"audio": np.zeros((10 * self.config.sample_rate,))},
             )
 
         info = runtime_info[0]
@@ -508,12 +502,27 @@ class OmniVoiceModel(
             },
         )
 
+    def _resolve_model_dir(self) -> str:
+        """Resolve model directory to local path (handles HF hub IDs)."""
+        model_dir = self.model_dir
+        if os.path.isdir(model_dir):
+            return model_dir
+        # HF hub model ID — resolve to local cache
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(model_dir)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        model_dir = self._resolve_model_dir()
+
         if self.model_stage == "omnivoice_generator":
-            device = next(self.parameters()).device
-            self.generator.load_weights(self.model_dir, device)
+            self.generator.load_weights(model_dir, device)
         elif self.model_stage == "omnivoice_decoder":
-            device = next(self.parameters()).device
-            self.decoder.load_weights(self.model_dir, device)
+            self.decoder.load_weights(model_dir, device)
         else:
             raise ValueError(f"{self.model_stage} not supported!")
