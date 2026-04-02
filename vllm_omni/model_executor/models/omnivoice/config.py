@@ -14,6 +14,11 @@ class OmniVoiceConfig(PretrainedConfig):
 
     model_type = "omnivoice"
 
+    def get_text_config(self):
+        """Return self so vLLM uses our top-level config (which has
+        num_attention_heads etc.) instead of trying to extract a sub-config."""
+        return self
+
     def __init__(self, **kwargs):
         # HF repos (e.g. k2-fsa/OmniVoice) may nest generation hyperparameters.
         gen_cfg = kwargs.pop("generation_config", None)
@@ -49,6 +54,16 @@ class OmniVoiceConfig(PretrainedConfig):
         self.llm_rope_theta = llm_config.get("rope_theta", 1000000.0)
         self.llm_rms_norm_eps = llm_config.get("rms_norm_eps", 1e-6)
         self.llm_head_dim = llm_config.get("head_dim", self.llm_hidden_size // self.llm_num_attention_heads)
+
+        # Expose LLM params at top level for vLLM ModelConfig compatibility
+        # (vLLM expects num_attention_heads, hidden_size, etc. on the config)
+        self.num_attention_heads = self.llm_num_attention_heads
+        self.num_key_value_heads = self.llm_num_key_value_heads
+        self.num_hidden_layers = self.llm_num_hidden_layers
+        self.hidden_size = self.llm_hidden_size
+        self.head_dim = self.llm_head_dim
+        if not hasattr(self, "vocab_size"):
+            self.vocab_size = self.llm_vocab_size
 
         # Generation params (defaults from OmniVoiceGenerationConfig)
         self.num_step = getattr(self, "num_step", 32)

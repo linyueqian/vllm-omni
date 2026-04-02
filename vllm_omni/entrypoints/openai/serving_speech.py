@@ -47,7 +47,10 @@ logger = init_logger(__name__)
 _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
 _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
-_TTS_MODEL_STAGES: set[str] = _VOXTRAL_TTS_MODEL_STAGES | _QWEN3_TTS_MODEL_STAGES | _FISH_TTS_MODEL_STAGES
+_OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
+_TTS_MODEL_STAGES: set[str] = (
+    _VOXTRAL_TTS_MODEL_STAGES | _QWEN3_TTS_MODEL_STAGES | _FISH_TTS_MODEL_STAGES | _OMNIVOICE_TTS_MODEL_STAGES
+)
 _TTS_LANGUAGES: set[str] = {
     "Auto",
     "Chinese",
@@ -240,6 +243,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "voxtral_tts"
         if model_stage in _FISH_TTS_MODEL_STAGES:
             return "fish_tts"
+        if model_stage in _OMNIVOICE_TTS_MODEL_STAGES:
+            return "omnivoice"
         return None
 
     def _compute_max_instructions_length(self) -> int:
@@ -1211,6 +1216,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if self._tts_model_type == "voxtral_tts":
                 prompt = await self._build_voxtral_prompt(request)
                 tts_params = {}
+            elif self._tts_model_type == "omnivoice":
+                tts_params = {}
+                prompt = {"prompt": request.input}
             else:
                 tts_params = self._build_tts_params(request)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
