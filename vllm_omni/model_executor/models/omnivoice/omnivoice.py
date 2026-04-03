@@ -317,10 +317,10 @@ class OmniVoiceModel(
         if self.model_stage == "omnivoice_generator":
             # Generator handles its own embedding in forward()
             hidden = int(self.config.llm_hidden_size)
-            return torch.zeros((input_ids.shape[0], hidden))
+            return torch.zeros((input_ids.shape[0], hidden), device=input_ids.device)
         elif self.model_stage == "omnivoice_decoder":
             hidden = int(self.config.llm_hidden_size)
-            return torch.zeros((input_ids.shape[0], hidden))
+            return torch.zeros((input_ids.shape[0], hidden), device=input_ids.device)
         else:
             raise RuntimeError(f"embed_input_ids not valid for {self.model_stage}")
 

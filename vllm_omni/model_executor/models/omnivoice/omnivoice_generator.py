@@ -500,6 +500,7 @@ class OmniVoiceGenerator(nn.Module):
 
                 # Update tokens and batch inputs for next iteration
                 tokens[i : i + 1, :, :t_len] = sample_tokens
+                input_ids = input_ids.clone()
                 input_ids[i, :, c_len - t_len : c_len] = sample_tokens.squeeze(0)
                 input_ids[B + i, :, :t_len] = sample_tokens.squeeze(0)
 
@@ -549,9 +550,6 @@ class OmniVoiceGenerator(nn.Module):
             if key.startswith("llm.layers."):
                 # llm.layers.0.self_attn.q_proj.weight -> layers.0.self_attn.q_proj.weight
                 our_key = key.replace("llm.layers.", "layers.")
-                # Handle Qwen3 QK norm naming
-                our_key = our_key.replace("self_attn.q_norm.", "self_attn.q_norm.")
-                our_key = our_key.replace("self_attn.k_norm.", "self_attn.k_norm.")
                 parts = our_key.split(".")
                 module = self
                 try:

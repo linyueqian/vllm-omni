@@ -52,7 +52,6 @@ def test_omnivoice_text_to_audio() -> None:
 
         sampling_params_list = [
             SamplingParams(temperature=1.0, max_tokens=1, detokenize=False),
-            SamplingParams(temperature=1.0, max_tokens=1, detokenize=False),
         ]
 
         outputs = list(omni.generate(prompts, sampling_params_list=sampling_params_list))
