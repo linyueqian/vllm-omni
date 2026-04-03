@@ -6,7 +6,6 @@ from __future__ import annotations
 import importlib
 import json
 import os
-import sys
 import time
 from pathlib import Path
 
@@ -15,17 +14,16 @@ import pytest
 import torch
 
 from tests.utils import hardware_test
-from vllm_omni.diffusion.models.prismaudio.pipeline_prismaudio import load_prismaudio_conditioning_data
+from vllm_omni.diffusion.models.prismaudio.pipeline_prismaudio import (
+    PrismAudioPipeline,
+    PrismAudioRuntimeConfig,
+    load_prismaudio_conditioning_data,
+    load_prismaudio_state_dict,
+)
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
-
-# ruff: noqa: E402
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 _ENV_TRANSFORMER_CKPT = "PRISMAUDIO_E2E_TRANSFORMER_CKPT"
@@ -237,6 +235,51 @@ def test_prismaudio_conditioning_loader_ignores_npz_string_metadata(tmp_path: Pa
     assert loaded["id"] == "demo"
     assert loaded["video_path"] == "/tmp/demo.mp4"
     assert loaded["caption_cot"] == "PrismAudio e2e smoke request"
+
+
+def test_prismaudio_checkpoint_loader_warns_on_unsafe_torch_load_fallback(monkeypatch, tmp_path: Path) -> None:
+    ckpt_path = tmp_path / "legacy.ckpt"
+    ckpt_path.write_bytes(b"placeholder")
+    warning_calls: list[tuple[str, ...]] = []
+
+    def _fake_torch_load(path, *args, **kwargs):
+        if kwargs.get("weights_only") is True:
+            raise TypeError("weights_only is not supported")
+        return {"weight": torch.ones(1)}
+
+    def _fake_warning(msg, *args, **kwargs):
+        warning_calls.append((msg, *(str(arg) for arg in args)))
+
+    monkeypatch.setattr(torch, "load", _fake_torch_load)
+    monkeypatch.setattr("vllm_omni.diffusion.models.prismaudio.pipeline_prismaudio.logger.warning", _fake_warning)
+    state_dict = load_prismaudio_state_dict(ckpt_path)
+
+    assert list(state_dict) == ["weight"]
+    assert torch.equal(state_dict["weight"], torch.ones(1))
+    assert warning_calls
+    assert "without weights_only=True" in warning_calls[0][0]
+
+
+def test_prismaudio_call_factory_spec_reraises_non_official_module_not_found() -> None:
+    pipeline = PrismAudioPipeline()
+    runtime_config = PrismAudioRuntimeConfig(sample_rate=44100, audio_channels=2, latent_channels=64)
+
+    def _factory(_runtime_config):
+        raise ModuleNotFoundError("No module named 'custom_dependency'")
+
+    with pytest.raises(ModuleNotFoundError, match="custom_dependency"):
+        pipeline._call_factory_spec({"callable": _factory, "input": "runtime_config"}, runtime_config)
+
+
+def test_prismaudio_call_factory_spec_reraises_non_official_attribute_errors() -> None:
+    pipeline = PrismAudioPipeline()
+    runtime_config = PrismAudioRuntimeConfig(sample_rate=44100, audio_channels=2, latent_channels=64)
+
+    def _factory(_runtime_config):
+        raise AttributeError("custom factory bug")
+
+    with pytest.raises(AttributeError, match="custom factory bug"):
+        pipeline._call_factory_spec({"callable": _factory, "input": "runtime_config"}, runtime_config)
 
 
 def test_prismaudio_e2e_prompt_uses_video_path_contract(tmp_path: Path) -> None:

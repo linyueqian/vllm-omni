@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from os import PathLike
@@ -24,6 +25,8 @@ from vllm_omni.diffusion.models.interface import SupportAudioOutput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class PrismAudioCheckpointLoadReport:
@@ -42,15 +45,25 @@ class PrismAudioRuntimeConfig:
     raw_model_config: dict[str, Any] | None = None
 
 
+def _torch_load_with_weights_only_fallback(path: str | PathLike[str]) -> Any:
+    path_str = str(path)
+    try:
+        return torch.load(path_str, map_location="cpu", weights_only=True)
+    except TypeError:
+        logger.warning(
+            "PrismAudio falling back to torch.load without weights_only=True for %s. "
+            "This PyTorch version does not support safe weights-only loading.",
+            path_str,
+        )
+        return torch.load(path_str, map_location="cpu")
+
+
 def load_prismaudio_state_dict(checkpoint_path: str | PathLike[str]) -> dict[str, torch.Tensor]:
     checkpoint_path = str(checkpoint_path)
     if checkpoint_path.endswith(".safetensors"):
         raw_state = load_safetensors_file(checkpoint_path)
     else:
-        try:
-            raw_state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        except TypeError:
-            raw_state = torch.load(checkpoint_path, map_location="cpu")
+        raw_state = _torch_load_with_weights_only_fallback(checkpoint_path)
 
     if not isinstance(raw_state, dict):
         raise TypeError(
@@ -92,10 +105,7 @@ def load_prismaudio_conditioning_data(conditioning_path: str | PathLike[str]) ->
         npz_data = np.load(path, allow_pickle=True)
         raw_data: Any = {key: npz_data[key] for key in npz_data.files}
     else:
-        try:
-            raw_data = torch.load(path, map_location="cpu", weights_only=True)
-        except TypeError:
-            raw_data = torch.load(path, map_location="cpu")
+        raw_data = _torch_load_with_weights_only_fallback(path)
 
     if not isinstance(raw_data, dict):
         raise TypeError(
@@ -188,7 +198,7 @@ def sample_discrete_euler(
     timesteps = torch.linspace(sigma_max, 0, steps + 1, device=x.device, dtype=x.dtype)
 
     for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
-        t_curr_tensor = t_curr * torch.ones((x.shape[0],), dtype=x.dtype, device=x.device)
+        t_curr_tensor = x.new_full((x.shape[0],), t_curr)
         dt = t_prev - t_curr
         x = x + dt * model(x, t_curr_tensor, **extra_args)
 
@@ -232,8 +242,14 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
 
         if self.od_config is not None:
             self.runtime_config = self._build_runtime_config(self.od_config)
-            self.conditioning_factory = self._resolve_conditioning_factory_spec()
-            self.video_preprocessor_factory = self._resolve_video_preprocessor_factory_spec()
+            self.conditioning_factory = self._resolve_runtime_prompt_factory_spec(
+                config_key="conditioning_factory",
+                default_input="prompt_and_runtime_config",
+            )
+            self.video_preprocessor_factory = self._resolve_runtime_prompt_factory_spec(
+                config_key="video_preprocessor_factory",
+                default_input="prompt_and_runtime_config",
+            )
             self._maybe_initialize_components_from_config()
 
     def _load_prismaudio_model_config(self, od_config: OmniDiffusionConfig) -> dict[str, Any]:
@@ -349,39 +365,26 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
             return getattr(importlib.import_module(module_name), attr_name)
         return resolve_obj_by_qualname(spec)
 
-    def _resolve_conditioning_factory_spec(self) -> Any:
+    def _resolve_runtime_prompt_factory_spec(
+        self,
+        *,
+        config_key: str,
+        default_input: str,
+    ) -> Any:
         if self.od_config is None:
             return None
         factories = getattr(self.od_config, "model_config", {}) or {}
-        spec = factories.get("conditioning_factory")
+        spec = factories.get(config_key)
         resolved = self._resolve_factory_spec(spec)
         if isinstance(resolved, Mapping):
             return {
                 **resolved,
-                "input": resolved.get("input", "prompt_and_runtime_config"),
+                "input": resolved.get("input", default_input),
             }
         if callable(resolved):
             return {
                 "callable": resolved,
-                "input": "prompt_and_runtime_config",
-            }
-        return None
-
-    def _resolve_video_preprocessor_factory_spec(self) -> Any:
-        if self.od_config is None:
-            return None
-        factories = getattr(self.od_config, "model_config", {}) or {}
-        spec = factories.get("video_preprocessor_factory")
-        resolved = self._resolve_factory_spec(spec)
-        if isinstance(resolved, Mapping):
-            return {
-                **resolved,
-                "input": resolved.get("input", "prompt_and_runtime_config"),
-            }
-        if callable(resolved):
-            return {
-                "callable": resolved,
-                "input": "prompt_and_runtime_config",
+                "input": default_input,
             }
         return None
 
@@ -513,6 +516,7 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
                         f"a required dependency is missing: {exc}. Install the upstream PrismAudio runtime "
                         "dependencies before using the default builder path."
                     ) from exc
+                raise
             except AttributeError as exc:
                 if spec.get("source") == "official_default_builder" and "np.float_" in str(exc):
                     raise RuntimeError(
@@ -520,6 +524,7 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
                         f"while constructing the model: {exc}. Use a NumPy version compatible with the "
                         "upstream PrismAudio stack, or patch the upstream dependency to avoid `np.float_`."
                     ) from exc
+                raise
             raise ValueError(f"Unsupported PrismAudio factory input mode: {factory_input!r}.")
         return spec(runtime_config)
 
