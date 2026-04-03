@@ -1407,6 +1407,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 response_format=request.response_format or "wav",
                 speed=request.speed or 1.0,
                 stream_format=request.stream_format,
+                base64_encode=False,
             )
             audio_response: AudioResponse = self.create_audio(audio_obj)
             return Response(content=audio_response.audio_data, media_type=audio_response.media_type)
