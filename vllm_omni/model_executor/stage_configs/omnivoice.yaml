@@ -1,48 +1,20 @@
-# Stage config for OmniVoice two-stage TTS pipeline
-# Stage 0: Generator (Qwen3 iterative unmasking → 8-codebook audio tokens)
-# Stage 1: Decoder (HiggsAudioV2 → 24kHz waveform)
+# Stage config for OmniVoice TTS via diffusion engine
+# Single stage: text → 32-step iterative unmasking → 8-codebook tokens → DAC decode → 24kHz audio
 
 stage_args:
   - stage_id: 0
+    stage_type: diffusion
     is_comprehension: true
     runtime:
       devices: 0
     engine_args:
-      model_stage: omnivoice_generator
-      task_type: generate
-      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
-      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-      model_arch: OmniVoiceModel
-      trust_remote_code: true
-      gpu_memory_utilization: 0.3
-      engine_output_type: latent
-      disable_hybrid_kv_cache_manager: true
-      enable_prefix_caching: false
+      model_stage: dit
+      model_class_name: "OmniVoicePipeline"
+      gpu_memory_utilization: 0.5
       enforce_eager: true
-      mm_processor_cache_gb: 0
-      skip_mm_profiling: true
-      skip_tokenizer_init: true
-      dtype: "float32"
-
-  - stage_id: 1
-    runtime:
-      devices: 0
-    engine_args:
-      model_stage: omnivoice_decoder
-      task_type: generate
-      model_arch: OmniVoiceModel
       trust_remote_code: true
-      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
-      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-      engine_output_type: latent
-      gpu_memory_utilization: 0.2
-      enforce_eager: true
-      disable_hybrid_kv_cache_manager: true
-      enable_prefix_caching: false
-      skip_mm_profiling: true
-      skip_tokenizer_init: true
+      engine_output_type: audio
+      distributed_executor_backend: "mp"
       dtype: "float32"
-    engine_input_source: [0]
-    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.omnivoice.tokens2audio
     final_output: true
     final_output_type: audio
