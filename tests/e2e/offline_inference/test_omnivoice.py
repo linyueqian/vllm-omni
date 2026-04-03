@@ -15,7 +15,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from vllm import SamplingParams
 
 from tests.utils import hardware_test
 
@@ -50,9 +49,9 @@ def test_omnivoice_text_to_audio() -> None:
     try:
         prompts = {"prompt": "Hello, this is a test for text to audio."}
 
-        sampling_params_list = [
-            SamplingParams(temperature=1.0, max_tokens=1, detokenize=False),
-        ]
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        sampling_params_list = [OmniDiffusionSamplingParams()]
 
         outputs = list(omni.generate(prompts, sampling_params_list=sampling_params_list))
 

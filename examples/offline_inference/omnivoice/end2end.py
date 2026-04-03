@@ -20,9 +20,9 @@ import os
 
 import numpy as np
 import soundfile as sf
-from vllm import SamplingParams
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
 def run_e2e():
@@ -121,20 +121,7 @@ def run_e2e():
     if mm_processor_kwargs:
         prompts["mm_processor_kwargs"] = mm_processor_kwargs
 
-    # SamplingParams for each stage (generator doesn't use AR sampling,
-    # but we need to provide them for the pipeline)
-    generator_sampling = SamplingParams(
-        temperature=1.0,
-        max_tokens=1,  # Generator handles its own iteration
-        detokenize=False,
-    )
-    decoder_sampling = SamplingParams(
-        temperature=1.0,
-        max_tokens=1,
-        detokenize=False,
-    )
-
-    sampling_params_list = [generator_sampling, decoder_sampling]
+    sampling_params_list = [OmniDiffusionSamplingParams()]
 
     print(f"Generating speech for: {args.text}")
 
