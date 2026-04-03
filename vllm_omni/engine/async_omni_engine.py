@@ -80,7 +80,7 @@ def _patch_generation_config_if_needed(model_config: Any) -> None:
     try:
         model_config.try_get_generation_config()
     except Exception:
-        model_config.try_get_generation_config = lambda: None
+        model_config.try_get_generation_config = lambda: {}
 
 
 def _inject_kv_stage_info(stage_cfg: Any, stage_id: int) -> None:
