@@ -148,6 +148,27 @@ def _validate_path_within_directory(file_path: Path, directory: Path) -> bool:
 
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
+    _diffusion_mode: bool = False
+
+    @classmethod
+    def for_diffusion(
+        cls,
+        diffusion_engine: "Any",
+        model_name: str,
+        stage_configs: "list[Any] | None" = None,
+    ) -> "OmniOpenAIServingSpeech":
+        """Create a speech serving instance for pure diffusion TTS models.
+
+        Bypasses OpenAIServing.__init__ which requires a fully configured
+        engine client that pure diffusion engines don't provide.
+        """
+        instance = cls.__new__(cls)
+        instance._diffusion_mode = True
+        instance._diffusion_engine = diffusion_engine
+        instance._diffusion_model_name = model_name
+        instance._diffusion_stage_configs = stage_configs
+        return instance
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Initialize uploaded speakers storage
@@ -1332,6 +1353,78 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         audio_response: AudioResponse = self.create_audio(audio_obj)
         return audio_response.audio_data, audio_response.media_type
 
+    async def _create_diffusion_speech(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> Response:
+        """Handle speech generation for pure diffusion TTS models (e.g. OmniVoice)."""
+        from vllm_omni.outputs import OmniRequestOutput
+
+        try:
+            request_id = f"speech-{random_uuid()}"
+            prompt = request.input
+
+            logger.info(
+                "Diffusion TTS speech request %s: text=%r",
+                request_id,
+                prompt[:50] + "..." if len(prompt) > 50 else prompt,
+            )
+
+            generator = self._diffusion_engine.generate(
+                prompt=prompt,
+                request_id=request_id,
+                sampling_params_list=self._diffusion_engine.default_sampling_params_list,
+                output_modalities=["audio"],
+            )
+
+            final_output: OmniRequestOutput | None = None
+            async for res in generator:
+                final_output = res
+
+            if final_output is None:
+                raise ValueError("No output generated from the model.")
+
+            audio_output, audio_key = self._extract_audio_output(final_output)
+            if audio_key is None:
+                raise ValueError("TTS model did not produce audio output.")
+
+            audio_tensor = audio_output[audio_key]
+            sr_raw = audio_output.get("sr", 24000)
+            sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+            sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+
+            if isinstance(audio_tensor, list):
+                non_empty = [c for c in audio_tensor if c.numel() > 0]
+                audio_tensor = torch.cat(non_empty, dim=-1) if non_empty else np.zeros((0,), dtype=np.float32)
+            if hasattr(audio_tensor, "float"):
+                audio_tensor = audio_tensor.float().detach().cpu().numpy()
+            if audio_tensor.ndim > 1:
+                audio_tensor = audio_tensor.squeeze()
+
+            audio_obj = CreateAudio(
+                audio_tensor=audio_tensor,
+                sample_rate=sample_rate,
+                response_format=request.response_format or "wav",
+                speed=request.speed or 1.0,
+                stream_format=request.stream_format,
+            )
+            audio_response: AudioResponse = self.create_audio(audio_obj)
+            return Response(content=audio_response.audio_data, media_type=audio_response.media_type)
+
+        except asyncio.CancelledError:
+            return self._diffusion_error_response("Client disconnected")
+        except ValueError as e:
+            return self._diffusion_error_response(str(e))
+        except Exception as e:
+            logger.exception("Diffusion speech generation failed: %s", e)
+            return self._diffusion_error_response(f"Speech generation failed: {e}")
+
+    @staticmethod
+    def _diffusion_error_response(message: str) -> Response:
+        """Create a JSON error response without depending on OpenAIServing."""
+        error_body = json.dumps({"error": {"message": message, "type": "server_error", "param": None, "code": 500}})
+        return Response(content=error_body, media_type="application/json", status_code=500)
+
     async def create_speech(
         self,
         request: OpenAICreateSpeechRequest,
@@ -1357,6 +1450,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Each Code2Wav chunk is yielded as raw audio bytes as soon as it is decoded.
         For WAV format, a header with placeholder size values is emitted first.
         """
+        if self._diffusion_mode:
+            return await self._create_diffusion_speech(request)
+
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -1434,6 +1530,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         batch_request: BatchSpeechRequest,
     ) -> BatchSpeechResponse | ErrorResponse:
         """Generate speech for multiple items concurrently."""
+        if self._diffusion_mode:
+            raise ValueError("Batch speech is not supported in diffusion mode")
         if len(batch_request.items) > self._batch_max_items:
             raise ValueError(
                 f"Batch contains {len(batch_request.items)} items, exceeding the maximum of {self._batch_max_items}."

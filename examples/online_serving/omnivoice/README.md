@@ -1,6 +1,6 @@
 # OmniVoice
 
-## Model
+## Model Overview
 
 | Model | Description |
 |-------|-------------|
