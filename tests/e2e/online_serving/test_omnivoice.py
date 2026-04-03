@@ -65,7 +65,7 @@ def verify_wav_audio(content: bytes) -> bool:
 class TestOmniVoiceTTS:
     """E2E tests for OmniVoice TTS model."""
 
-    @pytest.mark.advanced_model
+    @pytest.mark.core_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speech_auto_voice(self, omni_server) -> None:
