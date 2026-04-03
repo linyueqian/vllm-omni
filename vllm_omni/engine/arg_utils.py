@@ -17,6 +17,7 @@ logger = init_logger(__name__)
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
+    "OmniVoiceModel": "omnivoice",
 }
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
