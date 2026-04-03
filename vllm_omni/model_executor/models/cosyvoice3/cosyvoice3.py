@@ -272,7 +272,12 @@ class CosyVoice3Model(
         self.config = vllm_config.model_config.hf_config
         self.have_multimodal_outputs = True
         self.model_stage = vllm_config.model_config.model_stage
-        self.model_dir = vllm_config.model_config.model
+        model_dir = vllm_config.model_config.model
+        if not os.path.isdir(model_dir):
+            from huggingface_hub import snapshot_download
+
+            model_dir = snapshot_download(model_dir)
+        self.model_dir = model_dir
         self.model = None
         if self.model_stage == "cosyvoice3_talker":
             # Initialize talker stage (text to speech tokens)
