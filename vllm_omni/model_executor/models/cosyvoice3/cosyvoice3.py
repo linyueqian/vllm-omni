@@ -66,6 +66,12 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         if cached_model_dir == model_dir:
             return
 
+        # If model_dir is an HF repo ID (not a local path), resolve to cache
+        if not os.path.isdir(model_dir):
+            from huggingface_hub import snapshot_download
+
+            model_dir = snapshot_download(model_dir)
+
         import onnxruntime
 
         from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
