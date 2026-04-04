@@ -187,16 +187,21 @@ def _try_resolve_omni_model_type(model: str) -> str | None:
 
     Checks if any registered omni stage config file name matches a substring
     in the model name (e.g. 'cosyvoice3' in 'FunAudioLLM/Fun-CosyVoice3-0.5B-2512').
+    When multiple configs match, the longest stem wins to avoid ambiguity
+    (e.g. 'bagel_single_stage' over 'bagel').
     """
     stage_configs_dir = PROJECT_ROOT / "vllm_omni" / "model_executor" / "stage_configs"
     if not stage_configs_dir.exists():
         return None
     model_lower = model.lower().replace("-", "").replace("_", "")
-    for config_file in stage_configs_dir.glob("*.yaml"):
+    best_match: str | None = None
+    best_len = 0
+    for config_file in sorted(stage_configs_dir.glob("*.yaml")):
         candidate = config_file.stem.replace("-", "").replace("_", "")
-        if candidate in model_lower:
-            return config_file.stem
-    return None
+        if candidate in model_lower and len(candidate) > best_len:
+            best_match = config_file.stem
+            best_len = len(candidate)
+    return best_match
 
 
 def resolve_model_config_path(model: str) -> str:
