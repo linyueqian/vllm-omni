@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
 
 from tests.utils import hardware_test
 from vllm_omni.diffusion.models.prismaudio.pipeline_prismaudio import (
@@ -20,7 +21,6 @@ from vllm_omni.diffusion.models.prismaudio.pipeline_prismaudio import (
     load_prismaudio_conditioning_data,
     load_prismaudio_state_dict,
 )
-from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
