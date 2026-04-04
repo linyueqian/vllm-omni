@@ -182,6 +182,23 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     return obj
 
 
+def _try_resolve_omni_model_type(model: str) -> str | None:
+    """Try to resolve model_type for omni models with empty config.json.
+
+    Checks if any registered omni stage config file name matches a substring
+    in the model name (e.g. 'cosyvoice3' in 'FunAudioLLM/Fun-CosyVoice3-0.5B-2512').
+    """
+    stage_configs_dir = PROJECT_ROOT / "vllm_omni" / "model_executor" / "stage_configs"
+    if not stage_configs_dir.exists():
+        return None
+    model_lower = model.lower().replace("-", "").replace("_", "")
+    for config_file in stage_configs_dir.glob("*.yaml"):
+        candidate = config_file.stem.replace("-", "").replace("_", "")
+        if candidate in model_lower:
+            return config_file.stem
+    return None
+
+
 def resolve_model_config_path(model: str) -> str:
     """Resolve the stage config file path from the model name.
 
@@ -220,7 +237,11 @@ def resolve_model_config_path(model: str) -> str:
                 if config_dict and "model_type" in config_dict:
                     model_type = config_dict["model_type"]
                 else:
-                    raise ValueError(f"config.json found but missing 'model_type' for model: {model}")
+                    # For models with empty config.json (e.g. CosyVoice3),
+                    # try matching against registered omni stage configs.
+                    model_type = _try_resolve_omni_model_type(model)
+                    if model_type is None:
+                        raise ValueError(f"config.json found but missing 'model_type' for model: {model}")
             except Exception as e:
                 raise ValueError(f"Failed to read config.json for model: {model}. Error: {e}") from e
         else:
