@@ -563,6 +563,7 @@ class CosyVoice3Model(
         sampled_ids: list[int] = []
         for req_idx in range(int(logits.shape[0])):
             row_logits = logits[req_idx]
+
             temperature = float(self._req_scalar(sampling_metadata.temperature, req_idx, 1.0))
             if temperature < self._sampling_eps:
                 sampled_ids.append(int(torch.argmax(row_logits).item()))
@@ -595,14 +596,24 @@ class CosyVoice3Model(
             hidden_states = hidden_states.text_hidden_states
         if self.model_stage == "cosyvoice3_talker":
             logits = self.model.llm_decoder(hidden_states)
+            # The decoder outputs speech_token_size + 200 logits.  The official
+            # CosyVoice3 treats ALL tokens >= speech_token_size (the last 200)
+            # as stop signals.  Merge their probabilities into a single EOS
+            # token (6562) via logsumexp so that vLLM's stop_token_ids=[6562]
+            # fires with the correct aggregate stop probability.
+            speech_token_size = self.config.llm["speech_token_size"]
+            eos_idx = self.config.llm["eos_token_id"]
+            stop_logits = logits[..., speech_token_size:]  # last 200
+            merged_stop = torch.logsumexp(stop_logits, dim=-1, keepdim=True)
+            logits[..., speech_token_size:] = float("-inf")  # mask all
+            logits[..., eos_idx] = merged_stop.squeeze(-1)  # restore merged
+            # Pad to full vocab_size for vLLM token handling.
             vocab_size = self.config.vocab_size
             pad_size = vocab_size - logits.size(-1)
-            pad_shape = logits.shape[:-1] + (pad_size,)
-            pad = logits.new_full(pad_shape, float("-inf"))
-            eos_token_val = logits[..., self.config.llm["eos_token_id"]].clone()
-            logits[..., -200:] = float("-inf")
-            logits[..., self.config.llm["eos_token_id"]] = eos_token_val
-            logits = torch.cat([logits, pad], dim=-1)
+            if pad_size > 0:
+                pad_shape = logits.shape[:-1] + (pad_size,)
+                pad = logits.new_full(pad_shape, float("-inf"))
+                logits = torch.cat([logits, pad], dim=-1)
             return logits
         else:
             raise RuntimeError(f"compute_logits is only valid for {self.model_stage}.")

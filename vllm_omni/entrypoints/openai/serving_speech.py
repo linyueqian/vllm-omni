@@ -1343,6 +1343,29 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         sampling_params_list = self.engine_client.default_sampling_params_list
 
+        # CosyVoice3: set dynamic min/max tokens based on text length.
+        # The official model requires min_token_text_ratio to prevent early
+        # EOS and max_token_text_ratio to cap generation length.
+        if self._tts_model_type == "cosyvoice3" and sampling_params_list:
+            import copy
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            text_len = len(request.input)  # rough char-level estimate
+            # Use the model's configured ratios (defaults: min=2, max=20)
+            hf_cfg = self.model_config.hf_config
+            min_ratio = getattr(hf_cfg, "min_token_text_ratio", 2)
+            max_ratio = getattr(hf_cfg, "max_token_text_ratio", 20)
+            min_tokens = max(1, int(text_len * min_ratio))
+            max_tokens = min(2048, int(text_len * max_ratio))
+            sampling_params_list[0].min_tokens = min_tokens
+            sampling_params_list[0].max_tokens = max_tokens
+            logger.info(
+                "CosyVoice3 dynamic tokens: text_len=%d, min_tokens=%d, max_tokens=%d",
+                text_len,
+                min_tokens,
+                max_tokens,
+            )
+
         # Fish defaults come from stage_configs YAML. Only override when the caller
         # explicitly requests a different generation length.
         if self._is_fish_speech and request.max_new_tokens is not None and sampling_params_list:
