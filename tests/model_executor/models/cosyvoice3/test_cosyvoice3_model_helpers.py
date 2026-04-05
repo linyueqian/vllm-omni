@@ -61,7 +61,7 @@ def _make_code2wav_model(
 ) -> CosyVoice3Model:
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
-    model.model_stage = "code2wav"
+    model.model_stage = "cosyvoice3_code2wav"
     hift_cfg = {} if not with_stride_cfg else {"upsample_rates": [8, 5, 3], "istft_params": {"hop_len": 4}}
     model.config = SimpleNamespace(
         sample_rate=24000,

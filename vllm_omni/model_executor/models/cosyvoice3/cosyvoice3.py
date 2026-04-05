@@ -518,7 +518,7 @@ class CosyVoice3Model(
         return top_id
 
     def _cosyvoice3_ras_enabled(self, sampling_metadata: SamplingMetadata) -> bool:
-        if self.model_stage != "talker":
+        if self.model_stage != "cosyvoice3_talker":
             return False
         if sampling_metadata.max_num_logprobs is not None:
             return False
@@ -539,7 +539,7 @@ class CosyVoice3Model(
     ) -> SamplerOutput | None:
         if logits is None or logits.numel() == 0:
             return None
-        if self.model_stage != "talker":
+        if self.model_stage != "cosyvoice3_talker":
             return None
 
         sampler = getattr(self, "_talker_sampler", None)
