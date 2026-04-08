@@ -237,6 +237,11 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
                 prefix="fast_ar",
             )
 
+        # Expose .talker so OmniGPUModelRunner wraps talker_mtp in
+        # CUDAGraphWrapper, capturing the entire Fast AR codebook
+        # decode loop in one graph replay.
+        self.talker = self.fast_ar
+
         # Constant logit mask: allow only semantic tokens + im_end.
         vocab = int(self.text_config.vocab_size)
         semantic_mask = torch.zeros((vocab,), dtype=torch.bool)
@@ -622,19 +627,16 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         # This ensures the Slow AR sees codes from FastAR(hidden_{t-1}).
         inputs_embeds_out = input_embeds.reshape(bsz, -1).clone()
 
+        # Branchless codebook embedding (CUDA-graph-safe: no data-dependent
+        # control flow).  Compute for all positions, mask via torch.where.
         semantic_mask = (input_ids[:, 0] >= self._semantic_begin_id) & (input_ids[:, 0] <= self._semantic_end_id)
-        if semantic_mask.any():
-            semantic_codes = audio_codes[semantic_mask].clamp(min=0)
-            offsets = (
-                torch.arange(self._num_codebooks, device=dev, dtype=semantic_codes.dtype) * self._codebook_size
-            ).unsqueeze(0)
-            codebook_sum = self.codebook_embeddings(semantic_codes + offsets).sum(dim=1).to(dtype=torch.bfloat16)
-
-            # Normalize by sqrt(num_codebooks + 1) as in the reference model
-            # (scale_codebook_embeddings=True for fish_qwen3_omni).
-            inputs_embeds_out[semantic_mask] = (inputs_embeds_out[semantic_mask] + codebook_sum) / math.sqrt(
-                self._num_codebooks + 1
-            )
+        clamped_codes = audio_codes.clamp(min=0)
+        offsets = (
+            torch.arange(self._num_codebooks, device=dev, dtype=clamped_codes.dtype) * self._codebook_size
+        ).unsqueeze(0)
+        codebook_sum = self.codebook_embeddings(clamped_codes + offsets).sum(dim=1).to(dtype=torch.bfloat16)
+        normalized = (inputs_embeds_out + codebook_sum) / math.sqrt(self._num_codebooks + 1)
+        inputs_embeds_out = torch.where(semantic_mask.unsqueeze(-1), normalized, inputs_embeds_out)
 
         return inputs_embeds_out, audio_codes.to(dtype=torch.long)
 
