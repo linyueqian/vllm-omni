@@ -90,33 +90,8 @@ class OmniGPUModelRunner(GPUModelRunner):
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
-
-        # TODO move this model specific logic to a separate class
-        # TTS model IS the talker (no .talker sub-attr); use getattr to support both Omni and TTS.
+        # talker_mtp setup is handled by GPUARModelRunner.load_model()
         self.has_talker_mtp = False
-        talker_mtp = getattr(self.model, "talker_mtp", None)
-        if talker_mtp is not None:
-            self.talker_mtp = talker_mtp  # type: ignore[assignment]
-            self.has_talker_mtp = True
-            cudagraph_mode = self.compilation_config.cudagraph_mode
-            assert cudagraph_mode is not None
-            # Only wrap talker_mtp in CUDAGraphWrapper for Omni models that
-            # have a separate .talker sub-module.  TTS models' code predictor
-            # has internal AR loops / torch.multinomial — not graph-safe.
-            has_separate_talker = getattr(self.model, "talker", None) is not None
-            if cudagraph_mode.has_full_cudagraphs() and has_separate_talker:
-                self.talker_mtp = CUDAGraphWrapper(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
-            # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
-            hidden_size = int(
-                getattr(self.model, "mtp_hidden_size", 0) or getattr(self.model_config.hf_text_config, "hidden_size")
-            )
-            max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
-            self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.int32)
-            self.talker_mtp_inputs_embeds = self._make_buffer(
-                max_batch_size, hidden_size, dtype=self.dtype, numpy=False
-            )
-            self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
-            self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         """Initialize M-RoPE positions for multimodal inputs.
