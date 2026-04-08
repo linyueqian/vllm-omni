@@ -538,7 +538,9 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
                 )
             else:
                 _voice_cache_key = self._voice_cache.make_cache_key(
-                    voice_name, xvec_only=False, created_at=_created_at,
+                    voice_name,
+                    xvec_only=False,
+                    created_at=_created_at,
                 )
                 _cached = self._voice_cache.get(_voice_cache_key)
                 if _cached is not None:
@@ -549,7 +551,10 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
                     _voice_cache_key = None  # hit → don't store again
                     logger.debug("Voice cache HIT for Fish Speech voice '%s'", voice_name)
                     return self._apply_codebook_embeddings(
-                        tokenizer, text, ref_text, ref_codes_fq,
+                        tokenizer,
+                        text,
+                        ref_text,
+                        ref_codes_fq,
                     )
 
         if not isinstance(ref_audio_sr, int):

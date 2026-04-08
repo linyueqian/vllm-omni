@@ -130,10 +130,14 @@ async def run_round(
             for i in range(num_warmups):
                 payload = create_payload_fn(PROMPTS[i % len(PROMPTS)])
                 r = await send_streaming_request(
-                    session, api_url, payload, SAMPLE_RATE, SAMPLE_WIDTH,
+                    session,
+                    api_url,
+                    payload,
+                    SAMPLE_RATE,
+                    SAMPLE_WIDTH,
                 )
                 status = "OK" if r.success else f"FAIL: {r.error[:80]}"
-                print(f"    warmup {i+1}: ttfp={r.ttfp*1000:.0f}ms  {status}")
+                print(f"    warmup {i + 1}: ttfp={r.ttfp * 1000:.0f}ms  {status}")
 
         # Benchmark.
         print(f"  [{label}] Running {num_prompts} requests (concurrency=1)...")
@@ -143,13 +147,17 @@ async def run_round(
             prompt = PROMPTS[i % len(PROMPTS)]
             payload = create_payload_fn(prompt)
             r = await send_streaming_request(
-                session, api_url, payload, SAMPLE_RATE, SAMPLE_WIDTH,
+                session,
+                api_url,
+                payload,
+                SAMPLE_RATE,
+                SAMPLE_WIDTH,
             )
             results.append(r)
             tag = "HIT" if i > 0 and label == "uploaded_voice" else ""
             print(
-                f"    req {i+1:3d}: ttfp={r.ttfp*1000:7.1f}ms  "
-                f"e2e={r.e2e*1000:7.1f}ms  "
+                f"    req {i + 1:3d}: ttfp={r.ttfp * 1000:7.1f}ms  "
+                f"e2e={r.e2e * 1000:7.1f}ms  "
                 f"{'OK' if r.success else 'FAIL'} {tag}"
             )
         wall_time = time.perf_counter() - start
@@ -181,12 +189,12 @@ async def main():
         sys.exit(1)
 
     ref_audio_b64 = encode_audio_to_base64(args.ref_audio)
-    print(f"Reference audio: {args.ref_audio} ({len(ref_audio_b64)//1024}KB base64)")
+    print(f"Reference audio: {args.ref_audio} ({len(ref_audio_b64) // 1024}KB base64)")
 
     # ---- Round A: Inline ref_audio (no cache) ----
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("Round A: INLINE ref_audio (every request sends full audio)")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     def make_inline_payload(prompt: str) -> dict:
         return {
@@ -200,26 +208,32 @@ async def main():
         }
 
     bench_inline = await run_round(
-        args.host, args.port, args.num_prompts,
-        make_inline_payload, "inline_ref_audio",
+        args.host,
+        args.port,
+        args.num_prompts,
+        make_inline_payload,
+        "inline_ref_audio",
         num_warmups=args.num_warmups,
     )
     print_benchmark_results(bench_inline)
 
     # ---- Upload voice ----
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("Uploading voice for cache test...")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     await delete_voice(args.host, args.port, args.voice_name)
     await upload_voice(
-        args.host, args.port,
-        args.ref_audio, args.ref_text, args.voice_name,
+        args.host,
+        args.port,
+        args.ref_audio,
+        args.ref_text,
+        args.voice_name,
     )
 
     # ---- Round B: Uploaded voice (cache hits after 1st request) ----
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("Round B: UPLOADED VOICE (cache hits after 1st request)")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     def make_uploaded_payload(prompt: str) -> dict:
         return {
@@ -232,18 +246,21 @@ async def main():
         }
 
     bench_cached = await run_round(
-        args.host, args.port, args.num_prompts,
-        make_uploaded_payload, "uploaded_voice",
+        args.host,
+        args.port,
+        args.num_prompts,
+        make_uploaded_payload,
+        "uploaded_voice",
         num_warmups=args.num_warmups,
     )
     print_benchmark_results(bench_cached)
 
     # ---- Comparison ----
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("COMPARISON: Inline ref_audio vs Uploaded voice (cached)")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"{'Metric':<30} {'Inline':>12} {'Cached':>12} {'Speedup':>10}")
-    print(f"{'-'*64}")
+    print(f"{'-' * 64}")
 
     def fmt_speedup(inline_val: float, cached_val: float) -> str:
         if cached_val > 0 and inline_val > 0:
@@ -262,8 +279,8 @@ async def main():
     for label, a, b in rows:
         print(f"{label:<30} {a:>12.1f} {b:>12.1f} {fmt_speedup(a, b):>10}")
 
-    print(f"\nNote: Round B request #1 is a cache MISS (cold start).")
-    print(f"      Requests #2+ are cache HITs (skip DAC encoding).")
+    print("\nNote: Round B request #1 is a cache MISS (cold start).")
+    print("      Requests #2+ are cache HITs (skip DAC encoding).")
 
     # Cleanup.
     await delete_voice(args.host, args.port, args.voice_name)
