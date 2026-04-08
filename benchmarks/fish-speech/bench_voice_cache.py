@@ -84,7 +84,7 @@ async def upload_voice(
     if ref_text:
         data.add_field("ref_text", ref_text)
     data.add_field(
-        "file",
+        "audio_sample",
         open(audio_path, "rb"),
         filename=os.path.basename(audio_path),
         content_type="audio/wav",
