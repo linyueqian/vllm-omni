@@ -145,6 +145,21 @@ _OMNI_MODELS = {
         "fish_speech_dac_decoder",
         "FishSpeechDACDecoder",
     ),
+    "VoxCPMForConditionalGeneration": (
+        "voxcpm",
+        "voxcpm",
+        "VoxCPMForConditionalGeneration",
+    ),
+    "VoxCPM2ForConditionalGeneration": (
+        "voxcpm2",
+        "voxcpm2",
+        "VoxCPM2ForConditionalGeneration",
+    ),
+    "VoxCPM2TalkerForConditionalGeneration": (
+        "voxcpm2",
+        "voxcpm2_talker",
+        "VoxCPM2TalkerForConditionalGeneration",
+    ),
     ## Voxtral TTS
     "VoxtralTTSForConditionalGeneration": (
         "voxtral_tts",
