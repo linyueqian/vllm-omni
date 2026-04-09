@@ -145,11 +145,6 @@ _OMNI_MODELS = {
         "fish_speech_dac_decoder",
         "FishSpeechDACDecoder",
     ),
-    "VoxCPMForConditionalGeneration": (
-        "voxcpm",
-        "voxcpm",
-        "VoxCPMForConditionalGeneration",
-    ),
     "VoxCPM2ForConditionalGeneration": (
         "voxcpm2",
         "voxcpm2",
