@@ -420,6 +420,15 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         subtalker_params = getattr(self.vllm_config.model_config, "subtalker_sampling_params", None)
         if not isinstance(subtalker_params, dict):
             subtalker_params = {}
+        # Extract seed from the first request's sampling params for Fast AR
+        # determinism.  NOTE: when batch_size > 1, all requests share the first
+        # request's seed.  Per-request Fast AR seeding requires row-by-row
+        # torch.multinomial calls and is left as a follow-up optimisation.
+        _seed = None
+        if decode_req_ids:
+            _first_sp = self.requests[decode_req_ids[0]].sampling_params
+            if _first_sp is not None and getattr(_first_sp, "seed", None) is not None:
+                _seed = _first_sp.seed
         with set_ascend_forward_context(
             None, self.vllm_config, aclgraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
@@ -432,6 +441,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                 temperature=subtalker_params.get("temperature"),
                 top_k=subtalker_params.get("top_k"),
                 top_p=subtalker_params.get("top_p"),
+                seed=_seed,
             )
         # code_predictor_codes stays on GPU here; _update_intermediate_buffer
         # keeps it device-resident when the key is in gpu_resident_buffer_keys.
