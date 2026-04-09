@@ -349,19 +349,43 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self.residual_lm.kv_cache.fill_caches(res_kv)
 
         # Store states for decode
-        self._lm_hidden = fsq_enc[-1, :].detach()
-        self._res_hidden = res_outputs[0, -1, :].detach()
+        lm_hidden = fsq_enc[-1, :].detach()
+        res_hidden = res_outputs[0, -1, :].detach()
         p = self._patch_size
         d = self._feat_dim
-        self._curr_prefix_feat_cond = torch.zeros(
-            p, d, device=dev, dtype=side_dtype,
-        )
+        pfc = torch.zeros(p, d, device=dev, dtype=side_dtype)
 
-        # Precompute stop logits
+        # Precompute stop logits (checked BEFORE first diffusion, like native)
         stop_logits = self.stop_head(
-            self.stop_actn(self.stop_proj(self._lm_hidden.unsqueeze(0)))
+            self.stop_actn(self.stop_proj(lm_hidden.unsqueeze(0)))
         )
         self._precomputed_stop_logits = stop_logits.detach()
+
+        # Run first diffusion step during prefill (like nanovllm).
+        # This produces feat_0 and curr_embed_0, which becomes the
+        # input to base_lm on the first decode step.
+        dit_h1 = self.lm_to_dit_proj(lm_hidden.unsqueeze(0))
+        dit_h2 = self.res_to_dit_proj(res_hidden.unsqueeze(0))
+        dit_hidden = torch.cat([dit_h1, dit_h2], dim=-1)
+        pred_feat = self.feat_decoder(
+            mu=dit_hidden.float(),
+            patch_size=p,
+            cond=pfc.unsqueeze(0).transpose(1, 2).contiguous().float(),
+            n_timesteps=self._inference_timesteps,
+            cfg_value=self._cfg_value,
+        ).to(side_dtype).transpose(1, 2)  # [1, P, D]
+
+        curr_embed_enc = self.feat_encoder(pred_feat.unsqueeze(1))
+        curr_embed = self.enc_to_lm_proj(curr_embed_enc).squeeze(1)
+
+        # Store first patch and curr_embed for decode
+        self._curr_embed_for_next = curr_embed.detach()
+        self._curr_prefix_feat_cond = pred_feat[0].detach()
+        self._last_audio_patch = pred_feat.reshape(1, -1).detach().cpu().to(
+            torch.float32
+        )
+        # Store the prev_feat_embed for residual_lm in next decode step
+        self._prev_feat_embed = curr_embed.detach()
 
         return enc_outputs.to(self.model.norm.weight.dtype)
 
@@ -369,24 +393,46 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self, enc_outputs: torch.Tensor, dev: torch.device,
         side_dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Decode side computation: full pipeline in one call."""
+        """Decode side computation following nanovllm pattern.
+
+        Order (matching nanovllm):
+          1. FSQ current enc_outputs → lm_hidden (CURRENT step)
+          2. residual_lm step with (lm_hidden, prev_feat_embed) → res_hidden
+          3. diffusion(lm_hidden, res_hidden) → pred_feat
+          4. feat_encoder(pred_feat) → curr_embed (for next step's base_lm)
+          5. stop_head(lm_hidden)
+        """
         p = self._patch_size
         d = self._feat_dim
 
-        lm_hidden = getattr(self, "_lm_hidden", None)
-        res_hidden = getattr(self, "_res_hidden", None)
-        if lm_hidden is None:
+        if not hasattr(self, "_prev_feat_embed"):
             return enc_outputs
 
-        # Flatten to 1D [H] for consistent handling
-        lm_h = lm_hidden.to(side_dtype).reshape(-1)
-        res_h = (res_hidden.to(side_dtype).reshape(-1)
-                 if res_hidden is not None
-                 else torch.zeros_like(lm_h))
+        # 1. FSQ current enc_outputs → CURRENT lm_hidden
+        h = enc_outputs.to(side_dtype)
+        lm_hidden = self.fsq_layer(h[-1:]).squeeze(0)  # [H]
 
-        # 1. Diffusion — inputs are [1, H]
-        dit_h1 = self.lm_to_dit_proj(lm_h.unsqueeze(0))
-        dit_h2 = self.res_to_dit_proj(res_h.unsqueeze(0))
+        # 2. Residual LM step: cat(lm_hidden, prev_feat_embed)
+        #    In nanovllm: residual_inputs = fusion_concat_proj(cat(enc_outputs, feat_embeds))
+        #    where feat_embeds is from the INPUT feat (= previous step's pred_feat)
+        prev_fe = self._prev_feat_embed.to(side_dtype)
+        if prev_fe.ndim == 1:
+            prev_fe = prev_fe.unsqueeze(0)
+        fusion_input = self.fusion_concat_proj(
+            torch.cat([lm_hidden.unsqueeze(0), prev_fe], dim=-1)
+        )  # [1, H]
+        step_pos = torch.tensor(
+            [self.residual_lm.kv_cache.step()], device=dev,
+        )
+        res_hidden = self.residual_lm.forward_step(
+            fusion_input, step_pos,
+        ).clone()
+        if res_hidden.ndim == 1:
+            res_hidden = res_hidden.unsqueeze(0)
+
+        # 3. Diffusion with CURRENT lm_hidden + res_hidden
+        dit_h1 = self.lm_to_dit_proj(lm_hidden.unsqueeze(0))
+        dit_h2 = self.res_to_dit_proj(res_hidden)
         dit_hidden = torch.cat([dit_h1, dit_h2], dim=-1)
 
         pfc = getattr(self, "_curr_prefix_feat_cond", None)
@@ -402,44 +448,23 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             cfg_value=self._cfg_value,
         ).to(side_dtype).transpose(1, 2)  # [1, P, D]
 
-        # 2. feat_encoder → curr_embed
+        # 4. feat_encoder → curr_embed (input for next step's base_lm)
         curr_embed_enc = self.feat_encoder(pred_feat.unsqueeze(1))
         curr_embed = self.enc_to_lm_proj(curr_embed_enc).squeeze(1)  # [1, H]
 
-        # 3. Update prefix_feat_cond
+        # 5. Store state for next step
         self._curr_prefix_feat_cond = pred_feat[0].detach()
-
-        # 4. Store audio patch
-        self._last_audio_patch = pred_feat.reshape(1, -1).detach().cpu().to(torch.float32)
-
-        # 5. FSQ current enc_outputs → new lm_hidden
-        h = enc_outputs.to(side_dtype)
-        new_lm_hidden = self.fsq_layer(h[-1:]).squeeze(0)
-
-        # 6. residual_lm step
-        ce_2d = curr_embed if curr_embed.ndim == 2 else curr_embed.unsqueeze(0)
-        fusion_input = self.fusion_concat_proj(
-            torch.cat([new_lm_hidden.unsqueeze(0), ce_2d], dim=-1)
-        )  # [1, H]
-        step_pos = torch.tensor(
-            [self.residual_lm.kv_cache.step()], device=dev,
+        self._last_audio_patch = pred_feat.reshape(1, -1).detach().cpu().to(
+            torch.float32
         )
-        new_res_hidden = self.residual_lm.forward_step(
-            fusion_input, step_pos,
-        ).clone()
+        self._curr_embed_for_next = curr_embed.detach()
+        self._prev_feat_embed = curr_embed.detach()
 
-        # 7. Update states for next step (flatten to 1D)
-        self._lm_hidden = new_lm_hidden.detach().reshape(-1)
-        self._res_hidden = new_res_hidden.detach().reshape(-1)
-
-        # 8. Precompute stop logits for this step
+        # 6. Stop logits from CURRENT lm_hidden (like nanovllm)
         stop_logits = self.stop_head(
-            self.stop_actn(self.stop_proj(lm_h.unsqueeze(0)))
+            self.stop_actn(self.stop_proj(lm_hidden.unsqueeze(0)))
         )
         self._precomputed_stop_logits = stop_logits.detach()
-
-        # Store curr_embed for next decode preprocess
-        self._curr_embed_for_next = curr_embed.detach()
 
         return enc_outputs
 
