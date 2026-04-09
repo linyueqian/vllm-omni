@@ -293,7 +293,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             )
             return self._forward_prefill_side(enc_outputs, dev, side_dtype)
 
-        if not is_prefill and getattr(self, "_lm_hidden", None) is not None:
+        if not is_prefill and getattr(self, "_prev_feat_embed", None) is not None:
             return self._forward_decode_side(enc_outputs, dev, side_dtype)
 
         return enc_outputs
