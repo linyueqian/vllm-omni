@@ -5,7 +5,7 @@ import os
 import pytest
 import torch
 
-from tests.e2e.utils.conftest_utils import hardware_test
+from tests.utils import hardware_test
 
 VOXCPM2_MODEL = "openbmb/VoxCPM2"
 STAGE_CONFIG = os.path.join(
