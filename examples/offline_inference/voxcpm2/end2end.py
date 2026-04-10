@@ -71,13 +71,12 @@ def parse_args():
 def extract_audio(multimodal_output: dict) -> torch.Tensor:
     """Extract the final complete audio tensor from multimodal output.
 
-    The native AR pipeline returns a list of tensors (one per decode step,
-    each containing the full audio up to that point). We take the last
-    non-empty element for the complete audio waveform.
+    The output processor concatenates per-step delta tensors under
+    ``model_outputs``.  Falls back to ``audio`` for backwards compat.
     """
-    audio = multimodal_output.get("audio")
+    audio = multimodal_output.get("model_outputs") or multimodal_output.get("audio")
     if audio is None:
-        raise ValueError("No 'audio' key in multimodal_output.")
+        raise ValueError(f"No audio key in multimodal_output: {list(multimodal_output.keys())}")
 
     if isinstance(audio, list):
         # Take the last valid tensor (most complete audio)

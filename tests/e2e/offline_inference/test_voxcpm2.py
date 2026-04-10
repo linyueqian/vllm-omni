@@ -33,9 +33,11 @@ def voxcpm2_engine():
 def _extract_audio(multimodal_output: dict) -> torch.Tensor:
     """Extract the final complete audio tensor from multimodal output."""
     assert isinstance(multimodal_output, dict), f"Expected dict, got {type(multimodal_output)}"
-    assert "audio" in multimodal_output, f"Missing 'audio' key, got {list(multimodal_output.keys())}"
 
-    audio = multimodal_output["audio"]
+    # Output processor concatenates per-step deltas under "model_outputs".
+    audio = multimodal_output.get("model_outputs") or multimodal_output.get("audio")
+    assert audio is not None, f"No audio key, got {list(multimodal_output.keys())}"
+
     if isinstance(audio, list):
         valid = [x for x in audio if isinstance(x, torch.Tensor) and x.numel() > 100]
         assert valid, "No valid audio tensors in output list"

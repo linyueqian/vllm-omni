@@ -69,6 +69,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._inference_timesteps = 10
         self._cfg_value = 2.0
 
+        # TODO: implement sliding-window VAE decode (nanovllm pattern)
+        # for O(1) per-step streaming. Current impl re-decodes all patches.
+
     @property
     def tts(self) -> nn.Module:
         assert self._tts is not None, "Model not loaded yet"
@@ -409,13 +412,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             self._last_audio_patch = None
             self._accumulated_patches.append(patch.clone())
 
-        # Only decode and emit audio when we have patches
-        # The output processor accumulates per-step outputs, so we
-        # emit the full decoded audio on every step (latest version).
+        # Decode all accumulated patches → full audio waveform.
+        # TODO: implement sliding-window VAE decode (nanovllm pattern)
+        # for O(1) per-step streaming instead of O(N) re-decode.
         if self._accumulated_patches:
-            all_p = torch.cat(self._accumulated_patches, dim=0)  # [N, P*D]
-
-            # Reshape [N, P*D] → [1, N*P, D] → [1, D, N*P] for VAE
+            all_p = torch.cat(self._accumulated_patches, dim=0)
             d = self._feat_dim
             from einops import rearrange
 
