@@ -24,6 +24,11 @@ SAMPLE_RATE = 48000
 @pytest.fixture(scope="module")
 def voxcpm2_engine():
     """Create VoxCPM2 engine for testing."""
+    try:
+        import voxcpm  # noqa: F401
+    except ImportError:
+        pytest.skip("voxcpm package not installed")
+
     from vllm_omni import Omni
 
     engine = Omni(model=VOXCPM2_MODEL, stage_configs_path=STAGE_CONFIG)
