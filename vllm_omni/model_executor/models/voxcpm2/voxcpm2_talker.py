@@ -2,13 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """VoxCPM2 native AR talker — uses native MiniCPM4 base_lm directly.
 
-Phase 1: Uses native VoxCPM2 modules for correct audio output.
-         No PagedAttention (uses manual KV cache).
-         Each AR decode step:
-           feat_encoder → base_lm → FSQ → residual_lm → LocDiT → stop
+Uses native VoxCPM2 modules (no PagedAttention, manual KV cache).
+Each AR decode step:
+  feat_encoder → base_lm → FSQ → residual_lm → LocDiT → stop
 
-Phase 2 (future): Replace base_lm with vllm's MiniCPM4Model + PagedAttention
-                   once per-request side-computation state is resolved.
+TODO(PagedAttention): The base_lm is a MiniCPM4 variant (GQA + LongRoPE,
+use_mup=False).  vllm's MiniCPMModel already supports the architecture
+(LongRoPE via Phi3LongRoPEScaledRotaryEmbedding, muP via config), but
+two issues block replacing the native base_lm with a vllm MiniCPM4Model:
+  1. Per-request state isolation — residual_lm and LocDiT diffusion use
+     shared native KV caches; concurrent requests clobber each other.
+     Fix: save/restore residual_lm cache per request, or pool N instances.
+  2. Streaming audio — make_omni_output re-decodes all patches each step.
+     Fix: sliding-window VAE decode (decode_pad pattern from nanovllm).
 """
 
 from __future__ import annotations
