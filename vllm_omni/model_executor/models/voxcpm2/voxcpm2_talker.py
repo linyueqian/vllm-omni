@@ -4,11 +4,11 @@
 
 Phase 1: Uses native VoxCPM2 modules for correct audio output.
          No PagedAttention (uses manual KV cache).
-         Follows nanovllm decode pattern:
-           base_lm → FSQ → residual_lm → diffusion → feat_encoder → stop
+         Each AR decode step:
+           feat_encoder → base_lm → FSQ → residual_lm → LocDiT → stop
 
-Phase 2 (future): Replace base_lm with vllm's MiniCPMModel + PagedAttention
-                   once LongRoPE compatibility is resolved.
+Phase 2 (future): Replace base_lm with vllm's MiniCPM4Model + PagedAttention
+                   once per-request side-computation state is resolved.
 """
 
 from __future__ import annotations

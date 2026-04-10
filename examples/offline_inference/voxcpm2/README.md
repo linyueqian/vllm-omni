@@ -72,12 +72,12 @@ RTF < 1.0 means faster than real time.
 VoxCPM2 uses a single-stage native AR pipeline:
 
 ```
-MiniCPM4 (base LM)
-    └─► FSQ (finite scalar quantization)
-         └─► residual_lm (residual AR)
-              └─► LocDiT (local diffusion transformer)
-                   └─► feat_encoder
-                        └─► AudioVAE → 48 kHz waveform
+feat_encoder
+└─► MiniCPM4 (base LM)
+     └─► FSQ (finite scalar quantization)
+          └─► residual_lm (residual AR)
+               └─► LocDiT (local diffusion transformer)
+                    └─► AudioVAE → 48 kHz waveform
 ```
 
 All stages are fused into one vllm-native execution graph via `voxcpm2.yaml`, eliminating inter-stage coordination overhead and enabling true end-to-end batching.
