@@ -72,7 +72,7 @@ class OpenAICreateSpeechRequest(BaseModel):
     seed: int | None = Field(
         default=None,
         ge=0,
-        le=2**63,
+        le=2**63 - 1,
         description="Random seed for reproducible generation. When set, ensures "
         "deterministic output for the same input text and seed value.",
     )
