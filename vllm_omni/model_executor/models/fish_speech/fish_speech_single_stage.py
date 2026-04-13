@@ -311,52 +311,12 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
 
             req_info["_decoded_up_to"] = decoded_up_to + n_chunks * _CHUNK_FRAMES
 
-        # Also submit tail decode (< _CHUNK_FRAMES remaining).
-        # The tail is re-submitted each step but only the latest result
-        # is kept.  Since this runs on the background stream, it does NOT
-        # block the AR forward path — the cost is just the GPU overlap.
-        decoded_up_to = req_info.get("_decoded_up_to", 0)
-        tail_frames = total_frames - decoded_up_to
-        if tail_frames > 0:
-            all_codes = torch.cat(codes_list, dim=0)
-            ctx_start = max(0, decoded_up_to - _LEFT_CONTEXT_FRAMES)
-            left_ctx = decoded_up_to - ctx_start
-            chunk_codes = all_codes[ctx_start:total_frames].clone()
-
-            self._ensure_dac_loaded()
-            assert self._dac_stream is not None
-
-            device = self.vllm_config.device_config.device
-            current_stream = torch.cuda.current_stream(device)
-            start_event = current_stream.record_event()
-
-            with torch.cuda.stream(self._dac_stream):
-                self._dac_stream.wait_event(start_event)
-                try:
-                    tail_wav = self._decode_chunk(chunk_codes, left_ctx)
-                except Exception as exc:
-                    logger.error("Async DAC tail decode failed: %s", exc)
-                    tail_wav = torch.zeros((0,), dtype=torch.float32)
-                done_event = self._dac_stream.record_event()
-
-            req_info["_tail_pending"] = (done_event, tail_wav)
-        else:
-            req_info["_tail_pending"] = None
-
-        # Return accumulated waveform (collected chunks + tail).
+        # Return accumulated waveform from collected async chunks.
+        # Tail frames (< _CHUNK_FRAMES) are not decoded to avoid sync
+        # overhead. Max truncation: 24 frames (~1.1s).
+        # TODO: decode tail once on request completion via output processor.
         wav_chunks = req_info.get("_wav_chunks")
-        parts: list[torch.Tensor] = list(wav_chunks) if wav_chunks else []
-
-        tail_pending = req_info.get("_tail_pending")
-        if tail_pending is not None:
-            done_event, tail_wav = tail_pending
-            # Wait for tail — this is the only sync point, and it's
-            # just the tail (< 25 frames), so very fast (~2ms).
-            done_event.synchronize()
-            if tail_wav.numel() > 0:
-                parts.append(tail_wav.cpu())
-
-        if parts:
+        if wav_chunks:
             full_wav = torch.cat(parts, dim=0)
             sr_tensor = torch.tensor(self._dac_sample_rate, dtype=torch.int32)
             return OmniOutput(
