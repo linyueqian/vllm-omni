@@ -13,7 +13,7 @@ stage_args:
     stage_type: llm
     is_comprehension: true
     runtime:
-      devices: "0"
+      devices: "0,1"
       max_batch_size: 16
     engine_args:
       max_num_seqs: 4
