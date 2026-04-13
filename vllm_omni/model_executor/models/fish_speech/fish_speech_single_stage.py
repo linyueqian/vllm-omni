@@ -231,40 +231,38 @@ class FishSpeechSingleStageForConditionalGeneration(
         stride = _INITIAL_VOCODE_STRIDE if in_initial_phase else _VOCODE_STRIDE
         should_vocode = new_since_vocode >= stride
 
-        if not should_vocode:
+        sr_tensor = torch.tensor(self._dac_sample_rate, dtype=torch.int32)
+        empty_wav = torch.zeros((0,), dtype=torch.float32)
+
+        # ALWAYS return model_outputs to override the model runner's
+        # default "hidden" key remapping (output processor remaps both
+        # "hidden" and "model_outputs" to "audio"; whichever is later
+        # wins).  Without this, no-vocode steps would inject hidden
+        # states as fake audio chunks.
+        def _return(wav: torch.Tensor) -> OmniOutput:
             return OmniOutput(
                 text_hidden_states=parent_output.text_hidden_states,
-                multimodal_outputs={},
+                multimodal_outputs={
+                    "model_outputs": [wav],
+                    "sr": [sr_tensor],
+                },
             )
 
+        if not should_vocode:
+            return _return(empty_wav)
+
         # Re-vocode all codes; emit only the delta audio (new samples
-        # since last emission) so the streaming output is correct.
+        # since last emission) for correct streaming.
         all_codes = torch.cat(codes_list, dim=0)
         try:
             full_wav = self._decode_all(all_codes).cpu()
         except Exception as exc:
             logger.error("DAC re-vocode failed: %s", exc)
-            return OmniOutput(
-                text_hidden_states=parent_output.text_hidden_states,
-                multimodal_outputs={},
-            )
+            return _return(empty_wav)
 
         emitted_samples = req_info.get("_emitted_samples", 0)
-        delta_wav = full_wav[emitted_samples:]
+        delta_wav = full_wav[emitted_samples:].contiguous()
         req_info["_emitted_samples"] = int(full_wav.numel())
         req_info["_last_vocoded_at"] = total_frames
 
-        if delta_wav.numel() == 0:
-            return OmniOutput(
-                text_hidden_states=parent_output.text_hidden_states,
-                multimodal_outputs={},
-            )
-
-        sr_tensor = torch.tensor(self._dac_sample_rate, dtype=torch.int32)
-        return OmniOutput(
-            text_hidden_states=parent_output.text_hidden_states,
-            multimodal_outputs={
-                "model_outputs": [delta_wav],
-                "sr": [sr_tensor],
-            },
-        )
+        return _return(delta_wav if delta_wav.numel() > 0 else empty_wav)
