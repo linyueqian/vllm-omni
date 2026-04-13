@@ -232,13 +232,6 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
         decoded_up_to = req_info.get("_decoded_up_to", 0)
         new_frames = total_frames - decoded_up_to
 
-        # Debug: save codes after every chunk boundary for offline analysis.
-        if total_frames >= 25:
-            try:
-                torch.save(torch.cat(codes_list, dim=0), "/tmp/debug_codes.pt")
-            except Exception:
-                pass
-
         # Check if we have enough for a chunk.
         if new_frames >= _CHUNK_FRAMES:
             all_codes = torch.cat(codes_list, dim=0)

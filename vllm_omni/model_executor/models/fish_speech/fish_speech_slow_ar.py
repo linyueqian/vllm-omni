@@ -339,13 +339,6 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
 
         audio_codes = torch.cat(audio_codes_list, dim=0)
-
-        # DEBUG: save codes for offline comparison
-        try:
-            torch.save(audio_codes.cpu(), "/tmp/debug_slowar_codes.pt")
-        except Exception:
-            pass
-
         span_len = int(audio_codes.shape[0])
         hidden = hidden[:span_len]
         mm: dict[str, torch.Tensor] = {"audio_codes": audio_codes}

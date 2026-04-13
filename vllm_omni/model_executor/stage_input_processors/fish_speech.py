@@ -78,15 +78,6 @@ def slow_ar_to_dac_decoder_async_chunk(
     elif not finished:
         return None
 
-    # DEBUG: save connector-accumulated codes for comparison
-    try:
-        frames_list = transfer_manager.code_prompt_token_ids.get(request_id, [])
-        if frames_list and len(frames_list) >= 5:
-            stacked = torch.stack(frames_list, dim=0)
-            torch.save(stacked, "/tmp/debug_connector_codes.pt")
-    except Exception:
-        pass
-
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
