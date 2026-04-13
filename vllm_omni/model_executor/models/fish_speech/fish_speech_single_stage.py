@@ -1,4 +1,4 @@
-"""Fish Speech S2 Pro -- Single-Stage model (AR + async DAC decode).
+"""Fish Speech S2 Pro -- Single-Stage model (AR + incremental DAC decode).
 
 Folds DAC codec decoding into the Slow AR model so that AR generation
 and audio synthesis run in one vLLM engine process.  This eliminates:
@@ -6,10 +6,12 @@ and audio synthesis run in one vLLM engine process.  This eliminates:
   - SharedMemoryConnector serialisation / polling
   - OmniGenerationScheduler overhead
 
-DAC decode runs asynchronously on a CUDA stream separate from the main
-AR forward stream.  Each chunk is submitted to the background stream
-when enough frames accumulate; results are collected on the next call.
-This mirrors two-stage parallelism without inter-process overhead.
+Uses incremental chunked decode: every ``_CHUNK_FRAMES`` new codec
+frames, decode only the new chunk (with left-context overlap) and
+append to accumulated waveform.  O(1) per chunk, not O(N).
+
+Audio codes accumulate in ``model_intermediate_buffer`` (since the
+buffer only stores the latest step's 1-frame codes).
 """
 
 from __future__ import annotations
@@ -35,15 +37,13 @@ _LEFT_CONTEXT_FRAMES = 0
 
 
 class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForConditionalGeneration):
-    """Single-stage Fish Speech: Slow AR + Fast AR + async DAC decode."""
+    """Single-stage Fish Speech: Slow AR + Fast AR + incremental DAC decode."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._dac_codec: nn.Module | None = None
         self._dac_sample_rate: int = DAC_SAMPLE_RATE
         self._dac_num_codebooks: int = DAC_NUM_CODEBOOKS
-        # Async decode state
-        self._dac_stream: torch.cuda.Stream | None = None
 
     # -------------------- DAC codec management --------------------
 
@@ -132,7 +132,6 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
         codec = codec.to(device=device, dtype=torch.float32)
         codec.eval()
         self._dac_codec = codec
-        self._dac_stream = torch.cuda.Stream(device=device)
         logger.info(
             "Single-stage DAC codec loaded from %s (device=%s)", codec_path, device
         )
@@ -174,80 +173,17 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
 
         return wav.to(dtype=torch.float32).reshape(-1)
 
-    # -------------------- Async DAC helpers --------------------
-
-    def _submit_async_decode(
-        self, req_info: dict[str, Any], all_codes: torch.Tensor,
-        chunk_start: int, chunk_end: int,
-    ) -> None:
-        """Submit a DAC chunk decode on the background CUDA stream."""
-        ctx_start = max(0, chunk_start - _LEFT_CONTEXT_FRAMES)
-        left_ctx = chunk_start - ctx_start
-        chunk_codes = all_codes[ctx_start:chunk_end].clone()
-
-        self._ensure_dac_loaded()
-        assert self._dac_stream is not None
-
-        # Record an event on the current (default) stream so the DAC
-        # stream waits for any in-flight AR kernels to finish writing
-        # the codes tensor before reading it.
-        device = self.vllm_config.device_config.device
-        current_stream = torch.cuda.current_stream(device)
-        start_event = current_stream.record_event()
-
-        # Launch decode on the DAC stream.
-        with torch.cuda.stream(self._dac_stream):
-            self._dac_stream.wait_event(start_event)
-            try:
-                wav = self._decode_chunk(chunk_codes, left_ctx)
-            except Exception as exc:
-                logger.error("Async DAC chunk decode failed: %s", exc)
-                wav = torch.zeros((0,), dtype=torch.float32)
-            # Record completion event.
-            done_event = self._dac_stream.record_event()
-
-        # Store pending result.
-        pending = req_info.get("_pending_decode")
-        if pending is None:
-            pending = []
-            req_info["_pending_decode"] = pending
-        pending.append((done_event, wav))
-
-    def _collect_async_results(self, req_info: dict[str, Any]) -> None:
-        """Collect completed async DAC decode results into wav_chunks."""
-        pending = req_info.get("_pending_decode")
-        if not pending:
-            return
-
-        wav_chunks = req_info.get("_wav_chunks")
-        if wav_chunks is None:
-            wav_chunks = []
-            req_info["_wav_chunks"] = wav_chunks
-
-        still_pending = []
-        for done_event, wav in pending:
-            if done_event.query():
-                # Already done — collect without blocking.
-                if wav.numel() > 0:
-                    wav_chunks.append(wav.cpu())
-            else:
-                # Not done yet — must wait (shouldn't happen often if
-                # DAC is faster than _CHUNK_FRAMES AR steps).
-                done_event.synchronize()
-                if wav.numel() > 0:
-                    wav_chunks.append(wav.cpu())
-        req_info["_pending_decode"] = still_pending
-
     # -------------------- Override make_omni_output --------------------
 
     def make_omni_output(
         self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any
     ) -> OmniOutput:
-        """Accumulate audio codes and decode asynchronously.
+        """Accumulate audio codes and decode incrementally.
 
-        Every _CHUNK_FRAMES new frames, submit a chunk decode on a
-        background CUDA stream.  Collect finished results on each call.
-        This keeps DAC decode off the critical AR forward path.
+        Every _CHUNK_FRAMES new frames, decode a chunk (with left context)
+        and append to the accumulated waveform.  Returns the growing
+        waveform each step so the output processor / serving layer
+        always has the latest audio.
         """
         if isinstance(model_outputs, OmniOutput):
             parent_output = model_outputs
@@ -285,9 +221,6 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
                     req_info["_all_codes"] = codes_list
                 codes_list.append(latest_codes[valid].detach().cpu())
 
-        # Collect any finished async decode results.
-        self._collect_async_results(req_info)
-
         codes_list = req_info.get("_all_codes")
         if not codes_list:
             return OmniOutput(
@@ -299,22 +232,35 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
         decoded_up_to = req_info.get("_decoded_up_to", 0)
         new_frames = total_frames - decoded_up_to
 
-        # Submit complete chunks for async decode.
+        # Decode only complete chunks.  Remaining tail frames (< _CHUNK_FRAMES)
+        # are NOT decoded here to avoid per-step DAC overhead (~12ms/call).
+        # TODO: move tail decode to serving layer for zero-truncation.
         if new_frames >= _CHUNK_FRAMES:
             all_codes = torch.cat(codes_list, dim=0)
+            wav_chunks = req_info.get("_wav_chunks")
+            if wav_chunks is None:
+                wav_chunks = []
+                req_info["_wav_chunks"] = wav_chunks
 
             n_chunks = new_frames // _CHUNK_FRAMES
             for i in range(n_chunks):
                 chunk_start = decoded_up_to + i * _CHUNK_FRAMES
                 chunk_end = chunk_start + _CHUNK_FRAMES
-                self._submit_async_decode(req_info, all_codes, chunk_start, chunk_end)
+                ctx_start = max(0, chunk_start - _LEFT_CONTEXT_FRAMES)
+                left_ctx = chunk_start - ctx_start
+
+                try:
+                    wav = self._decode_chunk(
+                        all_codes[ctx_start:chunk_end], left_ctx
+                    )
+                    if wav.numel() > 0:
+                        wav_chunks.append(wav.cpu())
+                except Exception as exc:
+                    logger.error("DAC chunk decode failed: %s", exc)
 
             req_info["_decoded_up_to"] = decoded_up_to + n_chunks * _CHUNK_FRAMES
 
-        # Return accumulated waveform from collected async chunks.
-        # Tail frames (< _CHUNK_FRAMES) are not decoded to avoid sync
-        # overhead. Max truncation: 24 frames (~1.1s).
-        # TODO: decode tail once on request completion via output processor.
+        # Return accumulated waveform.
         wav_chunks = req_info.get("_wav_chunks")
         if wav_chunks:
             full_wav = torch.cat(wav_chunks, dim=0)
