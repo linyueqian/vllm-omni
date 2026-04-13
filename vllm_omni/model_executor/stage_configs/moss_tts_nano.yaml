@@ -1,0 +1,61 @@
+# Stage config for MOSS-TTS-Nano (OpenMOSS-Team/MOSS-TTS-Nano).
+#
+# Single generation stage: the 0.1B AR LM and MOSS-Audio-Tokenizer-Nano codec
+# both run inside MossTTSNanoForGeneration.forward().  No inter-stage connector
+# is needed.  Streaming (realtime) audio is supported via inference_stream()
+# inside the model, which progressively collects audio chunks during AR decoding.
+#
+# Verified on: 1x GPU with ≥2 GB VRAM, or CPU (slower).
+# Output: 48 kHz, 2-channel stereo audio.
+#
+# Request additional_information fields:
+#   text              (str)   – text to synthesize [required]
+#   voice             (str)   – built-in voice preset, default "Junhao"
+#   mode              (str)   – "voice_clone" (default) | "continuation"
+#   prompt_audio_path (str)   – path to reference audio for custom voice clone
+#   prompt_text       (str)   – reference transcript (continuation mode)
+#   max_new_frames    (int)   – max AR frames, default 375 (~14 s)
+#   text_temperature  (float) – default 1.0
+#   audio_temperature (float) – default 0.8
+#   audio_top_k       (int)   – default 25
+#   audio_top_p       (float) – default 0.95
+#   seed              (int)   – optional RNG seed
+
+async_chunk: false
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: false
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: moss_tts_nano
+      model_arch: MossTTSNanoForCausalLM
+      worker_type: generation
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      trust_remote_code: true
+      enforce_eager: true
+      engine_output_type: audio
+      gpu_memory_utilization: 0.3
+      enable_prefix_caching: false
+      skip_mm_profiling: true
+      max_num_seqs: 4
+      max_model_len: 4096
+      max_num_batched_tokens: 4096
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 1.0
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      detokenize: false
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 4
