@@ -259,8 +259,6 @@ class FishSpeechSingleStageForConditionalGeneration(
         all_codes_combined = mm.get("audio_codes")
 
         # Process EACH request independently to support concurrency.
-        # Two-pass: first collect any pending async decode results, then
-        # submit new ones.  Lets DAC overlap with the next AR step.
         deltas: list[torch.Tensor] = []
         for i, req_info in enumerate(req_infos):
             # This request's latest frame: row i of combined codes.
@@ -274,31 +272,9 @@ class FishSpeechSingleStageForConditionalGeneration(
                         req_info["_all_codes"] = codes_list
                     codes_list.append(latest_codes[valid].detach().cpu())
 
-            # Collect pending async decode from previous vocode call.
-            delta_to_emit = empty_wav
-            pending = req_info.get("_pending_decode")
-            if pending is not None:
-                done_event, payload = pending
-                if done_event is None:
-                    # Sync fallback (single GPU): payload IS the waveform.
-                    full_wav = payload.cpu()
-                else:
-                    # True async: wait for vocoder stream completion.
-                    done_event.synchronize()
-                    wav_t, audio_len_t = payload
-                    audio_len = int(audio_len_t.item()) if audio_len_t is not None else int(wav_t.shape[0])
-                    full_wav = wav_t[:audio_len].to(dtype=torch.float32).cpu()
-
-                emitted_samples = req_info.get("_emitted_samples", 0)
-                delta_to_emit = full_wav[emitted_samples:].contiguous()
-                req_info["_emitted_samples"] = int(full_wav.numel())
-                req_info["_pending_decode"] = None
-                if delta_to_emit.numel() == 0:
-                    delta_to_emit = empty_wav
-
             codes_list = req_info.get("_all_codes")
             if not codes_list:
-                deltas.append(delta_to_emit)
+                deltas.append(empty_wav)
                 continue
 
             total_frames = sum(c.shape[0] for c in codes_list)
@@ -308,18 +284,24 @@ class FishSpeechSingleStageForConditionalGeneration(
             in_initial_phase = last_vocoded_at == 0
             stride = _INITIAL_VOCODE_STRIDE if in_initial_phase else _VOCODE_STRIDE
             if new_since_vocode < stride:
-                deltas.append(delta_to_emit)
+                deltas.append(empty_wav)
                 continue
 
-            # Submit async decode of all codes; result collected next call.
+            # Re-vocode all of THIS request's codes (sync; runs on
+            # vocoder_device which may be a different GPU than AR).
             all_codes = torch.cat(codes_list, dim=0)
             try:
-                req_info["_pending_decode"] = self._submit_decode_async(all_codes)
-                req_info["_last_vocoded_at"] = total_frames
+                full_wav = self._decode_all(all_codes).cpu()
             except Exception as exc:
-                logger.error("DAC submit failed for req %d: %s", i, exc)
+                logger.error("DAC re-vocode failed for req %d: %s", i, exc)
+                deltas.append(empty_wav)
+                continue
 
-            deltas.append(delta_to_emit)
+            emitted_samples = req_info.get("_emitted_samples", 0)
+            delta_wav = full_wav[emitted_samples:].contiguous()
+            req_info["_emitted_samples"] = int(full_wav.numel())
+            req_info["_last_vocoded_at"] = total_frames
+            deltas.append(delta_wav if delta_wav.numel() > 0 else empty_wav)
 
         # Pad deltas list to batch_size (in case there are fewer info_dicts).
         while len(deltas) < batch_size:
