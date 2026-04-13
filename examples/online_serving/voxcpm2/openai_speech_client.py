@@ -28,7 +28,7 @@ import os
 import httpx
 
 DEFAULT_API_BASE = "http://localhost:8000"
-DEFAULT_API_KEY = "EMPTY"
+DEFAULT_API_KEY = "sk-empty"
 
 
 def encode_audio_to_base64(audio_path: str) -> str:

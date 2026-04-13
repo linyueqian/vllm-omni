@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+import librosa
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -62,8 +63,6 @@ def _encode_raw_audio(
     Returns:
         audio_feat: (T, P, D) tensor of latent patches.
     """
-    import librosa
-
     if isinstance(samples, list):
         audio = torch.tensor(samples, dtype=torch.float32)
     else:
@@ -73,7 +72,7 @@ def _encode_raw_audio(
         audio = audio.unsqueeze(0)
 
     # Resample to the model's expected encoding sample rate
-    encode_sr = getattr(tts, "_encode_sample_rate", sr)
+    encode_sr = tts._encode_sample_rate
     if sr != encode_sr:
         audio_np = audio.squeeze(0).numpy()
         audio_np = librosa.resample(audio_np, orig_sr=sr, target_sr=encode_sr)
