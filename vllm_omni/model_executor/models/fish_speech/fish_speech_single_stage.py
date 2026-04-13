@@ -191,7 +191,8 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
         # Record an event on the current (default) stream so the DAC
         # stream waits for any in-flight AR kernels to finish writing
         # the codes tensor before reading it.
-        current_stream = torch.cuda.current_stream(chunk_codes.device)
+        device = self.vllm_config.device_config.device
+        current_stream = torch.cuda.current_stream(device)
         start_event = current_stream.record_event()
 
         # Launch decode on the DAC stream.
@@ -325,7 +326,8 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
             self._ensure_dac_loaded()
             assert self._dac_stream is not None
 
-            current_stream = torch.cuda.current_stream(chunk_codes.device)
+            device = self.vllm_config.device_config.device
+            current_stream = torch.cuda.current_stream(device)
             start_event = current_stream.record_event()
 
             with torch.cuda.stream(self._dac_stream):
