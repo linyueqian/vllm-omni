@@ -1,13 +1,16 @@
 """Fish Speech S2 Pro -- Single-Stage model (AR + DAC decode in one stage).
 
-Folds the DAC codec decoder into the Slow AR model so that after AR
-generation finishes, codec codes are decoded to audio inline.  This
-eliminates the overhead of a second vLLM engine, SharedMemoryConnector
-serialisation, and OmniGenerationScheduler.
+Folds the DAC codec decoder into the Slow AR model so that AR generation
+and audio synthesis run in one vLLM engine process.  This eliminates:
+  - Second engine process and ``distributed_executor_backend: "mp"``
+  - SharedMemoryConnector serialisation / polling
+  - OmniGenerationScheduler overhead
 
-Inherits from ``FishSpeechSlowARForConditionalGeneration`` and overrides
-``make_omni_output`` to run DAC waveform synthesis on the accumulated
-audio codes before returning.
+Streaming is supported: ``make_omni_output`` tracks per-request decode
+state via ``model_intermediate_buffer`` and emits incremental audio
+chunks every ``codec_chunk_frames`` frames with left-context overlap
+for smooth transitions (same chunking logic as the two-stage
+async_chunk connector, but inline).
 """
 
 from __future__ import annotations
@@ -28,12 +31,19 @@ from .fish_speech_slow_ar import FishSpeechSlowARForConditionalGeneration
 
 logger = init_logger(__name__)
 
+# Chunked streaming defaults (match two-stage connector config).
+_DEFAULT_CHUNK_FRAMES = 25
+_DEFAULT_LEFT_CONTEXT_FRAMES = 25
+_DEFAULT_INITIAL_CHUNK_FRAMES = 4
+
 
 class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForConditionalGeneration):
     """Single-stage Fish Speech: Slow AR + Fast AR + inline DAC decode.
 
     Produces audio output directly (engine_output_type: audio) without
-    needing a second stage for codec decoding.
+    needing a second stage for codec decoding.  Supports per-step
+    streaming via chunked DAC decode with configurable chunk size and
+    left-context overlap.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -43,9 +53,15 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
         self._dac_hop_length: int = DAC_HOP_LENGTH
         self._dac_num_codebooks: int = DAC_NUM_CODEBOOKS
 
+        # Chunked streaming config.
+        self._chunk_frames: int = _DEFAULT_CHUNK_FRAMES
+        self._left_context_frames: int = _DEFAULT_LEFT_CONTEXT_FRAMES
+        self._initial_chunk_frames: int = _DEFAULT_INITIAL_CHUNK_FRAMES
+
     # -------------------- DAC codec management --------------------
 
-    def _bake_weight_norm(self, codec: nn.Module) -> None:
+    @staticmethod
+    def _bake_weight_norm(codec: nn.Module) -> None:
         baked = 0
         for module in codec.modules():
             parametrizations = getattr(module, "parametrizations", None)
@@ -57,7 +73,8 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
         if baked > 0:
             logger.info("Baked %d DAC parametrized weights for inference", baked)
 
-    def _cache_attention_masks(self, codec: nn.Module) -> None:
+    @staticmethod
+    def _cache_attention_masks(codec: nn.Module) -> None:
         for module in codec.modules():
             if not hasattr(module, "make_mask") or not hasattr(module, "make_window_limited_mask"):
                 continue
@@ -67,7 +84,12 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
             mask_cache: dict[int, torch.Tensor] = {}
             window_mask_cache: dict[int, torch.Tensor] = {}
 
-            def make_mask_cached(max_length: int, x_lens: torch.Tensor | None = None, *, _orig=base_make_mask):
+            def make_mask_cached(
+                max_length: int,
+                x_lens: torch.Tensor | None = None,
+                *,
+                _orig=base_make_mask,
+            ):
                 if x_lens is not None:
                     return _orig(max_length, x_lens)
                 key = int(max_length)
@@ -144,88 +166,155 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
     # -------------------- DAC decode --------------------
 
     @torch.no_grad()
-    def _decode_codes_to_audio(self, audio_codes: torch.Tensor) -> torch.Tensor:
+    def _decode_codes_to_audio(
+        self,
+        codes_fq: torch.Tensor,
+        left_context_frames: int = 0,
+    ) -> torch.Tensor:
         """Decode [num_frames, num_codebooks] codec codes to audio waveform.
 
         Args:
-            audio_codes: Tensor of shape [num_frames, num_codebooks].
+            codes_fq: Tensor of shape [num_frames, num_codebooks].
+            left_context_frames: Number of leading context frames to trim
+                from the decoded audio (for overlap-add streaming).
 
         Returns:
-            1-D float32 audio tensor.
+            1-D float32 audio tensor (context-trimmed).
         """
         self._ensure_dac_loaded()
         assert self._dac_codec is not None
 
-        q = self._dac_num_codebooks
-        # audio_codes: [F, Q] -> codes_qf: [Q, F]
-        codes_qf = audio_codes.transpose(0, 1).to(dtype=torch.long)
-        frames = codes_qf.shape[1]
+        # codes_fq: [F, Q] -> [Q, F]
+        codes_qf = codes_fq.transpose(0, 1).to(dtype=torch.long)
+        total_frames = codes_qf.shape[1]
 
-        # Batch dim for DAC: [1, Q, F]
+        # Batch dim: [1, Q, F]
         codes_bqf = codes_qf.unsqueeze(0)
-        feature_lengths = torch.tensor([frames], device=codes_bqf.device, dtype=torch.long)
+        feature_lengths = torch.tensor(
+            [total_frames], device=codes_bqf.device, dtype=torch.long
+        )
 
         with torch.amp.autocast("cuda", enabled=False):
-            wav_batch, audio_lengths = self._dac_codec.decode(codes_bqf, feature_lengths)
+            wav_batch, audio_lengths = self._dac_codec.decode(
+                codes_bqf, feature_lengths
+            )
 
-        audio_len = int(audio_lengths[0].item()) if audio_lengths.numel() > 0 else int(wav_batch.shape[-1])
+        audio_len = (
+            int(audio_lengths[0].item())
+            if audio_lengths.numel() > 0
+            else int(wav_batch.shape[-1])
+        )
         wav = wav_batch[0, 0, :audio_len]
+
+        # Trim left context using proportional cut (same as DAC decoder stage).
+        if left_context_frames > 0 and total_frames > 0:
+            cut = int(left_context_frames / total_frames * wav.shape[0])
+            cut = max(0, min(cut, wav.shape[0]))
+            if cut < wav.shape[0]:
+                wav = wav[cut:]
+            else:
+                return torch.zeros((0,), dtype=torch.float32)
+
         return wav.to(dtype=torch.float32).reshape(-1)
 
     # -------------------- Override make_omni_output --------------------
 
-    def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
-        """Override: decode accumulated audio codes to audio waveform inline.
+    def make_omni_output(
+        self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any
+    ) -> OmniOutput:
+        """Decode accumulated audio codes to audio waveform inline.
 
-        When audio_codes are present (from Fast AR), decode them via the DAC
-        codec and return audio directly.  When no codes are available yet
-        (e.g. during prefill), fall back to the parent's latent output.
+        Implements chunked streaming: tracks per-request decode state in
+        the model_intermediate_buffer and emits incremental audio chunks
+        every ``codec_chunk_frames`` frames with left-context overlap.
         """
+        # Use parent to extract audio_codes from info_dicts.
         if isinstance(model_outputs, OmniOutput):
-            # Already an OmniOutput -- check if it has audio_codes to decode.
-            mm = model_outputs.multimodal_outputs or {}
-            audio_codes = mm.get("audio_codes")
-            if isinstance(audio_codes, torch.Tensor) and audio_codes.numel() > 0:
-                return self._make_audio_omni_output(model_outputs.text_hidden_states, audio_codes)
-            return model_outputs
+            parent_output = model_outputs
+        else:
+            parent_output = super().make_omni_output(model_outputs, **kwargs)
 
-        # Not yet wrapped -- use parent to extract audio_codes from info_dicts.
-        parent_output = super().make_omni_output(model_outputs, **kwargs)
         mm = parent_output.multimodal_outputs or {}
         audio_codes = mm.get("audio_codes")
 
-        if isinstance(audio_codes, torch.Tensor) and audio_codes.numel() > 0:
-            return self._make_audio_omni_output(parent_output.text_hidden_states, audio_codes)
-
-        return parent_output
-
-    def _make_audio_omni_output(
-        self,
-        text_hidden_states: torch.Tensor | None,
-        audio_codes: torch.Tensor,
-    ) -> OmniOutput:
-        """Convert audio_codes → waveform and wrap in OmniOutput."""
-        sr_tensor = torch.tensor(self._dac_sample_rate, dtype=torch.int32)
-        empty = torch.zeros((0,), dtype=torch.float32)
+        if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
+            return parent_output
 
         # Filter zero-padded frames.
         if audio_codes.ndim == 2:
             valid_mask = audio_codes.any(dim=1)
             audio_codes = audio_codes[valid_mask]
 
-        if audio_codes.numel() == 0:
-            return OmniOutput(
-                text_hidden_states=text_hidden_states,
-                multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
-            )
+        total_frames = audio_codes.shape[0] if audio_codes.ndim == 2 else 0
+        if total_frames == 0:
+            return parent_output
+
+        # --- Per-request chunked decode state ---
+        # Read/write decode progress from model_intermediate_buffer.
+        info_dicts = kwargs.get("model_intermediate_buffer") or kwargs.get(
+            "runtime_additional_information"
+        ) or []
+
+        last_decoded: int = 0
+        req_info: dict[str, Any] | None = None
+        for info in info_dicts:
+            if isinstance(info, dict):
+                last_decoded = info.get("_dac_last_decoded", 0)
+                req_info = info
+                break
+
+        new_frames = total_frames - last_decoded
+        chunk_size = self._chunk_frames
+        initial_chunk = self._initial_chunk_frames
+        left_ctx = self._left_context_frames
+
+        # Determine if we should decode a chunk now.
+        in_initial_phase = initial_chunk > 0 and total_frames <= chunk_size
+        should_decode = False
+        context_frames = 0
+
+        if in_initial_phase:
+            # Small initial chunks for fast TTFA.
+            if new_frames >= initial_chunk:
+                should_decode = True
+                context_frames = max(0, last_decoded)
+        else:
+            # Regular chunks.
+            if new_frames >= chunk_size:
+                should_decode = True
+                context_frames = min(left_ctx, last_decoded)
+
+        if not should_decode:
+            # Not enough frames for a chunk yet.  Return parent output
+            # (with audio_codes for the output processor to track progress).
+            return parent_output
+
+        # Select the window to decode: [context + new frames].
+        window_start = max(0, total_frames - new_frames - context_frames)
+        # Snap to chunk boundary for regular phase.
+        if not in_initial_phase:
+            decode_end = last_decoded + chunk_size
+            decode_end = min(decode_end, total_frames)
+            window_start = max(0, decode_end - chunk_size - context_frames)
+        else:
+            decode_end = total_frames
+
+        window_codes = audio_codes[window_start:decode_end]
+        actual_context = max(0, last_decoded - window_start)
+
+        sr_tensor = torch.tensor(self._dac_sample_rate, dtype=torch.int32)
 
         try:
-            wav = self._decode_codes_to_audio(audio_codes)
+            wav = self._decode_codes_to_audio(window_codes, actual_context)
         except Exception as exc:
             logger.error("DAC decode failed: %s", exc)
-            wav = empty
+            wav = torch.zeros((0,), dtype=torch.float32)
+
+        # Update per-request decode state.
+        if req_info is not None:
+            req_info["_dac_last_decoded"] = decode_end
 
         return OmniOutput(
-            text_hidden_states=text_hidden_states,
+            text_hidden_states=parent_output.text_hidden_states,
             multimodal_outputs={"model_outputs": [wav], "sr": [sr_tensor]},
         )
