@@ -285,9 +285,13 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
                 context_frames = min(left_ctx, last_decoded)
 
         if not should_decode:
-            # Not enough frames for a chunk yet.  Return parent output
-            # (with audio_codes for the output processor to track progress).
-            return parent_output
+            # Not enough frames for a chunk yet.  Return an OmniOutput
+            # with empty multimodal_outputs so the output processor
+            # does not forward raw codec codes to the serving layer.
+            return OmniOutput(
+                text_hidden_states=parent_output.text_hidden_states,
+                multimodal_outputs={},
+            )
 
         # Select the window to decode: [context + new frames].
         window_start = max(0, total_frames - new_frames - context_frames)
