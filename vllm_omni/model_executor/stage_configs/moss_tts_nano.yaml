@@ -1,9 +1,10 @@
 # Stage config for MOSS-TTS-Nano (OpenMOSS-Team/MOSS-TTS-Nano).
 #
-# Single generation stage: the 0.1B AR LM and MOSS-Audio-Tokenizer-Nano codec
-# both run inside MossTTSNanoForGeneration.forward().  No inter-stage connector
-# is needed.  Streaming (realtime) audio is supported via inference_stream()
-# inside the model, which progressively collects audio chunks during AR decoding.
+# Single AR stage: the 0.1B AR LM and MOSS-Audio-Tokenizer-Nano codec
+# both run inside MossTTSNanoForGeneration.forward().  The model uses the
+# VoxCPM-style generator pattern for streaming: inference_stream() is
+# stored per-request, and each forward() call yields one audio chunk.
+# compute_logits() controls EOS to keep requests alive until done.
 #
 # Verified on: 1x GPU with ≥2 GB VRAM, or CPU (slower).
 # Output: 48 kHz, 2-channel stereo audio.
@@ -11,7 +12,7 @@
 # Request additional_information fields:
 #   text              (str)   – text to synthesize [required]
 #   voice             (str)   – built-in voice preset, default "Junhao"
-#   mode              (str)   – "voice_clone" (default) | "continuation"
+#   mode              (str)   – "continuation" (default) | "voice_clone"
 #   prompt_audio_path (str)   – path to reference audio for custom voice clone
 #   prompt_text       (str)   – reference transcript (continuation mode)
 #   max_new_frames    (int)   – max AR frames, default 375 (~14 s)
@@ -32,9 +33,8 @@ stage_args:
     engine_args:
       model_stage: moss_tts_nano
       model_arch: MossTTSNanoForCausalLM
-      worker_type: generation
-      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
-      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       trust_remote_code: true
       enforce_eager: true
       engine_output_type: audio
