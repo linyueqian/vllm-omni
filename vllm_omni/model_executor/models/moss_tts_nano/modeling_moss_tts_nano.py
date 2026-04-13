@@ -2,14 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MOSS-TTS-Nano single-stage model for vLLM-Omni.
 
-Runs in a single GPUGenerationWorker stage.  The 0.1B AR LM and the
-MOSS-Audio-Tokenizer-Nano codec are both loaded here; the full
-text → audio-codes → waveform pipeline executes inside forward().
+Runs in a single AR worker stage.  The 0.1B AR LM and the
+MOSS-Audio-Tokenizer-Nano codec are both loaded here.
 
-Streaming (realtime) generation is supported via model.inference_stream():
-audio chunks are collected as the LM emits tokens and returned as a
-concatenated waveform.  Future work can expose per-chunk streaming via
-vLLM-Omni's SSE audio endpoint.
+Streaming is supported via the VoxCPM-style generator pattern:
+  - On first forward() for a request, inference_stream() is started as
+    a Python generator and stored in self._stream_gens[request_key].
+  - Each subsequent forward() call pops one audio chunk from the generator
+    and returns it as multimodal_outputs.
+  - compute_logits() emits EOS only when the last chunk has been yielded,
+    telling the AR scheduler to finish the request.
 
 Weight loading deliberately happens inside load_weights() -- NOT __init__ --
 so that vLLM initialises distributed state before any CUDA allocations occur.
@@ -35,43 +37,32 @@ logger = init_logger(__name__)
 
 
 def _patch_torchaudio_load() -> None:
-    """Patch torchaudio.load to use soundfile if torchcodec is unavailable.
-
-    torchaudio 2.10+ removed set_audio_backend() and defaults to torchcodec,
-    which requires libnvrtc (missing on some servers).  soundfile handles all
-    common audio formats (WAV, FLAC, OGG) without FFmpeg/NVRTC.
-    """
+    """Patch torchaudio.load to use soundfile if torchcodec is unavailable."""
     try:
         import torchaudio
-        # Probe if the current torchaudio.load works.
-        torchaudio  # noqa -- just importing is enough to check
-        import torchcodec  # noqa: F401 -- will raise if broken
-        return  # torchcodec is fine, no patch needed
+        torchaudio  # noqa
+        import torchcodec  # noqa: F401
+        return
     except Exception:
         pass
 
     import soundfile as sf
-    import numpy as np
 
     def _soundfile_load(path, frame_offset=0, num_frames=-1, normalize=True, channels_first=True, format=None):
         data, sr = sf.read(str(path), dtype="float32", always_2d=True)
-        # data shape: [samples, channels]
         if frame_offset > 0:
             data = data[frame_offset:]
         if num_frames > 0:
             data = data[:num_frames]
         waveform = torch.from_numpy(data)
-        if normalize:
-            # soundfile already gives float32 in [-1, 1] for integer formats
-            pass
         if channels_first:
-            waveform = waveform.T  # [channels, samples]
+            waveform = waveform.T
         return waveform, sr
 
     def _soundfile_save(path, src, sample_rate, channels_first=True, **kwargs):
         wav = src.detach().cpu().float().numpy()
         if channels_first and wav.ndim == 2:
-            wav = wav.T  # [channels, samples] → [samples, channels]
+            wav = wav.T
         sf.write(str(path), wav, sample_rate)
 
     try:
@@ -105,30 +96,11 @@ def _pick(info: dict, key: str, default):
 
 
 class MossTTSNanoForGeneration(nn.Module):
-    """Single-stage MOSS-TTS-Nano generation model.
+    """Single-stage MOSS-TTS-Nano model with streaming audio output.
 
-    Integrates the 0.1B MOSS-TTS-Nano LM and the MOSS-Audio-Tokenizer-Nano
-    codec into a single vLLM-Omni generation stage (GPUGenerationWorker).
-
-    The model uses trust_remote_code=True to load the upstream HuggingFace
-    model classes, keeping our implementation thin and easy to update as
-    the upstream model evolves.
-
-    Supported request fields in additional_information:
-      text        (str)  – text to synthesize [required]
-      voice       (str)  – built-in voice preset name, default "Junhao"
-      mode        (str)  – "voice_clone" (default) or "continuation"
-      prompt_audio_path (str) – path to reference WAV/MP3 for custom voice clone
-      prompt_text (str)  – reference transcript (for continuation mode)
-      max_new_frames    (int)   – max AR frames, default 375 (~14s audio)
-      text_temperature  (float) – LM text-layer temperature
-      text_top_p        (float) – LM text-layer top-p
-      text_top_k        (int)   – LM text-layer top-k
-      audio_temperature (float) – LM audio-layer temperature
-      audio_top_p       (float) – LM audio-layer top-p
-      audio_top_k       (int)   – LM audio-layer top-k
-      audio_repetition_penalty (float) – LM audio repetition penalty
-      seed        (int)  – optional random seed for reproducibility
+    Uses the VoxCPM-style generator pattern: inference_stream() is stored
+    per-request and yields one audio chunk per forward() call.  The AR
+    scheduler keeps the request alive until compute_logits() emits EOS.
     """
 
     requires_raw_input_tokens = True
@@ -136,48 +108,40 @@ class MossTTSNanoForGeneration(nn.Module):
     has_preprocess = False
     has_postprocess = False
     enable_update_additional_information = True
+    inject_omni_request_id_into_runtime_info = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        self.vllm_config = vllm_config
         self.config = vllm_config.model_config.hf_config
         self.model_path: str = vllm_config.model_config.model
 
-        # Populated by load_weights(); kept None until then so __init__ is
-        # allocation-free (vLLM may call __init__ before CUDA is ready).
         self._lm: nn.Module | None = None
         self._audio_tokenizer: nn.Module | None = None
         self._device: torch.device | None = None
         self._lock = threading.Lock()
+
+        # Per-request streaming generators (VoxCPM pattern).
+        self._stream_gens: dict[str, Any] = {}
+        # Controls whether compute_logits() emits EOS.
+        self._ar_emit_stop_token = True
 
     # ------------------------------------------------------------------
     # Weight loading
     # ------------------------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load the MOSS-TTS-Nano LM and MOSS-Audio-Tokenizer-Nano codec.
-
-        Both models are loaded via trust_remote_code so we stay in sync
-        with any upstream architecture changes without reimplementing
-        the model code ourselves.
-        """
         with self._lock:
             if self._lm is not None:
                 return set()
-
-            # torchaudio 2.10+ dropped set_audio_backend() and defaults to
-            # torchcodec which requires libnvrtc -- unavailable on some servers.
-            # Patch torchaudio.load to fall back to soundfile so reference audio
-            # loading works regardless of the FFmpeg/torchcodec installation.
             _patch_torchaudio_load()
 
             try:
                 device = next(self.parameters()).device
             except StopIteration:
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
             self._device = device
 
-            # Select compute dtype: bfloat16 on capable CUDA, float32 elsewhere.
             if device.type == "cuda" and torch.cuda.is_bf16_supported():
                 tts_dtype = torch.bfloat16
             elif device.type == "cuda":
@@ -185,18 +149,12 @@ class MossTTSNanoForGeneration(nn.Module):
             else:
                 tts_dtype = torch.float32
 
-            # --- Load the AR language model ---
             logger.info("Loading MOSS-TTS-Nano LM from %s (dtype=%s)", self.model_path, tts_dtype)
             from transformers import AutoModelForCausalLM
-
             lm = AutoModelForCausalLM.from_pretrained(
-                self.model_path,
-                trust_remote_code=True,
-                torch_dtype=tts_dtype,
+                self.model_path, trust_remote_code=True, torch_dtype=tts_dtype,
             )
             if device.type == "cuda":
-                # Prefer flash_attention_2 but fall back to sdpa if the
-                # flash_attn package is not installed.
                 try:
                     import flash_attn  # noqa: F401
                     lm._set_attention_implementation("flash_attention_2")
@@ -209,98 +167,46 @@ class MossTTSNanoForGeneration(nn.Module):
             self._lm = lm
             logger.info("MOSS-TTS-Nano LM loaded on %s", device)
 
-            # --- Load the audio tokenizer (codec) ---
             codec_path: str = getattr(
-                self.config,
-                "audio_tokenizer_pretrained_name_or_path",
+                self.config, "audio_tokenizer_pretrained_name_or_path",
                 "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano",
             )
             logger.info("Loading MOSS-Audio-Tokenizer-Nano from %s", codec_path)
             from transformers import AutoModel
-
             audio_tokenizer = AutoModel.from_pretrained(
-                codec_path,
-                trust_remote_code=True,
-                torch_dtype=torch.float32,  # codec runs in fp32 for stability
+                codec_path, trust_remote_code=True, torch_dtype=torch.float32,
             )
             audio_tokenizer.to(device=device)
             audio_tokenizer.eval()
             self._audio_tokenizer = audio_tokenizer
             logger.info("MOSS-Audio-Tokenizer-Nano loaded on %s", device)
 
-        # Consume the vLLM weight iterator (we loaded weights ourselves above).
         for _ in weights:
             pass
         return set()
 
     # ------------------------------------------------------------------
-    # Dummy run support (vLLM profiling / KV-cache estimation)
+    # Dummy run support
     # ------------------------------------------------------------------
 
     def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict]:
         return [{"text": "hello", "voice": _DEFAULT_VOICE, "_is_dummy": True}] * num_reqs
 
     # ------------------------------------------------------------------
-    # Core forward pass
+    # Streaming generator management
     # ------------------------------------------------------------------
 
-    @torch.inference_mode()
-    def forward(
-        self,
-        input_ids: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,
-        intermediate_tensors: Any = None,
-        inputs_embeds: torch.Tensor | None = None,
-        runtime_additional_information: list[dict[str, Any]] | None = None,
-        **kwargs: Any,
-    ) -> OmniOutput:
-        """Run full MOSS-TTS-Nano pipeline: text → audio codes → waveform.
+    def _create_stream_gen(self, info: dict[str, Any]):
+        """Create an inference_stream() generator for a request.
 
-        Each request in the batch is processed independently.  Results are
-        returned as lists so the generation runner can demultiplex them.
+        Yields (waveform_tensor, is_last) tuples.
         """
-        sr = getattr(self.config, "audio_tokenizer_sample_rate", 48000)
-        sr_tensor = torch.tensor(sr, dtype=torch.int32)
-        empty = torch.zeros((0,), dtype=torch.float32)
-
-        if not runtime_additional_information:
-            # Profiling / dummy run — return empty audio.
-            n = 1 if input_ids is None else max(1, input_ids.shape[0])
-            return OmniOutput(
-                text_hidden_states=None,
-                multimodal_outputs={
-                    "model_outputs": [empty] * n,
-                    "sr": [sr_tensor] * n,
-                },
-            )
-
-        if self._lm is None or self._audio_tokenizer is None:
-            raise RuntimeError("MOSS-TTS-Nano model not loaded.  Was load_weights() called?")
-
-        waveforms: list[torch.Tensor] = []
-        srs: list[torch.Tensor] = []
-
-        for info in runtime_additional_information:
-            if info.get("_is_dummy"):
-                waveforms.append(empty)
-                srs.append(sr_tensor)
-                continue
-
-            waveform = self._run_single_inference(info, sr)
-            waveforms.append(waveform)
-            srs.append(sr_tensor)
-
-        return OmniOutput(
-            text_hidden_states=None,
-            multimodal_outputs={"model_outputs": waveforms, "sr": srs},
-        )
-
-    def _run_single_inference(self, info: dict[str, Any], sr: int) -> torch.Tensor:
-        """Run inference for a single request and return the waveform tensor."""
         text: str = str(_pick(info, "text", "") or "")
         if not text.strip():
-            logger.warning("MOSS-TTS-Nano received empty text; returning silence.")
-            return torch.zeros((sr,), dtype=torch.float32)
+            logger.warning("MOSS-TTS-Nano received empty text; yielding silence.")
+            sr = getattr(self.config, "audio_tokenizer_sample_rate", 48000)
+            yield torch.zeros((sr,), dtype=torch.float32), True
+            return
 
         voice: str = str(_pick(info, "voice", _DEFAULT_VOICE))
         mode: str = str(_pick(info, "mode", _DEFAULT_MODE))
@@ -314,6 +220,9 @@ class MossTTSNanoForGeneration(nn.Module):
         seed: int | None = _pick(info, "seed", None)
         if seed is not None:
             seed = int(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
 
         sampling = {
             "text_temperature": float(_pick(info, "text_temperature", _DEFAULT_TEXT_TEMPERATURE)),
@@ -327,19 +236,15 @@ class MossTTSNanoForGeneration(nn.Module):
             ),
         }
 
-        if seed is not None:
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
-
         device = self._device or torch.device("cpu")
 
-        # Use a temp file as the output path (the upstream API requires a path).
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             output_path = tmp.name
 
+        # Collect all audio events from inference_stream, then yield them
+        # one by one.  We buffer first because inference_stream mixes
+        # "audio" events with a final "result" event.
         audio_chunks: list[torch.Tensor] = []
-
         try:
             for event in self._lm.inference_stream(
                 text=text,
@@ -361,53 +266,153 @@ class MossTTSNanoForGeneration(nn.Module):
                     waveform = event.get("waveform")
                     if waveform is not None:
                         chunk = torch.as_tensor(waveform, dtype=torch.float32).cpu()
+                        if chunk.ndim == 2:
+                            chunk = chunk.T.reshape(-1)
+                        else:
+                            chunk = chunk.reshape(-1)
                         audio_chunks.append(chunk)
+                        # Yield each chunk as it arrives (is_last=False).
+                        yield chunk, False
                 elif event_type == "result":
-                    # Final event -- prefer the full waveform from the result
-                    # if no intermediate chunks were collected.
                     if not audio_chunks:
                         waveform = event.get("waveform")
                         if waveform is not None:
-                            audio_chunks.append(
-                                torch.as_tensor(waveform, dtype=torch.float32).cpu()
-                            )
+                            chunk = torch.as_tensor(waveform, dtype=torch.float32).cpu().reshape(-1)
+                            yield chunk, True
+                            return
         except Exception:
             logger.exception("MOSS-TTS-Nano inference failed for text=%r", text[:80])
-            return torch.zeros((sr,), dtype=torch.float32)
         finally:
-            # Clean up temp file.
             try:
                 Path(output_path).unlink(missing_ok=True)
             except Exception:
                 pass
 
-        if not audio_chunks:
-            logger.warning("MOSS-TTS-Nano produced no audio for text=%r", text[:80])
-            return torch.zeros((sr,), dtype=torch.float32)
-
-        # Concatenate all streaming chunks into a single waveform.
-        # inference_stream yields chunks that are 1D or 2D [samples] / [channels, samples].
-        # Flatten to 1D for the vLLM-Omni audio output format.
-        processed: list[torch.Tensor] = []
-        for chunk in audio_chunks:
-            if chunk.ndim == 2:
-                # [channels, samples] → interleave to [samples * channels] for stereo
-                processed.append(chunk.T.reshape(-1))
-            else:
-                processed.append(chunk.reshape(-1))
-
-        return torch.cat(processed, dim=0)
+        # Signal completion. If we yielded audio chunks above, the last
+        # yield was is_last=False, so emit a final empty sentinel.
+        yield torch.zeros((0,), dtype=torch.float32), True
 
     # ------------------------------------------------------------------
-    # vLLM boilerplate: embed_input_ids required by generation runner
+    # Core forward pass (streaming, VoxCPM pattern)
+    # ------------------------------------------------------------------
+
+    def _make_dummy_hidden(self, input_ids: torch.Tensor | None) -> torch.Tensor:
+        """Return a dummy hidden_states tensor for the AR runner."""
+        device = self._device or torch.device("cpu")
+        hidden = int(getattr(self.config, "hidden_size", 768))
+        n = 1 if input_ids is None else max(1, input_ids.shape[0])
+        return torch.zeros((n, hidden), device=device, dtype=torch.float32)
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: Any = None,
+        inputs_embeds: torch.Tensor | None = None,
+        runtime_additional_information: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> OmniOutput:
+        sr = getattr(self.config, "audio_tokenizer_sample_rate", 48000)
+        sr_tensor = torch.tensor(sr, dtype=torch.int32)
+        empty = torch.zeros((0,), dtype=torch.float32)
+        hidden = self._make_dummy_hidden(input_ids)
+
+        infos = runtime_additional_information or [{}]
+
+        if not runtime_additional_information or all(info.get("_is_dummy") for info in infos):
+            self._ar_emit_stop_token = True
+            return OmniOutput(
+                text_hidden_states=hidden,
+                multimodal_outputs={
+                    "model_outputs": [empty] * len(infos),
+                    "sr": [sr_tensor] * len(infos),
+                },
+            )
+
+        if self._lm is None or self._audio_tokenizer is None:
+            raise RuntimeError("MOSS-TTS-Nano model not loaded.  Was load_weights() called?")
+
+        outputs: list[torch.Tensor] = []
+        srs: list[torch.Tensor] = []
+        last_chunk_flags: list[bool] = []
+
+        for info in infos:
+            if info.get("_is_dummy"):
+                outputs.append(empty)
+                srs.append(sr_tensor)
+                last_chunk_flags.append(True)
+                continue
+
+            request_key = str(info.get("_omni_req_id", "0"))
+
+            # Create generator on first call for this request.
+            if request_key not in self._stream_gens:
+                self._stream_gens[request_key] = self._create_stream_gen(info)
+
+            generator = self._stream_gens[request_key]
+            try:
+                chunk, is_last = next(generator)
+            except StopIteration:
+                self._stream_gens.pop(request_key, None)
+                outputs.append(empty)
+                last_chunk_flags.append(True)
+            else:
+                if is_last:
+                    self._stream_gens.pop(request_key, None)
+                outputs.append(chunk)
+                last_chunk_flags.append(bool(is_last))
+
+            srs.append(sr_tensor)
+
+        # Emit EOS only when ALL requests in this batch have finished.
+        self._ar_emit_stop_token = all(last_chunk_flags)
+
+        return OmniOutput(
+            text_hidden_states=hidden,
+            multimodal_outputs={"model_outputs": outputs, "sr": srs},
+        )
+
+    # ------------------------------------------------------------------
+    # AR runner interface
     # ------------------------------------------------------------------
 
     def compute_logits(
         self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor | None:
-        # Generation stage does not produce logits; satisfy VllmModelForTextGeneration protocol.
-        return None
+        hidden_states: torch.Tensor | OmniOutput,
+        sampling_metadata: Any = None,
+    ) -> torch.Tensor:
+        """Emit EOS or non-EOS logits to control AR scheduler lifetime.
+
+        When _ar_emit_stop_token is True, the logits strongly favour EOS
+        so the scheduler finishes the request.  Otherwise, a non-EOS token
+        is favoured to keep the request alive for the next chunk.
+        """
+        if isinstance(hidden_states, OmniOutput):
+            hidden_states = hidden_states.text_hidden_states
+
+        if hidden_states is None:
+            device = self._device or torch.device("cpu")
+            hidden_states = torch.zeros((0, 1), device=device, dtype=torch.float32)
+        if hidden_states.ndim == 1:
+            hidden_states = hidden_states.unsqueeze(-1)
+        elif hidden_states.ndim > 2:
+            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+
+        vocab_size = int(getattr(self.config, "vocab_size", 32000))
+        num_rows = int(hidden_states.shape[0])
+        logits = torch.zeros(
+            (num_rows, vocab_size), dtype=torch.float32, device=hidden_states.device,
+        )
+        eos_id = 2 if vocab_size > 2 else 0
+        safe_id = 1 if vocab_size > 1 and 1 != eos_id else 0
+        if num_rows > 0:
+            if self._ar_emit_stop_token:
+                logits[:, eos_id] = 1.0e6
+            else:
+                logits[:, eos_id] = -1.0e9
+                logits[:, safe_id] = 1.0e6
+        return logits
 
     def embed_input_ids(
         self,
@@ -415,8 +420,6 @@ class MossTTSNanoForGeneration(nn.Module):
         multimodal_embeddings=None,
         is_multimodal=None,
     ) -> torch.Tensor:
-        # Generation stage does not use token embeddings -- return a dummy
-        # zero tensor of the expected shape so the runner's prefill works.
         hidden = int(getattr(self.config, "hidden_size", 768))
         return torch.zeros(
             (input_ids.shape[0], hidden),
