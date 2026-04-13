@@ -29,8 +29,9 @@ from .fish_speech_slow_ar import FishSpeechSlowARForConditionalGeneration
 logger = init_logger(__name__)
 
 # Re-vocode stride: decode every N new frames.
-# Smaller = lower latency, more GPU work.  Larger = higher latency, less work.
-_VOCODE_STRIDE = 25
+# Smaller stride = less truncation but more DAC compute.
+# stride=10 trims max truncation from 1.1s (stride=25) to ~0.42s.
+_VOCODE_STRIDE = 10
 # Initial stride for low-latency first audio chunk.
 _INITIAL_VOCODE_STRIDE = 4
 
