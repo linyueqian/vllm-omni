@@ -33,7 +33,7 @@ from .fish_speech_slow_ar import FishSpeechSlowARForConditionalGeneration
 logger = init_logger(__name__)
 
 _CHUNK_FRAMES = 25
-_LEFT_CONTEXT_FRAMES = 25
+_LEFT_CONTEXT_FRAMES = 0
 
 
 class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForConditionalGeneration):
