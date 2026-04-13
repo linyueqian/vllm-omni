@@ -317,7 +317,7 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
         # TODO: decode tail once on request completion via output processor.
         wav_chunks = req_info.get("_wav_chunks")
         if wav_chunks:
-            full_wav = torch.cat(parts, dim=0)
+            full_wav = torch.cat(wav_chunks, dim=0)
             sr_tensor = torch.tensor(self._dac_sample_rate, dtype=torch.int32)
             return OmniOutput(
                 text_hidden_states=parent_output.text_hidden_states,
