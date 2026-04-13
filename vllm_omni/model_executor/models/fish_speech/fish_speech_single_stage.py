@@ -230,8 +230,18 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
 
         sr_tensor = torch.tensor(self._dac_sample_rate, dtype=torch.int32)
 
+        logger.info(
+            "Single-stage DAC decode: frames=%d codebooks=%d nonzero=%d device=%s",
+            audio_codes.shape[0],
+            audio_codes.shape[1],
+            int(audio_codes.any(dim=1).sum().item()),
+            audio_codes.device,
+        )
+
         try:
             wav = self._decode_codes_to_audio(audio_codes)
+            logger.info("DAC decode produced %d samples (%.3fs at %dHz)",
+                        wav.numel(), wav.numel() / self._dac_sample_rate, self._dac_sample_rate)
         except Exception as exc:
             logger.error("DAC decode failed: %s", exc)
             return OmniOutput(
