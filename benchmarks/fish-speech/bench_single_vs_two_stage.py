@@ -47,21 +47,17 @@ def send_tts_request(
         "model": model,
         "input": text,
         "voice": "alloy",
-        "response_format": "pcm",
-        "stream": True,
+        "response_format": "wav",
     }
 
     t_start = time.perf_counter()
     t_first_byte = None
     audio_bytes = bytearray()
 
-    with requests.post(url, json=payload, stream=True, timeout=timeout) as resp:
+    with requests.post(url, json=payload, timeout=timeout) as resp:
         resp.raise_for_status()
-        for chunk in resp.iter_content(chunk_size=4096):
-            if chunk:
-                if t_first_byte is None:
-                    t_first_byte = time.perf_counter()
-                audio_bytes.extend(chunk)
+        audio_bytes.extend(resp.content)
+        t_first_byte = time.perf_counter()
 
     t_end = time.perf_counter()
 
