@@ -187,76 +187,70 @@ class FishSpeechSingleStageForConditionalGeneration(
         sr_tensor = torch.tensor(self._dac_sample_rate, dtype=torch.int32)
         empty_wav = torch.zeros((0,), dtype=torch.float32)
 
-        # ALWAYS return model_outputs (even empty) to override the model
-        # runner's default "hidden" key remapping.  The output processor
-        # remaps both "hidden" and "model_outputs" to "audio"; whichever
-        # comes later in dict iteration wins.  Without this, steps that
-        # produce no audio inject hidden state tensors as fake audio.
-        def _return(wav: torch.Tensor) -> OmniOutput:
-            return OmniOutput(
-                text_hidden_states=parent_output.text_hidden_states,
-                multimodal_outputs={
-                    "model_outputs": [wav],
-                    "sr": [sr_tensor],
-                },
-            )
-
-        mm = parent_output.multimodal_outputs or {}
-        latest_codes = mm.get("audio_codes")
-
         info_dicts = kwargs.get("model_intermediate_buffer") or kwargs.get(
             "runtime_additional_information"
         ) or []
+        # Filter to only dict entries (one per request in batch order).
+        req_infos: list[dict[str, Any]] = [info for info in info_dicts if isinstance(info, dict)]
+        batch_size = max(len(req_infos), 1)
 
-        req_info: dict[str, Any] | None = None
-        for info in info_dicts:
-            if isinstance(info, dict):
-                req_info = info
-                break
+        # Get per-request audio_codes from parent's combined output.
+        # Parent concatenates all requests' codes [batch_size, num_codebooks].
+        mm = parent_output.multimodal_outputs or {}
+        all_codes_combined = mm.get("audio_codes")
 
-        if req_info is None:
-            return _return(empty_wav)
+        # Process EACH request independently to support concurrency.
+        deltas: list[torch.Tensor] = []
+        for i, req_info in enumerate(req_infos):
+            # This request's latest frame: row i of combined codes.
+            if isinstance(all_codes_combined, torch.Tensor) and i < all_codes_combined.shape[0]:
+                latest_codes = all_codes_combined[i:i + 1]
+                valid = latest_codes.any(dim=1)
+                if valid.any():
+                    codes_list = req_info.get("_all_codes")
+                    if codes_list is None:
+                        codes_list = []
+                        req_info["_all_codes"] = codes_list
+                    codes_list.append(latest_codes[valid].detach().cpu())
 
-        # Accumulate latest frame.
-        if isinstance(latest_codes, torch.Tensor) and latest_codes.numel() > 0:
-            if latest_codes.ndim == 1:
-                latest_codes = latest_codes.unsqueeze(0)
-            valid = latest_codes.any(dim=1)
-            if valid.any():
-                codes_list = req_info.get("_all_codes")
-                if codes_list is None:
-                    codes_list = []
-                    req_info["_all_codes"] = codes_list
-                codes_list.append(latest_codes[valid].detach().cpu())
+            codes_list = req_info.get("_all_codes")
+            if not codes_list:
+                deltas.append(empty_wav)
+                continue
 
-        codes_list = req_info.get("_all_codes")
-        if not codes_list:
-            return _return(empty_wav)
+            total_frames = sum(c.shape[0] for c in codes_list)
+            last_vocoded_at = req_info.get("_last_vocoded_at", 0)
+            new_since_vocode = total_frames - last_vocoded_at
 
-        total_frames = sum(c.shape[0] for c in codes_list)
-        last_vocoded_at = req_info.get("_last_vocoded_at", 0)
-        new_since_vocode = total_frames - last_vocoded_at
+            in_initial_phase = last_vocoded_at == 0
+            stride = _INITIAL_VOCODE_STRIDE if in_initial_phase else _VOCODE_STRIDE
+            if new_since_vocode < stride:
+                deltas.append(empty_wav)
+                continue
 
-        # Determine if it's time to re-vocode.
-        in_initial_phase = last_vocoded_at == 0
-        stride = _INITIAL_VOCODE_STRIDE if in_initial_phase else _VOCODE_STRIDE
-        should_vocode = new_since_vocode >= stride
+            # Re-vocode all of THIS request's codes.
+            all_codes = torch.cat(codes_list, dim=0)
+            try:
+                full_wav = self._decode_all(all_codes).cpu()
+            except Exception as exc:
+                logger.error("DAC re-vocode failed for req %d: %s", i, exc)
+                deltas.append(empty_wav)
+                continue
 
-        if not should_vocode:
-            return _return(empty_wav)
+            emitted_samples = req_info.get("_emitted_samples", 0)
+            delta_wav = full_wav[emitted_samples:].contiguous()
+            req_info["_emitted_samples"] = int(full_wav.numel())
+            req_info["_last_vocoded_at"] = total_frames
+            deltas.append(delta_wav if delta_wav.numel() > 0 else empty_wav)
 
-        # Re-vocode all codes; emit only the delta audio (new samples
-        # since last emission) for correct streaming.
-        all_codes = torch.cat(codes_list, dim=0)
-        try:
-            full_wav = self._decode_all(all_codes).cpu()
-        except Exception as exc:
-            logger.error("DAC re-vocode failed: %s", exc)
-            return _return(empty_wav)
+        # Pad deltas list to batch_size (in case there are fewer info_dicts).
+        while len(deltas) < batch_size:
+            deltas.append(empty_wav)
 
-        emitted_samples = req_info.get("_emitted_samples", 0)
-        delta_wav = full_wav[emitted_samples:].contiguous()
-        req_info["_emitted_samples"] = int(full_wav.numel())
-        req_info["_last_vocoded_at"] = total_frames
-
-        return _return(delta_wav if delta_wav.numel() > 0 else empty_wav)
+        return OmniOutput(
+            text_hidden_states=parent_output.text_hidden_states,
+            multimodal_outputs={
+                "model_outputs": deltas,
+                "sr": [sr_tensor] * batch_size,
+            },
+        )
