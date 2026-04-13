@@ -164,6 +164,10 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
         self._ensure_dac_loaded()
         assert self._dac_codec is not None
 
+        # Ensure codes are on the same device as the codec.
+        codec_device = next(self._dac_codec.parameters()).device
+        codes_fq = codes_fq.to(device=codec_device)
+
         # codes_fq: [F, Q] -> [Q, F]
         codes_qf = codes_fq.transpose(0, 1).to(dtype=torch.long)
         total_frames = codes_qf.shape[1]
