@@ -93,7 +93,7 @@ _DEFAULT_AUDIO_TOP_K = 25
 _DEFAULT_AUDIO_REPETITION_PENALTY = 1.2
 _DEFAULT_MAX_NEW_FRAMES = 375
 _DEFAULT_VOICE = "Junhao"
-_DEFAULT_MODE = "voice_clone"
+_DEFAULT_MODE = "continuation"
 
 
 def _pick(info: dict, key: str, default):
@@ -148,9 +148,6 @@ class MossTTSNanoForGeneration(nn.Module):
         self._audio_tokenizer: nn.Module | None = None
         self._device: torch.device | None = None
         self._lock = threading.Lock()
-
-        # Dummy parameter so vLLM can resolve the device via next(parameters()).
-        self._sentinel = nn.Parameter(torch.zeros(1), requires_grad=False)
 
     # ------------------------------------------------------------------
     # Weight loading
@@ -404,6 +401,13 @@ class MossTTSNanoForGeneration(nn.Module):
     # ------------------------------------------------------------------
     # vLLM boilerplate: embed_input_ids required by generation runner
     # ------------------------------------------------------------------
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        # Generation stage does not produce logits; satisfy VllmModelForTextGeneration protocol.
+        return None
 
     def embed_input_ids(
         self,
