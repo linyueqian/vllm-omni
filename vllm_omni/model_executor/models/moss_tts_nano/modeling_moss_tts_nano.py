@@ -33,6 +33,49 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
 
+
+def _patch_torchaudio_load() -> None:
+    """Patch torchaudio.load to use soundfile if torchcodec is unavailable.
+
+    torchaudio 2.10+ removed set_audio_backend() and defaults to torchcodec,
+    which requires libnvrtc (missing on some servers).  soundfile handles all
+    common audio formats (WAV, FLAC, OGG) without FFmpeg/NVRTC.
+    """
+    try:
+        import torchaudio
+        # Probe if the current torchaudio.load works.
+        torchaudio  # noqa -- just importing is enough to check
+        import torchcodec  # noqa: F401 -- will raise if broken
+        return  # torchcodec is fine, no patch needed
+    except Exception:
+        pass
+
+    import soundfile as sf
+    import numpy as np
+
+    def _soundfile_load(path, frame_offset=0, num_frames=-1, normalize=True, channels_first=True, format=None):
+        data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        # data shape: [samples, channels]
+        if frame_offset > 0:
+            data = data[frame_offset:]
+        if num_frames > 0:
+            data = data[:num_frames]
+        waveform = torch.from_numpy(data)
+        if normalize:
+            # soundfile already gives float32 in [-1, 1] for integer formats
+            pass
+        if channels_first:
+            waveform = waveform.T  # [channels, samples]
+        return waveform, sr
+
+    try:
+        import torchaudio
+        torchaudio.load = _soundfile_load
+        logger.info("Patched torchaudio.load to use soundfile (torchcodec unavailable)")
+    except Exception as e:
+        logger.warning("Could not patch torchaudio.load: %s", e)
+
+
 # Default sampling parameters matching the upstream demo defaults.
 _DEFAULT_TEXT_TEMPERATURE = 1.0
 _DEFAULT_TEXT_TOP_P = 1.0
@@ -116,6 +159,12 @@ class MossTTSNanoForGeneration(nn.Module):
         with self._lock:
             if self._lm is not None:
                 return set()
+
+            # torchaudio 2.10+ dropped set_audio_backend() and defaults to
+            # torchcodec which requires libnvrtc -- unavailable on some servers.
+            # Patch torchaudio.load to fall back to soundfile so reference audio
+            # loading works regardless of the FFmpeg/torchcodec installation.
+            _patch_torchaudio_load()
 
             try:
                 device = next(self.parameters()).device
