@@ -39,12 +39,12 @@ PROMPTS = [
 
 
 def send_tts_request(
-    host: str, port: int, text: str, timeout: float = 120.0
+    host: str, port: int, text: str, model: str = "tts", timeout: float = 120.0
 ) -> dict:
     """Send a single TTS request and measure timing."""
     url = f"http://{host}:{port}/v1/audio/speech"
     payload = {
-        "model": "tts",
+        "model": model,
         "input": text,
         "voice": "alloy",
         "response_format": "pcm",
@@ -89,6 +89,7 @@ def run_benchmark(
     tag: str,
     num_prompts: int,
     concurrency: int,
+    model: str = "tts",
 ) -> dict:
     """Run benchmark and return structured results."""
     prompts = (PROMPTS * ((num_prompts // len(PROMPTS)) + 1))[:num_prompts]
@@ -103,7 +104,7 @@ def run_benchmark(
     print("Warmup (2 requests)...")
     for i in range(2):
         try:
-            send_tts_request(host, port, "Warmup request number one.")
+            send_tts_request(host, port, "Warmup request number one.", model=model)
         except Exception as e:
             print(f"  Warmup {i} failed: {e}")
 
@@ -111,7 +112,7 @@ def run_benchmark(
     results = []
     for i, prompt in enumerate(prompts):
         try:
-            r = send_tts_request(host, port, prompt)
+            r = send_tts_request(host, port, prompt, model=model)
             results.append(r)
             print(
                 f"  [{i+1}/{num_prompts}] "
@@ -195,11 +196,12 @@ def main():
     parser.add_argument("--tag", required=True, help="Label for this run (e.g. two-stage, single-stage)")
     parser.add_argument("--num-prompts", type=int, default=10)
     parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--model", default="tts", help="Model name as registered on the server")
     parser.add_argument("--output-dir", default="/tmp/fish_bench_results")
     args = parser.parse_args()
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    output = run_benchmark(args.host, args.port, args.tag, args.num_prompts, args.concurrency)
+    output = run_benchmark(args.host, args.port, args.tag, args.num_prompts, args.concurrency, model=args.model)
 
     out_path = Path(args.output_dir) / f"{args.tag}_c{args.concurrency}.json"
     with open(out_path, "w") as f:
