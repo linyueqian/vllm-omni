@@ -232,14 +232,16 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
         decoded_up_to = req_info.get("_decoded_up_to", 0)
         new_frames = total_frames - decoded_up_to
 
-        all_codes = torch.cat(codes_list, dim=0)
-        wav_chunks = req_info.get("_wav_chunks")
-        if wav_chunks is None:
-            wav_chunks = []
-            req_info["_wav_chunks"] = wav_chunks
-
-        # Decode complete chunks.
+        # Decode only complete chunks.  Remaining tail frames (< _CHUNK_FRAMES)
+        # are NOT decoded here to avoid per-step DAC overhead (~12ms/call).
+        # TODO: move tail decode to serving layer for zero-truncation.
         if new_frames >= _CHUNK_FRAMES:
+            all_codes = torch.cat(codes_list, dim=0)
+            wav_chunks = req_info.get("_wav_chunks")
+            if wav_chunks is None:
+                wav_chunks = []
+                req_info["_wav_chunks"] = wav_chunks
+
             n_chunks = new_frames // _CHUNK_FRAMES
             for i in range(n_chunks):
                 chunk_start = decoded_up_to + i * _CHUNK_FRAMES
@@ -256,36 +258,12 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
                 except Exception as exc:
                     logger.error("DAC chunk decode failed: %s", exc)
 
-            decoded_up_to += n_chunks * _CHUNK_FRAMES
-            req_info["_decoded_up_to"] = decoded_up_to
+            req_info["_decoded_up_to"] = decoded_up_to + n_chunks * _CHUNK_FRAMES
 
-        # Decode any remaining tail frames so audio is never truncated.
-        # The tail is re-decoded each step (overwriting the previous tail
-        # waveform) since we don't know which step is last.  This is cheap
-        # because tail_frames < _CHUNK_FRAMES (< 25 frames).
-        tail_frames = total_frames - decoded_up_to
-        old_tail = req_info.get("_tail_wav")
-        if tail_frames > 0:
-            ctx_start = max(0, decoded_up_to - _LEFT_CONTEXT_FRAMES)
-            left_ctx = decoded_up_to - ctx_start
-            try:
-                tail_wav = self._decode_chunk(
-                    all_codes[ctx_start:total_frames], left_ctx
-                )
-                req_info["_tail_wav"] = tail_wav.cpu() if tail_wav.numel() > 0 else None
-            except Exception as exc:
-                logger.error("DAC tail decode failed: %s", exc)
-                req_info["_tail_wav"] = None
-        else:
-            req_info["_tail_wav"] = None
-
-        # Return accumulated waveform (chunks + tail).
-        parts = list(wav_chunks)
-        tail = req_info.get("_tail_wav")
-        if tail is not None and tail.numel() > 0:
-            parts.append(tail)
-        if parts:
-            full_wav = torch.cat(parts, dim=0)
+        # Return accumulated waveform.
+        wav_chunks = req_info.get("_wav_chunks")
+        if wav_chunks:
+            full_wav = torch.cat(wav_chunks, dim=0)
             sr_tensor = torch.tensor(self._dac_sample_rate, dtype=torch.int32)
             return OmniOutput(
                 text_hidden_states=parent_output.text_hidden_states,
