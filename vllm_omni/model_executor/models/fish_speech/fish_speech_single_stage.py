@@ -196,54 +196,68 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
     def make_omni_output(
         self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any
     ) -> OmniOutput:
-        """Decode ALL accumulated audio codes to audio waveform inline.
+        """Accumulate audio codes and decode to audio waveform inline.
 
-        Re-decodes every step (like VoxCPM2).  The output processor
-        keeps the latest full waveform.
+        The model_intermediate_buffer only holds the LATEST step's
+        audio_codes (1 frame).  We accumulate them in a private key
+        ``_dac_all_codes`` and re-decode the full sequence each step
+        (same O(N) pattern as VoxCPM2).
         """
-        # Use parent to extract audio_codes from info_dicts.
+        # Use parent to extract the latest audio_codes frame.
         if isinstance(model_outputs, OmniOutput):
             parent_output = model_outputs
         else:
             parent_output = super().make_omni_output(model_outputs, **kwargs)
 
         mm = parent_output.multimodal_outputs or {}
-        audio_codes = mm.get("audio_codes")
+        latest_codes = mm.get("audio_codes")
 
-        if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
-            # No codes yet (e.g. during prefill).
+        # Get per-request buffer to accumulate codes across steps.
+        info_dicts = kwargs.get("model_intermediate_buffer") or kwargs.get(
+            "runtime_additional_information"
+        ) or []
+
+        req_info: dict[str, Any] | None = None
+        for info in info_dicts:
+            if isinstance(info, dict):
+                req_info = info
+                break
+
+        if req_info is None:
             return OmniOutput(
                 text_hidden_states=parent_output.text_hidden_states,
                 multimodal_outputs={},
             )
 
-        # Filter zero-padded frames.
-        if audio_codes.ndim == 2:
-            valid_mask = audio_codes.any(dim=1)
-            audio_codes = audio_codes[valid_mask]
+        # Accumulate the latest frame into our private list.
+        if isinstance(latest_codes, torch.Tensor) and latest_codes.numel() > 0:
+            # latest_codes: [1, num_codebooks] or [num_codebooks]
+            if latest_codes.ndim == 1:
+                latest_codes = latest_codes.unsqueeze(0)
+            # Filter zero frames.
+            valid = latest_codes.any(dim=1)
+            if valid.any():
+                codes_list = req_info.get("_dac_all_codes")
+                if codes_list is None:
+                    codes_list = []
+                    req_info["_dac_all_codes"] = codes_list
+                codes_list.append(latest_codes[valid].detach().cpu())
 
-        if audio_codes.ndim != 2 or audio_codes.shape[0] == 0:
+        # Decode all accumulated codes.
+        codes_list = req_info.get("_dac_all_codes")
+        if not codes_list:
             return OmniOutput(
                 text_hidden_states=parent_output.text_hidden_states,
                 multimodal_outputs={},
             )
 
+        all_codes = torch.cat(codes_list, dim=0)  # [total_frames, Q]
         sr_tensor = torch.tensor(self._dac_sample_rate, dtype=torch.int32)
 
-        logger.info(
-            "Single-stage DAC decode: frames=%d codebooks=%d nonzero=%d device=%s",
-            audio_codes.shape[0],
-            audio_codes.shape[1],
-            int(audio_codes.any(dim=1).sum().item()),
-            audio_codes.device,
-        )
-
         try:
-            wav = self._decode_codes_to_audio(audio_codes)
-            logger.info("DAC decode produced %d samples (%.3fs at %dHz)",
-                        wav.numel(), wav.numel() / self._dac_sample_rate, self._dac_sample_rate)
+            wav = self._decode_codes_to_audio(all_codes)
         except Exception as exc:
-            logger.error("DAC decode failed: %s", exc)
+            logger.error("DAC decode failed (frames=%d): %s", all_codes.shape[0], exc)
             return OmniOutput(
                 text_hidden_states=parent_output.text_hidden_states,
                 multimodal_outputs={},
