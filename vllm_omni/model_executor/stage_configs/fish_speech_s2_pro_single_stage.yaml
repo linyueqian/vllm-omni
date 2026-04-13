@@ -17,8 +17,8 @@ stage_args:
       max_batch_size: 16
     engine_args:
       max_num_seqs: 4
-      model_stage: fish_speech_single_stage
-      model_arch: FishSpeechSingleStageForConditionalGeneration
+      model_stage: fish_speech_slow_ar
+      model_arch: FishSpeechSlowARForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       enforce_eager: false
