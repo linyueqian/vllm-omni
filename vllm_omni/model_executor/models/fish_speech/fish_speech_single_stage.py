@@ -243,24 +243,12 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
                     req_info["_dac_all_codes"] = codes_list
                 codes_list.append(latest_codes[valid].detach().cpu())
 
-        # Only decode when we have enough frames (avoid O(N^2) per-step).
-        # The output processor will get the full audio on the final step.
-        # We decode every N frames to provide streaming chunks.
+        # Always decode all accumulated codes.  The output processor
+        # keeps the latest waveform and discards prior snapshots.
+        # This is O(N) per step (same as VoxCPM2), but the DAC codec
+        # is fast for short sequences and the AR decode is the bottleneck.
         codes_list = req_info.get("_dac_all_codes")
         if not codes_list:
-            return OmniOutput(
-                text_hidden_states=parent_output.text_hidden_states,
-                multimodal_outputs={},
-            )
-
-        total_frames = sum(c.shape[0] for c in codes_list)
-        last_decoded_frames = req_info.get("_dac_last_decoded_frames", 0)
-        new_frames = total_frames - last_decoded_frames
-
-        # Decode every 25 frames (same as two-stage chunk size) or
-        # when we suspect the request is finishing (generated_len check).
-        decode_interval = 25
-        if new_frames < decode_interval:
             return OmniOutput(
                 text_hidden_states=parent_output.text_hidden_states,
                 multimodal_outputs={},
@@ -277,8 +265,6 @@ class FishSpeechSingleStageForConditionalGeneration(FishSpeechSlowARForCondition
                 text_hidden_states=parent_output.text_hidden_states,
                 multimodal_outputs={},
             )
-
-        req_info["_dac_last_decoded_frames"] = total_frames
 
         if wav.numel() == 0:
             return OmniOutput(
