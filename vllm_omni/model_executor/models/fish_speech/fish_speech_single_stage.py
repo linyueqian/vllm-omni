@@ -29,11 +29,13 @@ from .fish_speech_slow_ar import FishSpeechSlowARForConditionalGeneration
 logger = init_logger(__name__)
 
 # Re-vocode stride: decode every N new frames.
-# Smaller stride = less truncation but more DAC compute.
-# stride=10 trims max truncation from 1.1s (stride=25) to ~0.42s.
 _VOCODE_STRIDE = 10
 # Initial stride for low-latency first audio chunk.
 _INITIAL_VOCODE_STRIDE = 4
+# Optional secondary device for vocoder (e.g. "cuda:1") to truly
+# parallelize DAC compute with AR generation on different GPUs.
+# Set via env var VLLM_OMNI_FISH_VOCODER_DEVICE.  None = same as AR.
+_VOCODER_DEVICE_ENV = "VLLM_OMNI_FISH_VOCODER_DEVICE"
 
 
 class FishSpeechSingleStageForConditionalGeneration(
@@ -132,13 +134,26 @@ class FishSpeechSingleStageForConditionalGeneration(
         codec.quantizer.pre_module = None
         codec.quantizer.downsample = None
 
-        device = self.vllm_config.device_config.device
-        codec = codec.to(device=device, dtype=torch.float32)
+        # Allow vocoder on a different device for true GPU parallelism.
+        ar_device = self.vllm_config.device_config.device
+        vocoder_device_str = os.environ.get(_VOCODER_DEVICE_ENV)
+        if vocoder_device_str:
+            try:
+                vocoder_device = torch.device(vocoder_device_str)
+            except Exception:
+                logger.warning(
+                    "Invalid %s=%s; using AR device",
+                    _VOCODER_DEVICE_ENV, vocoder_device_str,
+                )
+                vocoder_device = ar_device
+        else:
+            vocoder_device = ar_device
+        codec = codec.to(device=vocoder_device, dtype=torch.float32)
         codec.eval()
         self._dac_codec = codec
         logger.info(
-            "Single-stage DAC codec loaded from %s (device=%s)",
-            codec_path, device,
+            "Single-stage DAC codec loaded from %s (vocoder_device=%s, ar_device=%s)",
+            codec_path, vocoder_device, ar_device,
         )
 
     # -------------------- DAC decode --------------------
