@@ -184,6 +184,23 @@ class FishSpeechSingleStageForConditionalGeneration(
         else:
             parent_output = super().make_omni_output(model_outputs, **kwargs)
 
+        sr_tensor = torch.tensor(self._dac_sample_rate, dtype=torch.int32)
+        empty_wav = torch.zeros((0,), dtype=torch.float32)
+
+        # ALWAYS return model_outputs (even empty) to override the model
+        # runner's default "hidden" key remapping.  The output processor
+        # remaps both "hidden" and "model_outputs" to "audio"; whichever
+        # comes later in dict iteration wins.  Without this, steps that
+        # produce no audio inject hidden state tensors as fake audio.
+        def _return(wav: torch.Tensor) -> OmniOutput:
+            return OmniOutput(
+                text_hidden_states=parent_output.text_hidden_states,
+                multimodal_outputs={
+                    "model_outputs": [wav],
+                    "sr": [sr_tensor],
+                },
+            )
+
         mm = parent_output.multimodal_outputs or {}
         latest_codes = mm.get("audio_codes")
 
@@ -198,10 +215,7 @@ class FishSpeechSingleStageForConditionalGeneration(
                 break
 
         if req_info is None:
-            return OmniOutput(
-                text_hidden_states=parent_output.text_hidden_states,
-                multimodal_outputs={},
-            )
+            return _return(empty_wav)
 
         # Accumulate latest frame.
         if isinstance(latest_codes, torch.Tensor) and latest_codes.numel() > 0:
@@ -217,10 +231,7 @@ class FishSpeechSingleStageForConditionalGeneration(
 
         codes_list = req_info.get("_all_codes")
         if not codes_list:
-            return OmniOutput(
-                text_hidden_states=parent_output.text_hidden_states,
-                multimodal_outputs={},
-            )
+            return _return(empty_wav)
 
         total_frames = sum(c.shape[0] for c in codes_list)
         last_vocoded_at = req_info.get("_last_vocoded_at", 0)
@@ -230,23 +241,6 @@ class FishSpeechSingleStageForConditionalGeneration(
         in_initial_phase = last_vocoded_at == 0
         stride = _INITIAL_VOCODE_STRIDE if in_initial_phase else _VOCODE_STRIDE
         should_vocode = new_since_vocode >= stride
-
-        sr_tensor = torch.tensor(self._dac_sample_rate, dtype=torch.int32)
-        empty_wav = torch.zeros((0,), dtype=torch.float32)
-
-        # ALWAYS return model_outputs to override the model runner's
-        # default "hidden" key remapping (output processor remaps both
-        # "hidden" and "model_outputs" to "audio"; whichever is later
-        # wins).  Without this, no-vocode steps would inject hidden
-        # states as fake audio chunks.
-        def _return(wav: torch.Tensor) -> OmniOutput:
-            return OmniOutput(
-                text_hidden_states=parent_output.text_hidden_states,
-                multimodal_outputs={
-                    "model_outputs": [wav],
-                    "sr": [sr_tensor],
-                },
-            )
 
         if not should_vocode:
             return _return(empty_wav)
