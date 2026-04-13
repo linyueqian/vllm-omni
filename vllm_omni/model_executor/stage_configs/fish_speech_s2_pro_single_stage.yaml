@@ -7,7 +7,7 @@
 #   - OmniGenerationScheduler overhead
 #
 # Compare with fish_speech_s2_pro.yaml (two-stage) to measure speedup.
-async_chunk: false
+async_chunk: true
 stage_args:
   - stage_id: 0
     stage_type: llm
