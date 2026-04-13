@@ -68,12 +68,19 @@ def _patch_torchaudio_load() -> None:
             waveform = waveform.T  # [channels, samples]
         return waveform, sr
 
+    def _soundfile_save(path, src, sample_rate, channels_first=True, **kwargs):
+        wav = src.detach().cpu().float().numpy()
+        if channels_first and wav.ndim == 2:
+            wav = wav.T  # [channels, samples] → [samples, channels]
+        sf.write(str(path), wav, sample_rate)
+
     try:
         import torchaudio
         torchaudio.load = _soundfile_load
-        logger.info("Patched torchaudio.load to use soundfile (torchcodec unavailable)")
+        torchaudio.save = _soundfile_save
+        logger.info("Patched torchaudio.load/save to use soundfile (torchcodec unavailable)")
     except Exception as e:
-        logger.warning("Could not patch torchaudio.load: %s", e)
+        logger.warning("Could not patch torchaudio: %s", e)
 
 
 # Default sampling parameters matching the upstream demo defaults.
@@ -191,11 +198,15 @@ class MossTTSNanoForGeneration(nn.Module):
                 torch_dtype=tts_dtype,
             )
             if device.type == "cuda":
-                # Use SDPA when flash_attention_2 is unavailable.
+                # Prefer flash_attention_2 but fall back to sdpa if the
+                # flash_attn package is not installed.
                 try:
+                    import flash_attn  # noqa: F401
                     lm._set_attention_implementation("flash_attention_2")
-                except Exception:
+                    logger.info("MOSS-TTS-Nano using flash_attention_2")
+                except ImportError:
                     lm._set_attention_implementation("sdpa")
+                    logger.info("MOSS-TTS-Nano using sdpa (flash_attn not installed)")
             lm.to(device=device)
             lm.eval()
             self._lm = lm
