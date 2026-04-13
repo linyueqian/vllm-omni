@@ -27,6 +27,7 @@ stage_args:
       enable_prefix_caching: false
       engine_output_type: audio
       gpu_memory_utilization: 0.7
+      distributed_executor_backend: "mp"
       max_num_batched_tokens: 3072
       max_model_len: 16384
     final_output: true
