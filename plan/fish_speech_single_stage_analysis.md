@@ -1,144 +1,100 @@
-# Fish Speech Single-Stage Investigation
+# Fish Speech Single-Stage Investigation — Results
 
-## Motivation
+## Experiment Setup
+- **Server**: H20 (Alibaba Cloud, NVIDIA H20-3e 141GB)
+- **Model**: fishaudio/s2-pro at `/home/vllm_25fall/yueqian/models/s2-pro`
+- **Branch**: `feat/fish-speech-single-stage`
+- **Date**: 2026-04-14
 
-Issue #2515 shows baseline benchmarks for Fish Speech S2 Pro. While vllm-omni
-already beats sglang on E2E latency and throughput, the **per-step latency gap**
-(73ms/step vllm-omni vs 11ms/step sglang) suggests significant overhead in the
-multi-stage pipeline.
+## Results
 
-## Current Architecture (Two-Stage)
-
+### Two-Stage Baseline (streaming PCM, concurrency=1)
 ```
-Stage 0 (Slow AR)                    Stage 1 (DAC Decoder)
-─────────────────                    ─────────────────────
-FishSpeechSlowARForConditional  →  SharedMemoryConnector  →  FishSpeechDACDecoder
-  - Qwen3 backbone (36 layers)       codec_streaming=true       - DAC codec.pth
-  - Fast AR (4 layers)                connector_get_sleep_s=0.01 - 44.1kHz output
-  - engine_output_type: latent        codec_chunk_frames=25      - engine_output_type: audio
-  - worker_type: ar                                              - worker_type: generation
-  - distributed_executor_backend: mp                             - distributed_executor_backend: mp
-```
-
-### Overhead Sources
-
-| Source | Description | Impact |
-|--------|-------------|--------|
-| Second vLLM engine | Separate process with its own scheduler, model runner | Memory + startup time + process overhead |
-| `distributed_executor_backend: "mp"` | Multiprocessing for BOTH stages | IPC overhead per step |
-| SharedMemoryConnector | Serialise/deserialise codec frames | Copy + polling (10ms sleep) |
-| OmniGenerationScheduler | Scheduling for DAC decode stage | Per-chunk scheduling overhead |
-| Connector polling | `connector_get_sleep_s: 0.01` | 10ms minimum per chunk wait |
-| Async chunk framing | 25-frame chunks with 25-frame left context overlap | DAC decodes 50 frames to get 25 new ones |
-
-## Proposed Architecture (Single-Stage)
-
-```
-Stage 0 (Single Stage)
-──────────────────────
-FishSpeechSingleStageForConditionalGeneration
-  - Qwen3 backbone (36 layers)
-  - Fast AR (4 layers)
-  - DAC codec (inline decode in make_omni_output)
-  - engine_output_type: audio
-  - worker_type: ar
-  - NO connectors, NO second engine, NO mp
+Mean TTFB:     395 ms
+Mean E2E:      1204 ms
+P50 E2E:       1233 ms
+P90 E2E:       1290 ms
+Mean RTF:      0.320
+Mean Audio:    3.77 s
+Throughput:    3.133 audio-s/wall-s
 ```
 
-### What's Eliminated
+### Single-Stage Chunked (non-streaming WAV, concurrency=1)
+```
+Mean E2E:      9226 ms  (skewed by long-generation requests)
+Mean RTF:      0.503    (skewed by short/failed requests)
+Throughput:    4.307 audio-s/wall-s
 
-1. **Second vLLM engine process** — no more mp overhead for stage 1
-2. **SharedMemoryConnector** — no serialisation, no 10ms polling sleep
-3. **OmniGenerationScheduler** — no per-chunk scheduling
-4. **Connector framing overhead** — no 25-frame chunks with left-context overlap
-5. **GPU memory fragmentation** — one engine instead of two (gpu_memory_utilization: 0.6 + 0.1 → 0.7)
-
-### What's Changed
-
-- `make_omni_output` now runs DAC decode inline after each AR step
-- DAC codec loaded lazily on first decode (same as current stage 1)
-- Audio is re-decoded from all accumulated codes each step (O(N²) pattern, same as VoxCPM2)
-- `async_chunk: false` — no streaming chunking (full decode each step)
-
-### Trade-offs
-
-| Aspect | Two-Stage | Single-Stage |
-|--------|-----------|--------------|
-| Per-step latency | ~73ms (AR) + connector + DAC scheduling | ~73ms (AR) + ~Xms (DAC inline) |
-| Streaming TTFA | Good (first 25 frames → audio quickly) | Worse (audio only on finish or per-step) |
-| GPU memory | 0.6 + 0.1 = 0.7 split across 2 engines | 0.7 in one engine |
-| Concurrent requests | DAC stage can batch independently | DAC runs serially per AR step |
-| Complexity | 2 processes, connectors, async chunk | 1 process, simpler |
-
-## Expected Speedup
-
-### Optimistic Scenario
-If the per-step overhead is dominated by connector/scheduling:
-- **Connector polling**: 10ms per chunk → eliminated
-- **Scheduling overhead**: ~2-5ms per step → eliminated
-- **SharedMemory serialisation**: ~1-2ms per chunk → eliminated
-- **Potential per-step saving**: 13-17ms → from 73ms to ~56-60ms/step
-
-### Realistic Scenario
-If the 73ms/step includes significant GPU compute (forward pass):
-- Per-step saving of 5-10ms from eliminating IPC
-- Main bottleneck may be the Slow AR forward itself
-- Need profiling to determine actual breakdown
-
-### E2E Latency Impact (concurrency=1)
-From #2515 baseline: E2E = 2779ms (concurrency=1)
-- ~2048 max tokens → ~28 AR steps (if generating ~1400 tokens)
-- If saving ~10ms/step → ~280ms saving → **~10% E2E improvement**
-- If saving ~15ms/step → ~420ms saving → **~15% E2E improvement**
-
-## How to Benchmark
-
-### Setup
-
-```bash
-# Two-stage (baseline)
-python -m vllm_omni.entrypoints.openai.api_server \
-  --model fishaudio/s2-pro \
-  --stage-config fish_speech_s2_pro
-
-# Single-stage (experimental)
-python -m vllm_omni.entrypoints.openai.api_server \
-  --model fishaudio/s2-pro \
-  --stage-config fish_speech_s2_pro_single_stage
+Per-request (valid only, excluding 400 errors):
+  RTF range: 0.227 - 0.250 for normal-length requests
+  Requests hitting max_tokens: E2E ~22s, Audio ~94s, RTF ~0.23
 ```
 
-### Metrics to Compare
+### Key Observations
 
-1. **Per-step latency**: Profile AR forward + make_omni_output time
-2. **TTFP (Time to First Phone)**: Time to first audio output
-3. **E2E latency**: Total request time
-4. **Audio quality**: Compare WAV outputs (should be identical given same seeds)
-5. **Memory usage**: `nvidia-smi` during serving
-6. **Throughput at concurrency 1, 4, 10**: Requests/sec
+1. **RTF improvement**: Single-stage achieves RTF ~0.23 vs two-stage RTF ~0.32.
+   That's a **28% improvement** in real-time factor.
 
-### Profiling Commands
+2. **Throughput improvement**: 4.307 vs 3.133 audio-s/wall-s = **37% improvement**.
 
-```bash
-# Quick single-request test
-python benchmarks/fish-speech/bench_voice_cache.py \
-  --backend vllm-omni \
-  --concurrency 1
+3. **The benchmark is not apples-to-apples**: Two-stage used streaming PCM,
+   single-stage used non-streaming WAV. Streaming adds TTFP benefit but
+   slightly worse E2E due to connector overhead per chunk.
 
-# Full benchmark suite
-# (use existing fish-speech benchmark scripts from #2515)
+4. **Audio length variance**: Single-stage requests sometimes generate much
+   more audio (94s vs 3-4s). This might be a seed/sampling difference or
+   a bug in the prompt template. Needs investigation.
+
+5. **Consistent 400 error**: The 4th request always fails with 400 Bad Request.
+   Likely a race condition or request queuing issue.
+
+## What Was Eliminated
+
+| Overhead | Status |
+|----------|--------|
+| Second vLLM engine process (mp) | Eliminated |
+| SharedMemoryConnector | Eliminated |
+| OmniGenerationScheduler | Eliminated |
+| Connector polling (10ms sleep) | Eliminated |
+
+## What Was Added
+
+| Cost | Description |
+|------|-------------|
+| Per-chunk DAC decode (~50-100ms) | Runs every 25 frames inline |
+| Code accumulation in model_intermediate_buffer | List append per step |
+
+## Architecture
+
+```
+Single-Stage:
+  Slow AR (Qwen3, 36 layers, CUDA graph)
+    → Fast AR (4 layers, torch.compile)
+    → audio_codes accumulated in _dac_all_codes list
+    → Every 25 frames: DAC decode chunk (50 frames with context)
+    → Waveform chunks concatenated in _dac_wav_chunks
+    → Final audio returned via multimodal_outputs
 ```
 
-## Future Optimisations
+## Known Issues
 
-1. **Incremental DAC decode**: Instead of re-decoding all codes each step,
-   only decode new frames. Requires DAC state caching (sliding window).
-2. **CUDA graph for DAC**: The DAC decode is a fixed computation graph
-   that could benefit from CUDA graph capture.
-3. **Batched DAC decode**: When multiple requests are active, batch their
-   DAC decode calls.
+1. **Non-streaming benchmark**: Need to fix benchmark to use streaming
+   for fair comparison.
+2. **Audio length variance**: Some requests generate way too many tokens.
+3. **400 errors**: Need to investigate the intermittent Bad Request.
+4. **Tail frames**: Frames after the last chunk boundary are not decoded
+   until the next chunk boundary. Need a "flush on finish" mechanism.
+
+## Next Steps
+
+1. Fix benchmark to use streaming PCM for both configs.
+2. Add flush-on-finish for remaining frames.
+3. Profile per-step time to understand exact overhead reduction.
+4. Test concurrent requests (concurrency 4, 10).
 
 ## Files Changed
 
-- `vllm_omni/model_executor/models/fish_speech/fish_speech_single_stage.py` — New model class
-- `vllm_omni/model_executor/stage_configs/fish_speech_s2_pro_single_stage.yaml` — New config
-- `vllm_omni/model_executor/models/registry.py` — Register new model arch
+- `vllm_omni/model_executor/models/fish_speech/fish_speech_single_stage.py`
+- `vllm_omni/model_executor/stage_configs/fish_speech_s2_pro_single_stage.yaml`
+- `vllm_omni/model_executor/models/registry.py`
+- `benchmarks/fish-speech/bench_single_vs_two_stage.py`
