@@ -229,15 +229,46 @@ class FishSpeechSingleStageForConditionalGeneration(
 
     # -------------------- Override make_omni_output --------------------
 
+    def _collect_pending(
+        self, req_info: dict[str, Any]
+    ) -> torch.Tensor | None:
+        """Collect a previously submitted async decode; return delta wav or None."""
+        pending = req_info.get("_pending_decode")
+        if pending is None:
+            return None
+        done_event, wav_info, frames_at_submit = pending
+        # Wait for the decode to finish (usually done already since ~10 AR
+        # steps have elapsed since submit).
+        if done_event is not None:
+            done_event.synchronize()
+        wav_gpu, audio_len_t = wav_info
+        if audio_len_t is not None:
+            audio_len = int(audio_len_t.item())
+        else:
+            audio_len = int(wav_gpu.shape[-1])
+        full_wav = wav_gpu[:audio_len].to(dtype=torch.float32, device="cpu")
+        emitted_samples = req_info.get("_emitted_samples", 0)
+        delta = full_wav[emitted_samples:].contiguous()
+        req_info["_emitted_samples"] = int(full_wav.numel())
+        req_info["_last_vocoded_at"] = frames_at_submit
+        req_info["_pending_decode"] = None
+        return delta
+
     def make_omni_output(
         self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any,
     ) -> OmniOutput:
-        """Accumulate codes; re-vocode all codes at stride boundaries.
+        """Pipelined async vocode: submit DAC on stride, collect on next.
 
-        Instead of chunked decode (which truncates tail frames), we
-        re-decode ALL accumulated codes every _VOCODE_STRIDE frames and
-        emit only the delta audio.  The waveform grows monotonically
-        and always covers all frames — zero truncation.
+        On each call:
+          1. Accumulate the new frame into the per-request code buffer.
+          2. If an async decode is pending, collect it (wait for event) and
+             emit the delta audio.  This overlaps DAC compute with AR.
+          3. If a new stride boundary is reached, submit an async decode
+             on the vocoder stream.  The result will be collected next call.
+
+        The delta for decode submitted at step N is emitted ~stride steps
+        later (when decode N+1 is submitted).  Audio is thus delayed by one
+        stride on the streaming path, but AR generation never stalls.
         """
         if isinstance(model_outputs, OmniOutput):
             parent_output = model_outputs
@@ -250,19 +281,15 @@ class FishSpeechSingleStageForConditionalGeneration(
         info_dicts = kwargs.get("model_intermediate_buffer") or kwargs.get(
             "runtime_additional_information"
         ) or []
-        # Filter to only dict entries (one per request in batch order).
         req_infos: list[dict[str, Any]] = [info for info in info_dicts if isinstance(info, dict)]
         batch_size = max(len(req_infos), 1)
 
-        # Get per-request audio_codes from parent's combined output.
-        # Parent concatenates all requests' codes [batch_size, num_codebooks].
         mm = parent_output.multimodal_outputs or {}
         all_codes_combined = mm.get("audio_codes")
 
-        # Process EACH request independently to support concurrency.
         deltas: list[torch.Tensor] = []
         for i, req_info in enumerate(req_infos):
-            # This request's latest frame: row i of combined codes.
+            # 1) Accumulate this step's codes (keep on GPU).
             if isinstance(all_codes_combined, torch.Tensor) and i < all_codes_combined.shape[0]:
                 latest_codes = all_codes_combined[i:i + 1]
                 valid = latest_codes.any(dim=1)
@@ -271,41 +298,71 @@ class FishSpeechSingleStageForConditionalGeneration(
                     if codes_list is None:
                         codes_list = []
                         req_info["_all_codes"] = codes_list
-                    codes_list.append(latest_codes[valid].detach().cpu())
+                    codes_list.append(latest_codes[valid].detach())
+
+            # 2) ALWAYS try to collect any pending async decode first.
+            #    The DAC has had ~stride AR steps to finish, so sync is cheap.
+            #    This ensures deltas are emitted ASAP and no tail is lost.
+            delta_from_pending = self._collect_pending(req_info)
 
             codes_list = req_info.get("_all_codes")
             if not codes_list:
-                deltas.append(empty_wav)
+                deltas.append(delta_from_pending if delta_from_pending is not None else empty_wav)
                 continue
 
+            # 3) Check stride boundary for submitting a NEW decode.
             total_frames = sum(c.shape[0] for c in codes_list)
             last_vocoded_at = req_info.get("_last_vocoded_at", 0)
             new_since_vocode = total_frames - last_vocoded_at
-
             in_initial_phase = last_vocoded_at == 0
             stride = _INITIAL_VOCODE_STRIDE if in_initial_phase else _VOCODE_STRIDE
+
             if new_since_vocode < stride:
-                deltas.append(empty_wav)
+                deltas.append(delta_from_pending if delta_from_pending is not None else empty_wav)
                 continue
 
-            # Re-vocode all of THIS request's codes (sync; runs on
-            # vocoder_device which may be a different GPU than AR).
+            # 4) Consolidate list → single tensor (prevent fragmentation).
             all_codes = torch.cat(codes_list, dim=0)
-            t_voc = time.perf_counter()
-            try:
-                full_wav = self._decode_all(all_codes).cpu()
-            except Exception as exc:
-                logger.error("DAC re-vocode failed for req %d: %s", i, exc)
-                deltas.append(empty_wav)
-                continue
-            voc_ms = (time.perf_counter() - t_voc) * 1000
-            logger.info("vocode %d frames in %.1fms", total_frames, voc_ms)
+            codes_list.clear()
+            codes_list.append(all_codes)
 
-            emitted_samples = req_info.get("_emitted_samples", 0)
-            delta_wav = full_wav[emitted_samples:].contiguous()
-            req_info["_emitted_samples"] = int(full_wav.numel())
-            req_info["_last_vocoded_at"] = total_frames
-            deltas.append(delta_wav if delta_wav.numel() > 0 else empty_wav)
+            # 5) Submit a new async decode on the vocoder stream.
+            try:
+                t_voc = time.perf_counter()
+                result = self._submit_decode_async(all_codes)
+                submit_ms = (time.perf_counter() - t_voc) * 1000
+            except Exception as exc:
+                logger.error("DAC submit failed for req %d: %s", i, exc)
+                deltas.append(delta_from_pending if delta_from_pending is not None else empty_wav)
+                continue
+
+            done_event, payload = result
+            if done_event is None:
+                # Sync fallback (no vocoder stream available).
+                full_wav = payload.cpu() if isinstance(payload, torch.Tensor) else None
+                if full_wav is None:
+                    deltas.append(delta_from_pending if delta_from_pending is not None else empty_wav)
+                    continue
+                emitted_samples = req_info.get("_emitted_samples", 0)
+                delta = full_wav[emitted_samples:].contiguous()
+                req_info["_emitted_samples"] = int(full_wav.numel())
+                req_info["_last_vocoded_at"] = total_frames
+                if delta.numel() > 0:
+                    deltas.append(delta)
+                elif delta_from_pending is not None:
+                    deltas.append(delta_from_pending)
+                else:
+                    deltas.append(empty_wav)
+            else:
+                # Async path: store pending, emit the previously pending
+                # decode (if any) now.
+                req_info["_pending_decode"] = (done_event, payload, total_frames)
+                logger.debug(
+                    "submit_async %d frames in %.2fms (pending delta: %d samples)",
+                    total_frames, submit_ms,
+                    0 if delta_from_pending is None else delta_from_pending.numel(),
+                )
+                deltas.append(delta_from_pending if delta_from_pending is not None else empty_wav)
 
         # Pad deltas list to batch_size (in case there are fewer info_dicts).
         while len(deltas) < batch_size:
