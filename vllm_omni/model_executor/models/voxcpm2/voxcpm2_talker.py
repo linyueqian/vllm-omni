@@ -11,6 +11,7 @@ Architecture:
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 import time
 from collections.abc import Iterable
@@ -234,11 +235,11 @@ def _optimized_solve_euler(
             buffers.x_in[b : 2 * b].copy_(x)
             buffers.mu_in[:b].copy_(mu)
             buffers.mu_in[b : 2 * b].zero_()
-            buffers.t_in[:b].fill_(t.item())
-            buffers.t_in[b : 2 * b].fill_(t.item())
+            # Broadcast the 0-dim GPU scalar directly instead of
+            # ``.fill_(t.item())`` — ``.item()`` forces a GPU->CPU sync.
+            buffers.t_in[: 2 * b].copy_(t)
             if mean_mode:
-                buffers.dt_in[:b].fill_(dt.item())
-                buffers.dt_in[b : 2 * b].fill_(dt.item())
+                buffers.dt_in[: 2 * b].copy_(dt)
             else:
                 buffers.dt_in.zero_()
             buffers.cond_in[:b].copy_(cond[:b])
@@ -268,9 +269,10 @@ def _optimized_solve_euler(
         else:
             buffers.x_in[:b].copy_(x)
             buffers.mu_in[:b].copy_(mu)
-            buffers.t_in[:b].fill_(t.item())
+            # Broadcast the 0-dim GPU scalar; ``.fill_(t.item())`` would sync.
+            buffers.t_in[:b].copy_(t)
             if mean_mode:
-                buffers.dt_in[:b].fill_(dt.item())
+                buffers.dt_in[:b].copy_(dt)
             else:
                 buffers.dt_in[:b].zero_()
             buffers.cond_in[:b].copy_(cond[:b])
@@ -695,7 +697,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         state.request_start_time = time.perf_counter()
         state.prefill_completed = True
 
-        logger.info("PREFILL[%s]: patch norm=%.4f", state.request_id, pred_feat.norm().item())
+        if logger.isEnabledFor(logging.DEBUG):
+            # Only compute the norm (which forces a GPU->CPU sync) if we will log it.
+            logger.debug("PREFILL[%s]: patch norm=%.4f", state.request_id, pred_feat.norm().item())
         self._perf.reset()
 
     def _finish_decode(self, state: _RequestState, meta: dict, res_out: torch.Tensor, dev: Any):
