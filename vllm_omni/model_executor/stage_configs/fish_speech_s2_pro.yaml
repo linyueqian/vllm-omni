@@ -15,11 +15,11 @@ stage_args:
       enforce_eager: false
       trust_remote_code: true
       async_scheduling: false
-      enable_prefix_caching: true
+      enable_prefix_caching: false
       engine_output_type: latent
-      gpu_memory_utilization: 0.6
+      gpu_memory_utilization: 0.7
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 3072
+      max_num_batched_tokens: 4096
       max_model_len: 16384
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.fish_speech.slow_ar_to_dac_decoder_async_chunk
     output_connectors:
@@ -49,7 +49,7 @@ stage_args:
       enforce_eager: true
       trust_remote_code: true
       async_scheduling: false
-      enable_prefix_caching: true
+      enable_prefix_caching: false
       engine_output_type: audio
       gpu_memory_utilization: 0.1
       distributed_executor_backend: "mp"
