@@ -82,3 +82,39 @@ Beat sgl-omni's RTF on Fish Speech S2-Pro.
 
 The gap explodes with concurrency — points to a serialization/locking
 issue in the inter-stage pipeline that doesn't scale.
+
+## Profile Results (PR #2472 torch profiler, H20, c=1, 3 reqs)
+
+**CPU time (2.97s) > CUDA time (2.03s)** — CPU-bound at orchestration.
+
+| Op | CPU time | % | Calls |
+|----|----------|---|-------|
+| aten::copy_ | 1.213s | 40.82% | 7910 |
+| aten::sort | 56ms | 1.90% | 247 |
+| aten::mm | 26ms | 0.88% | 679 |
+| aten::index | 21ms | 0.70% | 494 |
+
+**Top GPU kernels (already optimal):**
+- nvjet matmul (transformer attn/MLP): 423ms (20.86%)
+- Flash Attention 3 fwd: 123ms (6.07%)
+- _vllm_fa3_C::fwd: 1.5ms (FA3 confirmed)
+
+## Bottleneck Identified
+The 1.21s spent on `aten::copy_` is the single biggest opportunity.
+Sources of per-step copies in `_preprocess`:
+- 4 per-request talker_mtp buffer copies (lines 1258-1261)
+- 1 per-request inputs_embeds copy (line 1269)
+- 1 per-request input_ids copy (line 1271)
+- KV cache writes (in graph, but plumbing copies before)
+- Prefill prompt embed overlay (line 1061)
+- inputs_embeds.gpu copy (line 1138)
+
+For batch_size=N at 100 steps: ~6×N×100 = 600×N small copies.
+Each copy has ~20-30μs Python overhead. At c=8: 4800 copies × 25μs ≈ 120ms.
+Profile shows 1.2s — there's more overhead than just direct copies.
+
+## Next Action: Batch the per-request preprocess loop
+Replace per-request `.gpu[i:i+1].copy_(...)` with batched
+`torch.cat(per_req_data)` + single `.gpu[:n].copy_(...)`.
+Expected gain: 5-10% reduction in CPU time → similar improvement
+in throughput at high concurrency where CPU-bound.
