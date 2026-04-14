@@ -239,8 +239,12 @@ class FishSpeechSingleStageForConditionalGeneration(
         done_event, wav_info, frames_at_submit = pending
         # Wait for the decode to finish (usually done already since ~10 AR
         # steps have elapsed since submit).
+        t_sync = time.perf_counter()
         if done_event is not None:
             done_event.synchronize()
+        sync_ms = (time.perf_counter() - t_sync) * 1000
+        if sync_ms > 2.0:
+            logger.info("collect sync wait %.2fms (frames=%d)", sync_ms, frames_at_submit)
         wav_gpu, audio_len_t = wav_info
         if audio_len_t is not None:
             audio_len = int(audio_len_t.item())
@@ -357,7 +361,7 @@ class FishSpeechSingleStageForConditionalGeneration(
                 # Async path: store pending, emit the previously pending
                 # decode (if any) now.
                 req_info["_pending_decode"] = (done_event, payload, total_frames)
-                logger.debug(
+                logger.info(
                     "submit_async %d frames in %.2fms (pending delta: %d samples)",
                     total_frames, submit_ms,
                     0 if delta_from_pending is None else delta_from_pending.numel(),
