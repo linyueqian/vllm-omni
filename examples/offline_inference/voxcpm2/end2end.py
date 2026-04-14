@@ -79,11 +79,13 @@ def extract_audio(multimodal_output: dict) -> torch.Tensor:
         raise ValueError(f"No audio key in multimodal_output: {list(multimodal_output.keys())}")
 
     if isinstance(audio, list):
-        # Take the last valid tensor (most complete audio)
+        # Defensive: usually the output processor consolidates into a single
+        # tensor at request completion, but concatenate here too in case the
+        # caller consumes intermediate (pre-consolidation) outputs.
         valid = [torch.as_tensor(a).float().cpu().reshape(-1) for a in audio if a is not None]
         if not valid:
             raise ValueError("Audio list is empty or all elements are None.")
-        return valid[-1]
+        return torch.cat(valid, dim=0) if len(valid) > 1 else valid[0]
 
     return torch.as_tensor(audio).float().cpu().reshape(-1)
 
