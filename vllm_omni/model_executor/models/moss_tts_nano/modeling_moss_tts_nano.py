@@ -19,7 +19,6 @@ so that vLLM initialises distributed state before any CUDA allocations occur.
 
 from __future__ import annotations
 
-import logging
 import tempfile
 import threading
 from collections.abc import Iterable
@@ -40,8 +39,10 @@ def _patch_torchaudio_load() -> None:
     """Patch torchaudio.load to use soundfile if torchcodec is unavailable."""
     try:
         import torchaudio
+
         torchaudio  # noqa
         import torchcodec  # noqa: F401
+
         return
     except Exception:
         pass
@@ -67,6 +68,7 @@ def _patch_torchaudio_load() -> None:
 
     try:
         import torchaudio
+
         torchaudio.load = _soundfile_load
         torchaudio.save = _soundfile_save
         logger.info("Patched torchaudio.load/save to use soundfile (torchcodec unavailable)")
@@ -151,12 +153,16 @@ class MossTTSNanoForGeneration(nn.Module):
 
             logger.info("Loading MOSS-TTS-Nano LM from %s (dtype=%s)", self.model_path, tts_dtype)
             from transformers import AutoModelForCausalLM
+
             lm = AutoModelForCausalLM.from_pretrained(
-                self.model_path, trust_remote_code=True, torch_dtype=tts_dtype,
+                self.model_path,
+                trust_remote_code=True,
+                torch_dtype=tts_dtype,
             )
             if device.type == "cuda":
                 try:
                     import flash_attn  # noqa: F401
+
                     lm._set_attention_implementation("flash_attention_2")
                     logger.info("MOSS-TTS-Nano using flash_attention_2")
                 except ImportError:
@@ -168,13 +174,17 @@ class MossTTSNanoForGeneration(nn.Module):
             logger.info("MOSS-TTS-Nano LM loaded on %s", device)
 
             codec_path: str = getattr(
-                self.config, "audio_tokenizer_pretrained_name_or_path",
+                self.config,
+                "audio_tokenizer_pretrained_name_or_path",
                 "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano",
             )
             logger.info("Loading MOSS-Audio-Tokenizer-Nano from %s", codec_path)
             from transformers import AutoModel
+
             audio_tokenizer = AutoModel.from_pretrained(
-                codec_path, trust_remote_code=True, torch_dtype=torch.float32,
+                codec_path,
+                trust_remote_code=True,
+                torch_dtype=torch.float32,
             )
             audio_tokenizer.to(device=device)
             audio_tokenizer.eval()
@@ -208,7 +218,6 @@ class MossTTSNanoForGeneration(nn.Module):
             yield torch.zeros((sr,), dtype=torch.float32), True
             return
 
-        voice: str = str(_pick(info, "voice", _DEFAULT_VOICE))
         mode: str = str(_pick(info, "mode", _DEFAULT_MODE))
         prompt_audio_path: str | None = _pick(info, "prompt_audio_path", None)
         if prompt_audio_path is not None:
@@ -402,7 +411,9 @@ class MossTTSNanoForGeneration(nn.Module):
         vocab_size = int(getattr(self.config, "vocab_size", 32000))
         num_rows = int(hidden_states.shape[0])
         logits = torch.zeros(
-            (num_rows, vocab_size), dtype=torch.float32, device=hidden_states.device,
+            (num_rows, vocab_size),
+            dtype=torch.float32,
+            device=hidden_states.device,
         )
         eos_id = 2 if vocab_size > 2 else 0
         safe_id = 1 if vocab_size > 1 and 1 != eos_id else 0

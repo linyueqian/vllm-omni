@@ -40,9 +40,7 @@ from vllm_omni import Omni  # noqa: E402
 MODEL = "OpenMOSS-Team/MOSS-TTS-Nano"
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
-DEFAULT_STAGE_CONFIG = str(
-    _REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "moss_tts_nano.yaml"
-)
+DEFAULT_STAGE_CONFIG = str(_REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "moss_tts_nano.yaml")
 
 BATCH_SAMPLES = [
     {"text": "Hello, this is a test of MOSS-TTS-Nano.", "voice": "Ava", "label": "en_hello"},
@@ -118,10 +116,7 @@ def main(args) -> None:
 
     if args.batch:
         print(f"Running batch synthesis ({len(BATCH_SAMPLES)} samples)...")
-        inputs = [
-            build_request(s["text"], voice=s["voice"], seed=args.seed)
-            for s in BATCH_SAMPLES
-        ]
+        inputs = [build_request(s["text"], voice=s["voice"], seed=args.seed) for s in BATCH_SAMPLES]
         params_list = [sampling_params] * len(inputs)
     else:
         print(f"Synthesizing: {args.text!r}")

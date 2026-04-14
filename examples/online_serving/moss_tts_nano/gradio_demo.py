@@ -27,9 +27,7 @@ import logging
 try:
     import gradio as gr
 except ImportError:
-    raise ImportError(
-        "gradio is required to run this demo. Install it with: pip install 'vllm-omni[demo]'"
-    ) from None
+    raise ImportError("gradio is required to run this demo. Install it with: pip install 'vllm-omni[demo]'") from None
 
 import httpx
 import numpy as np
@@ -602,8 +600,8 @@ def create_app(api_base: str):
             if stream:
                 return (
                     gr.update(value="pcm", interactive=False),
-                    gr.update(visible=True),   # player
-                    gr.update(visible=False),   # audio
+                    gr.update(visible=True),  # player
+                    gr.update(visible=False),  # audio
                 )
             return (
                 gr.update(value="wav", interactive=True),
@@ -619,9 +617,9 @@ def create_app(api_base: str):
 
         def on_reset():
             return (
-                "",     # text
-                None,   # audio_output
-                "",     # hidden_payload
+                "",  # text
+                None,  # audio_output
+                "",  # hidden_payload
                 PLAYER_HTML,  # reset player
             )
 
@@ -672,9 +670,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Gradio demo for MOSS-TTS-Nano with gapless AudioWorklet streaming.",
     )
-    parser.add_argument(
-        "--api-base", default=DEFAULT_API_BASE, help=f"API base URL (default: {DEFAULT_API_BASE})"
-    )
+    parser.add_argument("--api-base", default=DEFAULT_API_BASE, help=f"API base URL (default: {DEFAULT_API_BASE})")
     parser.add_argument("--host", default="0.0.0.0", help="Gradio host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=7860, help="Gradio port (default: 7860)")
     parser.add_argument("--share", action="store_true", help="Share publicly via Gradio tunnel")
@@ -686,6 +682,7 @@ def main():
     app = create_app(args.api_base)
 
     import uvicorn
+
     uvicorn.run(app, host=args.host, port=args.port)
 
 
