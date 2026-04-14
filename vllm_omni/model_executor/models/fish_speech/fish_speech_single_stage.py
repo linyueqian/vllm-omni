@@ -1,14 +1,13 @@
-"""Fish Speech S2 Pro -- Single-Stage model (AR + incremental vocode).
+"""Fish Speech S2 Pro -- Single-Stage model (AR + re-vocode).
 
 Folds codec decoding into the same engine process as AR generation.
-DAC vocoder uses incremental chunked decode:
+DAC vocoder uses re-vocode-all strategy:
 
-  Every ``_VOCODE_STRIDE`` new frames, decode only the new chunk
-  (with left context overlap for smooth transitions) and emit the
-  delta audio.  This approach:
-  - Has near-zero audio truncation (final decode covers remaining frames)
+  Every ``_VOCODE_STRIDE`` new frames, re-decode ALL accumulated codes
+  and emit only the new (delta) audio samples.  This approach:
+  - Has zero audio truncation (every frame is decoded)
   - Supports streaming (emit audio progressively)
-  - Scales O(chunk_size) per stride, not O(total_frames)
+  - Audio quality is optimal (full context for every decode)
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-from .dac_utils import DAC_NUM_CODEBOOKS, DAC_SAMPLE_RATE, DAC_HOP_LENGTH, build_dac_codec
+from .dac_utils import DAC_NUM_CODEBOOKS, DAC_SAMPLE_RATE, build_dac_codec
 from .fish_speech_slow_ar import FishSpeechSlowARForConditionalGeneration
 
 logger = init_logger(__name__)
@@ -33,8 +32,6 @@ logger = init_logger(__name__)
 _VOCODE_STRIDE = 10
 # Initial stride for low-latency first audio chunk.
 _INITIAL_VOCODE_STRIDE = 4
-# Left context frames for smooth transitions in incremental decode.
-_LEFT_CONTEXT_FRAMES = 4
 # Optional secondary device for vocoder (e.g. "cuda:1").
 _VOCODER_DEVICE_ENV = "VLLM_OMNI_FISH_VOCODER_DEVICE"
 
@@ -42,14 +39,13 @@ _VOCODER_DEVICE_ENV = "VLLM_OMNI_FISH_VOCODER_DEVICE"
 class FishSpeechSingleStageForConditionalGeneration(
     FishSpeechSlowARForConditionalGeneration,
 ):
-    """Single-stage Fish Speech: AR + incremental chunked vocode."""
+    """Single-stage Fish Speech: AR + re-vocode-all."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._dac_codec: nn.Module | None = None
         self._dac_sample_rate: int = DAC_SAMPLE_RATE
         self._dac_num_codebooks: int = DAC_NUM_CODEBOOKS
-        self._dac_hop_length: int = DAC_HOP_LENGTH
         self._vocoder_device: torch.device | None = None
         self._vocoder_stream: torch.cuda.Stream | None = None
 
@@ -167,17 +163,8 @@ class FishSpeechSingleStageForConditionalGeneration(
     # -------------------- DAC decode --------------------
 
     @torch.no_grad()
-    def _decode_chunk(
-        self, codes_fq: torch.Tensor,
-    ) -> torch.Tensor:
-        """Decode [N, Q] codes → waveform tensor (synchronous).
-
-        Args:
-            codes_fq: [num_frames, num_codebooks] codes to decode.
-
-        Returns:
-            Waveform tensor [samples] (float32, on CPU).
-        """
+    def _decode_all(self, codes_fq: torch.Tensor) -> torch.Tensor:
+        """Decode [N, Q] codes → waveform tensor (synchronous, blocking)."""
         self._ensure_dac_loaded()
         assert self._dac_codec is not None
 
@@ -198,7 +185,7 @@ class FishSpeechSingleStageForConditionalGeneration(
             if audio_lengths.numel() > 0
             else int(wav_batch.shape[-1])
         )
-        return wav_batch[0, 0, :audio_len].to(dtype=torch.float32, device="cpu")
+        return wav_batch[0, 0, :audio_len].to(dtype=torch.float32).reshape(-1)
 
     @torch.no_grad()
     def _submit_decode_async(
@@ -212,7 +199,7 @@ class FishSpeechSingleStageForConditionalGeneration(
         self._ensure_dac_loaded()
         assert self._dac_codec is not None
         if self._vocoder_stream is None:
-            wav = self._decode_chunk(codes_fq)
+            wav = self._decode_all(codes_fq)
             return None, wav
 
         vocoder_device = self._vocoder_device
@@ -238,10 +225,10 @@ class FishSpeechSingleStageForConditionalGeneration(
     def make_omni_output(
         self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any,
     ) -> OmniOutput:
-        """Accumulate codes; incremental chunked vocode at stride boundaries.
+        """Accumulate codes; re-vocode all codes at stride boundaries.
 
-        Uses left-context overlap for smooth chunk transitions.  Only decodes
-        ``left_context + new_frames`` each time (not all accumulated codes).
+        Re-decodes ALL accumulated codes and emits only the delta audio
+        (new samples since last decode).  Waveform grows monotonically.
         """
         if isinstance(model_outputs, OmniOutput):
             parent_output = model_outputs
@@ -297,26 +284,17 @@ class FishSpeechSingleStageForConditionalGeneration(
             codes_list.clear()
             codes_list.append(all_codes)
 
-            # Incremental chunked decode: left_context + new frames.
-            ctx_start = max(0, last_vocoded_at - _LEFT_CONTEXT_FRAMES)
-            chunk_codes = all_codes[ctx_start:]
-
+            # Re-vocode ALL codes and emit only the new delta.
             try:
-                chunk_wav = self._decode_chunk(chunk_codes)
+                full_wav = self._decode_all(all_codes).cpu()
             except Exception as exc:
-                logger.error("DAC vocode failed for req %d: %s", i, exc)
+                logger.error("DAC re-vocode failed for req %d: %s", i, exc)
                 deltas.append(empty_wav)
                 continue
 
-            # Trim left-context audio to get only new samples.
-            ctx_frames = last_vocoded_at - ctx_start
-            if ctx_frames > 0:
-                # Each frame produces hop_length samples in DAC.
-                ctx_samples = ctx_frames * self._dac_hop_length
-                delta_wav = chunk_wav[ctx_samples:]
-            else:
-                delta_wav = chunk_wav
-
+            emitted_samples = req_info.get("_emitted_samples", 0)
+            delta_wav = full_wav[emitted_samples:].contiguous()
+            req_info["_emitted_samples"] = int(full_wav.numel())
             req_info["_last_vocoded_at"] = total_frames
             deltas.append(delta_wav if delta_wav.numel() > 0 else empty_wav)
 
