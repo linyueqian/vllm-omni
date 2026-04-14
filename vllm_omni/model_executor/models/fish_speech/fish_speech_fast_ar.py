@@ -4,13 +4,14 @@
 autoregressively after each Slow AR step.  Analogous to Qwen3 TTS's
 CodePredictor but with its own embedding table, RoPE, and output head.
 
-Uses re-prefill (no KV cache): each AR step forwards the full growing
-sequence through the 4-layer transformer.  This trades ~O(T^2) attention
-FLOPs (negligible for T=10, 4 layers) for zero KV cache management.
+Uses KV-cached incremental decode: each codebook step only forwards the
+new token [B, 1, H] while caching K/V from prior positions.  The KV cache
+is reset at each Slow AR step (max 10+1 positions, negligible memory).
 
 Optimisations:
+  - KV-cached incremental decode (O(n) vs O(n^2) per step)
   - torch.compile on model forward (kernel fusion)
-  - Pre-allocated projection / embedding buffer
+  - Pre-allocated KV cache + embedding buffer
   - Pre-allocated position_ids
   - Inline sampling
 """
@@ -44,15 +45,17 @@ logger = init_logger(__name__)
 
 
 # ===================================================================
-#  Standalone Fast AR Layers (no vLLM paged attention)
+#  Standalone Fast AR Layers (KV-cached incremental decode)
 # ===================================================================
 
 
 class _FastARAttention(nn.Module):
-    """Multi-head attention using F.scaled_dot_product_attention (SDPA).
+    """Multi-head attention with static KV cache for incremental decode.
 
     Supports fused QKV, RoPE, optional q/k normalization, and native GQA.
     Input: [B, seq_len, hidden_size].
+
+    KV cache layout per layer: (k_cache, v_cache) each [B, num_kv_heads, max_seq, head_dim].
     """
 
     def __init__(self, config: FishSpeechFastARConfig, *, prefix: str = "") -> None:
@@ -96,7 +99,24 @@ class _FastARAttention(nn.Module):
             self.q_norm = None
             self.k_norm = None
 
-    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cache_position: int = 0,
+    ) -> torch.Tensor:
+        """Forward with optional KV cache.
+
+        Args:
+            hidden_states: [B, seq_len, H]
+            position_ids: [B, seq_len]
+            kv_cache: (k_cache, v_cache) each [B, num_kv_heads, max_seq, head_dim].
+                      If provided, writes new K/V at cache_position and attends
+                      over positions [0, cache_position + seq_len).
+            cache_position: write offset into KV cache (number of tokens
+                            already cached).
+        """
         bsz, seq_len, _ = hidden_states.shape
 
         qkv, _ = self.qkv_proj(hidden_states.reshape(bsz * seq_len, -1))
@@ -112,12 +132,26 @@ class _FastARAttention(nn.Module):
         k = k.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
+        if kv_cache is not None:
+            k_cache, v_cache = kv_cache
+            # Write new K/V into cache at the current position.
+            k_cache[:bsz, :, cache_position : cache_position + seq_len, :] = k
+            v_cache[:bsz, :, cache_position : cache_position + seq_len, :] = v
+            # Attend over all cached positions [0, cache_position + seq_len).
+            total_len = cache_position + seq_len
+            k = k_cache[:bsz, :, :total_len, :]
+            v = v_cache[:bsz, :, :total_len, :]
+
+        # For prefill (seq_len > 1), use causal mask so each position only
+        # attends to itself and earlier positions.  For single-token decode
+        # (seq_len == 1), no mask needed since there is only one query.
+        use_causal = seq_len > 1
         attn_out = F.scaled_dot_product_attention(
             q,
             k,
             v,
             scale=self.scaling,
-            is_causal=True,
+            is_causal=use_causal,
             enable_gqa=self._use_gqa,
         )
         attn_out = attn_out.transpose(1, 2).reshape(bsz * seq_len, -1)
@@ -154,7 +188,7 @@ class _FastARMLP(nn.Module):
 
 
 class _FastARDecoderLayer(nn.Module):
-    """Transformer decoder layer for Fast AR (SDPA, no KV cache)."""
+    """Transformer decoder layer for Fast AR with optional KV cache."""
 
     def __init__(self, config: FishSpeechFastARConfig, *, prefix: str = "") -> None:
         super().__init__()
@@ -163,10 +197,19 @@ class _FastARDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cache_position: int = 0,
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_ids)
+        hidden_states = self.self_attn(
+            hidden_states, position_ids,
+            kv_cache=kv_cache, cache_position=cache_position,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -182,7 +225,7 @@ class _FastARDecoderLayer(nn.Module):
 
 
 class FishSpeechFastARModel(nn.Module):
-    """4-layer transformer for residual codebook prediction (re-prefill)."""
+    """4-layer transformer for residual codebook prediction (KV-cached)."""
 
     def __init__(self, config: FishSpeechFastARConfig, *, prefix: str = "") -> None:
         super().__init__()
@@ -193,10 +236,20 @@ class FishSpeechFastARModel(nn.Module):
         # NOTE: final norm is handled by FishSpeechFastAR.fast_norm (one norm weight
         # in checkpoint: audio_decoder.norm.weight → fast_ar.fast_norm.weight).
 
-    def forward(self, inputs_embeds: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        cache_position: int = 0,
+    ) -> torch.Tensor:
         hidden_states = inputs_embeds
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, position_ids)
+        for i, layer in enumerate(self.layers):
+            kv = kv_caches[i] if kv_caches is not None else None
+            hidden_states = layer(
+                hidden_states, position_ids,
+                kv_cache=kv, cache_position=cache_position,
+            )
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -252,21 +305,26 @@ class FishSpeechFastARModel(nn.Module):
 
 
 # ===================================================================
-#  Fast AR Wrapper (optimised re-prefill + torch.compile)
+#  Fast AR Wrapper (KV-cached incremental decode + torch.compile)
 # ===================================================================
 
 
 class FishSpeechFastAR(nn.Module):
     """vLLM-native Fast AR for Fish Speech (residual codebooks).
 
-    Re-prefill approach: each AR step forwards the full growing sequence
-    through the 4-layer transformer.  No KV cache needed.
+    KV-cached incremental decode: each codebook step only forwards
+    the new token [B, 1, H] while KV from prior positions stays cached.
+    The cache is reset at the start of each Slow AR step.
 
-    Optimisations over baseline:
-      1. torch.compile on model forward -- kernel fusion.
-      2. Pre-allocated embedding buffer [B, max_seq, H].
-      3. Pre-allocated position_ids.
-      4. Inline sampling.
+    This is O(n) per step vs O(n^2) for re-prefill, and enables better
+    batching across concurrent requests.
+
+    Optimisations:
+      1. KV-cached incremental decode (each step is [B, 1, H]).
+      2. torch.compile on model forward -- kernel fusion.
+      3. Pre-allocated KV cache + embedding buffer.
+      4. Pre-allocated position_ids.
+      5. Inline sampling.
     """
 
     def __init__(
@@ -302,18 +360,22 @@ class FishSpeechFastAR(nn.Module):
             self.fast_project_in = nn.Identity()
 
         self._num_codebooks = config.num_codebooks
+        self._num_layers = config.num_hidden_layers
         self._fast_dim = config.hidden_size
+        self._num_kv_heads = config.num_key_value_heads
+        self._head_dim = config.head_dim
+        self._max_seq = config.num_codebooks + 1  # projected hidden + codebook tokens
 
         # Pre-allocated buffers (lazily initialised on first forward).
         self._embed_buf: torch.Tensor | None = None
         self._pos_ids: torch.Tensor | None = None
+        self._kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         self._compiled_model_fwd: object | None = None
         self._compile_attempted = False
         self._compile_failed = False
         self._disable_compile_for_graph = False
 
     def _ensure_buffers(self, bsz: int, device: torch.device, dtype: torch.dtype) -> None:
-        max_seq = self._num_codebooks + 1  # hidden_state + num_codebooks codes
         if (
             self._embed_buf is not None
             and self._embed_buf.shape[0] >= bsz
@@ -321,8 +383,24 @@ class FishSpeechFastAR(nn.Module):
             and self._embed_buf.dtype == dtype
         ):
             return
-        self._embed_buf = torch.zeros(bsz, max_seq, self._fast_dim, dtype=dtype, device=device)
-        self._pos_ids = torch.arange(max_seq, dtype=torch.long, device=device)
+        self._embed_buf = torch.zeros(bsz, self._max_seq, self._fast_dim, dtype=dtype, device=device)
+        self._pos_ids = torch.arange(self._max_seq, dtype=torch.long, device=device)
+        # Allocate KV caches for all layers.
+        # Each: (k_cache, v_cache) with shape [bsz, num_kv_heads, max_seq, head_dim]
+        self._kv_caches = [
+            (
+                torch.zeros(bsz, self._num_kv_heads, self._max_seq, self._head_dim, dtype=dtype, device=device),
+                torch.zeros(bsz, self._num_kv_heads, self._max_seq, self._head_dim, dtype=dtype, device=device),
+            )
+            for _ in range(self._num_layers)
+        ]
+
+    def reset_caches(self) -> None:
+        """Reset KV caches (called at the start of each Slow AR step)."""
+        if self._kv_caches is not None:
+            for k_cache, v_cache in self._kv_caches:
+                k_cache.zero_()
+                v_cache.zero_()
 
     def _setup_compile(self) -> None:
         if self._compile_attempted:
@@ -375,20 +453,26 @@ class FishSpeechFastAR(nn.Module):
         torch.cuda.synchronize(device)
 
     @torch.inference_mode()
-    def _run_model(self, step_input: torch.Tensor, step_pos_ids: torch.Tensor, bsz: int) -> torch.Tensor:
-        if self._disable_compile_for_graph:
-            model_fwd = self._compiled_model_fwd or self.model.forward
-        else:
-            model_fwd = self._compiled_model_fwd if bsz == 1 else self.model.forward
+    def _run_model(
+        self,
+        step_input: torch.Tensor,
+        step_pos_ids: torch.Tensor,
+        bsz: int,
+        kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        cache_position: int = 0,
+    ) -> torch.Tensor:
+        model_fwd = self._compiled_model_fwd or self.model.forward
+        if not self._disable_compile_for_graph and bsz != 1:
+            model_fwd = self.model.forward
         try:
-            return model_fwd(step_input, step_pos_ids)
+            return model_fwd(step_input, step_pos_ids, kv_caches=kv_caches, cache_position=cache_position)
         except Exception as exc:
             if model_fwd is self.model.forward or self._compile_failed:
                 raise
             self._compile_failed = True
             self._compiled_model_fwd = self.model.forward
             logger.warning("Fish Speech Fast AR torch.compile fallback to eager after runtime failure: %s", exc)
-            return self.model.forward(step_input, step_pos_ids)
+            return self.model.forward(step_input, step_pos_ids, kv_caches=kv_caches, cache_position=cache_position)
 
     @torch.inference_mode()
     def forward(
@@ -401,7 +485,7 @@ class FishSpeechFastAR(nn.Module):
         top_k: int = 30,
         top_p: float = 0.9,
     ) -> torch.Tensor:
-        """Predict residual codebook codes 0..num_codebooks-1 autoregressively.
+        """Predict residual codebook codes 0..num_codebooks-1 via KV-cached decode.
 
         Args:
             slow_ar_hidden: [B, hidden_size] last hidden state from Slow AR.
@@ -420,7 +504,6 @@ class FishSpeechFastAR(nn.Module):
         semantic_end = self.slow_ar_config.semantic_end_id
         codebook_size = semantic_end - semantic_begin + 1  # 4096
         # Convert vocab-space semantic token to codebook index.
-        # Clamp to valid range: im_end or other non-semantic tokens map to 0 (pad).
         semantic_code = (semantic_token_id.reshape(bsz) - semantic_begin).clamp(min=0, max=codebook_size - 1)
 
         all_codes = torch.empty(bsz, num_cb, dtype=torch.long, device=device)
@@ -431,6 +514,9 @@ class FishSpeechFastAR(nn.Module):
 
         embed_buf = self._embed_buf
         pos_ids = self._pos_ids
+
+        # Reset KV caches for this new Slow AR step.
+        self.reset_caches()
 
         # Position 0: projected Slow AR hidden state.
         projected = self.fast_project_in(slow_ar_hidden.reshape(bsz, -1))
@@ -444,47 +530,63 @@ class FishSpeechFastAR(nn.Module):
         inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
 
         # Residual codebook size (1024) vs semantic codebook size (4096).
-        # The fast_output head has codebook_size (4096) outputs, but residual
-        # codebooks only have 1024 entries.  Truncate logits for steps > 0.
         residual_codebook_size = 1024
 
-        for step in range(1, num_cb):
-            seq_len = step + 1
-            step_input = embed_buf[:bsz, :seq_len, :]
-            # Use a dense 2D position tensor for every batch size; stride-0
-            # views from expand() were fragile under compiled execution.
-            step_pos_ids = pos_ids[:seq_len].unsqueeze(0).repeat(bsz, 1)
+        # Prefill step: forward positions [0, 1] together to populate KV cache.
+        prefill_input = embed_buf[:bsz, :2, :]  # [B, 2, H]
+        prefill_pos = pos_ids[:2].unsqueeze(0).expand(bsz, -1)  # [B, 2]
+        hidden_out = self._run_model(
+            prefill_input, prefill_pos, bsz,
+            kv_caches=self._kv_caches, cache_position=0,
+        )
+        # Sample first residual code from position 1's output.
+        logits = self.fast_output(self.fast_norm(hidden_out[:, -1, :]))
+        logits = logits[:, :residual_codebook_size]
+        all_codes[:, 1] = self._sample(logits, use_sampling, inv_temperature, top_k, top_p)
 
-            hidden_out = self._run_model(step_input, step_pos_ids, bsz)
+        # Incremental decode: steps 2..num_cb-1, each forwarding only [B, 1, H].
+        for step in range(2, num_cb):
+            # Embed the code just sampled at step-1.
+            new_embed = self.fast_embeddings(all_codes[:, step - 1])
+            embed_buf[:bsz, step, :] = new_embed
+
+            step_input = embed_buf[:bsz, step : step + 1, :]  # [B, 1, H]
+            step_pos = pos_ids[step : step + 1].unsqueeze(0).expand(bsz, -1)  # [B, 1]
+
+            hidden_out = self._run_model(
+                step_input, step_pos, bsz,
+                kv_caches=self._kv_caches, cache_position=step,
+            )
             logits = self.fast_output(self.fast_norm(hidden_out[:, -1, :]))
-
-            # Residual codebooks (step >= 1) only have 1024 entries.
-            if step >= 1:
-                logits = logits[:, :residual_codebook_size]
-
-            if use_sampling:
-                scaled = logits * inv_temperature
-                if top_k > 0:
-                    topk_vals, _ = scaled.topk(min(top_k, scaled.shape[-1]), dim=-1)
-                    scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                if top_p < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(scaled, descending=True)
-                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                    sorted_indices_to_remove = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
-                    sorted_logits[sorted_indices_to_remove] = float("-inf")
-                    scaled = sorted_logits.scatter(1, sorted_indices, sorted_logits)
-                probs = F.softmax(scaled, dim=-1)
-                next_ids = torch.multinomial(probs, num_samples=1)
-            else:
-                next_ids = logits.argmax(dim=-1, keepdim=True)
-
-            all_codes[:, step] = next_ids.reshape(bsz)
-
-            if step < num_cb - 1:
-                new_embed = self.fast_embeddings(next_ids.reshape(bsz))
-                embed_buf[:bsz, step + 1, :] = new_embed
+            logits = logits[:, :residual_codebook_size]
+            all_codes[:, step] = self._sample(logits, use_sampling, inv_temperature, top_k, top_p)
 
         return all_codes
+
+    @staticmethod
+    def _sample(
+        logits: torch.Tensor,
+        use_sampling: bool,
+        inv_temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> torch.Tensor:
+        """Sample from logits with temperature/top-k/top-p."""
+        if not use_sampling:
+            return logits.argmax(dim=-1)
+
+        scaled = logits * inv_temperature
+        if top_k > 0:
+            topk_vals, _ = scaled.topk(min(top_k, scaled.shape[-1]), dim=-1)
+            scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(scaled, descending=True)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
+            sorted_logits[sorted_indices_to_remove] = float("-inf")
+            scaled = sorted_logits.scatter(1, sorted_indices, sorted_logits)
+        probs = F.softmax(scaled, dim=-1)
+        return torch.multinomial(probs, num_samples=1).reshape(-1)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights -- Fast AR weights have already been remapped by the parent."""
