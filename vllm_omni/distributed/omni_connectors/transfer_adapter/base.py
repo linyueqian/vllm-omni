@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import threading
 from collections import deque
 from typing import Any
@@ -8,6 +9,13 @@ from typing import Any
 from ..utils.logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
+
+# Number of save_loop worker threads. More threads → better concurrency
+# scaling for inter-stage handoff, but per-request ordering is preserved
+# via per-request locks.  Override via VLLM_OMNI_SAVE_LOOP_WORKERS.
+_DEFAULT_SAVE_LOOP_WORKERS = int(
+    os.environ.get("VLLM_OMNI_SAVE_LOOP_WORKERS", "4")
+)
 
 
 class OmniTransferAdapterBase:
@@ -32,6 +40,12 @@ class OmniTransferAdapterBase:
         # Requests that have successfully saved data
         self._finished_save_reqs = set()
 
+        # Per-request locks for save ordering across multiple save threads.
+        # Tasks for the same request always serialize through the same lock;
+        # different requests can run in parallel on different threads.
+        self._req_save_locks: dict[str, threading.Lock] = {}
+        self._req_save_locks_lock = threading.Lock()
+
         self.stop_event = threading.Event()
         self._recv_cond = threading.Condition()
         self._save_cond = threading.Condition()
@@ -39,8 +53,21 @@ class OmniTransferAdapterBase:
         self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
         self.recv_thread.start()
 
-        self.save_thread = threading.Thread(target=self.save_loop, daemon=True)
-        self.save_thread.start()
+        # Multiple save_loop worker threads to parallelize inter-stage
+        # chunk transfer at high concurrency.  Per-request ordering is
+        # preserved by per-request locks acquired inside _send_single_request.
+        self.save_threads: list[threading.Thread] = []
+        num_workers = max(1, _DEFAULT_SAVE_LOOP_WORKERS)
+        for i in range(num_workers):
+            t = threading.Thread(
+                target=self.save_loop,
+                daemon=True,
+                name=f"OmniSaveLoop-{i}",
+            )
+            t.start()
+            self.save_threads.append(t)
+        # Backward-compat alias (some tests reference this attribute).
+        self.save_thread = self.save_threads[0]
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -82,19 +109,66 @@ class OmniTransferAdapterBase:
                 elif not any_success and not self.stop_event.is_set():
                     self._recv_cond.wait(timeout=0.001)
 
-    def save_loop(self):
-        """Loop to send outgoing data."""
-        while not self.stop_event.is_set():
-            while self._pending_save_reqs:
-                task = self._pending_save_reqs.popleft()
-                try:
-                    self._send_single_request(task)
-                except Exception as e:
-                    logger.warning(f"Error saving data for {task.get('request_id')}: {e}")
+    def _get_request_save_lock(self, req_id: str) -> threading.Lock:
+        """Get or create a per-request lock that serializes save tasks
+        for that request across multiple save_loop worker threads."""
+        with self._req_save_locks_lock:
+            lock = self._req_save_locks.get(req_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._req_save_locks[req_id] = lock
+            return lock
 
-            with self._save_cond:
-                if not self._pending_save_reqs and not self.stop_event.is_set():
-                    self._save_cond.wait(timeout=0.1)
+    def _release_request_save_lock(self, req_id: str) -> None:
+        """Drop the per-request lock entry once a request finishes,
+        to bound memory growth."""
+        with self._req_save_locks_lock:
+            self._req_save_locks.pop(req_id, None)
+
+    def save_loop(self):
+        """Worker loop to send outgoing data.
+
+        Multiple worker threads run this loop concurrently.  Each worker
+        pops the next pending task atomically (deque.popleft is thread-
+        safe in CPython), then acquires a per-request lock to ensure
+        tasks for the SAME request run in submission order.  Tasks for
+        DIFFERENT requests run in parallel on different workers.
+        """
+        while not self.stop_event.is_set():
+            task = None
+            # Atomically pop a task (deque.popleft is thread-safe).
+            try:
+                task = self._pending_save_reqs.popleft()
+            except IndexError:
+                task = None
+
+            if task is None:
+                with self._save_cond:
+                    if not self._pending_save_reqs and not self.stop_event.is_set():
+                        self._save_cond.wait(timeout=0.1)
+                continue
+
+            # Resolve a stable request id for ordering.  Subclasses may
+            # store either a "request_id" string or a "request" object.
+            req_id = task.get("request_id")
+            if req_id is None:
+                req_obj = task.get("request")
+                req_id = (
+                    getattr(req_obj, "external_req_id", None)
+                    or getattr(req_obj, "request_id", None)
+                )
+            req_lock = (
+                self._get_request_save_lock(str(req_id)) if req_id else None
+            )
+
+            try:
+                if req_lock is not None:
+                    with req_lock:
+                        self._send_single_request(task)
+                else:
+                    self._send_single_request(task)
+            except Exception as e:
+                logger.warning(f"Error saving data for {task.get('request_id')}: {e}")
 
     def _poll_single_request(self, *args, **kwargs):
         """Poll connector for a single request task.

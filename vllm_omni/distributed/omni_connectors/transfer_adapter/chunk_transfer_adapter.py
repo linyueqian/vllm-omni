@@ -120,7 +120,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         }
         self._pending_save_reqs.append(task)
         with self._save_cond:
-            self._save_cond.notify()
+            # notify_all so multiple save workers can wake up and pick
+            # up parallel tasks at high concurrency.
+            self._save_cond.notify_all()
 
     def _poll_single_request(self, request: Request):
         stage_id = self.connector.stage_id
@@ -298,6 +300,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
+
+        # Drop the per-request save lock to bound memory growth.
+        self._release_request_save_lock(external_req_id)
 
     def cleanup(
         self,

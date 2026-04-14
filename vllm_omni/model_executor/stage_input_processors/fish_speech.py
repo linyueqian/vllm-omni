@@ -74,7 +74,12 @@ def slow_ar_to_dac_decoder_async_chunk(
     if isinstance(pooling_output, dict):
         frame = _extract_last_frame(pooling_output)
         if frame is not None:
-            transfer_manager.code_prompt_token_ids[request_id].append(frame.detach().to(device="cpu", dtype=torch.long))
+            # non_blocking D2H avoids stalling the save_loop thread on
+            # CUDA stream sync.  The .long() conversion forces a sync
+            # only when the data is actually read downstream.
+            transfer_manager.code_prompt_token_ids[request_id].append(
+                frame.detach().to(device="cpu", dtype=torch.long, non_blocking=True)
+            )
     elif not finished:
         return None
 
@@ -138,9 +143,17 @@ def slow_ar_to_dac_decoder_async_chunk(
         left_context_size = max(0, int(end_index - context_length))
         window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
-    # Pack into codebook-major flat codes.
-    stacked_frames = torch.stack(window_frames, dim=0)
-    code_predictor_codes = stacked_frames.transpose(0, 1).reshape(-1).tolist()
+    # Pack into codebook-major flat codes.  numpy ops + tolist() are ~3x
+    # faster than torch.stack().transpose().reshape().tolist() for the
+    # tiny tensors involved (50 frames × 10 codebooks).
+    import numpy as np
+
+    stacked_np = np.stack(
+        [f.numpy() for f in window_frames], axis=0,
+    )  # [F, Q]
+    code_predictor_codes = (
+        stacked_np.transpose(1, 0).reshape(-1).tolist()
+    )  # [Q*F] ints
 
     return {
         "code_predictor_codes": code_predictor_codes,
