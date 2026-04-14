@@ -753,8 +753,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             return state.last_decoded_audio
 
         pending_count = len(state.pending_latents)
-        if not (pending_count >= self._vae_decode_interval or state.is_stopping
-                or state.last_decoded_audio is None):
+        if not (pending_count >= self._vae_decode_interval or state.is_stopping or state.last_decoded_audio is None):
             return state.last_decoded_audio
 
         self._perf.start("vae_decode")
@@ -774,11 +773,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         # Slice out the newly-generated audio (everything after the pad region).
         chunk_size = int(getattr(self.tts.audio_vae, "decode_chunk_size", audio.numel() // vae_latents.shape[0]))
-        new_audio = audio[pad_frames * chunk_size:].detach().cpu().float()
+        new_audio = audio[pad_frames * chunk_size :].detach().cpu().float()
         state.audio_chunks.append(new_audio)
 
         # Roll the pad buffer to the last N frames of the current input.
-        state.decode_pad = vae_latents[-self._n_decode_pad_frames:].detach()
+        state.decode_pad = vae_latents[-self._n_decode_pad_frames :].detach()
 
         # Cumulative audio preserves the existing "last element = complete audio"
         # semantic relied on by tests, examples and the speech serving layer.
