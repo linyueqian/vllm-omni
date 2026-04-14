@@ -229,73 +229,98 @@ class Orchestrator:
 
         Control flow: poll raw → process through output processor → route.
         """
+        # Pre-compute which stages are LLM (need async polling) vs diffusion.
+        llm_stage_ids = [
+            sid for sid in range(self.num_stages)
+            if self.stage_clients[sid].stage_type != "diffusion"
+        ]
+        diffusion_stage_ids = [
+            sid for sid in range(self.num_stages)
+            if self.stage_clients[sid].stage_type == "diffusion"
+        ]
+
         while not self._shutdown_event.is_set():
             idle = True
-            for stage_id in range(self.num_stages):
+
+            # 1a) Drain diffusion queues (non-blocking).
+            for stage_id in diffusion_stage_ids:
                 if self._shutdown_event.is_set():
                     return
-
-                # 1) Diffusion stage: poll non-blocking queue
-                # TODO (Peiqi): the output of diffusion stage is OmniRequestOutput,
-                # which is different from EngineCoreOutputs (LLM stages). We may want to unify
-                # the output format in the future to simplify the processing logic in Orchestrator.
                 stage_client = self.stage_clients[stage_id]
-                if stage_client.stage_type == "diffusion":
-                    output = stage_client.get_diffusion_output_nowait()
-                    if output is not None:
-                        idle = False
-                        req_state = self.request_states.get(output.request_id)
-                        if req_state is not None:
-                            stage_metrics = self._build_stage_metrics(stage_id, output.request_id, [output], req_state)
-                            await self._route_output(stage_id, output, req_state, stage_metrics)
-                    continue
+                output = stage_client.get_diffusion_output_nowait()
+                if output is not None:
+                    idle = False
+                    req_state = self.request_states.get(output.request_id)
+                    if req_state is not None:
+                        stage_metrics = self._build_stage_metrics(
+                            stage_id, output.request_id, [output], req_state,
+                        )
+                        await self._route_output(
+                            stage_id, output, req_state, stage_metrics,
+                        )
 
-                # 1) Poll raw outputs from the stage
+            # 1b) Poll ALL LLM stages in parallel with a single timeout
+            # budget instead of paying timeout × N stages serially.
+            if llm_stage_ids:
+                poll_coros = [
+                    self._poll_stage_raw(sid) for sid in llm_stage_ids
+                ]
                 try:
-                    raw_outputs = await asyncio.wait_for(self._poll_stage_raw(stage_id), timeout=0.001)
+                    poll_results = await asyncio.wait_for(
+                        asyncio.gather(*poll_coros, return_exceptions=True),
+                        timeout=0.001,
+                    )
                 except asyncio.TimeoutError:
-                    continue
+                    poll_results = [None] * len(llm_stage_ids)
                 except asyncio.CancelledError:
                     raise
-                except Exception:
+
+                for stage_id, raw_outputs in zip(llm_stage_ids, poll_results):
                     if self._shutdown_event.is_set():
                         return
-                    logger.exception(
-                        "[Orchestrator] _poll_stage_raw failed for stage-%s",
-                        stage_id,
-                    )
-                    raise
-
-                if raw_outputs is None:
-                    continue
-                idle = False
-
-                # Handle prefill-finished KV-ready signals before finished outputs.
-                await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
-
-                # 2) Process raw outputs through the output processor
-                request_outputs = await self._process_stage_outputs(stage_id, raw_outputs)
-
-                # 3) Route each processed output
-                for output in request_outputs:
-                    req_state = self.request_states.get(output.request_id)
-                    if req_state is None:
-                        logger.warning(
-                            "[Orchestrator] Dropping output for unknown req %s at stage-%s (known reqs: %s)",
-                            output.request_id,
-                            stage_id,
-                            list(self.request_states.keys()),
+                    if isinstance(raw_outputs, BaseException):
+                        if isinstance(raw_outputs, asyncio.CancelledError):
+                            raise raw_outputs
+                        logger.exception(
+                            "[Orchestrator] _poll_stage_raw failed for stage-%s: %s",
+                            stage_id, raw_outputs,
                         )
                         continue
-                    stage_metrics = None
-                    if output.finished:
-                        stage_metrics = self._build_stage_metrics(
-                            stage_id,
-                            output.request_id,
-                            [output],
-                            req_state,
+                    if raw_outputs is None:
+                        continue
+                    idle = False
+
+                    # Handle prefill-finished KV-ready signals before
+                    # finished outputs.
+                    await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+
+                    # 2) Process raw outputs through the output processor.
+                    request_outputs = await self._process_stage_outputs(
+                        stage_id, raw_outputs,
+                    )
+
+                    # 3) Route each processed output.
+                    for output in request_outputs:
+                        req_state = self.request_states.get(output.request_id)
+                        if req_state is None:
+                            logger.warning(
+                                "[Orchestrator] Dropping output for unknown req %s at stage-%s (known reqs: %s)",
+                                output.request_id,
+                                stage_id,
+                                list(self.request_states.keys()),
+                            )
+                            continue
+                        stage_metrics = None
+                        if output.finished:
+                            stage_metrics = self._build_stage_metrics(
+                                stage_id,
+                                output.request_id,
+                                [output],
+                                req_state,
+                            )
+                        await self._route_output(
+                            stage_id, output, req_state, stage_metrics,
                         )
-                    await self._route_output(stage_id, output, req_state, stage_metrics)
 
             if idle:
                 await asyncio.sleep(0.001)
