@@ -7,7 +7,7 @@ stage_args:
       devices: "0"
       max_batch_size: 16
     engine_args:
-      max_num_seqs: 4
+      max_num_seqs: 16
       model_stage: fish_speech_slow_ar
       model_arch: FishSpeechSlowARForConditionalGeneration
       worker_type: ar
@@ -41,7 +41,7 @@ stage_args:
       devices: "0"
       max_batch_size: 16
     engine_args:
-      max_num_seqs: 1
+      max_num_seqs: 16
       model_stage: dac_decoder
       model_arch: FishSpeechDACDecoder
       worker_type: generation
