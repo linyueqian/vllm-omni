@@ -19,7 +19,6 @@ from typing import Any
 import librosa
 import torch
 import torch.nn as nn
-from einops import rearrange
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import (
@@ -86,7 +85,13 @@ class _RequestState:
     curr_prefix_feat_cond: torch.Tensor | None = None
     last_audio_patch_gpu: torch.Tensor | None = None
     precomputed_stop_logits: torch.Tensor | None = None
-    accumulated_patches: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    # Patches produced since the last VAE decode, shape (patch_size, feat_dim) each.
+    pending_latents: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    # Rolling tail of previously-decoded latents used as VAE receptive-field context.
+    # Shape (n_pad_frames, feat_dim) on GPU. None before first decode.
+    decode_pad: torch.Tensor | None = None
+    # Audio chunks already emitted (CPU float32), concatenated for cumulative output.
+    audio_chunks: list[torch.Tensor] = dataclasses.field(default_factory=list)
     decode_step_count: int = 0
     request_start_time: float = 0.0
     prefill_completed: bool = False
@@ -321,6 +326,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._cfg_value = 2.0
         self._cfg_cutoff_ratio = 1.0
         self._vae_decode_interval = 5
+        # Number of trailing latent frames to keep as VAE receptive-field context
+        # for sliding-window streaming decode. 12 matches the nanovllm reference
+        # implementation and covers the longest VAE decoder receptive field.
+        self._n_decode_pad_frames = 12
         self._enable_torch_compile = True
         self._compile_vae = True
         self._max_decode_steps = 2000
@@ -720,25 +729,57 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     # -------------------- audio collection --------------------
 
     def _collect_audio(self, state: _RequestState) -> torch.Tensor | None:
+        """Sliding-window VAE decode.
+
+        Each decode step appends the newly-generated latent patch to
+        ``pending_latents``. Every ``_vae_decode_interval`` steps (or on the
+        final step) we feed ``[decode_pad, *pending_latents]`` through the VAE
+        once, slice out only the *new* audio region, append it to
+        ``audio_chunks`` and refresh ``decode_pad`` with the last
+        ``_n_decode_pad_frames`` latent frames. Total VAE work is O(N) in
+        the number of decode steps instead of O(N**2) for the full re-decode.
+        """
         patch = state.last_audio_patch_gpu
         if patch is not None:
             state.last_audio_patch_gpu = None
-            state.accumulated_patches.append(patch.reshape(1, -1).float())
+            # patch shape is (1, patch_size, feat_dim); keep on GPU as float32.
+            state.pending_latents.append(patch.reshape(-1, self._feat_dim).to(torch.float32))
 
-        if not state.accumulated_patches:
-            return None
+        if not state.pending_latents:
+            return state.last_decoded_audio
 
-        n = len(state.accumulated_patches)
-        if n <= 1 or n % self._vae_decode_interval == 0 or state.is_stopping:
-            self._perf.start("vae_decode")
-            all_p = torch.cat(state.accumulated_patches, dim=0)
-            state.accumulated_patches = [all_p]
-            feat = rearrange(all_p.reshape(1, -1, self._feat_dim), "b t d -> b d t")
-            with torch.no_grad():
-                audio = self.tts.audio_vae.decode(feat.to(self._device)).reshape(-1).cpu().float()
-            self._perf.stop("vae_decode")
-            state.last_decoded_audio = audio
-            return audio
+        pending_count = len(state.pending_latents)
+        if not (pending_count >= self._vae_decode_interval or state.is_stopping
+                or state.last_decoded_audio is None):
+            return state.last_decoded_audio
+
+        self._perf.start("vae_decode")
+        new_latents = torch.cat(state.pending_latents, dim=0)  # (T_new, D)
+        state.pending_latents = []
+
+        if state.decode_pad is not None:
+            vae_latents = torch.cat([state.decode_pad, new_latents], dim=0)
+            pad_frames = state.decode_pad.shape[0]
+        else:
+            vae_latents = new_latents
+            pad_frames = 0
+
+        feat = vae_latents.reshape(1, -1, self._feat_dim).transpose(1, 2).contiguous()
+        with torch.no_grad():
+            audio = self.tts.audio_vae.decode(feat.to(self._device)).reshape(-1)
+
+        # Slice out the newly-generated audio (everything after the pad region).
+        chunk_size = int(getattr(self.tts.audio_vae, "decode_chunk_size", audio.numel() // vae_latents.shape[0]))
+        new_audio = audio[pad_frames * chunk_size:].detach().cpu().float()
+        state.audio_chunks.append(new_audio)
+
+        # Roll the pad buffer to the last N frames of the current input.
+        state.decode_pad = vae_latents[-self._n_decode_pad_frames:].detach()
+
+        # Cumulative audio preserves the existing "last element = complete audio"
+        # semantic relied on by tests, examples and the speech serving layer.
+        state.last_decoded_audio = torch.cat(state.audio_chunks, dim=0)
+        self._perf.stop("vae_decode")
         return state.last_decoded_audio
 
     # -------------------- compute_logits --------------------
@@ -830,7 +871,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
             state = self._get_or_create_state(req_id)
             state.prefill_text = ""
-            state.accumulated_patches = []
+            state.pending_latents = []
+            state.decode_pad = None
+            state.audio_chunks = []
             state.prefill_completed = False
             state.decode_step_count = 0
             state.precomputed_stop_logits = None
