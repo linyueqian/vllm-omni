@@ -153,6 +153,16 @@ class FishSpeechSingleStageForConditionalGeneration(
             vocoder_device = ar_device
         codec = codec.to(device=vocoder_device, dtype=torch.float32)
         codec.eval()
+        # Compile the codec decode path to fuse kernels and reduce Python
+        # dispatch overhead (DAC has ~55 conv layers dispatched eagerly).
+        # dynamic=True handles variable frame counts across vocode calls.
+        try:
+            codec.decode = torch.compile(
+                codec.decode, mode="reduce-overhead", dynamic=True, fullgraph=False,
+            )
+            logger.info("Enabled torch.compile on DAC codec.decode (mode=reduce-overhead)")
+        except Exception as exc:
+            logger.warning("torch.compile on DAC codec.decode failed: %s", exc)
         self._dac_codec = codec
         self._vocoder_device = vocoder_device
         # Dedicated stream on vocoder device for true async decode.
