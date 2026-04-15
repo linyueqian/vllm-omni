@@ -166,12 +166,18 @@ class FishSpeechSingleStageForConditionalGeneration(
         self._cache_attention_masks(codec, vocoder_device)
         # Compile decode to fuse kernels and cut Python dispatch overhead.
         # The DAC has ~55 conv layers run eagerly; compile reduces ~570ms
-        # CPU/request to a much smaller kernel-launch cost.
+        # CPU/request to a much smaller kernel-launch cost.  Bump the
+        # Dynamo recompile limit since variable frame counts can specialize.
         try:
+            import torch._dynamo as _dynamo
+            _dynamo.config.recompile_limit = max(256, _dynamo.config.recompile_limit)
             codec.decode = torch.compile(
                 codec.decode, mode="default", dynamic=True, fullgraph=False,
             )
-            logger.info("Enabled torch.compile on DAC codec.decode")
+            logger.info(
+                "Enabled torch.compile on DAC codec.decode (recompile_limit=%d)",
+                _dynamo.config.recompile_limit,
+            )
         except Exception as exc:
             logger.warning("torch.compile on DAC codec.decode failed: %s", exc)
         self._dac_codec = codec
