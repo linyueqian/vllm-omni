@@ -160,6 +160,12 @@ class FishSpeechSingleStageForConditionalGeneration(
             vocoder_device = ar_device
         codec = codec.to(device=vocoder_device, dtype=torch.float32)
         codec.eval()
+        # Enable TF32 for float32 matmul/conv: ~2x throughput on Ampere+
+        # with negligible accuracy impact for vocoder decode.
+        if vocoder_device.type == "cuda":
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         # Cache attention masks AFTER .to(device) so cached masks land on
         # the same device as the rest of the codec (Triton-compiled kernels
         # can't accept CPU tensors as pointer arguments).
