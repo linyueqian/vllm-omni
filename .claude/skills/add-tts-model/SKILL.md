@@ -101,7 +101,7 @@ These bugs appear in almost every new TTS PR. Check all before the first push:
 - **All return paths must emit `model_outputs`** — if any early-return branch skips setting `model_outputs`, the serving layer silently drops that step's audio (fish speech: `fix: ensure ALL return paths emit model_outputs`)
 - **Per-request state isolation** — for batched concurrent requests, key all state by request ID; a shared buffer corrupts audio across requests (fish speech: `fix: per-request vocode + delta emission`)
 - **Codec tensor device** — move codec codes to the codec decoder's device before calling decode; mismatches cause silent CPU fallback or crashes (fish speech: `fix: use model device for CUDA stream`)
-- **Stage 1 `max_num_seqs`** — set to at least 4 in production configs; default of 1 causes audio gaps under concurrency because Stage 1 round-robins codec windows across requests (RFC #2568)
+- **AR stage `max_num_seqs`** — set to at least 4 in production configs; for single-stage models this is the only stage. For two-stage models, Stage 0 (AR) needs `max_num_seqs ≥ 4` to pipeline concurrent requests; Stage 1 (codec decoder) typically uses `max_num_seqs: 1` intentionally. Default of 1 everywhere causes audio gaps under concurrency because the codec window round-robins across requests (RFC #2568)
 
 ### Optional Dependency Handling
 
@@ -132,7 +132,7 @@ def _patch_torchaudio_load() -> None:
     # patch .save similarly if needed
 ```
 
-Call this patch function at the top of `load_weights()` before loading any audio assets.
+The real fallback must mirror `torchaudio.load`'s full signature (`frame_offset`, `num_frames`, `normalize`, `channels_first`, `format`) to avoid `TypeError` when calling code passes keyword arguments. Catch `except Exception` (not just `ImportError`) because `import torchaudio` itself can also fail. See `vllm_omni/model_executor/models/moss_tts_nano/modeling_moss_tts_nano.py` for the complete reference implementation. Call the patch function at the top of `load_weights()` before loading any audio assets.
 
 ### Single-Stage AR Pattern (alternative to two-stage)
 
@@ -155,22 +155,48 @@ class YourModelForCausalLM(nn.Module):
         # Load self._lm here, after vLLM distributed init
         ...
 
-    def forward(self, input_ids, positions, intermediate_tensors=None, **kwargs):
-        key = self._get_request_key(kwargs)
-        if key not in self._stream_gens:
-            self._stream_gens[key] = self._create_stream_gen(kwargs)
-        try:
-            chunk, is_last = next(self._stream_gens[key])
-        except StopIteration:
-            chunk, is_last = torch.zeros(0), True
-        if is_last:
-            del self._stream_gens[key]
-        return OmniOutput(multimodal_outputs={"waveform": chunk, "is_last": is_last})
+    def forward(
+        self,
+        input_ids,
+        positions,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        runtime_additional_information: list[dict] | None = None,  # one dict per request
+        **kwargs,
+    ) -> OmniOutput:
+        infos = runtime_additional_information or [{}]
+        # Skip dummy/profiling calls
+        if not runtime_additional_information or all(i.get("_is_dummy") for i in infos):
+            self._ar_emit_stop_token = True
+            return OmniOutput(...)  # return empty outputs
 
-    def _create_stream_gen(self, kwargs):
+        outputs, last_flags = [], []
+        for info in infos:
+            request_key = str(info.get("_omni_req_id", "0"))  # per-request ID from vLLM
+            if request_key not in self._stream_gens:
+                self._stream_gens[request_key] = self._create_stream_gen(info)
+            try:
+                chunk, is_last = next(self._stream_gens[request_key])
+            except StopIteration:
+                chunk, is_last = torch.zeros(0), True
+            if is_last:
+                del self._stream_gens[request_key]
+            outputs.append(chunk)
+            last_flags.append(is_last)
+
+        self._ar_emit_stop_token = all(last_flags)
+        return OmniOutput(multimodal_outputs={"model_outputs": outputs, ...})
+
+    def _create_stream_gen(self, info: dict):
+        """Yield (waveform_tensor, is_last) tuples from inference_stream()."""
         for event in self._lm.inference_stream(...):
             if event["type"] == "audio":
                 yield event["waveform"], False
+            elif event["type"] == "result":
+                # Fallback: some models emit a single "result" event instead of
+                # incremental "audio" events — handle both paths
+                yield event.get("waveform", torch.zeros(0)), True
+                return
         yield torch.zeros(0), True
 
     def compute_logits(self, hidden_states, sampling_metadata):
@@ -178,8 +204,14 @@ class YourModelForCausalLM(nn.Module):
         ...
 ```
 
+Key points:
+- `runtime_additional_information` is the correct parameter name (not `**kwargs`) — it carries one dict per request in the batch
+- The request ID is `info.get("_omni_req_id")` — this is set by vLLM, not by user code
+- Handle both `"audio"` (incremental) and `"result"` (final combined) event types from upstream models
+
 4. **Stage config** — single stage with `worker_type: ar`, `engine_output_type: audio`,
-   `final_output: true`
+   `final_output: true`, `is_comprehension: true`, and `async_chunk: false` at the
+   top level (omitting these causes silent misclassification in the serving layer)
 5. **Only extract params you forward** — any variable extracted from `additional_information`
    but not passed to the model call will fail `ruff F841` in pre-commit
 
@@ -243,8 +275,16 @@ Reference: `vllm_omni/model_executor/models/moss_tts_nano/modeling_moss_tts_nano
    Wire `_build_your_model_params` into `_create_tts_request()` alongside the other
    model-specific param builders.
 
+   > **Two dispatch patterns coexist**: Fish Speech uses a `self._is_fish_speech` boolean
+   > instance attribute checked before `elif self._is_tts`, while all newer models
+   > (CosyVoice3, MOSS-TTS-Nano) use the `_tts_model_type` string returned by
+   > `_get_tts_model_type()`. For new models, always use the `_tts_model_type` string
+   > pattern — do not add new `_is_*` flags.
+
    > **Unused variable rule**: only extract fields in `_build_your_model_params` that
    > are actually forwarded to the model. Unused extractions fail `ruff F841`.
+   > For voice-cloning fields (`ref_audio` → `prompt_audio_path`, `ref_text` →
+   > `prompt_text`), add them to the param builder and verify they reach the model call.
 
    **Rebase conflict note**: when rebasing onto `main` after another model was merged,
    `serving_speech.py` will conflict. Resolution: always keep *both* the upstream
