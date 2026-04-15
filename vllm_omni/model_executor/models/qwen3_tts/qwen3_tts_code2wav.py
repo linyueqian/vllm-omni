@@ -291,13 +291,21 @@ class Qwen3TTSCode2Wav(nn.Module):
             except Exception:
                 pass
 
-        # Decode directly via decoder.chunked_decode(), staying entirely on GPU.
-        # Each request decoded individually with CUDA graph replay at bs=1.
+        # Prefer batched decode when every request shares the same frame count
+        # (the steady-state streaming case under async_chunk). Falls back to a
+        # per-request loop for heterogeneous shapes (prefill / final chunks).
+        frame_counts = [c.shape[1] for c in valid_codes_qf]
         wav_tensors: list[torch.Tensor] = []
-        for codes_qf in valid_codes_qf:
-            codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
-            wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
-            wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
+        if len(valid_codes_qf) > 1 and len(set(frame_counts)) == 1:
+            codes_bqf = torch.stack(valid_codes_qf, dim=0)  # [B, Q, F]
+            wavs = decoder.chunked_decode(codes_bqf)  # [B, 1, wav_len]
+            for b in range(wavs.shape[0]):
+                wav_tensors.append(wavs[b].squeeze(0))  # [wav_len]
+        else:
+            for codes_qf in valid_codes_qf:
+                codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
+                wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
+                wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
@@ -305,6 +313,8 @@ class Qwen3TTSCode2Wav(nn.Module):
         for j, idx in enumerate(valid_indices):
             ctx_frames, actual_frames = parsed[idx]
             wav = wav_tensors[j]
+            if wav.dim() > 1:
+                wav = wav.reshape(-1)
             # Slice on exact codec-frame boundaries instead of proportionally.
             start = max(0, ctx_frames * upsample)
             end = max(start, actual_frames * upsample)
