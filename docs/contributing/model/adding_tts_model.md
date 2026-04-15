@@ -1,8 +1,16 @@
 # Adding a TTS Model
 
-This guide walks through adding a new TTS model to vLLM-Omni, using **Qwen3-TTS**
-as a reference. Qwen3-TTS demonstrates the standard two-stage TTS pipeline and the
-key optimizations all TTS models in this repo should follow.
+This guide walks through adding a new TTS model to vLLM-Omni. Two patterns are
+supported:
+
+- **Two-stage pipeline** (e.g. Qwen3-TTS, Fish Speech): an AR code-predictor stage
+  feeds an audio decoder stage via the `async_chunk` framework. This is the standard
+  pattern for maximum streaming performance.
+- **Single-stage AR model** (e.g. MOSS-TTS-Nano): the model runs entirely inside one
+  AR worker and streams audio chunks directly from its own `inference_stream()` generator.
+
+Qwen3-TTS is used as the reference for the two-stage pattern. For the single-stage
+pattern, refer to MOSS-TTS-Nano.
 
 ## Table of Contents
 
@@ -13,8 +21,11 @@ key optimizations all TTS models in this repo should follow.
 5. [Model Registration](#model-registration)
 6. [Stage Configuration](#stage-configuration)
 7. [Stage Input Processors](#stage-input-processors)
-8. [Testing](#testing)
-9. [Summary](#summary)
+8. [Online Serving Integration](#online-serving-integration)
+9. [Single-Stage Models](#single-stage-models)
+10. [Testing](#testing)
+11. [Pre-commit and DCO](#pre-commit-and-dco)
+12. [Summary](#summary)
 
 ## Overview
 
@@ -546,6 +557,241 @@ Recommended test cases for a new TTS model:
 
 Reference test: `tests/model_executor/stage_input_processors/test_qwen3_tts_async_chunk.py`
 
+## Online Serving Integration
+
+To expose your model through the `/v1/audio/speech` OpenAI-compatible endpoint, add
+**all five** of the following integration points to
+`vllm_omni/entrypoints/openai/serving_speech.py` in a **single commit**. Adding them
+piecemeal causes partial-integration failures that are hard to debug.
+
+### 1. Stage constant
+
+Near the top of the file (around line 50), alongside the other `_*_TTS_MODEL_STAGES`
+constants:
+
+```python
+_YOUR_MODEL_TTS_MODEL_STAGES = {"your_model_stage_key"}
+```
+
+### 2. Union into `_TTS_MODEL_STAGES`
+
+Add to the `_TTS_MODEL_STAGES` set union (around line 57):
+
+```python
+_TTS_MODEL_STAGES: set[str] = (
+    ...
+    | _YOUR_MODEL_TTS_MODEL_STAGES
+)
+```
+
+### 3. Model type detection
+
+In `_get_tts_model_type()`, add before the final `return None`:
+
+```python
+if model_stage in _YOUR_MODEL_TTS_MODEL_STAGES:
+    return "your_model"
+```
+
+### 4. Request validation dispatch
+
+In `_validate_tts_request()`, add before the fallback `return`:
+
+```python
+if self._tts_model_type == "your_model":
+    return self._validate_your_model_request(request)
+```
+
+### 5. Validation and parameter-builder methods
+
+Add two new methods:
+
+```python
+def _validate_your_model_request(
+    self, request: OpenAICreateSpeechRequest
+) -> str | None:
+    """Validate YourModel request. Returns an error string or None."""
+    if not request.input or not request.input.strip():
+        return "Input text cannot be empty"
+    return None
+
+def _build_your_model_params(
+    self, request: OpenAICreateSpeechRequest
+) -> dict[str, Any]:
+    """Build additional_information dict for YourModel."""
+    params: dict[str, Any] = {"text": [request.input]}
+    if request.voice is not None:
+        params["voice"] = [request.voice]
+    # Add any other model-specific fields here
+    return params
+```
+
+Then wire `_build_your_model_params` into the request-dispatch block in
+`_create_tts_request()` (search for the equivalent `_build_*_params` call for an
+existing model to find the right location).
+
+> **Note on unused variables:** Only extract parameters in `_build_your_model_params`
+> that you actually pass to the model's generate / `inference_stream` call. Extracting
+> a variable without forwarding it will trigger a `ruff F841` pre-commit failure.
+
+### Merge conflicts
+
+`serving_speech.py` is modified by every new model PR and is the most common source of
+rebase conflicts. When rebasing onto `main` and a conflict appears here, the resolution
+is always to **keep both** the upstream model's additions and your own — never discard
+either side. After resolving:
+
+```bash
+git add vllm_omni/entrypoints/openai/serving_speech.py
+git rebase --continue
+```
+
+## Single-Stage Models
+
+Some TTS models (e.g. MOSS-TTS-Nano) do not use a two-stage pipeline. Instead the
+entire AR LM and audio decoder run inside a single AR worker, streaming audio chunks
+directly from the model's own generator.
+
+### Directory structure
+
+```
+vllm_omni/model_executor/models/your_model_name/
+    __init__.py
+    modeling_your_model_name.py    # unified class: load_weights + forward + streaming
+
+vllm_omni/model_executor/stage_configs/your_model_name.yaml
+```
+
+No stage input processor is needed.
+
+### Stage config
+
+Use a single stage with `worker_type: ar`:
+
+```yaml
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: your_model_stage_key
+      model_arch: YourModelForCausalLM
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      engine_output_type: audio
+    final_output: true
+    final_output_type: audio
+```
+
+### VoxCPM-style streaming pattern
+
+Load model weights in `load_weights()` (not `__init__`) so vLLM finishes distributed
+initialisation before any CUDA allocations. Implement streaming via a per-request
+generator stored in an instance dict:
+
+```python
+class YourModelForCausalLM(nn.Module):
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        self._lm: nn.Module | None = None          # populated in load_weights()
+        self._stream_gens: dict[str, Any] = {}     # request_key → generator
+
+    def load_weights(self, weights):
+        # Load self._lm here, after vLLM distributed init
+        ...
+
+    def forward(self, input_ids, positions, intermediate_tensors=None,
+                inputs_embeds=None, **kwargs) -> OmniOutput:
+        info = kwargs.get("additional_information", {})
+        request_key = self._get_request_key(kwargs)
+
+        if request_key not in self._stream_gens:
+            self._stream_gens[request_key] = self._create_stream_gen(info)
+
+        gen = self._stream_gens[request_key]
+        try:
+            chunk, is_last = next(gen)
+        except StopIteration:
+            is_last = True
+            chunk = torch.zeros(0)
+
+        if is_last:
+            del self._stream_gens[request_key]
+
+        return OmniOutput(multimodal_outputs={"waveform": chunk, "is_last": is_last})
+
+    def _create_stream_gen(self, info):
+        """Yield (waveform_tensor, is_last) from the model's inference_stream()."""
+        for event in self._lm.inference_stream(...):
+            if event["type"] == "audio":
+                yield event["waveform"], False
+        yield torch.zeros(0), True
+
+    def compute_logits(self, hidden_states, sampling_metadata):
+        # Emit EOS only when the last chunk has been yielded so the AR
+        # scheduler ends the request at the right time.
+        ...
+```
+
+See `vllm_omni/model_executor/models/moss_tts_nano/modeling_moss_tts_nano.py` for the
+complete reference implementation.
+
+## Pre-commit and DCO
+
+All contributions must pass the pre-commit checks and the Developer Certificate of
+Origin (DCO) sign-off before merging.
+
+### Running pre-commit
+
+Install the hooks once with `pre-commit install`. Then run before committing:
+
+```bash
+pre-commit run --files \
+  vllm_omni/model_executor/models/your_model_name/*.py \
+  vllm_omni/entrypoints/openai/serving_speech.py \
+  vllm_omni/model_executor/models/registry.py \
+  tests/e2e/offline_inference/test_your_model_name.py \
+  tests/e2e/online_serving/test_your_model_name.py
+```
+
+When pre-commit **modifies files**, it exits with a non-zero code but the reformatting
+is correct. Stage the modified files and commit again — do not revert the changes.
+
+Common failures and fixes:
+
+| Check | Cause | Fix |
+|-------|-------|-----|
+| `ruff F841` | Local variable assigned but never used | Remove the extraction or forward it to the model call |
+| `ruff E402` | Module-level import not at top of file | Move import to the top-level import block |
+| `ruff format` | Line length, spacing, or quote style | Accept the auto-fix, stage, and re-commit |
+
+### DCO sign-off
+
+Every commit must carry a `Signed-off-by` trailer. Use the `-s` flag when committing:
+
+```bash
+git commit -s -m "feat(your-model): add YourModel TTS support"
+```
+
+Or configure git to add it automatically:
+
+```bash
+git config format.signOff true
+```
+
+To fix a missing sign-off on the most recent commit:
+
+```bash
+git commit --amend -s --no-edit
+git push origin your-branch --force-with-lease
+```
+
+> The DCO check verifies that the commit author email matches the `Signed-off-by` email.
+> Make sure `git config user.email` is set to the address associated with your GitHub
+> account before committing.
+
 ## Adding a Model Recipe
 
 After implementing and testing your model, add a model recipe to the
@@ -557,15 +803,18 @@ for the expected format.
 
 Adding a TTS model to vLLM-Omni involves:
 
-1. **Create model directory** with AR stage, decoder stage, and unified class
+1. **Create model directory** with AR stage, decoder stage, and unified class (two-stage)
+   or a single unified class with VoxCPM-style streaming (single-stage)
 2. **AR stage** - use vLLM's native decoder layers with fused QKV; do not wrap HF directly
 3. **Decoder stage** - thin wrapper around your audio decoder; implement `chunked_decode_streaming()`
 4. **Unified class** - dispatches on `model_stage`; same structure as `Qwen3TTSModelForGeneration`
 5. **Register** all stage classes in `registry.py`
-6. **YAML configs** - provide both batch and `async_chunk` variants
-7. **Stage input processor** - buffer Stage 0 outputs and forward in chunks of 25
-8. **Tests** - cover single request, batching, and async_chunk streaming
-9. **Model recipe** - add to [vllm-project/recipes](https://github.com/vllm-project/recipes)
+6. **YAML configs** - provide both batch and `async_chunk` variants (two-stage), or a single-stage AR config
+7. **Stage input processor** - buffer Stage 0 outputs and forward in chunks of 25 (two-stage only)
+8. **Online serving** - add all 5 integration points to `serving_speech.py` in one commit
+9. **Tests** - cover single request, batching, and streaming
+10. **Pre-commit + DCO** - run `pre-commit` before pushing; sign every commit with `git commit -s`
+11. **Model recipe** - add to [vllm-project/recipes](https://github.com/vllm-project/recipes)
 
 ### Qwen3-TTS Reference Files
 
