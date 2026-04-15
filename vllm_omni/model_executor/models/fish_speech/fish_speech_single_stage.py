@@ -133,6 +133,12 @@ class FishSpeechSingleStageForConditionalGeneration(
         codec.load_state_dict(state_dict, strict=False)
         self._bake_weight_norm(codec)
         self._cache_attention_masks(codec)
+        # Convert numpy scalars to Python ints so torch.compile/Dynamo
+        # does not synthesize from_numpy() wrappers that fail guard checks.
+        if hasattr(codec, "hop_length"):
+            codec.hop_length = int(codec.hop_length)
+        if hasattr(codec, "frame_length"):
+            codec.frame_length = int(codec.frame_length)
         codec.encoder = None
         codec.quantizer.pre_module = None
         codec.quantizer.downsample = None
@@ -153,6 +159,17 @@ class FishSpeechSingleStageForConditionalGeneration(
             vocoder_device = ar_device
         codec = codec.to(device=vocoder_device, dtype=torch.float32)
         codec.eval()
+        # Compile decode to fuse kernels and cut Python dispatch overhead.
+        # The DAC has ~55 conv layers run eagerly; compile reduces ~570ms
+        # CPU/request to a much smaller kernel-launch cost. Use mode=default
+        # with dynamic=True so variable frame counts re-use one compiled fn.
+        try:
+            codec.decode = torch.compile(
+                codec.decode, mode="default", dynamic=True, fullgraph=False,
+            )
+            logger.info("Enabled torch.compile on DAC codec.decode")
+        except Exception as exc:
+            logger.warning("torch.compile on DAC codec.decode failed: %s", exc)
         self._dac_codec = codec
         self._vocoder_device = vocoder_device
         # Dedicated stream on vocoder device for true async decode.
