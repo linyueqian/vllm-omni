@@ -16,7 +16,7 @@ stage_args:
       devices: "0,1"
       max_batch_size: 16
     engine_args:
-      max_num_seqs: 4
+      max_num_seqs: 16
       model_stage: fish_speech_slow_ar
       model_arch: FishSpeechSingleStageForConditionalGeneration
       worker_type: ar
