@@ -15,17 +15,79 @@ pattern, refer to MOSS-TTS-Nano.
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Directory Structure](#directory-structure)
-3. [Step-by-Step Implementation](#step-by-step-implementation)
-4. [Key Components](#key-components)
-5. [Model Registration](#model-registration)
-6. [Stage Configuration](#stage-configuration)
-7. [Stage Input Processors](#stage-input-processors)
-8. [Online Serving Integration](#online-serving-integration)
-9. [Single-Stage Models](#single-stage-models)
-10. [Testing](#testing)
-11. [Pre-commit and DCO](#pre-commit-and-dco)
-12. [Summary](#summary)
+2. [Cross-Cutting Invariants](#cross-cutting-invariants)
+3. [Directory Structure](#directory-structure)
+4. [Step-by-Step Implementation](#step-by-step-implementation)
+5. [Key Components](#key-components)
+6. [Model Registration](#model-registration)
+7. [Stage Configuration](#stage-configuration)
+8. [Stage Input Processors](#stage-input-processors)
+9. [Online Serving Integration](#online-serving-integration)
+10. [Single-Stage Models](#single-stage-models)
+11. [Testing](#testing)
+12. [Pre-commit and DCO](#pre-commit-and-dco)
+13. [Summary](#summary)
+
+## Cross-Cutting Invariants
+
+These rules apply to every TTS model regardless of architecture (AR vs AR+diffusion,
+single-stage vs two-stage, codec-based vs VAE-based). Each has surfaced as a silent
+bug in a shipped PR — check them at the end of every phase, not just at the start.
+
+**I1. Streaming output contract.** Pick one per-step semantics for `forward()` and
+document it in the docstring:
+
+- *Delta*: yield only new audio samples produced this step. Preferred — linear cost.
+- *Cumulative*: re-decode from step 0 every call. O(N²); only acceptable when the
+  codec exposes no streaming decode.
+
+If you choose delta, audit the full chain: `forward()` returns the new chunk →
+`_consolidate_multimodal_tensors()` in `vllm_omni/engine/output_processor.py`
+concatenates the audio key into a single tensor at finish → streaming consumers
+receive per-step chunks, offline consumers receive the concatenated tensor. A
+mismatch (consolidator skips the key with `continue`, or consumers expect a list
+but receive a tensor) is invisible in offline RTF benchmarks — users hear replays
+or truncation only under live playback.
+
+**I2. Multimodal output consumer hygiene.** `outputs[0].outputs[0].multimodal_output[key]`
+can be `Tensor`, `list[Tensor]` (pre-consolidation snapshot), `np.ndarray`, or
+scalar. In every test, example, and benchmark:
+
+- Never write `dict.get("a") or dict.get("b")` on tensor values — Python evaluates
+  the tensor's truthiness and raises `Boolean value of Tensor with more than one
+  value is ambiguous`. Use explicit `if x is None` chains.
+- Defensively handle the list form:
+  `if isinstance(x, list): x = torch.cat([t.reshape(-1) for t in x], dim=0)`.
+- Assert `shape` / `dtype` / `duration` explicitly — do not rely on truthiness for
+  presence checks.
+
+**I3. Hot-loop GPU discipline.** Inside any per-step model loop (AR decode,
+diffusion solver, CFM Euler step, per-frame vocoder):
+
+- No `tensor.item()`, `.cpu()`, or `.tolist()` — each triggers a GPU→CPU sync; a
+  10-step × 60-frame × 4-op loop creates 2400 syncs per request.
+- Prefer `dst.copy_(src)` over `dst.fill_(src.item())` for scalar-into-buffer writes.
+- Whole-model `torch.compile(Model.forward, fullgraph=False)` usually outperforms
+  per-submodule compile — fewer dispatch boundaries, larger fusion regions. Measure
+  before choosing granularity.
+- No Python control flow that depends on tensor values; use `torch.where` or masking.
+
+Profile before optimizing.
+
+**I4. Validation pyramid.** Offline RTF alone is necessary but not sufficient. A
+new TTS model must pass all three levels:
+
+| Layer | Catches | Tool |
+|-------|---------|------|
+| Offline RTF / duration | Throughput regressions, missing audio, wrong sample rate | `end2end.py`, pytest e2e |
+| Browser streaming playback | Delta-vs-cumulative bugs, chunk boundary glitches, TTFP regressions | Gradio demo over `/v1/audio/speech?stream=true` |
+| Concurrent requests | Per-request state leaks, codec window round-robin gaps | `max_num_seqs>1` smoke with 4+ parallel prompts |
+
+**I5. Per-request state belongs to the request.** If the model caches anything
+across `forward()` calls (streaming generators, codec buffers, sliding-window pads,
+CUDA graph state), key it by `info.get("_omni_req_id")` and free the entry on
+request finish. A shared buffer silently corrupts audio across concurrent requests —
+the symptom is crosstalk or truncation under load, nothing in single-request tests.
 
 ## Overview
 
@@ -853,6 +915,7 @@ Adding a TTS model to vLLM-Omni involves:
 9. **Tests** - cover single request, batching, and streaming
 10. **Pre-commit + DCO** - run `pre-commit` before pushing; sign every commit with `git commit -s`
 11. **Model recipe** - add to [vllm-project/recipes](https://github.com/vllm-project/recipes)
+12. **Invariants** - re-check I1–I5 (streaming contract, consumer hygiene, hot-loop discipline, validation pyramid, per-request state) at the end of every phase
 
 ### Qwen3-TTS Reference Files
 

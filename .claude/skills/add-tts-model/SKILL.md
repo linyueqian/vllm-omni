@@ -19,6 +19,68 @@ Two architecture patterns are supported:
 
 The single-stage variant skips Phase 4 (async_chunk) but Phase 5 (CUDA graph) is still encouraged — capture the inner AR loop as a CUDA graph for a significant speedup. The VoxCPM-style streaming pattern is described in Phase 2.
 
+## Cross-Cutting Invariants
+
+These rules apply to every TTS model regardless of architecture (AR vs AR+diffusion, single-stage vs two-stage, codec-based vs VAE-based). They surface repeatedly across PRs — check them at the end of every phase.
+
+### I1. Streaming output contract
+
+Pick exactly one per-step semantics for `forward()` and document it in the docstring:
+
+- **Delta**: yield only new audio samples produced this step. Preferred — linear cost, low memory.
+- **Cumulative**: re-decode from step 0 every call. O(N²); only acceptable if the codec has no streaming decode path.
+
+If you choose **delta**, verify the full emit→consolidate→consume chain:
+
+1. `forward()` returns `{"model_outputs": <new_chunk_only>, ...}`
+2. `_consolidate_multimodal_tensors()` in `vllm_omni/engine/output_processor.py` concatenates the audio key into one tensor at finish. If it skips the key (`continue`), offline consumers receive only the final chunk. See `output_processor.py` for the concrete list of handled modality keys.
+3. Streaming consumers (SSE, Gradio) receive per-step deltas; offline consumers (`engine.generate()`) receive a single concatenated tensor.
+
+Cumulative-vs-delta mismatch is the most common silent bug — offline RTF benchmarks pass, but users hear replays or truncation.
+
+### I2. Multimodal output consumer hygiene
+
+`outputs[0].outputs[0].multimodal_output[<key>]` can be any of `Tensor`, `list[Tensor]` (pre-consolidation snapshot), `np.ndarray`, or scalar. When writing tests, examples, and benchmarks:
+
+- **Never** use `dict.get("a") or dict.get("b")` on tensor values — Python evaluates the tensor's boolean, raising `RuntimeError: Boolean value of Tensor with more than one value is ambiguous`. Use explicit `if x is None` chains.
+- Always defensively handle the list form: `if isinstance(x, list): x = torch.cat([t.reshape(-1) for t in x], dim=0)`.
+- Assert `shape` / `dtype` / `duration` explicitly; do not rely on truthiness for presence checks.
+
+### I3. Hot-loop GPU discipline
+
+Inside any per-step model loop (AR decode, diffusion solver, CFM Euler, vocoder block loop):
+
+- No `tensor.item()`, `.cpu()`, or `.tolist()` — each triggers a GPU→CPU sync; at 10 steps × 60 frames × 4 ops that is 2400 syncs per request.
+- Prefer `dst.copy_(src)` over `dst.fill_(src.item())` when writing a scalar tensor into a buffer.
+- Prefer `torch.compile(Model.forward, fullgraph=False)` on the whole forward over per-submodule compile — fewer dispatch boundaries, larger fusion regions. Measure before choosing granularity.
+- No Python-side control flow that depends on tensor values; use `torch.where` / masking instead.
+
+Profile first, optimize second. See the profiling docs / project memory for the trace-analysis workflow.
+
+### I4. Validation pyramid
+
+Offline RTF alone is necessary but not sufficient. Every new TTS model must pass all three:
+
+| Layer | Catches | Tool |
+|-------|---------|------|
+| Offline RTF / duration check | Throughput regressions, missing audio, wrong sample rate | `end2end.py`, pytest e2e |
+| Browser streaming playback | Delta/cumulative bugs, chunk boundary glitches, TTFP regressions | Gradio demo over `/v1/audio/speech?stream=true` |
+| Concurrent requests | Per-request state leaks, codec window round-robin gaps | `max_num_seqs>1` smoke test with 4+ parallel prompts |
+
+Declaring a model "done" without all three has shipped regressions more than once.
+
+### I5. Per-request state is owned by the request, not the model
+
+If the model caches *anything* across `forward()` calls (streaming generators, codec buffers, sliding-window pads, CUDA graph state), key it by request ID:
+
+```python
+self._state: dict[str, YourState] = {}    # request_key → state
+# fetch: request_key = str(info.get("_omni_req_id", "0"))
+# free on finish: del self._state[request_key]
+```
+
+A shared buffer silently corrupts audio across concurrent requests — the symptom is crosstalk or truncation only under load.
+
 ## Phase 1: HuggingFace Reference
 
 **Goal**: Understand the reference implementation and verify it produces correct audio.
@@ -94,7 +156,7 @@ When audio output is wrong, check in this order:
 
 ### Streaming Correctness Rules (single-stage and two-stage)
 
-These bugs appear in almost every new TTS PR. Check all before the first push:
+These bugs appear in almost every new TTS PR. Check all before the first push. See also the cross-cutting invariants I1 (output contract) and I5 (per-request state) above — the rules below are the Phase 2-specific instances of those invariants:
 
 - **Accumulate codes across AR steps** — each `forward()` appends new codes; do not reset between steps or audio will be truncated (fish speech: `fix: accumulate audio_codes across steps`)
 - **Emit delta audio, not full waveform** — in streaming mode yield only the new chunk per step, not the re-decoded full waveform from step 0 (fish speech: `fix: emit delta audio not full waveform`)
@@ -475,6 +537,13 @@ git push origin <branch> --force-with-lease
 ## Integration Checklist
 
 Use this checklist when integrating a new TTS model:
+
+### Cross-Cutting Invariants (verify at end of every phase)
+- [ ] I1: `forward()` docstring states cumulative vs delta; consolidation path audited end-to-end
+- [ ] I2: Tests / examples / benchmarks never use `dict.get(a) or dict.get(b)` on tensor values; list form handled
+- [ ] I3: No `.item()` / `.cpu()` / Python branch on tensor values inside per-step loops
+- [ ] I4: Offline RTF, browser streaming playback, and concurrent-request smoke test all pass
+- [ ] I5: Any cross-step cache keyed by `_omni_req_id`; entries freed when the request finishes
 
 ### Phase 1: HF Reference
 - [ ] Reference model runs and produces correct audio
