@@ -68,7 +68,7 @@ class FishSpeechSingleStageForConditionalGeneration(
             logger.info("Baked %d DAC parametrized weights for inference", baked)
 
     @staticmethod
-    def _cache_attention_masks(codec: nn.Module) -> None:
+    def _cache_attention_masks(codec: nn.Module, device: torch.device) -> None:
         for module in codec.modules():
             if not hasattr(module, "make_mask") or not hasattr(
                 module, "make_window_limited_mask"
@@ -84,12 +84,13 @@ class FishSpeechSingleStageForConditionalGeneration(
                 x_lens: torch.Tensor | None = None,
                 *,
                 _orig=base_make_mask,
+                _device=device,
             ):
                 if x_lens is not None:
-                    return _orig(max_length, x_lens)
+                    return _orig(max_length, x_lens).to(device=_device, non_blocking=True)
                 key = int(max_length)
                 if key not in mask_cache:
-                    mask_cache[key] = _orig(max_length, x_lens)
+                    mask_cache[key] = _orig(max_length, x_lens).to(device=_device)
                 return mask_cache[key]
 
             def _cached_window_mask(
@@ -97,12 +98,13 @@ class FishSpeechSingleStageForConditionalGeneration(
                 x_lens: torch.Tensor | None = None,
                 *,
                 _orig=base_make_window_mask,
+                _device=device,
             ):
                 if x_lens is not None:
-                    return _orig(max_length, x_lens)
+                    return _orig(max_length, x_lens).to(device=_device, non_blocking=True)
                 key = int(max_length)
                 if key not in window_mask_cache:
-                    window_mask_cache[key] = _orig(max_length, x_lens)
+                    window_mask_cache[key] = _orig(max_length, x_lens).to(device=_device)
                 return window_mask_cache[key]
 
             module.make_mask = _cached_mask
@@ -132,7 +134,6 @@ class FishSpeechSingleStageForConditionalGeneration(
             state_dict = state_dict["generator"]
         codec.load_state_dict(state_dict, strict=False)
         self._bake_weight_norm(codec)
-        self._cache_attention_masks(codec)
         # Convert numpy scalars to Python ints so torch.compile/Dynamo
         # does not synthesize from_numpy() wrappers that fail guard checks.
         if hasattr(codec, "hop_length"):
@@ -159,11 +160,20 @@ class FishSpeechSingleStageForConditionalGeneration(
             vocoder_device = ar_device
         codec = codec.to(device=vocoder_device, dtype=torch.float32)
         codec.eval()
-        # NOTE: torch.compile(codec.decode) was attempted but blocked by:
-        #   1. numpy-scalar guards (fixed via int() conversion above)
-        #   2. cached attention masks landing on CPU vs Triton expecting GPU
-        # Fixing (2) requires either rewriting the caching on GPU directly
-        # or splitting the compile target to inner subnets only. Left eager.
+        # Cache attention masks AFTER .to(device) so cached masks land on
+        # the same device as the rest of the codec (Triton-compiled kernels
+        # can't accept CPU tensors as pointer arguments).
+        self._cache_attention_masks(codec, vocoder_device)
+        # Compile decode to fuse kernels and cut Python dispatch overhead.
+        # The DAC has ~55 conv layers run eagerly; compile reduces ~570ms
+        # CPU/request to a much smaller kernel-launch cost.
+        try:
+            codec.decode = torch.compile(
+                codec.decode, mode="default", dynamic=True, fullgraph=False,
+            )
+            logger.info("Enabled torch.compile on DAC codec.decode")
+        except Exception as exc:
+            logger.warning("torch.compile on DAC codec.decode failed: %s", exc)
         self._dac_codec = codec
         self._vocoder_device = vocoder_device
         # Dedicated stream on vocoder device for true async decode.
