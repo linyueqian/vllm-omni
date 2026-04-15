@@ -12,12 +12,23 @@ HF Reference -> Stage Separation -> Online Serving -> Async Chunk -> CUDA Graph 
    (Phase 1)      (Phase 2)          (Phase 3)        (Phase 4)     (Phase 5)      (Phase 6)
 ```
 
-Two architecture patterns are supported:
+Three architecture patterns are supported:
 
-- **Two-stage pipeline** (e.g. Qwen3-TTS, Fish Speech): AR code-predictor → audio decoder, connected via async_chunk for low-latency streaming. Use this for maximum performance.
-- **Single-stage AR** (e.g. MOSS-TTS-Nano): entire model runs inside one AR worker, streaming audio chunks directly via a per-request generator. Use this when the upstream model bundles AR + codec inseparably or when a two-stage split is not feasible.
+- **Two-stage pipeline** (e.g. Qwen3-TTS, Fish Speech, CosyVoice3): AR
+  code-predictor → audio decoder, connected via async_chunk for low-latency
+  streaming. Use this for maximum performance.
+- **Single-stage AR via generator** (e.g. MOSS-TTS-Nano): entire model runs
+  inside one AR worker, streaming audio chunks through a per-request
+  `inference_stream()` generator. Use this when the upstream model bundles AR
+  + codec inseparably. See [references/single-stage-ar.md](references/single-stage-ar.md).
+- **Single-stage, vLLM-native base LM + side computation** (e.g. VoxCPM2):
+  the base language model runs under vLLM's PagedAttention as a normal AR
+  model; diffusion / VAE / side computations run outside vLLM and are
+  attached via the runner post-processing hook. This is a distinct pattern
+  from the generator approach above — do not confuse the two.
 
-The single-stage variant skips Phase 4 (async_chunk) but Phase 5 (CUDA graph) is still encouraged — capture the inner AR loop as a CUDA graph for a significant speedup. The VoxCPM-style streaming pattern is described in Phase 2.
+The single-stage variants skip Phase 4 (async_chunk) but Phase 5 (CUDA graph)
+is still encouraged for the inner AR loop.
 
 ## Cross-Cutting Invariants
 
@@ -167,117 +178,32 @@ These bugs appear in almost every new TTS PR. Check all before the first push. S
 
 ### Optional Dependency Handling
 
-Models that rely on `torchaudio`, `torchcodec`, `soundfile`, or other optional packages
-must handle the missing-package case at import time, not at call time. Failing to do this
-causes cryptic errors only on environments without the optional package — after the model
-is already deployed.
-
-Pattern (used in MOSS-TTS-Nano):
-
-```python
-def _patch_torchaudio_load() -> None:
-    """Fallback torchaudio.load/save to soundfile if torchcodec is unavailable."""
-    try:
-        import torchcodec  # noqa: F401
-        return  # torchcodec present, torchaudio works as-is
-    except ImportError:
-        pass
-
-    import soundfile as sf
-    import torchaudio
-
-    def _sf_load(path, **kwargs):
-        data, sr = sf.read(str(path), dtype="float32", always_2d=True)
-        return torch.from_numpy(data).T, sr
-
-    torchaudio.load = _sf_load
-    # patch .save similarly if needed
-```
-
-The real fallback must mirror `torchaudio.load`'s full signature (`frame_offset`, `num_frames`, `normalize`, `channels_first`, `format`) to avoid `TypeError` when calling code passes keyword arguments. Catch `except Exception` (not just `ImportError`) because `import torchaudio` itself can also fail. See `vllm_omni/model_executor/models/moss_tts_nano/modeling_moss_tts_nano.py` for the complete reference implementation. Call the patch function at the top of `load_weights()` before loading any audio assets.
+Patch optional dependencies (`torchaudio` / `torchcodec` / `soundfile`) at
+the top of `load_weights()`, not at module import. Failures to do so cause
+cryptic errors only on environments missing the optional package — after
+the model is already deployed. See
+[references/optional-deps.md](references/optional-deps.md) for the full
+pattern, signature constraints, and MOSS-TTS-Nano reference.
 
 ### Single-Stage AR Pattern (alternative to two-stage)
 
-When the upstream model cannot be cleanly split into an AR stage and a separate decoder,
-use the VoxCPM-style single-stage pattern instead:
+When the upstream model cannot be cleanly split into an AR stage and a
+separate decoder, run the full pipeline inside a single AR worker and
+stream audio through a per-request `inference_stream()` generator keyed by
+`_omni_req_id`. Stage config must set `worker_type: ar`,
+`engine_output_type: audio`, `final_output: true`, `is_comprehension: true`,
+and `async_chunk: false` at the top level. Only extract params from
+`additional_information` that you actually forward, or pre-commit fails
+`ruff F841`.
 
-1. **Single model file** — load both AR LM and codec inside `modeling_<model>.py`
-2. **Load weights in `load_weights()`**, not `__init__()` — vLLM initializes distributed
-   state before any CUDA allocations
-3. **Stream via a per-request generator** stored in `self._stream_gens`:
+Full walkthrough with the complete `forward()` / `_create_stream_gen()`
+skeleton and stage-config fields:
+[references/single-stage-ar.md](references/single-stage-ar.md). Reference
+implementation: `vllm_omni/model_executor/models/moss_tts_nano/`.
 
-```python
-class YourModelForCausalLM(nn.Module):
-    def __init__(self, *, vllm_config, prefix=""):
-        super().__init__()
-        self._lm = None                   # populated in load_weights()
-        self._stream_gens: dict = {}      # request_key → generator
-
-    def load_weights(self, weights):
-        # Load self._lm here, after vLLM distributed init
-        ...
-
-    def forward(
-        self,
-        input_ids,
-        positions,
-        intermediate_tensors=None,
-        inputs_embeds=None,
-        runtime_additional_information: list[dict] | None = None,  # one dict per request
-        **kwargs,
-    ) -> OmniOutput:
-        infos = runtime_additional_information or [{}]
-        # Skip dummy/profiling calls
-        if not runtime_additional_information or all(i.get("_is_dummy") for i in infos):
-            self._ar_emit_stop_token = True
-            return OmniOutput(...)  # return empty outputs
-
-        outputs, last_flags = [], []
-        for info in infos:
-            request_key = str(info.get("_omni_req_id", "0"))  # per-request ID from vLLM
-            if request_key not in self._stream_gens:
-                self._stream_gens[request_key] = self._create_stream_gen(info)
-            try:
-                chunk, is_last = next(self._stream_gens[request_key])
-            except StopIteration:
-                chunk, is_last = torch.zeros(0), True
-            if is_last:
-                del self._stream_gens[request_key]
-            outputs.append(chunk)
-            last_flags.append(is_last)
-
-        self._ar_emit_stop_token = all(last_flags)
-        return OmniOutput(multimodal_outputs={"model_outputs": outputs, ...})
-
-    def _create_stream_gen(self, info: dict):
-        """Yield (waveform_tensor, is_last) tuples from inference_stream()."""
-        for event in self._lm.inference_stream(...):
-            if event["type"] == "audio":
-                yield event["waveform"], False
-            elif event["type"] == "result":
-                # Fallback: some models emit a single "result" event instead of
-                # incremental "audio" events — handle both paths
-                yield event.get("waveform", torch.zeros(0)), True
-                return
-        yield torch.zeros(0), True
-
-    def compute_logits(self, hidden_states, sampling_metadata):
-        # Emit EOS only after the last chunk so the AR scheduler ends the request
-        ...
-```
-
-Key points:
-- `runtime_additional_information` is the correct parameter name (not `**kwargs`) — it carries one dict per request in the batch
-- The request ID is `info.get("_omni_req_id")` — this is set by vLLM, not by user code
-- Handle both `"audio"` (incremental) and `"result"` (final combined) event types from upstream models
-
-4. **Stage config** — single stage with `worker_type: ar`, `engine_output_type: audio`,
-   `final_output: true`, `is_comprehension: true`, and `async_chunk: false` at the
-   top level (omitting these causes silent misclassification in the serving layer)
-5. **Only extract params you forward** — any variable extracted from `additional_information`
-   but not passed to the model call will fail `ruff F841` in pre-commit
-
-Reference: `vllm_omni/model_executor/models/moss_tts_nano/modeling_moss_tts_nano.py`
+**VoxCPM2 is a different pattern** and should not reuse this skeleton — it
+runs the base LM under vLLM PagedAttention with external side-computation.
+See `plan/voxcpm2_native_ar_design.md`.
 
 ### Deliverables
 
@@ -467,35 +393,10 @@ Stage 0 (AR)                    Stage 1 (Decoder)
    - Fixed batch size (fall back to eager for other sizes)
    - No dynamic control flow inside the graph
 
-### Example: Code Predictor CUDA Graph (Qwen3-TTS)
-
-```python
-import torch
-
-class CodePredictorGraph:
-    """Captures the 16-step code predictor AR loop as a single CUDA graph."""
-
-    def setup_graph(self, device: torch.device, kv_heads: int = 4, head_dim: int = 64):
-        self.num_steps = 16
-        self.kv_cache = torch.zeros(1, kv_heads, self.num_steps, head_dim, device=device)
-        self.positions = torch.arange(self.num_steps, device=device)
-        self.causal_mask = torch.tril(torch.ones(self.num_steps, self.num_steps, device=device))
-        self.input_buf = torch.zeros(1, 1, kv_heads * head_dim, device=device)
-        self.output_buf = torch.zeros(1, self.num_steps, device=device, dtype=torch.long)
-        # Warm up, then: self.graph = torch.cuda.CUDAGraph(); self.graph.capture(...)
-
-    def run_graph(self, initial_input: torch.Tensor) -> torch.Tensor:
-        self.input_buf.copy_(initial_input)
-        self.graph.replay()
-        return self.output_buf.clone()
-```
-
-### Performance Expectations
-
-Based on Qwen3-TTS code predictor experience:
-- **3-5x speedup** for the graphed component
-- Only effective for fixed batch sizes (typically batch_size=1)
-- Falls back to eager mode for unsupported configurations
+See [references/cuda-graph-example.md](references/cuda-graph-example.md) for
+a worked skeleton (Qwen3-TTS code predictor, 16-step AR loop), performance
+expectations (3–5× on the graphed component for fixed batch_size=1), and the
+graph-safety constraints you must honor inside the captured region.
 
 ### Deliverables
 
@@ -505,50 +406,19 @@ Based on Qwen3-TTS code predictor experience:
 
 ## Phase 6: Pre-commit and DCO
 
-**Goal**: Ensure every commit passes CI linting checks and carries the required
-Developer Certificate of Origin sign-off before pushing.
+**Goal**: Every commit passes `pre-commit` lint and carries a DCO
+`Signed-off-by` line that matches the author email.
 
-### Pre-commit
+- Install hooks once: `pre-commit install`.
+- Run `pre-commit run --files <changed-files>` before every push; accept any
+  auto-fixes, stage, re-commit.
+- Sign every commit with `git commit -s`. DCO checks that author email and
+  `Signed-off-by` email match — `git config user.email` must match your
+  GitHub account email.
 
-Install hooks once: `pre-commit install`. Run before every commit:
-
-```bash
-pre-commit run --files \
-  vllm_omni/model_executor/models/<model_name>/*.py \
-  vllm_omni/entrypoints/openai/serving_speech.py \
-  vllm_omni/model_executor/models/registry.py \
-  tests/e2e/offline_inference/test_<model_name>.py \
-  tests/e2e/online_serving/test_<model_name>.py
-```
-
-When pre-commit **modifies files** (ruff format auto-fix), it exits non-zero but the
-changes are correct — stage the modified files and re-commit.
-
-| Failure | Root cause | Fix |
-|---------|-----------|-----|
-| `ruff F841` | Variable extracted but never forwarded to model call | Remove the extraction or wire it through |
-| `ruff E402` | Import added below function definitions | Move to top-level import block |
-| `ruff format` | Line length, spacing, quote style | Accept auto-fix, stage, re-commit |
-
-### DCO sign-off
-
-Every commit must carry `Signed-off-by: Your Name <your@email.com>`. Use `-s`:
-
-```bash
-git commit -s -m "feat(<model>): add <Model> TTS support"
-```
-
-Or set permanently: `git config format.signOff true`
-
-The DCO check verifies that the commit author email matches the `Signed-off-by` line.
-Confirm `git config user.email` matches your GitHub account email before committing.
-
-To fix a missing or mismatched sign-off on the latest commit:
-
-```bash
-git commit --amend -s --no-edit
-git push origin <branch> --force-with-lease
-```
+Common pre-commit failures, recovery commands for missing sign-off, and the
+full `pre-commit run` invocation for a TTS model:
+[references/precommit-dco.md](references/precommit-dco.md).
 
 ## Integration Checklist
 
@@ -609,16 +479,24 @@ Use this checklist when integrating a new TTS model:
 - [ ] Fallback to eager works for unsupported configs
 
 ### Phase 6: Pre-commit and DCO
-- [ ] `pre-commit run` passes on all changed files before every push
-- [ ] No `ruff F841` (unused variables) — all extracted params forwarded to model call
-- [ ] No `ruff E402` (import ordering) — imports at top-level
-- [ ] Every commit has `Signed-off-by` matching author email (`git commit -s`)
-- [ ] `git log --format="%ae"` shows only your registered GitHub account email
-- [ ] `serving_speech.py` rebase conflicts resolved by keeping both sides
+- [ ] `pre-commit run --files <changed>` passes before every push
+- [ ] Every commit has `Signed-off-by` matching the author email (`git commit -s`)
+- [ ] `git config user.email` matches the email registered on your GitHub account
+- [ ] Details and failure-recovery commands: [references/precommit-dco.md](references/precommit-dco.md)
 
 ## References
 
-- [TTS audio skill](../vllm-omni-audio-tts/SKILL.md) -- supported models and usage
-- [Fish Speech integration](../vllm-omni-audio-tts/references/fish-speech.md) -- complete example of Phases 1-3
-- [Qwen3-TTS reference](../vllm-omni-audio-tts/references/qwen-tts.md) -- complete example of all 5 phases
+In-skill references (details split out of the main body):
+
+- [references/single-stage-ar.md](references/single-stage-ar.md) — full `forward()` / generator skeleton for the MOSS-TTS-Nano-style pattern
+- [references/optional-deps.md](references/optional-deps.md) — torchaudio / torchcodec fallback pattern
+- [references/cuda-graph-example.md](references/cuda-graph-example.md) — Qwen3-TTS code-predictor CUDA graph skeleton
+- [references/precommit-dco.md](references/precommit-dco.md) — full pre-commit invocation, failure table, DCO recovery
+
+Project docs and adjacent skills:
+
+- [TTS audio skill](../vllm-omni-audio-tts/SKILL.md) — supported models and usage
+- [Fish Speech integration](../vllm-omni-audio-tts/references/fish-speech.md) — complete example of Phases 1–3
+- [Qwen3-TTS reference](../vllm-omni-audio-tts/references/qwen-tts.md) — complete example of all 5 phases
 - [Adding a TTS model (developer guide)](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/model/adding_tts_model.md)
+- `plan/voxcpm2_native_ar_design.md` — VoxCPM2's vLLM-native AR + side-computation pattern (distinct from the generator-based single-stage described above)
