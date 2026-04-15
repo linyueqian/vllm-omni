@@ -628,7 +628,14 @@ def _build_your_model_params(
 
 Then wire `_build_your_model_params` into the request-dispatch block in
 `_create_tts_request()` (search for the equivalent `_build_*_params` call for an
-existing model to find the right location).
+existing model to find the right location). If the model supports voice cloning
+(`ref_audio` → `prompt_audio_path`, `ref_text` → `prompt_text`), add those mappings
+here too — see `_build_moss_tts_params` for the pattern.
+
+> **Two dispatch patterns coexist:** Fish Speech uses a `self._is_fish_speech` boolean
+> checked *before* `elif self._is_tts`. All newer models use the `_tts_model_type`
+> string pattern shown above. For new models, always use the string pattern — do not
+> add new `_is_*` boolean flags.
 
 > **Note on unused variables:** Only extract parameters in `_build_your_model_params`
 > that you actually pass to the model's generate / `inference_stream` call. Extracting
@@ -666,12 +673,19 @@ No stage input processor is needed.
 
 ### Stage config
 
-Use a single stage with `worker_type: ar`:
+Use a single stage with `worker_type: ar`. The `is_comprehension: true` field and the
+top-level `async_chunk: false` are required — omitting them causes silent
+misclassification in the serving layer. Set `max_num_seqs` to at least 4 for
+concurrent production use.
 
 ```yaml
+# stage_configs/your_model_name.yaml
+async_chunk: false
+
 stage_args:
   - stage_id: 0
     stage_type: llm
+    is_comprehension: true          # required for serving_speech.py dispatch
     runtime:
       devices: "0"
     engine_args:
@@ -680,6 +694,7 @@ stage_args:
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       engine_output_type: audio
+      max_num_seqs: 4               # min 4 for concurrent requests; default 1 causes gaps
     final_output: true
     final_output_type: audio
 ```
@@ -702,13 +717,27 @@ class YourModelForCausalLM(nn.Module):
         # Load self._lm here, after vLLM distributed init
         ...
 
-    def forward(self, input_ids, positions, intermediate_tensors=None,
-                inputs_embeds=None, **kwargs) -> OmniOutput:
-        info = kwargs.get("additional_information", {})
-        request_key = self._get_request_key(kwargs)
+    def forward(
+        self,
+        input_ids,
+        positions,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        runtime_additional_information: list[dict] | None = None,  # one dict per request
+        **kwargs,
+    ) -> OmniOutput:
+        infos = runtime_additional_information or [{}]
+        # Return empty output during dummy/profiling calls
+        if not runtime_additional_information or all(i.get("_is_dummy") for i in infos):
+            self._ar_emit_stop_token = True
+            return OmniOutput(...)
 
-        if request_key not in self._stream_gens:
-            self._stream_gens[request_key] = self._create_stream_gen(info)
+        outputs, last_flags = [], []
+        for info in infos:
+            request_key = str(info.get("_omni_req_id", "0"))  # set by vLLM, not user code
+
+            if request_key not in self._stream_gens:
+                self._stream_gens[request_key] = self._create_stream_gen(info)
 
         gen = self._stream_gens[request_key]
         try:
@@ -722,11 +751,20 @@ class YourModelForCausalLM(nn.Module):
 
         return OmniOutput(multimodal_outputs={"waveform": chunk, "is_last": is_last})
 
-    def _create_stream_gen(self, info):
-        """Yield (waveform_tensor, is_last) from the model's inference_stream()."""
+    def _create_stream_gen(self, info: dict):
+        """Yield (waveform_tensor, is_last) from the model's inference_stream().
+
+        Handle both incremental ("audio" events) and batch ("result" event) models:
+        some upstream implementations emit one "result" event with the full waveform
+        instead of incremental "audio" events. Both paths must be covered.
+        """
         for event in self._lm.inference_stream(...):
             if event["type"] == "audio":
                 yield event["waveform"], False
+            elif event["type"] == "result":
+                # Fallback for models that don't emit incremental audio events
+                yield event.get("waveform", torch.zeros(0)), True
+                return
         yield torch.zeros(0), True
 
     def compute_logits(self, hidden_states, sampling_metadata):
