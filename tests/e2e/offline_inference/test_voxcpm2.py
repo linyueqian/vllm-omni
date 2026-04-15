@@ -34,7 +34,9 @@ def _extract_audio(multimodal_output: dict) -> torch.Tensor:
     assert isinstance(multimodal_output, dict), f"Expected dict, got {type(multimodal_output)}"
 
     # Output processor accumulates per-step audio chunks under "audio".
-    audio = multimodal_output.get("audio") or multimodal_output.get("model_outputs")
+    audio = multimodal_output.get("audio")
+    if audio is None:
+        audio = multimodal_output.get("model_outputs")
     assert audio is not None, f"No audio key, got {list(multimodal_output.keys())}"
 
     if isinstance(audio, list):

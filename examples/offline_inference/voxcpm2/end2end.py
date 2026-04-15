@@ -74,7 +74,9 @@ def extract_audio(multimodal_output: dict) -> torch.Tensor:
     The output processor concatenates per-step delta tensors under
     ``model_outputs``.  Falls back to ``audio`` for backwards compat.
     """
-    audio = multimodal_output.get("model_outputs") or multimodal_output.get("audio")
+    audio = multimodal_output.get("model_outputs")
+    if audio is None:
+        audio = multimodal_output.get("audio")
     if audio is None:
         raise ValueError(f"No audio key in multimodal_output: {list(multimodal_output.keys())}")
 
