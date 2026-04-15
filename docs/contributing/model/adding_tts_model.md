@@ -619,6 +619,29 @@ Recommended test cases for a new TTS model:
 
 Reference test: `tests/model_executor/stage_input_processors/test_qwen3_tts_async_chunk.py`
 
+### E2E Online Serving Tests (`tests/e2e/online_serving/test_<your_model>.py`)
+
+The `omni_server` fixture in `tests/conftest.py` is **module-scoped**. Each distinct
+`OmniServerParams` id in the same test file forces the fixture to tear the server
+down and spawn a new one mid-module. A few rules that save real CI debugging time:
+
+- **Prefer a single `OmniServerParams` set per file.** If you need to exercise two
+  deploy variants (e.g. `model.yaml` and `model_async_chunk.yaml`), either use one
+  variant and exercise streaming via request args, or split into two test files so
+  each file does exactly one server lifecycle. Mid-module teardown/restart is the
+  fragile path and surfaces startup races first.
+- **Never depend on server-side fetching of external URLs** for reference audio or
+  other fixture data. CI runners (and China-hosted dev boxes) routinely fail on
+  SSL/DNS for public URLs. Inline the payload as a `data:audio/wav;base64,...`
+  ref_audio value — the serving layer accepts both forms.
+- **Don't roll your own readiness probe.** The harness already waits for HTTP 200
+  on `/health` before releasing the server to the test. If your model needs extra
+  warmup signals, expose them through `/health` rather than adding `time.sleep(...)`
+  inside the test. (Bare TCP `connect_ex` probes were insufficient; see
+  `tests/conftest.py` `OmniServer.wait_for_ready`.)
+- **Use `core_model` marker + H100 hardware_test** to match the `test-ready.yml`
+  pipeline so your test is picked up by the `ready` label, not only nightly.
+
 ## Online Serving Integration
 
 To expose your model through the `/v1/audio/speech` OpenAI-compatible endpoint, add

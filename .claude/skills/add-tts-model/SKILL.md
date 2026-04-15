@@ -386,6 +386,22 @@ def build_voice_clone_prompt(ref_audio_path: str, text: str, codec) -> list:
 - Buildkite CI entry in `.buildkite/test-merge.yml`
 - Documentation (offline + online serving docs)
 
+### E2E test pitfalls to avoid
+
+- **One `OmniServerParams` set per file.** `omni_server` is module-scoped; a second
+  id in the same file forces mid-module teardown/restart and exposes startup
+  races (`APIConnectionError` on the first request post-restart). Split variants
+  into separate files instead.
+- **No external URL fetches from the server.** CI and some dev hosts can't
+  reach `raw.githubusercontent.com` over TLS. Inline ref audio as
+  `data:audio/wav;base64,...`; the serving layer accepts both URL and data URL.
+- **Use the harness readiness gate.** The fixture waits for HTTP 200 on
+  `/health`; don't add `time.sleep` in tests. If warmup is incomplete, make
+  `/health` return non-200 until you're actually ready.
+- **Mark with `@pytest.mark.core_model` + `hardware_test(res={"cuda": "H100"})`**
+  so the test lands in `test-ready.yml` (triggered by the `ready` label) rather
+  than only nightly.
+
 ## Phase 4: Async Chunk (Streaming)
 
 **Goal**: Enable inter-stage streaming so audio chunks are produced while AR generation continues.
