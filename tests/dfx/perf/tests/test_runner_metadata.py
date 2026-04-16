@@ -53,7 +53,7 @@ def test_enabled_false_entry_is_skipped():
         }
     ]
     mapping = create_test_parameter_mapping(configs)
-    params = mapping["test_model"]
+    params = mapping["test_model"]["benchmark_params"]
     # Only the enabled=True entry should appear
     assert len(params) == 1
     assert params[0].get("task") == "voice_clone"
