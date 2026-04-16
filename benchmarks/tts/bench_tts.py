@@ -33,6 +33,17 @@ from typing import Any
 
 import yaml
 
+
+def _vllm_omni_bin() -> str:
+    """Return the vllm-omni (or vllm) binary co-located with the current Python."""
+    bin_dir = Path(sys.executable).parent
+    for candidate in ("vllm-omni", "vllm"):
+        p = bin_dir / candidate
+        if p.is_file():
+            return str(p)
+    return "vllm-omni"  # fall back and let the shell resolve it
+
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _DEFAULT_STAGE_CONFIGS_DIR = _SCRIPT_DIR / "stage_configs"
@@ -87,9 +98,7 @@ def build_bench_args(
         resolved_dataset_path = None
 
     cmd = [
-        sys.executable,
-        "-m",
-        "vllm",
+        _vllm_omni_bin(),
         "bench",
         "serve",
         "--omni",
