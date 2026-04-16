@@ -39,7 +39,7 @@ stage_args:
       devices: "0"
     engine_args:
       model_stage: code2wav
-      max_num_seqs: 1
+      max_num_seqs: 8
       model_arch: Qwen3TTSCode2Wav
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
