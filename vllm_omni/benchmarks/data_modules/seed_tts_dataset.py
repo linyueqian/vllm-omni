@@ -361,7 +361,7 @@ class SeedTTSDesignDataset(SeedTTSDataset):
             target = row.target_text
             prompt_len = len(tok.encode(target))
             speech_extra: dict[str, Any] = {
-                "voice_description": row.voice_description,
+                "instructions": row.voice_description,
                 "task_type": "VoiceDesign",
                 "language": lang,
                 "max_new_tokens": output_len,
