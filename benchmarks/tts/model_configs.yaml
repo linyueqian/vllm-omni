@@ -1,0 +1,37 @@
+# Universal TTS benchmark model registry.
+# Maps HuggingFace model ID → stage config + supported tasks + per-task extra body fields.
+# To add a new TTS model: add an entry here. No code changes required.
+
+models:
+  Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice:
+    stage_config: qwen3_tts.yaml
+    supported_tasks: [voice_clone, default_voice, voice_design]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone:
+        task_type: Base
+      default_voice:
+        voice: Vivian
+        language: English
+        task_type: CustomVoice
+      voice_design:
+        task_type: VoiceDesign
+        language: English
+
+  Qwen/Qwen3-TTS-12Hz-1.7B-Base:
+    stage_config: qwen3_tts.yaml
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone:
+        task_type: Base
+
+  openbmb/VoxCPM2:
+    stage_config: voxcpm2.yaml
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone: {}
