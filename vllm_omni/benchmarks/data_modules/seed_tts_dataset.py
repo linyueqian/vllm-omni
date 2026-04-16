@@ -270,3 +270,65 @@ def load_seed_tts_dataset(
         system_prompt=system_prompt,
         **kwargs,
     )
+
+
+@dataclass
+class SeedTTSTextSampleRequest(SeedTTSSampleRequest):
+    """SampleRequest for default-voice TTS (no ref_audio, no ref_text).
+
+    The voice param (e.g. ``voice: "Vivian"``) is supplied at request time via
+    ``--extra-body`` in the benchmark config. SIM is skipped (empty ref_wav_path).
+    WER and UTMOS are computed normally.
+    """
+
+
+class SeedTTSTextDataset(SeedTTSDataset):
+    """Seed-TTS prompts for default-voice benchmarking (dataset name: ``seed-tts-text``).
+
+    Loads the same ``meta.lst`` as :class:`SeedTTSDataset` but builds requests
+    WITHOUT ``ref_audio`` / ``ref_text`` body fields. The named voice must be
+    supplied via ``--extra-body`` in the benchmark config.
+    Speaker-similarity (SIM) is not computed.
+    """
+
+    def sample(
+        self,
+        tokenizer: TokenizerLike,
+        num_requests: int,
+        output_len: int | None = None,
+        request_id_prefix: str = "",
+        no_oversample: bool = False,
+        **kwargs: Any,
+    ) -> list[SampleRequest]:
+        if output_len is None:
+            output_len = self.DEFAULT_OUTPUT_LEN
+
+        tok = get_cached_tokenizer(tokenizer)
+        out: list[SampleRequest] = []
+        for i, row in enumerate(self._rows):
+            if len(out) >= num_requests:
+                break
+            target = row.target_text
+            prompt_len = len(tok.encode(target))
+            out.append(
+                SeedTTSTextSampleRequest(
+                    prompt=target,
+                    prompt_len=prompt_len,
+                    expected_output_len=output_len,
+                    multi_modal_data=None,
+                    request_id=f"{request_id_prefix}{i}",
+                    seed_tts_speech_extra=None,   # voice supplied via --extra-body in config
+                    seed_tts_utterance_id=row.utterance_id,
+                    seed_tts_locale=self.locale,
+                    seed_tts_system_prompt=self._system_prompt,
+                    seed_tts_ref_wav_path="",     # empty → SIM skipped in seed_tts_eval
+                )
+            )
+
+        logger.info(
+            "Seed-TTS-Text: built %d requests (asked %d) — no ref_audio (default voice)",
+            len(out),
+            num_requests,
+        )
+        self.maybe_oversample_requests(out, num_requests, request_id_prefix, no_oversample)
+        return out
