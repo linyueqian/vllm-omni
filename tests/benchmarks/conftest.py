@@ -8,6 +8,7 @@ data-module unit tests can run without a full vLLM installation.  Only the
 symbols actually imported by
 ``vllm_omni.benchmarks.data_modules.seed_tts_dataset`` are emulated.
 """
+
 from __future__ import annotations
 
 import sys

@@ -1,4 +1,5 @@
 """Tests for the universal benchmarks/tts/bench_tts.py CLI."""
+
 from __future__ import annotations
 
 import json
@@ -60,7 +61,6 @@ def test_build_bench_args_voice_clone(model_configs_path: Path) -> None:
         locale="en",
         num_prompts=10,
         concurrency=1,
-
         dataset_path="/data/seed-tts",
         wer_eval=False,
         output_dir=None,
@@ -87,7 +87,6 @@ def test_build_bench_args_default_voice_has_voice_param(model_configs_path: Path
         locale="en",
         num_prompts=10,
         concurrency=1,
-
         dataset_path="/data/seed-tts",
         wer_eval=False,
         output_dir=None,
@@ -111,7 +110,6 @@ def test_build_bench_args_wer_eval_adds_flag(model_configs_path: Path) -> None:
         locale="en",
         num_prompts=10,
         concurrency=1,
-
         dataset_path="/data/seed-tts",
         wer_eval=True,
         output_dir=None,
@@ -124,10 +122,17 @@ def test_build_bench_args_wer_eval_adds_flag(model_configs_path: Path) -> None:
 def test_unsupported_task_exits(model_configs_path: Path, capsys: pytest.CaptureFixture) -> None:
     # ModelB does not support voice_design
     with pytest.raises(SystemExit):
-        with patch.object(sys, "argv", [
-            "bench_tts.py",
-            "--model", "test/ModelB",
-            "--task", "voice_design",
-            "--model-configs", str(model_configs_path),
-        ]):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "bench_tts.py",
+                "--model",
+                "test/ModelB",
+                "--task",
+                "voice_design",
+                "--model-configs",
+                str(model_configs_path),
+            ],
+        ):
             bench_tts.main()

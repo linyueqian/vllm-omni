@@ -3,6 +3,7 @@ and SeedTTSDesignSampleRequest.
 
 vllm stubs are installed by tests/benchmarks/conftest.py before collection.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -30,10 +31,10 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (  # noqa: E402
     SeedTTSTextSampleRequest,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture()
 def seed_tts_root(tmp_path: Path) -> Path:
@@ -44,10 +45,7 @@ def seed_tts_root(tmp_path: Path) -> Path:
     wav_dir.mkdir()
     for i in range(5):
         (wav_dir / f"utt{i:03d}.wav").write_bytes(b"RIFF\x00\x00\x00\x00WAVE")
-    meta = "\n".join(
-        f"utt{i:03d}|ref text {i}|prompt-wavs/utt{i:03d}.wav|target text {i}"
-        for i in range(5)
-    )
+    meta = "\n".join(f"utt{i:03d}|ref text {i}|prompt-wavs/utt{i:03d}.wav|target text {i}" for i in range(5))
     (locale_dir / "meta.lst").write_text(meta, encoding="utf-8")
     return tmp_path
 
@@ -55,6 +53,7 @@ def seed_tts_root(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 def test_seed_tts_text_dataset_omits_ref_audio(seed_tts_root):
     ds = SeedTTSTextDataset(
@@ -78,14 +77,14 @@ def test_seed_tts_text_dataset_omits_ref_audio(seed_tts_root):
 # SeedTTSDesignDataset tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture()
 def seed_tts_design_root(tmp_path: Path) -> Path:
     """seed-tts-design directory with 5-field meta.lst entries."""
     locale_dir = tmp_path / "en"
     locale_dir.mkdir()
     meta = "\n".join(
-        f"des{i:03d}|||target text {i}|A warm {['female', 'male'][i % 2]} voice with neutral accent."
-        for i in range(5)
+        f"des{i:03d}|||target text {i}|A warm {['female', 'male'][i % 2]} voice with neutral accent." for i in range(5)
     )
     (locale_dir / "meta.lst").write_text(meta, encoding="utf-8")
     return tmp_path
@@ -115,8 +114,7 @@ def test_seed_tts_design_dataset_rejects_missing_description(seed_tts_design_roo
     """Lines without a voice_description should be skipped."""
     locale_dir = seed_tts_design_root / "en"
     (locale_dir / "meta.lst").write_text(
-        "bad001|||target text without description\n"
-        "ok001|||good target|A clear female voice.\n",
+        "bad001|||target text without description\nok001|||good target|A clear female voice.\n",
         encoding="utf-8",
     )
     ds = SeedTTSDesignDataset(
@@ -134,6 +132,7 @@ def test_seed_tts_design_dataset_rejects_missing_description(seed_tts_design_roo
 def test_attach_sets_seed_tts_row_even_without_extra_body():
     """seed_tts_row=True must be set for SeedTTSTextSampleRequest (no extra body)."""
     from vllm_omni.benchmarks.data_modules.seed_tts_dataset import SeedTTSTextSampleRequest
+
     req = SeedTTSTextSampleRequest(
         prompt="hello world",
         prompt_len=2,
@@ -148,7 +147,9 @@ def test_attach_sets_seed_tts_row_even_without_extra_body():
     # The fix ensures that even with speech_extra=None, the function
     # sets seed_tts_row=True. We verify the source code has the fix.
     import inspect
+
     import vllm_omni.benchmarks.patch.patch as patch_mod
+
     src = inspect.getsource(patch_mod._attach_seed_tts_to_request_func_input)
     # seed_tts_row must be set BEFORE the 'if not ex: return' check
     row_pos = src.index("seed_tts_row")

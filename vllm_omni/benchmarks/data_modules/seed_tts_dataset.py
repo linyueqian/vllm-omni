@@ -272,17 +272,13 @@ def _parse_design_meta_line(line: str) -> _SeedTTSDesignRow | None:
         return None
     parts = line.split("|")
     if len(parts) < 5:
-        logger.warning(
-            "Skipping malformed design meta.lst line (need 5 '|'-fields): %r", line[:120]
-        )
+        logger.warning("Skipping malformed design meta.lst line (need 5 '|'-fields): %r", line[:120])
         return None
     utt_id = parts[0].strip()
     target_text = parts[3].strip()
     voice_description = parts[4].strip()
     if not voice_description:
-        logger.warning(
-            "Skipping design meta.lst line with empty voice_description: %r", line[:120]
-        )
+        logger.warning("Skipping design meta.lst line with empty voice_description: %r", line[:120])
         return None
     return _SeedTTSDesignRow(
         utterance_id=utt_id,
@@ -320,8 +316,7 @@ class SeedTTSDesignDataset(SeedTTSDataset):
         meta = self._root / self.locale / "meta.lst"
         if not meta.is_file():
             raise FileNotFoundError(
-                f"Seed-TTS-Design meta not found: {meta}. "
-                f"Expected layout: {self._root}/{self.locale}/meta.lst"
+                f"Seed-TTS-Design meta not found: {meta}. Expected layout: {self._root}/{self.locale}/meta.lst"
             )
         text = meta.read_text(encoding="utf-8")
         design_rows: list[_SeedTTSDesignRow] = []
@@ -460,11 +455,11 @@ class SeedTTSTextDataset(SeedTTSDataset):
                     expected_output_len=output_len,
                     multi_modal_data=None,
                     request_id=f"{request_id_prefix}{i}",
-                    seed_tts_speech_extra=None,   # voice supplied via --extra-body in config
+                    seed_tts_speech_extra=None,  # voice supplied via --extra-body in config
                     seed_tts_utterance_id=row.utterance_id,
                     seed_tts_locale=self.locale,
                     seed_tts_system_prompt=self._system_prompt,
-                    seed_tts_ref_wav_path="",     # empty → SIM skipped in seed_tts_eval
+                    seed_tts_ref_wav_path="",  # empty → SIM skipped in seed_tts_eval
                 )
             )
 

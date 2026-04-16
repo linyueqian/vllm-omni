@@ -18,6 +18,7 @@ Usage::
 
 See ``--help`` for full option list.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -45,9 +46,7 @@ _TASK_TO_DATASET: dict[str, str] = {
 }
 
 # Default design dataset path (bundled with the repo)
-_DEFAULT_DESIGN_DATASET_PATH = str(
-    _REPO_ROOT / "benchmarks" / "build_dataset" / "seed_tts_design"
-)
+_DEFAULT_DESIGN_DATASET_PATH = str(_REPO_ROOT / "benchmarks" / "build_dataset" / "seed_tts_design")
 
 
 def load_model_configs(path: Path) -> dict[str, Any]:
@@ -88,16 +87,30 @@ def build_bench_args(
         resolved_dataset_path = None
 
     cmd = [
-        sys.executable, "-m", "vllm", "bench", "serve", "--omni",
-        "--host", host,
-        "--port", str(port),
-        "--model", model,
-        "--backend", backend,
-        "--endpoint", endpoint,
-        "--dataset-name", dataset_name,
-        "--num-prompts", str(num_prompts),
-        "--num-warmups", "2",
-        "--percentile-metrics", "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        sys.executable,
+        "-m",
+        "vllm",
+        "bench",
+        "serve",
+        "--omni",
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--model",
+        model,
+        "--backend",
+        backend,
+        "--endpoint",
+        endpoint,
+        "--dataset-name",
+        dataset_name,
+        "--num-prompts",
+        str(num_prompts),
+        "--num-warmups",
+        "2",
+        "--percentile-metrics",
+        "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
     ]
 
     if resolved_dataset_path:
@@ -193,53 +206,39 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--model", required=True,
-        help="HuggingFace model ID (e.g. Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice)"
+        "--model", required=True, help="HuggingFace model ID (e.g. Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice)"
     )
-    parser.add_argument(
-        "--task", default="all",
-        help="Task type: voice_clone | default_voice | voice_design | all"
-    )
+    parser.add_argument("--task", default="all", help="Task type: voice_clone | default_voice | voice_design | all")
     parser.add_argument("--locale", default="en", choices=["en", "zh"])
+    parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4], metavar="N")
     parser.add_argument(
-        "--concurrency", type=int, nargs="+", default=[1, 4], metavar="N"
+        "--num-prompts",
+        type=int,
+        nargs="+",
+        default=[20],
+        metavar="N",
+        help="Number of prompts per run. If one value, applied to all concurrency levels.",
     )
     parser.add_argument(
-        "--num-prompts", type=int, nargs="+", default=[20], metavar="N",
-        help="Number of prompts per run. If one value, applied to all concurrency levels."
+        "--dataset-path", default=None, help="Root of seed-tts-eval dataset (required for voice_clone/default_voice)"
     )
-    parser.add_argument(
-        "--dataset-path", default=None,
-        help="Root of seed-tts-eval dataset (required for voice_clone/default_voice)"
-    )
-    parser.add_argument(
-        "--wer-eval", action="store_true",
-        help="Enable WER/SIM/UTMOS quality eval"
-    )
+    parser.add_argument("--wer-eval", action="store_true", help="Enable WER/SIM/UTMOS quality eval")
     parser.add_argument("--output-dir", default=None, help="Directory to save result JSON files")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--model-configs", default=str(_DEFAULT_MODEL_CONFIGS), help="Path to model_configs.yaml")
     parser.add_argument(
-        "--model-configs", default=str(_DEFAULT_MODEL_CONFIGS),
-        help="Path to model_configs.yaml"
+        "--stage-configs-dir",
+        default=str(_DEFAULT_STAGE_CONFIGS_DIR),
+        help="Directory containing stage config YAML files",
     )
-    parser.add_argument(
-        "--stage-configs-dir", default=str(_DEFAULT_STAGE_CONFIGS_DIR),
-        help="Directory containing stage config YAML files"
-    )
-    parser.add_argument(
-        "extra", nargs=argparse.REMAINDER,
-        help="Extra args passed directly to vllm bench serve"
-    )
+    parser.add_argument("extra", nargs=argparse.REMAINDER, help="Extra args passed directly to vllm bench serve")
     args = parser.parse_args()
 
     model_configs = load_model_configs(Path(args.model_configs))
     if args.model not in model_configs:
         known = "\n  ".join(model_configs.keys())
-        print(
-            f"[bench_tts] ERROR: model '{args.model}' not in model_configs.yaml.\n"
-            f"Known models:\n  {known}"
-        )
+        print(f"[bench_tts] ERROR: model '{args.model}' not in model_configs.yaml.\nKnown models:\n  {known}")
         sys.exit(1)
 
     model_cfg = model_configs[args.model]
@@ -252,8 +251,7 @@ def main() -> None:
         tasks_to_run = [args.task]
     else:
         print(
-            f"[bench_tts] ERROR: task '{args.task}' not supported by {args.model}.\n"
-            f"Supported tasks: {supported_tasks}"
+            f"[bench_tts] ERROR: task '{args.task}' not supported by {args.model}.\nSupported tasks: {supported_tasks}"
         )
         sys.exit(1)
 
@@ -273,9 +271,7 @@ def main() -> None:
     for task in tasks_to_run:
         for concurrency, num_prompts in zip(args.concurrency, num_prompts_list):
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            result_filename = (
-                f"bench_tts_{args.model.replace('/', '_')}_{task}_c{concurrency}_{ts}.json"
-            )
+            result_filename = f"bench_tts_{args.model.replace('/', '_')}_{task}_c{concurrency}_{ts}.json"
             cmd = build_bench_args(
                 host=args.host,
                 port=args.port,

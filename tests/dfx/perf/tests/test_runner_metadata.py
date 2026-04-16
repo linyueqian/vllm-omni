@@ -1,4 +1,5 @@
 """Tests for DFX runner metadata field exclusion."""
+
 import json
 
 
@@ -33,6 +34,7 @@ def test_enabled_false_entry_is_skipped():
     """benchmark_params entry with enabled=false should be skipped."""
     import sys
     from pathlib import Path
+
     sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
     from tests.dfx.conftest import create_test_parameter_mapping
 
@@ -41,14 +43,28 @@ def test_enabled_false_entry_is_skipped():
             "test_name": "test_model",
             "server_params": {"model": "some/model"},
             "benchmark_params": [
-                {"task": "voice_clone", "enabled": True, "dataset_name": "seed-tts",
-                 "backend": "openai-audio-speech", "endpoint": "/v1/audio/speech",
-                 "num_prompts": [10], "max_concurrency": [1],
-                 "percentile-metrics": "audio_rtf", "baseline": {}},
-                {"task": "voice_design", "enabled": False, "dataset_name": "seed-tts-design",
-                 "backend": "openai-audio-speech", "endpoint": "/v1/audio/speech",
-                 "num_prompts": [5], "max_concurrency": [1],
-                 "percentile-metrics": "audio_rtf", "baseline": {}},
+                {
+                    "task": "voice_clone",
+                    "enabled": True,
+                    "dataset_name": "seed-tts",
+                    "backend": "openai-audio-speech",
+                    "endpoint": "/v1/audio/speech",
+                    "num_prompts": [10],
+                    "max_concurrency": [1],
+                    "percentile-metrics": "audio_rtf",
+                    "baseline": {},
+                },
+                {
+                    "task": "voice_design",
+                    "enabled": False,
+                    "dataset_name": "seed-tts-design",
+                    "backend": "openai-audio-speech",
+                    "endpoint": "/v1/audio/speech",
+                    "num_prompts": [5],
+                    "max_concurrency": [1],
+                    "percentile-metrics": "audio_rtf",
+                    "baseline": {},
+                },
             ],
         }
     ]
