@@ -75,7 +75,7 @@
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
         "dataset_path": "benchmarks/build_dataset/seed_tts_design",
-        "num_prompts": [20],
+        "num_prompts": [20, 20],
         "max_concurrency": [1, 4],
         "seed_tts_locale": "en",
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
