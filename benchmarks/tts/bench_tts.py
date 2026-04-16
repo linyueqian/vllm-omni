@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +67,6 @@ def build_bench_args(
     locale: str,
     num_prompts: int,
     concurrency: int | None,
-    request_rate: float | None,
     dataset_path: str | None,
     wer_eval: bool,
     output_dir: str | None,
@@ -110,8 +111,6 @@ def build_bench_args(
 
     if concurrency is not None:
         cmd += ["--max-concurrency", str(concurrency), "--request-rate", "inf"]
-    elif request_rate is not None:
-        cmd += ["--request-rate", str(request_rate)]
 
     if wer_eval:
         cmd.append("--seed-tts-wer-eval")
@@ -178,7 +177,7 @@ def print_summary_table(results: list[dict[str, Any]]) -> None:
         utmos = r.get("seed_tts_mean_utmos", float("nan"))
 
         def fmt(v: float, digits: int = 3) -> str:
-            return f"{v:.{digits}f}" if v == v else "  n/a"  # nan check
+            return f"{v:.{digits}f}" if not math.isnan(v) else "  n/a"
 
         print(
             f"{task:<16} {str(conc):>11} {fmt(rtf):>10} {fmt(ttfp, 0):>10} "
@@ -273,7 +272,7 @@ def main() -> None:
 
     for task in tasks_to_run:
         for concurrency, num_prompts in zip(args.concurrency, num_prompts_list):
-            ts = __import__("datetime").datetime.now().strftime("%Y%m%d-%H%M%S")
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             result_filename = (
                 f"bench_tts_{args.model.replace('/', '_')}_{task}_c{concurrency}_{ts}.json"
             )
@@ -286,7 +285,6 @@ def main() -> None:
                 locale=args.locale,
                 num_prompts=num_prompts,
                 concurrency=concurrency,
-                request_rate=None,
                 dataset_path=args.dataset_path,
                 wer_eval=args.wer_eval,
                 output_dir=args.output_dir,
