@@ -18,9 +18,24 @@ from typing import Any
 
 
 def _install_vllm_stubs() -> None:
-    """Register minimal vllm stubs in sys.modules."""
+    """Register minimal vllm stubs in sys.modules.
+
+    Only installs when real vllm is unavailable.  We actively probe the
+    import because an empty or partial vllm may not yet have imported
+    the submodules we rely on, and unconditionally registering stubs
+    would shadow the real package for sibling tests (e.g.
+    ``tests/benchmarks/metrics/test_metrics.py`` needs the real
+    ``vllm.benchmarks.serve``).
+    """
+    try:
+        import vllm.benchmarks.datasets  # noqa: F401
+        import vllm.tokenizers  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        return  # real vllm available — do not shadow it
     if "vllm.benchmarks.datasets" in sys.modules:
-        return  # real vllm already present — nothing to do
+        return
 
     # ------------------------------------------------------------------ #
     # vllm.benchmarks.datasets                                            #
