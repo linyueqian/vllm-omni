@@ -8,6 +8,7 @@
       {
         "task": "voice_clone",
         "eval_phase": "latency",
+        "enabled": false,
         "dataset_name": "seed-tts",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
@@ -23,6 +24,7 @@
       {
         "task": "voice_clone",
         "eval_phase": "throughput",
+        "enabled": false,
         "dataset_name": "seed-tts",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
@@ -38,6 +40,7 @@
       {
         "task": "voice_clone",
         "eval_phase": "quality",
+        "enabled": false,
         "dataset_name": "seed-tts",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
@@ -64,6 +67,7 @@
         "dataset_name": "seed-tts-text",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
+        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
         "num_prompts": [20],
         "max_concurrency": [1],
         "seed_tts_locale": "en",
@@ -80,6 +84,7 @@
         "dataset_name": "seed-tts-text",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
+        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
         "num_prompts": [80],
         "max_concurrency": [8],
         "seed_tts_locale": "en",
@@ -93,9 +98,11 @@
       {
         "task": "default_voice",
         "eval_phase": "quality",
+        "enabled": false,
         "dataset_name": "seed-tts-text",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
+        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
         "num_prompts": [200],
         "max_concurrency": [4],
         "seed_tts_locale": "en",
