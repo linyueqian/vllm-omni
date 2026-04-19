@@ -47,6 +47,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni import AsyncOmni, Omni
 
+
 def _find_repo_root(start: Path) -> Path:
     """Walk up from ``start`` until a repo marker is found.
 

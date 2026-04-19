@@ -307,9 +307,7 @@ def main() -> None:
                 if args.output_dir and result_filename:
                     result_path = Path(args.output_dir) / result_filename
                     if result_path.is_file():
-                        result_path.write_text(
-                            json.dumps(result, indent=2), encoding="utf-8"
-                        )
+                        result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
     print_summary_table(all_results)
 
