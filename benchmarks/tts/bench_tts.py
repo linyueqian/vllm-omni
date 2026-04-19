@@ -46,7 +46,9 @@ def _vllm_omni_bin() -> str:
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_DEFAULT_STAGE_CONFIGS_DIR = _SCRIPT_DIR / "stage_configs"
+# Single source of truth for TTS stage configs lives under tests/dfx/perf/stage_configs
+# so that DFX nightly and this CLI never drift.
+_DEFAULT_STAGE_CONFIGS_DIR = _REPO_ROOT / "tests" / "dfx" / "perf" / "stage_configs"
 _DEFAULT_MODEL_CONFIGS = _SCRIPT_DIR / "model_configs.yaml"
 
 # Maps task name to the dataset_name used with vllm bench serve
@@ -301,6 +303,13 @@ def main() -> None:
                 result["_task"] = task
                 result["_concurrency"] = concurrency
                 all_results.append(result)
+                # Persist the metadata so plot_results.py can pick it up.
+                if args.output_dir and result_filename:
+                    result_path = Path(args.output_dir) / result_filename
+                    if result_path.is_file():
+                        result_path.write_text(
+                            json.dumps(result, indent=2), encoding="utf-8"
+                        )
 
     print_summary_table(all_results)
 

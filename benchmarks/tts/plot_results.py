@@ -170,7 +170,7 @@ def plot_comparison(
 
         metrics = [
             ("mean_audio_ttfp_ms", "TTFP (ms)", "Time-to-First-Packet", ".0f"),
-            ("mean_e2el", "E2E Latency (ms)", "End-to-End Latency", ".0f"),
+            ("mean_e2el_ms", "E2E Latency (ms)", "End-to-End Latency", ".0f"),
             ("mean_audio_rtf", "RTF", "Real-Time Factor (RTF)", ".3f"),
             ("audio_throughput", "audio-s / wall-s", "Audio Throughput", ".2f"),
         ]
@@ -212,7 +212,7 @@ def print_comparison_table(all_runs: list[list[dict]], labels: list[str]) -> Non
 
     perf_metrics = [
         ("TTFP (ms)", "mean_audio_ttfp_ms", ".1f"),
-        ("E2E (ms)", "mean_e2el", ".1f"),
+        ("E2E (ms)", "mean_e2el_ms", ".1f"),
         ("RTF", "mean_audio_rtf", ".3f"),
         ("Throughput (a-s/s)", "audio_throughput", ".2f"),
     ]

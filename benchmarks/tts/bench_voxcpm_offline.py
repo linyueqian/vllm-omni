@@ -47,7 +47,20 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni import AsyncOmni, Omni
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+def _find_repo_root(start: Path) -> Path:
+    """Walk up from ``start`` until a repo marker is found.
+
+    Falls back to ``parents[2]`` for backwards compatibility if no marker hits
+    (which can only happen in unusual checkouts — the tree should always have
+    pyproject.toml + vllm_omni/ at the top level).
+    """
+    for candidate in [start, *start.parents]:
+        if (candidate / "pyproject.toml").is_file() and (candidate / "vllm_omni").is_dir():
+            return candidate
+    return start.parents[2]
+
+
+REPO_ROOT = _find_repo_root(Path(__file__).resolve())
 DEFAULT_STAGE_ASYNC = REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "voxcpm_async_chunk.yaml"
 DEFAULT_STAGE_SYNC = REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "voxcpm.yaml"
 

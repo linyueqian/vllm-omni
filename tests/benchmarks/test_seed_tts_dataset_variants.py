@@ -90,7 +90,7 @@ def seed_tts_design_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_seed_tts_design_dataset_has_voice_description(seed_tts_design_root):
+def test_seed_tts_design_dataset_has_instructions(seed_tts_design_root):
     ds = SeedTTSDesignDataset(
         dataset_path=str(seed_tts_design_root),
         random_seed=0,
@@ -104,7 +104,8 @@ def test_seed_tts_design_dataset_has_voice_description(seed_tts_design_root):
     for req in requests:
         assert isinstance(req, SeedTTSDesignSampleRequest)
         extra = req.seed_tts_speech_extra or {}
-        assert "voice_description" in extra
+        assert "instructions" in extra
+        assert extra["instructions"], "instructions must be non-empty"
         assert extra.get("task_type") == "VoiceDesign"
         assert "ref_audio" not in extra
         assert req.seed_tts_ref_wav_path == ""

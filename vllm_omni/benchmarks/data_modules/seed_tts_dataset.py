@@ -291,7 +291,8 @@ def _parse_design_meta_line(line: str) -> _SeedTTSDesignRow | None:
 class SeedTTSDesignSampleRequest(SeedTTSSampleRequest):
     """SampleRequest for voice-design TTS (no ref_audio; voice described via natural language).
 
-    The ``seed_tts_speech_extra`` dict carries ``voice_description`` and
+    The ``seed_tts_speech_extra`` dict carries ``instructions`` (natural-language
+    voice description, forwarded as-is to the Qwen3-TTS VoiceDesign endpoint) and
     ``task_type="VoiceDesign"`` instead of ``ref_audio`` / ``ref_text``.
     SIM is skipped (``seed_tts_ref_wav_path`` is empty).
     """
@@ -304,9 +305,10 @@ class SeedTTSDesignDataset(SeedTTSDataset):
 
         utt_id|ref_text|wav_rel|target_text|voice_description
 
-    and builds requests with ``task_type="VoiceDesign"`` and a natural-language
-    ``voice_description`` instead of ``ref_audio`` / ``ref_text``.
-    Speaker-similarity (SIM) is not computed.
+    and builds requests with ``task_type="VoiceDesign"`` and the natural-language
+    ``voice_description`` column forwarded via the ``instructions`` field
+    (the Qwen3-TTS VoiceDesign endpoint's expected key) instead of
+    ``ref_audio`` / ``ref_text``.  Speaker-similarity (SIM) is not computed.
     """
 
     def load_data(self) -> None:
@@ -327,7 +329,7 @@ class SeedTTSDesignDataset(SeedTTSDataset):
         if not design_rows:
             raise ValueError(f"No valid rows in {meta}")
         if not self.disable_shuffle:
-            rng = __import__("random").Random(self.random_seed)
+            rng = random.Random(self.random_seed)
             rng.shuffle(design_rows)
         self._design_rows = design_rows
         # Keep self._rows empty — parent sample() is overridden.
