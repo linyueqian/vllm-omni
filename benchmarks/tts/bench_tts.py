@@ -46,9 +46,6 @@ def _vllm_omni_bin() -> str:
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _SCRIPT_DIR = Path(__file__).resolve().parent
-# Single source of truth for TTS stage configs lives under tests/dfx/perf/stage_configs
-# so that DFX nightly and this CLI never drift.
-_DEFAULT_STAGE_CONFIGS_DIR = _REPO_ROOT / "tests" / "dfx" / "perf" / "stage_configs"
 _DEFAULT_MODEL_CONFIGS = _SCRIPT_DIR / "model_configs.yaml"
 
 # Maps task name to the dataset_name used with vllm bench serve
@@ -238,11 +235,6 @@ def main() -> None:
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-configs", default=str(_DEFAULT_MODEL_CONFIGS), help="Path to model_configs.yaml")
-    parser.add_argument(
-        "--stage-configs-dir",
-        default=str(_DEFAULT_STAGE_CONFIGS_DIR),
-        help="Directory containing stage config YAML files",
-    )
     parser.add_argument("extra", nargs=argparse.REMAINDER, help="Extra args passed directly to vllm bench serve")
     args = parser.parse_args()
 

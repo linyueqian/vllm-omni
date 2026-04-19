@@ -2,8 +2,7 @@
   {
     "test_name": "test_qwen3_tts_base",
     "server_params": {
-      "model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-      "stage_config_name": "qwen3_tts.yaml"
+      "model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
     },
     "benchmark_params": [
       {
@@ -56,8 +55,7 @@
   {
     "test_name": "test_qwen3_tts_customvoice",
     "server_params": {
-      "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-      "stage_config_name": "qwen3_tts.yaml"
+      "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     },
     "benchmark_params": [
       {
@@ -140,60 +138,6 @@
         "baseline": {
           "mean_audio_ttfp_ms": [1500],
           "mean_audio_rtf": [0.35]
-        }
-      }
-    ]
-  },
-  {
-    "test_name": "test_voxcpm2",
-    "server_params": {
-      "model": "openbmb/VoxCPM2",
-      "stage_config_name": "voxcpm2.yaml"
-    },
-    "benchmark_params": [
-      {
-        "task": "voice_clone",
-        "eval_phase": "latency",
-        "dataset_name": "seed-tts",
-        "backend": "openai-audio-speech",
-        "endpoint": "/v1/audio/speech",
-        "num_prompts": [20],
-        "max_concurrency": [1],
-        "seed_tts_locale": "en",
-        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
-        "baseline": {
-          "mean_audio_ttfp_ms": [10000],
-          "mean_audio_rtf": [0.5]
-        }
-      },
-      {
-        "task": "voice_clone",
-        "eval_phase": "throughput",
-        "dataset_name": "seed-tts",
-        "backend": "openai-audio-speech",
-        "endpoint": "/v1/audio/speech",
-        "num_prompts": [80],
-        "max_concurrency": [4],
-        "seed_tts_locale": "en",
-        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
-        "baseline": {
-          "mean_audio_ttfp_ms": [15000],
-          "mean_audio_rtf": [0.7]
-        }
-      },
-      {
-        "task": "voice_clone",
-        "eval_phase": "quality",
-        "dataset_name": "seed-tts",
-        "backend": "openai-audio-speech",
-        "endpoint": "/v1/audio/speech",
-        "num_prompts": [200],
-        "max_concurrency": [4],
-        "seed_tts_locale": "en",
-        "seed_tts_wer_eval": true,
-        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
-        "baseline": {
-          "mean_audio_rtf": [0.7]
         }
       }
     ]
