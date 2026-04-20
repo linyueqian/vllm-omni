@@ -21,8 +21,11 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.mimo_audio"
 
 MIMO_AUDIO_PIPELINE = PipelineConfig(
     model_type="mimo_audio",
-    model_arch="MiMoAudioForConditionalGeneration",
-    hf_architectures=("MiMoAudioForConditionalGeneration",),
+    # HF ``architectures: ["MiMoAudioModel"]`` is also the registry key in
+    # ``model_executor/models/registry.py``; it resolves to the internal
+    # class ``MiMoAudioForConditionalGeneration`` in ``mimo_audio.py``.
+    model_arch="MiMoAudioModel",
+    hf_architectures=("MiMoAudioModel",),
     stages=(
         StagePipelineConfig(
             stage_id=0,
