@@ -62,6 +62,73 @@ python benchmarks/tts/plot_results.py \
 Outputs TTFP / RTF / throughput curves (and a markdown table) for every
 `(task, concurrency)` combination in the result set.
 
+## Raw `vllm bench serve` commands
+
+`bench_tts.py` is a thin wrapper that composes the right `vllm bench serve --omni`
+invocation from `model_configs.yaml`. If you need to hand-tweak bench flags
+(new sampling params, different endpoint, custom `--extra-body`, etc.), use
+the raw commands below directly — they are what the wrapper emits.
+
+### voice_clone (Qwen3-TTS-Base, seed-tts dataset)
+
+```bash
+vllm bench serve --omni \
+    --host 127.0.0.1 --port 8000 \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --backend openai-audio-speech \
+    --endpoint /v1/audio/speech \
+    --dataset-name seed-tts \
+    --dataset-path /path/to/seed-tts-eval \
+    --seed-tts-locale en \
+    --num-prompts 20 --num-warmups 2 \
+    --extra-body '{"task_type":"Base"}' \
+    --max-concurrency 1 --request-rate inf \
+    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration \
+    --save-result --result-dir ./results
+```
+
+### default_voice (Qwen3-TTS-CustomVoice, bundled seed_tts_smoke)
+
+```bash
+vllm bench serve --omni \
+    --host 127.0.0.1 --port 8000 \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --backend openai-audio-speech \
+    --endpoint /v1/audio/speech \
+    --dataset-name seed-tts-text \
+    --dataset-path benchmarks/build_dataset/seed_tts_smoke \
+    --seed-tts-locale en \
+    --num-prompts 20 --num-warmups 2 \
+    --extra-body '{"voice":"Vivian","language":"English","task_type":"CustomVoice"}' \
+    --max-concurrency 1 --request-rate inf \
+    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration \
+    --save-result --result-dir ./results
+```
+
+### voice_design (Qwen3-TTS-CustomVoice, bundled seed_tts_design)
+
+```bash
+vllm bench serve --omni \
+    --host 127.0.0.1 --port 8000 \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --backend openai-audio-speech \
+    --endpoint /v1/audio/speech \
+    --dataset-name seed-tts-design \
+    --dataset-path benchmarks/build_dataset/seed_tts_design \
+    --seed-tts-locale en \
+    --num-prompts 20 --num-warmups 2 \
+    --extra-body '{"task_type":"VoiceDesign","language":"English"}' \
+    --max-concurrency 1 --request-rate inf \
+    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration \
+    --save-result --result-dir ./results
+```
+
+### Add WER / SIM / UTMOS to any of the above
+
+Append `--seed-tts-wer-eval` (and optionally `SEED_TTS_EVAL_DEVICE=cuda:0`
+in the env, per PR #2558). This triggers the seed-tts-eval protocol:
+Whisper-large-v3 ASR → WER, WavLM embeddings → SIM, balacoon/utmos → UTMOS.
+
 ## Task types
 
 | Task            | Dataset           | Request body                                        | Checkpoints that support it              |
