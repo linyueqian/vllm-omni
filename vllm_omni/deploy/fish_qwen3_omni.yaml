@@ -25,7 +25,11 @@ stages:
     gpu_memory_utilization: 0.6
     enforce_eager: false
     async_scheduling: false
-    max_num_batched_tokens: 3072
+    # vLLM >=0.19 requires max_num_batched_tokens >= max_model_len when
+    # enable_chunked_prefill=false. Bumped from legacy 3072 to match
+    # max_model_len; chunked prefill stays off because the SlowAR decode
+    # loop isn't chunked-prefill-safe.
+    max_num_batched_tokens: 16384
     max_model_len: 16384
     devices: "0"
     output_connectors:
@@ -43,7 +47,7 @@ stages:
     gpu_memory_utilization: 0.1
     enforce_eager: true
     async_scheduling: false
-    max_num_batched_tokens: 8192
+    max_num_batched_tokens: 16384
     max_model_len: 16384
     devices: "0"
     input_connectors:
