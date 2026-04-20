@@ -1366,8 +1366,14 @@ class StageConfigFactory:
             from vllm.transformers_utils.config import get_hf_file_to_dict
 
             config_dict = get_hf_file_to_dict("config.json", model, revision=None)
-            if config_dict and "model_type" in config_dict:
-                return config_dict["model_type"], None
+            if config_dict:
+                if "model_type" in config_dict:
+                    return config_dict["model_type"], None
+                # VoxCPM2-style configs use singular ``architecture`` rather
+                # than HF's standard ``model_type`` / ``architectures``. Accept
+                # it as a fallback so the pipeline registry can still match.
+                if "architecture" in config_dict and isinstance(config_dict["architecture"], str):
+                    return config_dict["architecture"], None
         except Exception as e:
             logger.debug(f"Failed to auto-detect model type for {model}: {e}")
 
