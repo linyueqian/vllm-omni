@@ -1377,6 +1377,21 @@ class StageConfigFactory:
         except Exception as e:
             logger.debug(f"Failed to auto-detect model type for {model}: {e}")
 
+        # Final fallback: some models (e.g. CosyVoice3) ship an empty
+        # config.json and rely on naming conventions. Match the model path
+        # basename against registered pipeline keys — longest match wins
+        # so "cosyvoice3" (length 10) beats "cosyvoice" (length 9).
+        model_lower = model.lower().replace("-", "").replace("_", "")
+        best: str | None = None
+        best_len = 0
+        for registered_key in _PIPELINE_REGISTRY.keys():
+            candidate = registered_key.lower().replace("-", "").replace("_", "")
+            if candidate and candidate in model_lower and len(candidate) > best_len:
+                best = registered_key
+                best_len = len(candidate)
+        if best is not None:
+            return best, None
+
         return None, None
 
     @classmethod
