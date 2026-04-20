@@ -1,0 +1,38 @@
+# MiMo Audio deploy: 2-stage thinker+talker → code2wav (sync mode).
+# Verified on 2× H20 96G.
+# Stage 0 and stage 1 run on separate GPUs in this deploy because each
+# stage's footprint + KV cache is large; co-location needs the async-chunk
+# variant below. Use mimo_audio_async_chunk.yaml for 1-GPU streaming mode.
+async_chunk: false
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.3
+    enforce_eager: true
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 50
+      max_tokens: 18192
+      seed: 42
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.2
+    enforce_eager: true
+    async_scheduling: false
+    max_num_batched_tokens: 18192
+    max_model_len: 18192
+    devices: "1"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 18192
+      seed: 42

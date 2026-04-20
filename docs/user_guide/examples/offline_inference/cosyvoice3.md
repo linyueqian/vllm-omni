@@ -61,10 +61,14 @@ Key components live in `vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py
     - Stage 0 uses `CosyVoice3LM` and outputs speech tokens + conditioning features.
     - Stage 1 runs the flow model (DiT-based CFM) and HiFiGAN to synthesize waveform.
 
-Stage wiring is configured in `vllm_omni/model_executor/stage_configs/cosyvoice3.yaml`.
+Pipeline topology lives in `vllm_omni/model_executor/models/cosyvoice3/pipeline.py`;
+runtime tunables (batch size, memory limits, sampling) live in
+`vllm_omni/deploy/cosyvoice3.yaml` (sync) or `vllm_omni/deploy/cosyvoice3_async_chunk.yaml`
+(streaming). The deploy config auto-loads by HF `model_type`.
 
 - Stage 0 emits latent speech tokens.
-- Stage 1 consumes them via `custom_process_input_func` and outputs audio.
+- Stage 1 consumes them via `sync_process_input_func` (sync mode) or the
+  shared-memory connector (async-chunk mode) and outputs audio.
 
 ## Example materials
 
