@@ -42,7 +42,7 @@ def download_tokenizer():
 # Guard module-level setup so test collection doesn't fail in environments
 # where the model cache is read-only or models aren't available.
 try:
-    stage_configs = [get_deploy_config_path("mimo_audio_async_chunk.yaml")]
+    stage_configs = [get_deploy_config_path("mimo_audio.yaml")]
     tokenizer_path = download_tokenizer()
     os.environ["MIMO_AUDIO_TOKENIZER_PATH"] = tokenizer_path
 

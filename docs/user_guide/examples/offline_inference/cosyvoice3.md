@@ -63,8 +63,11 @@ Key components live in `vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py
 
 Pipeline topology lives in `vllm_omni/model_executor/models/cosyvoice3/pipeline.py`;
 runtime tunables (batch size, memory limits, sampling) live in
-`vllm_omni/deploy/cosyvoice3.yaml` (sync) or `vllm_omni/deploy/cosyvoice3_async_chunk.yaml`
-(streaming). The deploy config auto-loads by HF `model_type`.
+`vllm_omni/deploy/cosyvoice3.yaml`. The deploy config auto-loads by
+HF `model_type` and defaults to `async_chunk: true` (shared-memory
+streaming). Pass `--no-async-chunk` on `vllm serve` to switch to the
+legacy sync path where stage 1 runs `text2flow` over the full
+speech-token sequence.
 
 - Stage 0 emits latent speech tokens.
 - Stage 1 consumes them via `sync_process_input_func` (sync mode) or the
