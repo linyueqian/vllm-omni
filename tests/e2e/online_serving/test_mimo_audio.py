@@ -12,7 +12,7 @@ import pytest
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
-from tests.helpers.stage_config import modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -27,21 +27,16 @@ models = ["XiaomiMiMo/MiMo-Audio-7B-Instruct"]
 
 
 def get_chunk_config():
+    # Async-chunk variant of the deploy yaml, with load_format=dummy
+    # layered on top for CI (no real weight download).
     path = modify_stage_config(
-        str(Path(__file__).parent.parent / "stage_configs" / "mimo_audio_ci.yaml"),
+        get_deploy_config_path("mimo_audio_async_chunk.yaml"),
         updates={
-            "async_chunk": True,
-            "stage_args": {
-                0: {
-                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.mimo_audio.llm2code2wav_async_chunk"
-                },
-                1: {
-                    "engine_args.max_model_len": 8192,
-                    "engine_args.max_num_batched_tokens": 8192,
-                },
+            "stages": {
+                0: {"load_format": "dummy"},
+                1: {"load_format": "dummy"},
             },
         },
-        deletes={"stage_args": {1: ["custom_process_input_func"]}},
     )
     return path
 

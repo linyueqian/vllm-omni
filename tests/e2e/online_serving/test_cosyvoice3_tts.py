@@ -12,12 +12,11 @@ import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
-from pathlib import Path
-
 import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
+from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 
@@ -27,8 +26,8 @@ REF_TEXT = "希望你以后能够做的比我还好呦。"
 
 
 def get_stage_config(name: str = "cosyvoice3.yaml"):
-    """Get the stage config path from vllm_omni model_executor stage_configs."""
-    return str(Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / name)
+    """Get the deploy config path for CosyVoice3."""
+    return get_deploy_config_path(name)
 
 
 def get_prompt(prompt_type="zh"):

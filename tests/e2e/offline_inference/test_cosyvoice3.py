@@ -28,6 +28,7 @@ from vllm.sampling_params import SamplingParams
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 
@@ -44,13 +45,9 @@ REFERENCE_STAGE0_TEMPERATURE = 1.0
 REFERENCE_STAGE0_REPETITION_PENALTY = 2.0
 
 
-def _stage_config(name: str) -> str:
-    return str(Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / name)
-
-
 STAGE_CONFIGS = [
-    _stage_config("cosyvoice3.yaml"),
-    _stage_config("cosyvoice3_async_chunk.yaml"),
+    get_deploy_config_path("cosyvoice3.yaml"),
+    get_deploy_config_path("cosyvoice3_async_chunk.yaml"),
 ]
 
 
