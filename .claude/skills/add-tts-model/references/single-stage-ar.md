@@ -101,4 +101,8 @@ pre-commit.
 
 ## Reference implementation
 
-`vllm_omni/model_executor/models/moss_tts_nano/modeling_moss_tts_nano.py`
+Look for any single-stage AR model under
+`vllm_omni/model_executor/models/` — e.g. `moss_tts_nano/` when its
+integration lands. If none is in tree yet, follow the skeleton above and
+cross-check against the `is_comprehension: true` / `async_chunk: false`
+dispatch in `vllm_omni/entrypoints/openai/serving_speech.py`.

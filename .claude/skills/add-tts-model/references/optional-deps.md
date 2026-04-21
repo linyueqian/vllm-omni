@@ -33,10 +33,15 @@ def _patch_torchaudio_load() -> None:
   accepts `frame_offset`, `num_frames`, `normalize`, `channels_first`,
   `format` — missing any of them causes `TypeError` from calling code.
 - Catch `except Exception`, not just `ImportError`. `import torchaudio`
-  itself can fail with non-`ImportError` errors on broken installs.
+  itself can fail with non-`ImportError` errors on broken installs. Log the
+  exception type and message (`logger.warning("torchaudio probe failed: %s: %s",
+  type(exc).__name__, exc)`) before falling back, so unrelated errors are not
+  silently swallowed.
 - Call the patch function at the top of `load_weights()` before loading any
   audio assets. Do not call it at module import time.
 
 ## Reference implementation
 
-`vllm_omni/model_executor/models/moss_tts_nano/modeling_moss_tts_nano.py`
+Any in-tree model that patches `torchaudio.load` in its `load_weights()` —
+e.g. MOSS-TTS-Nano's `modeling_moss_tts_nano.py` once that integration
+lands.

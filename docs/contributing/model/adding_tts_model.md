@@ -661,8 +661,7 @@ piecemeal causes partial-integration failures that are hard to debug.
 
 ### 1. Stage constant
 
-Near the top of the file (around line 50), alongside the other `_*_TTS_MODEL_STAGES`
-constants:
+Near the top of the file, alongside the other `_*_TTS_MODEL_STAGES` constants:
 
 ```python
 _YOUR_MODEL_TTS_MODEL_STAGES = {"your_model_stage_key"}
@@ -670,7 +669,7 @@ _YOUR_MODEL_TTS_MODEL_STAGES = {"your_model_stage_key"}
 
 ### 2. Union into `_TTS_MODEL_STAGES`
 
-Add to the `_TTS_MODEL_STAGES` set union (around line 57):
+Add to the `_TTS_MODEL_STAGES` set union:
 
 ```python
 _TTS_MODEL_STAGES: set[str] = (
@@ -681,7 +680,7 @@ _TTS_MODEL_STAGES: set[str] = (
 
 ### 3. Model type detection
 
-In `_get_tts_model_type()`, add before the final `return None`:
+In `_detect_tts_model_type()`, add before the final `return None`:
 
 ```python
 if model_stage in _YOUR_MODEL_TTS_MODEL_STAGES:
@@ -725,7 +724,8 @@ Then wire `_build_your_model_params` into the request-dispatch block in
 `_create_tts_request()` (search for the equivalent `_build_*_params` call for an
 existing model to find the right location). If the model supports voice cloning
 (`ref_audio` → `prompt_audio_path`, `ref_text` → `prompt_text`), add those mappings
-here too — see `_build_moss_tts_params` for the pattern.
+here too — follow any existing `_build_<model>_params` in `serving_speech.py` (e.g.
+`_build_moss_tts_params` for the voice-cloning variant) for the pattern.
 
 > **Two dispatch patterns coexist:** Fish Speech uses a `self._is_fish_speech` boolean
 > checked *before* `elif self._is_tts`. All newer models use the `_tts_model_type`
@@ -794,11 +794,12 @@ stage_args:
     final_output_type: audio
 ```
 
-### VoxCPM-style streaming pattern
+### Generator-based streaming pattern
 
-Load model weights in `load_weights()` (not `__init__`) so vLLM finishes distributed
-initialisation before any CUDA allocations. Implement streaming via a per-request
-generator stored in an instance dict:
+This is the MOSS-TTS-Nano pattern, distinct from VoxCPM2's vLLM-native AR pattern
+(see `plan/voxcpm2_native_ar_design.md` for that variant). Load model weights in
+`load_weights()` (not `__init__`) so vLLM finishes distributed initialisation before
+any CUDA allocations. Stream via a per-request generator stored in an instance dict:
 
 ```python
 class YourModelForCausalLM(nn.Module):
@@ -830,21 +831,19 @@ class YourModelForCausalLM(nn.Module):
         outputs, last_flags = [], []
         for info in infos:
             request_key = str(info.get("_omni_req_id", "0"))  # set by vLLM, not user code
-
             if request_key not in self._stream_gens:
                 self._stream_gens[request_key] = self._create_stream_gen(info)
+            try:
+                chunk, is_last = next(self._stream_gens[request_key])
+            except StopIteration:
+                chunk, is_last = torch.zeros(0), True
+            if is_last:
+                del self._stream_gens[request_key]
+            outputs.append(chunk)
+            last_flags.append(is_last)
 
-        gen = self._stream_gens[request_key]
-        try:
-            chunk, is_last = next(gen)
-        except StopIteration:
-            is_last = True
-            chunk = torch.zeros(0)
-
-        if is_last:
-            del self._stream_gens[request_key]
-
-        return OmniOutput(multimodal_outputs={"waveform": chunk, "is_last": is_last})
+        self._ar_emit_stop_token = all(last_flags)
+        return OmniOutput(multimodal_outputs={"model_outputs": outputs, "is_last": last_flags})
 
     def _create_stream_gen(self, info: dict):
         """Yield (waveform_tensor, is_last) from the model's inference_stream().
@@ -868,8 +867,9 @@ class YourModelForCausalLM(nn.Module):
         ...
 ```
 
-See `vllm_omni/model_executor/models/moss_tts_nano/modeling_moss_tts_nano.py` for the
-complete reference implementation.
+For an in-tree reference, look for any single-stage AR model under
+`vllm_omni/model_executor/models/` (for example
+`moss_tts_nano/modeling_moss_tts_nano.py` once its integration has landed).
 
 ## Pre-commit and DCO
 
@@ -937,7 +937,7 @@ for the expected format.
 Adding a TTS model to vLLM-Omni involves:
 
 1. **Create model directory** with AR stage, decoder stage, and unified class (two-stage)
-   or a single unified class with VoxCPM-style streaming (single-stage)
+   or a single unified class with generator-based streaming (single-stage)
 2. **AR stage** - use vLLM's native decoder layers with fused QKV; do not wrap HF directly
 3. **Decoder stage** - thin wrapper around your audio decoder; implement `chunked_decode_streaming()`
 4. **Unified class** - dispatches on `model_stage`; same structure as `Qwen3TTSModelForGeneration`

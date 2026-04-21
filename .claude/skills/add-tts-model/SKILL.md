@@ -198,8 +198,10 @@ and `async_chunk: false` at the top level. Only extract params from
 
 Full walkthrough with the complete `forward()` / `_create_stream_gen()`
 skeleton and stage-config fields:
-[references/single-stage-ar.md](references/single-stage-ar.md). Reference
-implementation: `vllm_omni/model_executor/models/moss_tts_nano/`.
+[references/single-stage-ar.md](references/single-stage-ar.md). For an
+in-tree reference, look for any single-stage AR model under
+`vllm_omni/model_executor/models/` — e.g. the MOSS-TTS-Nano integration when
+it lands.
 
 **VoxCPM2 is a different pattern** and should not reuse this skeleton — it
 runs the base LM under vLLM PagedAttention with external side-computation.
@@ -222,12 +224,12 @@ See `plan/voxcpm2_native_ar_design.md`.
    partial integration causes hard-to-debug failures. This file is modified by every
    model PR and is the most common source of rebase conflicts — see conflict note below.
 
-   **Point 1** — stage constant (~line 50):
+   **Point 1** — stage constant (near the top, alongside the other `_*_TTS_MODEL_STAGES` sets):
    ```python
    _YOUR_MODEL_TTS_MODEL_STAGES = {"your_stage_key"}
    ```
 
-   **Point 2** — union into `_TTS_MODEL_STAGES` (~line 57):
+   **Point 2** — union into `_TTS_MODEL_STAGES`:
    ```python
    _TTS_MODEL_STAGES: set[str] = (
        ...
@@ -235,7 +237,7 @@ See `plan/voxcpm2_native_ar_design.md`.
    )
    ```
 
-   **Point 3** — model type detection in `_get_tts_model_type()`:
+   **Point 3** — model type detection in `_detect_tts_model_type()`:
    ```python
    if model_stage in _YOUR_MODEL_TTS_MODEL_STAGES:
        return "your_model"
@@ -266,7 +268,7 @@ See `plan/voxcpm2_native_ar_design.md`.
    > **Two dispatch patterns coexist**: Fish Speech uses a `self._is_fish_speech` boolean
    > instance attribute checked before `elif self._is_tts`, while all newer models
    > (CosyVoice3, MOSS-TTS-Nano) use the `_tts_model_type` string returned by
-   > `_get_tts_model_type()`. For new models, always use the `_tts_model_type` string
+   > `_detect_tts_model_type()`. For new models, always use the `_tts_model_type` string
    > pattern — do not add new `_is_*` flags.
 
    > **Unused variable rule**: only extract fields in `_build_your_model_params` that
