@@ -86,7 +86,10 @@ _DEFAULT_AUDIO_TOP_K = 25
 _DEFAULT_AUDIO_REPETITION_PENALTY = 1.2
 _DEFAULT_MAX_NEW_FRAMES = 375
 _DEFAULT_VOICE = "Junhao"
-_DEFAULT_MODE = "continuation"
+# "voice_clone" mirrors the mode used by offline examples and tests:
+# built-in voices (e.g. "Junhao") are backed by preset reference audio
+# upstream, so the default produces the expected voice timbre.
+_DEFAULT_MODE = "voice_clone"
 
 
 def _pick(info: dict, key: str, default):
@@ -124,9 +127,12 @@ class MossTTSNanoForGeneration(nn.Module):
         self._lock = threading.Lock()
 
         # Per-request streaming generators (VoxCPM pattern).
+        # Single-threaded AR worker: mutations happen only inside forward(),
+        # so we rely on the worker's serial execution instead of self._lock.
         self._stream_gens: dict[str, Any] = {}
-        # Controls whether compute_logits() emits EOS.
-        self._ar_emit_stop_token = True
+        # Per-row EOS mask aligned with the most recent forward() batch.
+        # compute_logits() emits EOS for rows flagged True, keeps others alive.
+        self._ar_last_chunk_flags: list[bool] = []
 
     # ------------------------------------------------------------------
     # Weight loading
@@ -191,6 +197,9 @@ class MossTTSNanoForGeneration(nn.Module):
             self._audio_tokenizer = audio_tokenizer
             logger.info("MOSS-Audio-Tokenizer-Nano loaded on %s", device)
 
+        # MOSS-TTS-Nano loads weights inline via from_pretrained() above;
+        # vLLM's weight-loading protocol still requires us to exhaust the
+        # iterator so the underlying stream is closed cleanly.
         for _ in weights:
             pass
         return set()
@@ -222,16 +231,29 @@ class MossTTSNanoForGeneration(nn.Module):
         prompt_audio_path: str | None = _pick(info, "prompt_audio_path", None)
         if prompt_audio_path is not None:
             prompt_audio_path = str(prompt_audio_path)
+        # Voice-cloning path: serving layer passes the resolved waveform as
+        # (wav_list, sample_rate) so we can avoid re-decoding base64 and the
+        # model owns temp-file lifecycle.
+        prompt_audio_array = _pick(info, "prompt_audio_array", None)
         prompt_text: str | None = _pick(info, "prompt_text", None)
         if prompt_text is not None:
             prompt_text = str(prompt_text)
         max_new_frames: int = int(_pick(info, "max_new_frames", _DEFAULT_MAX_NEW_FRAMES))
         seed: int | None = _pick(info, "seed", None)
         if seed is not None:
+            # Upstream inference_stream relies on global RNG state. With
+            # max_num_seqs > 1, concurrent seeded requests will race to set
+            # the global seed; snapshot and restore on exit so we at least
+            # don't leak state back to other components of the engine.
             seed = int(seed)
+            _cpu_rng_state = torch.get_rng_state()
+            _cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
+        else:
+            _cpu_rng_state = None
+            _cuda_rng_state = None
 
         sampling = {
             "text_temperature": float(_pick(info, "text_temperature", _DEFAULT_TEXT_TEMPERATURE)),
@@ -250,9 +272,29 @@ class MossTTSNanoForGeneration(nn.Module):
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             output_path = tmp.name
 
-        # Collect all audio events from inference_stream, then yield them
-        # one by one.  We buffer first because inference_stream mixes
-        # "audio" events with a final "result" event.
+        # Materialise resolved reference audio to a temp WAV so upstream's
+        # prompt_audio_path (which expects a filesystem path) can consume it.
+        prompt_audio_tmp: str | None = None
+        if prompt_audio_array is not None and prompt_audio_path is None:
+            try:
+                import numpy as np
+                import soundfile as sf
+
+                wav_list, sr_in = prompt_audio_array
+                wav_np = np.asarray(wav_list, dtype=np.float32)
+                if wav_np.ndim > 1:
+                    wav_np = np.mean(wav_np, axis=-1)
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_in:
+                    prompt_audio_tmp = tmp_in.name
+                sf.write(prompt_audio_tmp, wav_np, int(sr_in))
+                prompt_audio_path = prompt_audio_tmp
+            except Exception:
+                logger.exception("MOSS-TTS-Nano failed to stage prompt_audio_array to temp file")
+                prompt_audio_tmp = None
+
+        # Stream audio chunks from inference_stream as they arrive. A final
+        # "result" event is only used as a fallback when no audio events
+        # were emitted (e.g. very short utterances on some backends).
         audio_chunks: list[torch.Tensor] = []
         try:
             for event in self._lm.inference_stream(
@@ -296,6 +338,15 @@ class MossTTSNanoForGeneration(nn.Module):
                 Path(output_path).unlink(missing_ok=True)
             except Exception:
                 pass
+            if prompt_audio_tmp is not None:
+                try:
+                    Path(prompt_audio_tmp).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if _cpu_rng_state is not None:
+                torch.set_rng_state(_cpu_rng_state)
+            if _cuda_rng_state is not None:
+                torch.cuda.set_rng_state_all(_cuda_rng_state)
 
         # Signal completion. If we yielded audio chunks above, the last
         # yield was is_last=False, so emit a final empty sentinel.
@@ -330,7 +381,8 @@ class MossTTSNanoForGeneration(nn.Module):
         infos = runtime_additional_information or [{}]
 
         if not runtime_additional_information or all(info.get("_is_dummy") for info in infos):
-            self._ar_emit_stop_token = True
+            # Dummy/warmup path: finish immediately for every row.
+            self._ar_last_chunk_flags = [True] * len(infos)
             return OmniOutput(
                 text_hidden_states=hidden,
                 multimodal_outputs={
@@ -374,8 +426,9 @@ class MossTTSNanoForGeneration(nn.Module):
 
             srs.append(sr_tensor)
 
-        # Emit EOS only when ALL requests in this batch have finished.
-        self._ar_emit_stop_token = all(last_chunk_flags)
+        # Per-row EOS mask: compute_logits() finishes each request the step
+        # its last chunk was yielded, without waiting for the slowest peer.
+        self._ar_last_chunk_flags = last_chunk_flags
 
         return OmniOutput(
             text_hidden_states=hidden,
@@ -391,11 +444,11 @@ class MossTTSNanoForGeneration(nn.Module):
         hidden_states: torch.Tensor | OmniOutput,
         sampling_metadata: Any = None,
     ) -> torch.Tensor:
-        """Emit EOS or non-EOS logits to control AR scheduler lifetime.
+        """Emit per-row EOS / non-EOS logits to control AR scheduler lifetime.
 
-        When _ar_emit_stop_token is True, the logits strongly favour EOS
-        so the scheduler finishes the request.  Otherwise, a non-EOS token
-        is favoured to keep the request alive for the next chunk.
+        Rows whose ``_ar_last_chunk_flags`` entry is True get EOS-dominant
+        logits so the scheduler finishes that request; other rows get a
+        non-EOS token so they stay alive for the next streaming chunk.
         """
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
@@ -417,12 +470,18 @@ class MossTTSNanoForGeneration(nn.Module):
         )
         eos_id = 2 if vocab_size > 2 else 0
         safe_id = 1 if vocab_size > 1 and 1 != eos_id else 0
-        if num_rows > 0:
-            if self._ar_emit_stop_token:
-                logits[:, eos_id] = 1.0e6
+
+        flags = self._ar_last_chunk_flags
+        # If we lost alignment with the forward batch (e.g. scheduler dropped
+        # a row), conservatively treat missing rows as "finished" to avoid
+        # stranding requests.
+        for row in range(num_rows):
+            is_last = flags[row] if row < len(flags) else True
+            if is_last:
+                logits[row, eos_id] = 1.0e6
             else:
-                logits[:, eos_id] = -1.0e9
-                logits[:, safe_id] = 1.0e6
+                logits[row, eos_id] = -1.0e9
+                logits[row, safe_id] = 1.0e6
         return logits
 
     def embed_input_ids(
