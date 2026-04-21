@@ -12,7 +12,7 @@ import pytest
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -24,21 +24,6 @@ CHAT_TEMPLATE_PATH = str(
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 models = ["XiaomiMiMo/MiMo-Audio-7B-Instruct"]
-
-
-def get_chunk_config():
-    # Async-chunk variant of the deploy yaml, with load_format=dummy
-    # layered on top for CI (no real weight download).
-    path = modify_stage_config(
-        get_deploy_config_path("mimo_audio_async_chunk.yaml"),
-        updates={
-            "stages": {
-                0: {"load_format": "dummy"},
-                1: {"load_format": "dummy"},
-            },
-        },
-    )
-    return path
 
 
 def download_tokenizer():
@@ -54,19 +39,21 @@ def download_tokenizer():
     return local_path
 
 
-# CI stage config for H100 / MI325
 # Guard module-level setup so test collection doesn't fail in environments
 # where the model cache is read-only or models aren't available.
 try:
-    stage_configs = [get_chunk_config()]
+    stage_configs = [get_deploy_config_path("mimo_audio_async_chunk.yaml")]
     tokenizer_path = download_tokenizer()
     os.environ["MIMO_AUDIO_TOKENIZER_PATH"] = tokenizer_path
 
+    # --load-format dummy applies to every stage pipeline-wide, avoiding a
+    # per-stage yaml rewrite (the old approach wrote a tempfile + atexit-unlink
+    # which raced with CI's process lifecycle).
     test_params = [
         OmniServerParams(
             model=model,
             stage_config_path=stage_config,
-            server_args=["--chat-template", CHAT_TEMPLATE_PATH],
+            server_args=["--chat-template", CHAT_TEMPLATE_PATH, "--load-format", "dummy"],
         )
         for model in models
         for stage_config in stage_configs
