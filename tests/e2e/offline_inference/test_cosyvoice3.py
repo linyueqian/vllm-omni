@@ -164,9 +164,7 @@ def test_cosyvoice3_offline_reference_zero_shot(async_chunk: bool) -> None:
         sampling_params_list = omni_runner.get_default_sampling_params_list()
         sampling_params_list[0] = _reference_zero_shot_stage0_sampling(text=REFERENCE_SYNTH_TEXT)
 
-        outputs = omni_runner.omni.generate(
-            _build_reference_inputs((prompt_audio, prompt_sr)), sampling_params_list
-        )
+        outputs = omni_runner.omni.generate(_build_reference_inputs((prompt_audio, prompt_sr)), sampling_params_list)
 
         assert outputs, "No outputs returned"
         audio_mm = outputs[0].multimodal_output
