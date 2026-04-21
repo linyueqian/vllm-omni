@@ -12,7 +12,6 @@ from tests.utils import hardware_test
 from vllm_omni import Omni
 
 MODEL_NAME = "OpenMOSS-Team/MOSS-TTS-Nano"
-STAGE_CONFIG = "vllm_omni/model_executor/stage_configs/moss_tts_nano.yaml"
 SAMPLE_RATE = 48000
 
 DEFAULT_SAMPLING = SamplingParams(
@@ -61,7 +60,7 @@ def _collect_audio(omni: Omni, request: dict) -> tuple[torch.Tensor, int]:
 @pytest.fixture(scope="module")
 def omni_engine():
     """Module-scoped Omni engine to avoid re-loading the model for each test."""
-    return Omni(model=MODEL_NAME, stage_configs_path=STAGE_CONFIG, stage_init_timeout=180)
+    return Omni(model=MODEL_NAME, stage_init_timeout=180)
 
 
 @pytest.mark.omni

@@ -31,7 +31,7 @@ Options:
   --text-temperature F      Text layer temperature (default: 1.0)
   --batch                   Run a built-in batch of diverse samples (ZH/EN/FR)
   --output-dir DIR          Directory for WAV outputs (default: /tmp/moss_tts_nano_output)
-  --stage-config PATH       Path to stage config YAML
+  --deploy-config PATH      Override deploy YAML (defaults to vllm_omni/deploy/moss_tts_nano.yaml)
   --stage-init-timeout INT  Timeout in seconds for stage init (default: 120)
 ```
 
@@ -77,15 +77,17 @@ python end2end.py --text "Deterministic test." --seed 42
 | `Hina` | JA |
 | `Mei` | JA |
 
-## Stage Config
+## Deploy Config
 
-The stage config is at `vllm_omni/model_executor/stage_configs/moss_tts_nano.yaml`. Key settings:
+Runtime knobs live in `vllm_omni/deploy/moss_tts_nano.yaml` (auto-loaded;
+override with `--deploy-config PATH`). Key stage-level settings:
 
 ```yaml
-engine_args:
-  gpu_memory_utilization: 0.3   # ~2 GB VRAM; increase for faster init
-  max_num_seqs: 4               # concurrent requests
-  max_model_len: 4096
+stages:
+  - stage_id: 0
+    gpu_memory_utilization: 0.3   # ~2 GB VRAM; increase for faster init
+    max_num_seqs: 4               # concurrent requests
+    max_model_len: 4096
 ```
 
 ## Output Format

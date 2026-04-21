@@ -29,13 +29,12 @@ Features:
 ## Launch the Server
 
 ```bash
-vllm-omni serve OpenMOSS-Team/MOSS-TTS-Nano \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/moss_tts_nano.yaml \
-    --omni \
-    --port 8091 \
-    --trust-remote-code \
-    --enforce-eager
+vllm serve OpenMOSS-Team/MOSS-TTS-Nano --omni --port 8091
 ```
+
+The deploy config at `vllm_omni/deploy/moss_tts_nano.yaml` auto-loads; no
+`--stage-configs-path`, `--trust-remote-code`, or `--enforce-eager` flags
+are needed.
 
 Or use the convenience script:
 

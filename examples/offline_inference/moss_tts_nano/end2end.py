@@ -39,9 +39,6 @@ from vllm_omni import Omni  # noqa: E402
 
 MODEL = "OpenMOSS-Team/MOSS-TTS-Nano"
 
-_REPO_ROOT = Path(__file__).resolve().parents[4]
-DEFAULT_STAGE_CONFIG = str(_REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "moss_tts_nano.yaml")
-
 BATCH_SAMPLES = [
     {"text": "Hello, this is a test of MOSS-TTS-Nano.", "voice": "Ava", "label": "en_hello"},
     {"text": "你好，这是 MOSS-TTS-Nano 的语音合成测试。", "voice": "Junhao", "label": "zh_hello"},
@@ -98,7 +95,7 @@ def save_audio(waveform: torch.Tensor, path: str, sample_rate: int = 48000) -> N
 def main(args) -> None:
     omni = Omni(
         model=MODEL,
-        stage_configs_path=args.stage_config,
+        deploy_config=args.deploy_config,
         stage_init_timeout=args.stage_init_timeout,
     )
 
@@ -170,7 +167,11 @@ def parse_args():
     parser.add_argument("--text-temperature", type=float, default=1.0)
     parser.add_argument("--batch", action="store_true", help="Run built-in batch of diverse samples.")
     parser.add_argument("--output-dir", default="/tmp/moss_tts_nano_output", help="Directory for WAV outputs.")
-    parser.add_argument("--stage-config", default=DEFAULT_STAGE_CONFIG)
+    parser.add_argument(
+        "--deploy-config",
+        default=None,
+        help="Path to a deploy YAML; leave unset to auto-load vllm_omni/deploy/moss_tts_nano.yaml.",
+    )
     parser.add_argument("--stage-init-timeout", type=int, default=120)
     return parser.parse_args()
 

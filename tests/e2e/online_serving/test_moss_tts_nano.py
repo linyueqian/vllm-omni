@@ -12,19 +12,13 @@ import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
-from pathlib import Path
-
 import pytest
 
 from tests.conftest import OmniServerParams
+from tests.helpers.stage_config import get_deploy_config_path
 from tests.utils import hardware_test
 
 MODEL = "OpenMOSS-Team/MOSS-TTS-Nano"
-
-
-def get_stage_config(name: str = "moss_tts_nano.yaml"):
-    """Get the stage config path from vllm_omni model_executor stage_configs."""
-    return str(Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / name)
 
 
 def get_prompt(prompt_type="text"):
@@ -40,8 +34,8 @@ tts_server_params = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=get_stage_config("moss_tts_nano.yaml"),
-            server_args=["--trust-remote-code", "--enforce-eager", "--disable-log-stats"],
+            stage_config_path=get_deploy_config_path("moss_tts_nano.yaml"),
+            server_args=["--disable-log-stats"],
         ),
         id="moss_tts_nano",
     )
