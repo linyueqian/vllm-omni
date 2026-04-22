@@ -450,9 +450,7 @@ class MossTTSNanoForGeneration(nn.Module):
                 try:
                     gen.close()
                 except Exception:
-                    logger.exception(
-                        "MOSS-TTS-Nano failed to close stream gen for request %s", req_id
-                    )
+                    logger.exception("MOSS-TTS-Nano failed to close stream gen for request %s", req_id)
 
     # ------------------------------------------------------------------
     # AR runner interface
