@@ -2093,6 +2093,7 @@ async def _load_input_images(
 
     return images
 
+
 def apply_stage_default_sampling_params(
     default_params_json: str | None,
     sampling_params: Any,

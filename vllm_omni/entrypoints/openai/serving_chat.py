@@ -88,7 +88,7 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     choose_output_format,
     encode_image_base64_with_compression,
     get_vllm_image_params,
-    validate_layered_layers
+    validate_layered_layers,
 )
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio

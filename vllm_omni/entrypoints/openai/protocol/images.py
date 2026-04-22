@@ -9,8 +9,8 @@ for text-to-image generation, with vllm-omni specific extensions.
 
 from enum import Enum
 from typing import Annotated, Any
-from fastapi import Form
 
+from fastapi import Form
 from pydantic import BaseModel, Field, field_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers

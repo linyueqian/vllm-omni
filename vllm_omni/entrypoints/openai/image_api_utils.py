@@ -52,6 +52,7 @@ def parse_size(size_str: str) -> tuple[int, int]:
 
     return width, height
 
+
 def encode_image_base64_with_compression(
     image: Image.Image, format: str = "png", output_compression: int = 100
 ) -> str:
@@ -76,6 +77,7 @@ def encode_image_base64_with_compression(
     buffer.seek(0)
     return base64.b64encode(buffer.read()).decode("utf-8")
 
+
 def _prepare_image_for_output_format(image: Image.Image, format: str) -> Image.Image:
     fmt = format.lower()
     if fmt not in {"jpg", "jpeg"}:
@@ -92,6 +94,7 @@ def _prepare_image_for_output_format(image: Image.Image, format: str) -> Image.I
 
     return image.convert("RGB")
 
+
 def choose_output_format(output_format: str | None, background: str | None) -> str:
     # Normalize and choose extension
     fmt = (output_format or "").lower()
@@ -102,6 +105,7 @@ def choose_output_format(output_format: str | None, background: str | None) -> s
         return "png"
     # Default
     return "jpeg"
+
 
 def get_vllm_image_params(vllm_xargs: dict | None):
     if not vllm_xargs:
@@ -124,6 +128,7 @@ def get_vllm_image_params(vllm_xargs: dict | None):
         image_background = "auto"
 
     return image_format, image_compression, image_background
+
 
 def validate_layered_layers(layers: int | None) -> int | None:
     """Validate the Qwen-Image-Layered ``layers`` parameter."""
