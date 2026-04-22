@@ -1218,12 +1218,43 @@ class TestCLIExplicitPrecedence:
         )
         assert stages[0].runtime_overrides.get("gpu_memory_utilization") == 0.42
 
-    def test_none_explicit_set_treats_all_as_explicit(self):
-        """Programmatic Omni() callers (cli_explicit_keys=None) keep current behavior."""
+    def test_programmatic_nondefault_overrides_yaml(self):
+        """Programmatic ``Omni(...)`` callers (``cli_explicit_keys=None``) still
+        override YAML when the kwarg differs from the ``OmniEngineArgs``
+        dataclass default."""
         stages = self._stages(
             cli_overrides={"max_num_seqs": 999},
             cli_explicit_keys=None,
         )
+        assert stages[2].runtime_overrides.get("max_num_seqs") == 999
+
+    def test_programmatic_default_value_defers_to_yaml(self):
+        """Programmatic callers passing the dataclass default for a field must
+        not clobber a value the deploy YAML already sets. Guards the
+        precedence ladder against argparse-less callers that forward every
+        EngineArgs field unconditionally."""
+        import dataclasses
+
+        from vllm_omni.engine.arg_utils import OmniEngineArgs
+
+        default_max_num_seqs = next(
+            f.default for f in dataclasses.fields(OmniEngineArgs) if f.name == "max_num_seqs"
+        )
+        stages = self._stages(
+            cli_overrides={"max_num_seqs": default_max_num_seqs},
+            cli_explicit_keys=None,
+        )
+        # Stage 2's YAML value (1) must survive the default-valued kwarg.
+        assert stages[2].runtime_overrides.get("max_num_seqs") != default_max_num_seqs
+
+    def test_programmatic_required_field_still_explicit(self):
+        """Fields without a dataclass default (e.g. ``model``) are always
+        treated as explicit, even for argparse-less callers."""
+        stages = self._stages(
+            cli_overrides={"model": "openbmb/VoxCPM2", "max_num_seqs": 999},
+            cli_explicit_keys=None,
+        )
+        # Non-default max_num_seqs propagates; model (no default) propagates.
         assert stages[2].runtime_overrides.get("max_num_seqs") == 999
 
     def test_explicit_async_chunk_false_overrides_yaml(self):

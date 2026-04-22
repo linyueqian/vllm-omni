@@ -959,6 +959,51 @@ class ModelPipeline:
         return errors
 
 
+def _infer_explicit_keys_from_defaults(cli_overrides: dict[str, Any]) -> set[str]:
+    """Infer which ``cli_overrides`` keys were explicitly set by a caller
+    that has no argparse layer (programmatic ``Omni(...)`` / ``AsyncOmni(...)``).
+
+    Compares each override value against the corresponding ``OmniEngineArgs``
+    dataclass default. Values differing from the default are treated as
+    explicit and will override deploy YAML; values matching the default fall
+    through as fallbacks. Fields without a dataclass default (required args
+    like ``model``) are always treated as explicit.
+
+    This mirrors CLI semantics — where argparse distinguishes typed flags
+    from parser-default fill — without requiring every caller to track the
+    set of explicit keys manually. See vllm-project/vllm-omni#2958 discussion.
+    """
+    # Lazy import to avoid a circular dependency through engine.arg_utils.
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
+
+    field_defaults: dict[str, Any] = {}
+    for f in dataclasses.fields(OmniEngineArgs):
+        if f.default is not dataclasses.MISSING:
+            field_defaults[f.name] = f.default
+        elif f.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
+            try:
+                field_defaults[f.name] = f.default_factory()
+            except Exception:
+                # Factory needs state we don't have; be conservative and
+                # treat matching values as explicit by omitting from the map.
+                continue
+
+    explicit: set[str] = set()
+    for key, value in cli_overrides.items():
+        if key not in field_defaults:
+            # Required field (no default) or not a dataclass field at all.
+            # Treat as explicit to preserve current semantics.
+            explicit.add(key)
+            continue
+        try:
+            if value != field_defaults[key]:
+                explicit.add(key)
+        except Exception:
+            # Unhashable / unusual types: treat as explicit to be safe.
+            explicit.add(key)
+    return explicit
+
+
 class StageConfigFactory:
     """Factory that loads pipeline YAML and merges CLI overrides.
 
@@ -1056,8 +1101,11 @@ class StageConfigFactory:
         the user actually typed (captured in ``OmniServeCommand.cmd``). Any
         kwarg whose key is not in that set is treated as a parser default
         and is only used to fill fields YAML doesn't already cover. When the
-        set is ``None`` (programmatic ``Omni()`` callers, which have no
-        argparse layer), every kwarg is treated as explicit.
+        set is ``None`` (programmatic ``Omni()`` / ``AsyncOmni()`` callers,
+        which have no argparse layer), the explicit set is inferred by
+        comparing ``cli_overrides`` against ``OmniEngineArgs`` dataclass
+        defaults — values matching the dataclass default fall through as
+        fallbacks so deploy YAML keeps precedence.
         """
         # Resolve deploy config path
         if deploy_config_path is None:
@@ -1074,8 +1122,15 @@ class StageConfigFactory:
         else:
             deploy_cfg = load_deploy_config(deploy_path)
 
+        # Programmatic callers (no argparse layer) pass ``cli_explicit_keys=None``.
+        # Derive an explicit-key set from dataclass defaults so deploy YAML stays
+        # authoritative when the caller is just forwarding EngineArgs defaults.
+        resolved_explicit_keys: set[str] | None = cli_explicit_keys
+        if resolved_explicit_keys is None:
+            resolved_explicit_keys = _infer_explicit_keys_from_defaults(cli_overrides)
+
         cli_async_chunk = cli_overrides.get("async_chunk")
-        if cli_async_chunk is not None and (cli_explicit_keys is None or "async_chunk" in cli_explicit_keys):
+        if cli_async_chunk is not None and "async_chunk" in resolved_explicit_keys:
             deploy_cfg.async_chunk = bool(cli_async_chunk)
 
         pipeline_key = deploy_cfg.pipeline or model_type
@@ -1097,7 +1152,7 @@ class StageConfigFactory:
             if value is None:
                 continue
             is_per_stage = bool(re.match(r"stage_\d+_", key))
-            is_explicit = cli_explicit_keys is None or key in cli_explicit_keys or is_per_stage
+            is_explicit = key in resolved_explicit_keys or is_per_stage
             if is_explicit:
                 explicit_overrides[key] = value
             else:
