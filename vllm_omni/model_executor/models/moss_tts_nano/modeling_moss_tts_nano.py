@@ -435,6 +435,25 @@ class MossTTSNanoForGeneration(nn.Module):
             multimodal_outputs={"model_outputs": outputs, "sr": srs},
         )
 
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        """Release streaming generators for requests the scheduler finished.
+
+        forward() only pops generators on normal completion (is_last or
+        StopIteration). Abnormal termination (cancel, timeout, preempt) would
+        otherwise leak the generator and skip its ``finally`` block, stranding
+        temp WAV files. Closing here raises GeneratorExit inside the generator
+        so the cleanup block runs.
+        """
+        for req_id in finished_req_ids:
+            gen = self._stream_gens.pop(str(req_id), None)
+            if gen is not None:
+                try:
+                    gen.close()
+                except Exception:
+                    logger.exception(
+                        "MOSS-TTS-Nano failed to close stream gen for request %s", req_id
+                    )
+
     # ------------------------------------------------------------------
     # AR runner interface
     # ------------------------------------------------------------------
