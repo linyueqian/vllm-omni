@@ -1230,20 +1230,28 @@ class TestCLIExplicitPrecedence:
 
     def test_programmatic_default_value_defers_to_yaml(self):
         """Programmatic callers passing the dataclass default for a field must
-        not clobber a value the deploy YAML already sets. Guards the
-        precedence ladder against argparse-less callers that forward every
-        EngineArgs field unconditionally."""
+        not clobber a value the deploy YAML already sets. Matches the rank-4
+        precedence from #2655: plain caller kwargs are fallback-only.
+
+        Uses ``gpu_memory_utilization`` because it has a concrete non-None
+        dataclass default (``0.9``); fields with ``None`` defaults are already
+        short-circuited by the ``if value is None: continue`` guard upstream.
+        """
         import dataclasses
 
         from vllm_omni.engine.arg_utils import OmniEngineArgs
 
-        default_max_num_seqs = next(f.default for f in dataclasses.fields(OmniEngineArgs) if f.name == "max_num_seqs")
+        default_gpu_mem = next(
+            f.default for f in dataclasses.fields(OmniEngineArgs) if f.name == "gpu_memory_utilization"
+        )
+        # qwen3_omni_moe stage 2 yaml sets gpu_memory_utilization=0.1; the
+        # default (0.9) must not clobber it.
         stages = self._stages(
-            cli_overrides={"max_num_seqs": default_max_num_seqs},
+            cli_overrides={"gpu_memory_utilization": default_gpu_mem},
             cli_explicit_keys=None,
         )
-        # Stage 2's YAML value (1) must survive the default-valued kwarg.
-        assert stages[2].runtime_overrides.get("max_num_seqs") != default_max_num_seqs
+        assert stages[2].yaml_engine_args.get("gpu_memory_utilization") == 0.1
+        assert stages[2].runtime_overrides.get("gpu_memory_utilization") is None
 
     def test_programmatic_required_field_still_explicit(self):
         """Fields without a dataclass default (e.g. ``model``) are always
