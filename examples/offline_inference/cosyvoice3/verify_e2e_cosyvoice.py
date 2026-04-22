@@ -54,11 +54,15 @@ def run_e2e():
 
     print(f"Initializing cosyvoice E2E with model={args.model}")
 
-    omni = Omni(
-        model=args.model,
-        deploy_config=args.deploy_config,
+    # Route through ``from_cli_args`` so ``detect_explicit_cli_keys`` captures
+    # which flags the user actually typed on the command line. Without this,
+    # argparse-filled defaults would be indistinguishable from user-typed
+    # values at the StageConfigFactory boundary, and programmatic kwargs are
+    # fallback-only under the precedence ladder (see #2655, #3006).
+    omni = Omni.from_cli_args(
+        args,
+        parser=parser,
         trust_remote_code=True,
-        tokenizer=args.tokenizer,
         log_stats=True,
     )
 

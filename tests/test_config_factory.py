@@ -1218,49 +1218,49 @@ class TestCLIExplicitPrecedence:
         )
         assert stages[0].runtime_overrides.get("gpu_memory_utilization") == 0.42
 
-    def test_programmatic_nondefault_overrides_yaml(self):
-        """Programmatic ``Omni(...)`` callers (``cli_explicit_keys=None``) still
-        override YAML when the kwarg differs from the ``OmniEngineArgs``
-        dataclass default."""
+    def test_programmatic_kwargs_are_fallback_only(self):
+        """Programmatic ``Omni(...)`` callers (``cli_explicit_keys=None``)
+        cannot override deploy YAML — plain kwargs are rank-4 fallbacks per
+        #2655's precedence ladder. The deploy YAML value stays in force and
+        the kwarg does not bleed into ``runtime_overrides``."""
+        # qwen3_omni_moe stage 2 yaml sets max_num_seqs=1; a kwarg of 999 from
+        # an argparse-less caller must NOT override it.
         stages = self._stages(
             cli_overrides={"max_num_seqs": 999},
             cli_explicit_keys=None,
         )
-        assert stages[2].runtime_overrides.get("max_num_seqs") == 999
+        assert stages[2].yaml_engine_args.get("max_num_seqs") == 1
+        assert stages[2].runtime_overrides.get("max_num_seqs") is None
 
-    def test_programmatic_default_value_defers_to_yaml(self):
-        """Programmatic callers passing the dataclass default for a field must
-        not clobber a value the deploy YAML already sets. Matches the rank-4
-        precedence from #2655: plain caller kwargs are fallback-only.
-
-        Uses ``gpu_memory_utilization`` because it has a concrete non-None
-        dataclass default (``0.9``); fields with ``None`` defaults are already
-        short-circuited by the ``if value is None: continue`` guard upstream.
-        """
-        import dataclasses
-
-        from vllm_omni.engine.arg_utils import OmniEngineArgs
-
-        default_gpu_mem = next(
-            f.default for f in dataclasses.fields(OmniEngineArgs) if f.name == "gpu_memory_utilization"
-        )
-        # qwen3_omni_moe stage 2 yaml sets gpu_memory_utilization=0.1; the
-        # default (0.9) must not clobber it.
+    def test_programmatic_kwargs_fill_missing_yaml_field(self):
+        """Plain kwargs still fill fields the deploy YAML doesn't set. This
+        is the "fallback-only, combine but don't override" half of the
+        ladder."""
         stages = self._stages(
-            cli_overrides={"gpu_memory_utilization": default_gpu_mem},
+            cli_overrides={"some_unrelated_knob": "fallback"},
             cli_explicit_keys=None,
         )
-        assert stages[2].yaml_engine_args.get("gpu_memory_utilization") == 0.1
-        assert stages[2].runtime_overrides.get("gpu_memory_utilization") is None
+        assert stages[0].runtime_overrides.get("some_unrelated_knob") == "fallback"
 
-    def test_programmatic_required_field_still_explicit(self):
-        """Fields without a dataclass default (e.g. ``model``) are always
-        treated as explicit, even for argparse-less callers."""
+    def test_programmatic_per_stage_override_still_explicit(self):
+        """``stage_<id>_*`` keys are always explicit, even when
+        ``cli_explicit_keys`` is ``None``. Their presence is itself an
+        unambiguous per-stage override signal."""
         stages = self._stages(
-            cli_overrides={"model": "openbmb/VoxCPM2", "max_num_seqs": 999},
+            cli_overrides={"stage_0_gpu_memory_utilization": 0.42},
             cli_explicit_keys=None,
         )
-        # Non-default max_num_seqs propagates; model (no default) propagates.
+        assert stages[0].runtime_overrides.get("gpu_memory_utilization") == 0.42
+
+    def test_from_cli_args_style_explicit_set_overrides_yaml(self):
+        """Callers wanting override semantics from an argparse-based flow must
+        route through ``Omni.from_cli_args(args, parser=parser)`` which
+        supplies a real explicit set via ``detect_explicit_cli_keys``. This
+        mirrors that escape hatch directly at the factory boundary."""
+        stages = self._stages(
+            cli_overrides={"max_num_seqs": 999},
+            cli_explicit_keys={"max_num_seqs"},
+        )
         assert stages[2].runtime_overrides.get("max_num_seqs") == 999
 
     def test_explicit_async_chunk_false_overrides_yaml(self):
