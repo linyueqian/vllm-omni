@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 import yaml
@@ -13,6 +12,8 @@ import yaml
 # Add benchmarks/tts to path for import
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "benchmarks" / "tts"))
 import bench_tts
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.fixture()
@@ -119,20 +120,20 @@ def test_build_bench_args_wer_eval_adds_flag(model_configs_path: Path) -> None:
     assert "--seed-tts-wer-eval" in cmd
 
 
-def test_unsupported_task_exits(model_configs_path: Path, capsys: pytest.CaptureFixture) -> None:
+def test_unsupported_task_exits(model_configs_path: Path, capsys: pytest.CaptureFixture, mocker) -> None:
     # ModelB does not support voice_design
+    mocker.patch.object(
+        sys,
+        "argv",
+        [
+            "bench_tts.py",
+            "--model",
+            "test/ModelB",
+            "--task",
+            "voice_design",
+            "--model-configs",
+            str(model_configs_path),
+        ],
+    )
     with pytest.raises(SystemExit):
-        with patch.object(
-            sys,
-            "argv",
-            [
-                "bench_tts.py",
-                "--model",
-                "test/ModelB",
-                "--task",
-                "voice_design",
-                "--model-configs",
-                str(model_configs_path),
-            ],
-        ):
-            bench_tts.main()
+        bench_tts.main()

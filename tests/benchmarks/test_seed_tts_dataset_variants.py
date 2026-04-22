@@ -9,9 +9,10 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 # Load the data module directly (bypasses vllm_omni.__init__ heavy imports).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -55,14 +56,14 @@ def seed_tts_root(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_seed_tts_text_dataset_omits_ref_audio(seed_tts_root):
+def test_seed_tts_text_dataset_omits_ref_audio(seed_tts_root, mocker):
     ds = SeedTTSTextDataset(
         dataset_path=str(seed_tts_root),
         random_seed=0,
         locale="en",
         disable_shuffle=True,
     )
-    tokenizer = MagicMock()
+    tokenizer = mocker.MagicMock()
     tokenizer.encode = lambda text, **kw: [0] * len(text.split())
     requests = ds.sample(tokenizer, num_requests=3)
     assert len(requests) == 3
@@ -90,14 +91,14 @@ def seed_tts_design_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_seed_tts_design_dataset_has_instructions(seed_tts_design_root):
+def test_seed_tts_design_dataset_has_instructions(seed_tts_design_root, mocker):
     ds = SeedTTSDesignDataset(
         dataset_path=str(seed_tts_design_root),
         random_seed=0,
         locale="en",
         disable_shuffle=True,
     )
-    tokenizer = MagicMock()
+    tokenizer = mocker.MagicMock()
     tokenizer.encode = lambda text, **kw: [0] * len(text.split())
     requests = ds.sample(tokenizer, num_requests=3)
     assert len(requests) == 3
@@ -111,7 +112,7 @@ def test_seed_tts_design_dataset_has_instructions(seed_tts_design_root):
         assert req.seed_tts_ref_wav_path == ""
 
 
-def test_seed_tts_design_dataset_rejects_missing_description(seed_tts_design_root):
+def test_seed_tts_design_dataset_rejects_missing_description(seed_tts_design_root, mocker):
     """Lines without a voice_description should be skipped."""
     locale_dir = seed_tts_design_root / "en"
     (locale_dir / "meta.lst").write_text(
@@ -124,7 +125,7 @@ def test_seed_tts_design_dataset_rejects_missing_description(seed_tts_design_roo
         locale="en",
         disable_shuffle=True,
     )
-    tokenizer = MagicMock()
+    tokenizer = mocker.MagicMock()
     tokenizer.encode = lambda text, **kw: [0] * len(text.split())
     requests = ds.sample(tokenizer, num_requests=10)
     assert len(requests) == 1  # only the valid row

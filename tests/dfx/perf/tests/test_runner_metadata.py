@@ -2,6 +2,10 @@
 
 import json
 
+import pytest
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def test_task_excluded_from_cli_args():
     """'task' field must not become --task CLI arg."""
