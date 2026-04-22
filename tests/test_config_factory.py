@@ -1237,9 +1237,7 @@ class TestCLIExplicitPrecedence:
 
         from vllm_omni.engine.arg_utils import OmniEngineArgs
 
-        default_max_num_seqs = next(
-            f.default for f in dataclasses.fields(OmniEngineArgs) if f.name == "max_num_seqs"
-        )
+        default_max_num_seqs = next(f.default for f in dataclasses.fields(OmniEngineArgs) if f.name == "max_num_seqs")
         stages = self._stages(
             cli_overrides={"max_num_seqs": default_max_num_seqs},
             cli_explicit_keys=None,
