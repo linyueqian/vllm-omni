@@ -13,7 +13,7 @@ from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import Request
 
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 
@@ -49,8 +49,7 @@ class DACSScheduler(OmniGenerationScheduler):
         self._request_enqueue_time: dict[str, float] = {}
 
         logger.info(
-            "DACS scheduler initialized: gap_budget=%.3f, "
-            "weights=(gap=%.2f, ttfa=%.2f, age=%.2f)",
+            "DACS scheduler initialized: gap_budget=%.3f, weights=(gap=%.2f, ttfa=%.2f, age=%.2f)",
             self.gap_budget,
             self.gap_weight,
             self.ttfa_weight,
@@ -76,11 +75,7 @@ class DACSScheduler(OmniGenerationScheduler):
         if req_id in self._request_enqueue_time:
             age = min(1.0, (now - self._request_enqueue_time[req_id]) / 2.0)
 
-        return (
-            self.gap_weight * gap_urgency
-            + self.ttfa_weight * ttfa_urgency
-            + self.age_weight * age
-        )
+        return self.gap_weight * gap_urgency + self.ttfa_weight * ttfa_urgency + self.age_weight * age
 
     def schedule(self) -> SchedulerOutput:
         """Override to reorder running queue by DACS priority before scheduling."""

@@ -45,9 +45,7 @@ class CUDAGraphDecoderWrapper:
         self.decoder = decoder
         self._explicit_sizes = capture_sizes is not None
         self.capture_sizes = sorted(capture_sizes) if capture_sizes else []
-        self.capture_batch_sizes = (
-            sorted(set(capture_batch_sizes)) if capture_batch_sizes else [1]
-        )
+        self.capture_batch_sizes = sorted(set(capture_batch_sizes)) if capture_batch_sizes else [1]
         self.num_quantizers = num_quantizers
         self.enabled = enabled
 
