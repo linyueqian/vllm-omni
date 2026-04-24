@@ -14,9 +14,9 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import pytest
 
-from tests.conftest import OmniServerParams
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
-from tests.utils import hardware_test
 
 MODEL = "OpenMOSS-Team/MOSS-TTS-Nano"
 

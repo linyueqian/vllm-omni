@@ -8,7 +8,7 @@ import pytest
 import torch
 from vllm import SamplingParams
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 from vllm_omni import Omni
 
 MODEL_NAME = "OpenMOSS-Team/MOSS-TTS-Nano"
