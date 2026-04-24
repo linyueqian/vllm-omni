@@ -461,3 +461,34 @@ def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
 
     assert runner.input_batch.async_copy_ready_event.synced is True
     assert seen_histories == [[[11, 29]]]
+
+
+def test_gpu_ar_model_runner_keys_model_sampler_generators_by_request_id():
+    metadata = _make_sampling_metadata(output_token_ids=[[], []])
+
+    class _DummyInputBatch:
+        def __init__(self, req_ids):
+            self.sampling_metadata = metadata
+            self.req_output_token_ids = [[], []]
+            self.req_ids = list(req_ids)
+            self.sampled_token_ids_cpu = None
+            self.async_copy_ready_event = None
+            self.prev_req_id_to_index = None
+
+        def update_async_output_token_ids(self):
+            raise AssertionError("fallback async repair should not run for model sampler path")
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.device = "cpu"
+    runner.input_batch = _DummyInputBatch(["rid-a", "rid-b"])
+
+    first = runner._sampling_metadata_for_model_sampler(metadata)
+    gen_a = first.generators[0]
+    gen_b = first.generators[1]
+
+    runner.input_batch = _DummyInputBatch(["rid-b", "rid-a"])
+    second = runner._sampling_metadata_for_model_sampler(metadata)
+
+    assert first.generators[0] is not first.generators[1]
+    assert second.generators[0] is gen_b
+    assert second.generators[1] is gen_a

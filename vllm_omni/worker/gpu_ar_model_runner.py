@@ -6,6 +6,7 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+import random
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -134,11 +135,47 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         return output_token_ids
 
+    def _build_model_sampler_generators(self, sampling_metadata):
+        req_ids = list(getattr(self.input_batch, "req_ids", []))
+        generators = dict(getattr(sampling_metadata, "generators", {}) or {})
+        if not req_ids:
+            return generators
+
+        cache = getattr(self, "_model_sampler_generators_by_req_id", None)
+        if cache is None:
+            cache = {}
+            self._model_sampler_generators_by_req_id = cache
+
+        if all(generators.get(index) is not None for index in range(len(req_ids))):
+            return generators
+
+        device = getattr(self, "device", "cpu")
+        for index, req_id in enumerate(req_ids):
+            if generators.get(index) is not None:
+                continue
+
+            generator = cache.get(req_id)
+            if generator is None:
+                generator = torch.Generator(device=device)
+                generator.manual_seed(random.randint(0, 2**31 - 1))
+                cache[req_id] = generator
+            generators[index] = generator
+
+        return generators
+
     def _sampling_metadata_for_model_sampler(self, sampling_metadata):
         output_token_ids = self._build_model_sampler_output_token_ids()
-        if output_token_ids == sampling_metadata.output_token_ids:
+        generators = self._build_model_sampler_generators(sampling_metadata)
+        if (
+            output_token_ids == sampling_metadata.output_token_ids
+            and generators == sampling_metadata.generators
+        ):
             return sampling_metadata
-        return replace(sampling_metadata, output_token_ids=output_token_ids)
+        return replace(
+            sampling_metadata,
+            output_token_ids=output_token_ids,
+            generators=generators,
+        )
 
     def capture_model(self) -> int:
         result = super().capture_model()
@@ -323,6 +360,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # Notify model of finished requests for state cleanup
             if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
                 self.model.on_requests_finished(scheduler_output.finished_req_ids)
+            if scheduler_output.finished_req_ids:
+                cache = getattr(self, "_model_sampler_generators_by_req_id", None)
+                if cache is not None:
+                    for req_id in scheduler_output.finished_req_ids:
+                        cache.pop(req_id, None)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
