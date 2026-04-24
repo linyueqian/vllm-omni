@@ -451,7 +451,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             routed_experts = None
 
             # Diffusion request: completes in one step; mark finished and free resources
-            if (
+            _finish_gate_satisfied = (
                 request.status == RequestStatus.FINISHED_STOPPED
                 or (self.chunk_transfer_adapter is None and request.num_computed_tokens >= request.num_prompt_tokens)
                 or (
@@ -459,12 +459,21 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     and request.request_id in self.chunk_transfer_adapter.finished_requests
                     and request.num_computed_tokens >= len(request.prompt_token_ids)
                 )
-            ):
-                request.status = RequestStatus.FINISHED_STOPPED
-                # Optional: set a stop_reason for front-end clarity
-                # (does not affect protocol)
-                request.stop_reason = request.stop_reason  # or "generation_done"
-                stopped = True
+            )
+            if _finish_gate_satisfied:
+                if (
+                    self.chunk_transfer_adapter is not None
+                    and request.status != RequestStatus.FINISHED_STOPPED
+                    and not getattr(request, "_pending_finish", False)
+                ):
+                    # Defer one forward so stateful streaming vocoders
+                    # can drain their finalize buffer into pooler_output
+                    # before the request is freed (fix #3090).
+                    request._pending_finish = True
+                else:
+                    request.status = RequestStatus.FINISHED_STOPPED
+                    request.stop_reason = request.stop_reason
+                    stopped = True
 
             if stopped:
                 routed_experts = self._get_routed_experts(request)
