@@ -42,6 +42,27 @@ class OmniRequestState(RequestState):
     def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         if payload is None:
             return
+
+        # DEBUG instrumentation for issue #3090 investigation.
+        import os as _os
+
+        if _os.environ.get("VLLM_OMNI_DEBUG_3090"):
+            try:
+                _audio_shape = None
+                if isinstance(payload, dict) and "audio" in payload:
+                    v = payload["audio"]
+                    if isinstance(v, torch.Tensor):
+                        _audio_shape = list(v.shape)
+                    elif isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+                        _audio_shape = list(v[0].shape)
+                print(
+                    f"[3090-output-accum] rid={getattr(self, 'request_id', '?')} "
+                    f"mm_type={mm_type} "
+                    f"audio_chunk_shape={_audio_shape}",
+                    flush=True,
+                )
+            except Exception:
+                pass
         try:
             if mm_type:
                 self.mm_type = (mm_type or "").lower()
