@@ -705,6 +705,22 @@ class CosyVoice3Model(
                 info = runtime_info[idx] if idx < len(runtime_info) and isinstance(runtime_info[idx], dict) else {}
                 req_id = self._as_str(info.get("req_id")) if info else None
                 stream_finished = self._as_bool(info.get("stream_finished")) if info else False
+
+                # DEBUG instrumentation for #3090 investigation.
+                import os as _os
+
+                if _os.environ.get("VLLM_OMNI_DEBUG_3090"):
+                    try:
+                        print(
+                            f"[3090-s1-recv] rid={req_id} "
+                            f"raw_len={int(req_ids.numel())} "
+                            f"token_offset={info.get('token_offset') if info else None} "
+                            f"stream_finished={stream_finished} "
+                            f"has_speech_token={info.get('speech_token') is not None if info else False}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
                 speech_token = self._as_tensor(info.get("speech_token")) if info else None
                 speech_feat = self._as_tensor(info.get("speech_feat")) if info else None
                 embedding = self._as_tensor(info.get("embedding")) if info else None

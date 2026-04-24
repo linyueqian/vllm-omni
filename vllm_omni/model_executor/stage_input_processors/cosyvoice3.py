@@ -246,4 +246,22 @@ def talker2code2wav_async_chunk(
             state["terminal_sent"] = True
 
         state["emitted_chunks"] = int(state.get("emitted_chunks", 0)) + 1
+
+        # DEBUG instrumentation for issue #3090.
+        import os as _os
+
+        if _os.environ.get("VLLM_OMNI_DEBUG_3090"):
+            try:
+                print(
+                    f"[3090-s0-send] rid={request_id} "
+                    f"chunk={state['emitted_chunks']} "
+                    f"prefix_len={prefix_len} "
+                    f"token_offset={token_offset} "
+                    f"codes_in_payload={len(code_predictor_codes)} "
+                    f"finished={bool(finished)} "
+                    f"total_frames_buffered={length}",
+                    flush=True,
+                )
+            except Exception:
+                pass
         return payload
