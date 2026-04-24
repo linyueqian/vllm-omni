@@ -275,6 +275,26 @@ class CosyVoice3Code2Wav(nn.Module):
         speech_offset = max(0, min(speech_offset, int(tts_speech.shape[-1])))
         emitted_speech = tts_speech[:, speech_offset:]
 
+        import os as _os
+
+        if _os.environ.get("VLLM_OMNI_DEBUG_3090"):
+            try:
+                _cached_mel_len = 0 if cached_mel is None or not isinstance(cached_mel, torch.Tensor) else int(cached_mel.shape[-1])
+                print(
+                    f"[3090-vocoder] token_len={int(token.shape[-1])} "
+                    f"offset_tokens={int(token_offset_tokens)} "
+                    f"cached_mel_frames={_cached_mel_len} "
+                    f"chunk_mel_frames={int(chunk_mel.shape[-1])} "
+                    f"tts_mel_frames={int(tts_mel.shape[-1])} "
+                    f"tts_speech_samples={int(tts_speech.shape[-1])} "
+                    f"speech_offset_in={speech_offset} "
+                    f"emitted_samples={int(emitted_speech.shape[-1])} "
+                    f"finalize={bool(finalize)}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
         if finalize:
             return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), None
 
