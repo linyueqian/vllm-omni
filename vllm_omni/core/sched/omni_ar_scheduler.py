@@ -370,6 +370,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
+
+                # DEBUG instrumentation for issue #3090 investigation.
+                import os as _os
+
+                if _os.environ.get("VLLM_OMNI_DEBUG_3090"):
+                    try:
+                        _tids = list(getattr(request, "output_token_ids", []) or [])
+                        print(
+                            f"[3090-probe] rid={request.request_id} "
+                            f"n_output_tokens={len(_tids)} "
+                            f"last5={_tids[-5:]} "
+                            f"finish_reason={finish_reason} "
+                            f"stop_reason={getattr(request, 'stop_reason', None)}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
                 is_segment_finished = request.is_finished() and request.resumable
                 finished = self._handle_stopped_request(request)
                 if finished:
