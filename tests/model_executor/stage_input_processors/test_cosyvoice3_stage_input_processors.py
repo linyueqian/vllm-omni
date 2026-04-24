@@ -265,3 +265,66 @@ def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio(
     assert payload_final is not None
     assert payload_final["finished"].item() is True
     assert payload_final["code_predictor_codes"] == []
+
+
+def test_talker2code2wav_async_chunk_terminal_eof_reincludes_prompt_for_drain():
+    """Regression test for #3090.
+
+    When stage-0 emits a terminal empty+finished chunk AFTER a prior non-empty
+    chunk has already consumed ``sent_prompt``, the terminal payload must still
+    carry the prompt context so stage-1's causal HiFT vocoder can reconstruct
+    it, issue ``forward_streaming(finalize=True)``, and drain the held-back
+    look-ahead audio instead of silently discarding it.
+    """
+
+    # chunk_frames=2, prompt_token_len=2 => prompt_token_pad=0 so the first
+    # chunk fires with exactly 2 output tokens.
+    transfer_manager = _transfer_manager(chunk_frames=2)
+    request = SimpleNamespace(
+        external_req_id="rid-drain",
+        output_token_ids=[3, 4],
+        additional_information={
+            "speech_token": [torch.tensor([[11, 12]])],
+            "speech_feat": [torch.tensor([[[0.1, 0.2], [0.3, 0.4]]])],
+            "embedding": [torch.tensor([[0.5, 0.6]])],
+        },
+        is_finished=lambda: False,
+    )
+
+    # First chunk: carries tokens + prompt_payload (sent_prompt flips True).
+    payload_stream = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        pooling_output=None,
+        request=request,
+        is_finished=False,
+    )
+
+    assert payload_stream is not None
+    assert payload_stream["finished"].item() is False
+    assert payload_stream["code_predictor_codes"] == [3, 4]
+    assert "speech_token" in payload_stream
+    assert "speech_feat" in payload_stream
+    assert "embedding" in payload_stream
+
+    # Terminal chunk: all tokens already emitted, now finished=True. Must
+    # re-send the prompt context AND set stream_finished=True so the vocoder
+    # runs its finalize drain path.
+    payload_final = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        pooling_output=None,
+        request=request,
+        is_finished=True,
+    )
+
+    assert payload_final is not None
+    assert payload_final["finished"].item() is True
+    assert payload_final["stream_finished"].item() is True
+    assert payload_final["code_predictor_codes"] == []
+    # Prompt context must be re-included for the drain to succeed.
+    assert "speech_token" in payload_final
+    assert "speech_feat" in payload_final
+    assert "embedding" in payload_final
+    # token_offset must match the cumulative emitted length so the vocoder
+    # knows how many samples of audio have already been emitted.
+    assert payload_final["token_offset"] == 2
+    assert payload_final["left_context_size"] == 2

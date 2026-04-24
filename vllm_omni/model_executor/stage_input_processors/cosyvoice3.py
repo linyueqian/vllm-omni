@@ -182,11 +182,14 @@ def talker2code2wav_async_chunk(
                 return None
             payload: dict[str, Any] = {
                 "code_predictor_codes": [],
+                "stream_finished": torch.tensor(True, dtype=torch.bool),
                 "finished": torch.tensor(True, dtype=torch.bool),
             }
-            if not state.get("sent_prompt", False):
-                payload.update(state.get("prompt_payload", {}))
-                state["sent_prompt"] = True
+            # Always re-include prompt context on the terminal chunk so the
+            # downstream vocoder can drain its look-ahead cache even when the
+            # prior chunk already consumed ``sent_prompt`` (fix #3090).
+            payload.update(state.get("prompt_payload", {}))
+            state["sent_prompt"] = True
             state["terminal_sent"] = True
             return payload
 
@@ -194,11 +197,15 @@ def talker2code2wav_async_chunk(
         if finished and length <= emitted_token_len:
             payload = {
                 "code_predictor_codes": [],
+                "stream_finished": torch.tensor(True, dtype=torch.bool),
                 "finished": torch.tensor(True, dtype=torch.bool),
+                "token_offset": emitted_token_len,
+                "left_context_size": emitted_token_len,
             }
-            if not state.get("sent_prompt", False):
-                payload.update(state.get("prompt_payload", {}))
-                state["sent_prompt"] = True
+            # See note above: re-send prompt context so the vocoder has what
+            # it needs to emit its held-back finalize audio.
+            payload.update(state.get("prompt_payload", {}))
+            state["sent_prompt"] = True
             state["terminal_sent"] = True
             return payload
 

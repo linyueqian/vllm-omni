@@ -729,7 +729,49 @@ class CosyVoice3Model(
 
                 token = self._sanitize_codec_tokens(req_ids)
                 if token.numel() == 0:
-                    audios[idx] = self._stitch_stream_audio(req_id, empty_audio, stream_finished)
+                    # When stage-0 emits a terminal empty+finished chunk (triggered
+                    # when the generation length aligns with
+                    # ``token_hop_len + prompt_token_pad``), the causal HiFT
+                    # vocoder still holds ~one hop of look-ahead audio that was
+                    # trimmed from the previous non-finalize forward. Drain that
+                    # audio here before dropping the cache (fix #3090).
+                    drained_audio = empty_audio
+                    if (
+                        stream_finished
+                        and req_id is not None
+                        and hasattr(self, "_stream_vocoder_cache_by_req")
+                    ):
+                        with self._stream_audio_cache_lock:
+                            cache_state = self._stream_vocoder_cache_by_req.get(req_id)
+                        if cache_state is not None:
+                            token_offset = 0
+                            try:
+                                if info and "token_offset" in info:
+                                    token_offset = max(0, int(info.get("token_offset", 0)))
+                                elif info:
+                                    token_offset = max(0, int(info.get("left_context_size", 0)))
+                            except (TypeError, ValueError):
+                                token_offset = 0
+                            try:
+                                empty_codec = torch.empty((0,), dtype=token.dtype, device=token.device)
+                                tail_speech, _ = self.code2wav.forward_streaming(
+                                    token=empty_codec.unsqueeze(0),
+                                    prompt_token=speech_token[:1],
+                                    prompt_feat=speech_feat[:1],
+                                    embedding=embedding[:1],
+                                    cache_state=cache_state,
+                                    n_timesteps=10,
+                                    token_offset_tokens=token_offset,
+                                    finalize=True,
+                                )
+                                drained_audio = tail_speech.reshape(-1).to(dtype=torch.float32)
+                            except Exception as e:
+                                logger.warning_once(
+                                    "CosyVoice3 code2wav finalize drain failed for %s: %s",
+                                    req_id,
+                                    e,
+                                )
+                    audios[idx] = self._stitch_stream_audio(req_id, drained_audio, stream_finished)
                     if req_ids.numel() > 0:
                         logger.warning_once(
                             "CosyVoice3 code2wav received no valid codec tokens after filtering: "
