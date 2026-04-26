@@ -56,6 +56,16 @@ def seed_tts_root(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _make_tokenizer(mocker):
+    tokenizer = mocker.MagicMock()
+    tokenizer.encode = lambda text, **kw: [0] * len(text.split())
+    tokenizer.all_special_ids = []
+    tokenizer.all_special_tokens = []
+    tokenizer.get_vocab.return_value = {"<dummy>": 0}
+    tokenizer.__len__.return_value = 1
+    return tokenizer
+
+
 def test_seed_tts_text_dataset_omits_ref_audio(seed_tts_root, mocker):
     ds = SeedTTSTextDataset(
         dataset_path=str(seed_tts_root),
@@ -63,8 +73,7 @@ def test_seed_tts_text_dataset_omits_ref_audio(seed_tts_root, mocker):
         locale="en",
         disable_shuffle=True,
     )
-    tokenizer = mocker.MagicMock()
-    tokenizer.encode = lambda text, **kw: [0] * len(text.split())
+    tokenizer = _make_tokenizer(mocker)
     requests = ds.sample(tokenizer, num_requests=3)
     assert len(requests) == 3
     for req in requests:
@@ -98,8 +107,7 @@ def test_seed_tts_design_dataset_has_instructions(seed_tts_design_root, mocker):
         locale="en",
         disable_shuffle=True,
     )
-    tokenizer = mocker.MagicMock()
-    tokenizer.encode = lambda text, **kw: [0] * len(text.split())
+    tokenizer = _make_tokenizer(mocker)
     requests = ds.sample(tokenizer, num_requests=3)
     assert len(requests) == 3
     for req in requests:
@@ -125,8 +133,7 @@ def test_seed_tts_design_dataset_rejects_missing_description(seed_tts_design_roo
         locale="en",
         disable_shuffle=True,
     )
-    tokenizer = mocker.MagicMock()
-    tokenizer.encode = lambda text, **kw: [0] * len(text.split())
+    tokenizer = _make_tokenizer(mocker)
     requests = ds.sample(tokenizer, num_requests=10)
     assert len(requests) == 1  # only the valid row
 
