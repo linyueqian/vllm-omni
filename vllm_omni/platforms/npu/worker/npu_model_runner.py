@@ -426,18 +426,29 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         # torch.multinomial calls and is left as a follow-up optimisation.
         _seed = None
         if decode_req_ids:
-            _first_sp = self.requests[decode_req_ids[0]].sampling_params
+            _first_sp = getattr(self.requests[decode_req_ids[0]], "sampling_params", None)
             if _first_sp is not None and getattr(_first_sp, "seed", None) is not None:
                 _seed = _first_sp.seed
             # Warn when batched requests have different seeds.
             if len(decode_req_ids) > 1 and _seed is not None:
-                _other_seeds = {getattr(self.requests[rid].sampling_params, "seed", None) for rid in decode_req_ids[1:]}
+                _other_seeds = {
+                    getattr(getattr(self.requests[rid], "sampling_params", None), "seed", None)
+                    for rid in decode_req_ids[1:]
+                }
                 if _other_seeds != {_seed}:
                     logger.warning(
                         "Fast AR seed: batch has mixed seeds; using first request's seed=%d for all %d requests.",
                         _seed,
                         len(decode_req_ids),
                     )
+        talker_kwargs = {
+            "do_sample": subtalker_params.get("do_sample"),
+            "temperature": subtalker_params.get("temperature"),
+            "top_k": subtalker_params.get("top_k"),
+            "top_p": subtalker_params.get("top_p"),
+        }
+        if _seed is not None:
+            talker_kwargs["seed"] = _seed
         with set_ascend_forward_context(
             None, self.vllm_config, aclgraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
@@ -446,11 +457,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                 req_embeds,
                 last_talker_hidden,
                 text_step,
-                do_sample=subtalker_params.get("do_sample"),
-                temperature=subtalker_params.get("temperature"),
-                top_k=subtalker_params.get("top_k"),
-                top_p=subtalker_params.get("top_p"),
-                seed=_seed,
+                **talker_kwargs,
             )
         # code_predictor_codes stays on GPU here; _update_intermediate_buffer
         # keeps it device-resident when the key is in gpu_resident_buffer_keys.
