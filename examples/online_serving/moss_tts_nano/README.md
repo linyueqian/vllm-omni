@@ -1,6 +1,6 @@
 # MOSS-TTS-Nano
 
-## Model
+## Model checkpoint
 
 | Model | Description |
 |-------|-------------|
