@@ -1894,9 +1894,34 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     ) -> tuple[bytes | str, str]:
         request_id, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
 
+        # MOSS-TTS-Nano emits delta chunks per yield (single-stage,
+        # async_chunk=false). The engine surfaces each yield as its own
+        # RequestOutput, so we need to accumulate across the async-for loop —
+        # final_output alone only carries the last (often empty) sentinel.
+        is_moss = self._tts_model_type == "moss_tts_nano"
+        moss_chunks: list[Any] = []
+        moss_sample_rate: int | None = None
+
         final_output: OmniRequestOutput | None = None
         async for res in generator:
             final_output = res
+            if not is_moss:
+                continue
+            try:
+                step_audio, step_key = self._extract_audio_output(res)
+            except Exception:
+                continue
+            if step_key is None:
+                continue
+            chunk = step_audio[step_key]
+            candidates = chunk if isinstance(chunk, list) else [chunk]
+            for cand in candidates:
+                if hasattr(cand, "numel") and cand.numel() > 0:
+                    moss_chunks.append(cand)
+            sr_step = step_audio.get("sr")
+            if sr_step is not None:
+                sr_val_step = sr_step[-1] if isinstance(sr_step, list) and sr_step else sr_step
+                moss_sample_rate = int(sr_val_step.item()) if hasattr(sr_val_step, "item") else int(sr_val_step)
 
         if final_output is None:
             raise ValueError("No output generated from the model.")
@@ -1910,13 +1935,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
         sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
-        if isinstance(audio_tensor, list):
+        if is_moss:
+            audio_tensor = torch.cat(moss_chunks, dim=-1) if moss_chunks else np.zeros((0,), dtype=np.float32)
+            if moss_sample_rate is not None:
+                sample_rate = moss_sample_rate
+        elif isinstance(audio_tensor, list):
             async_chunk = bool(getattr(self.engine_client.model_config, "async_chunk", False))
-            # MOSS-TTS-Nano is single-stage (async_chunk=false) but yields delta
-            # chunks rather than cumulative history snapshots, so concat-all is
-            # the correct assembly mode regardless of the engine flag.
-            concat_all = async_chunk or self._tts_model_type == "moss_tts_nano"
-            if concat_all:
+            if async_chunk:
                 non_empty_chunks = [candidate for candidate in audio_tensor if candidate.numel() > 0]
                 audio_tensor = (
                     torch.cat(non_empty_chunks, dim=-1) if non_empty_chunks else np.zeros((0,), dtype=np.float32)
