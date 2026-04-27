@@ -1117,39 +1117,42 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return None
 
     def _validate_moss_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
-        """Validate MOSS-TTS-Nano request. Accepts optional ref_audio for voice cloning."""
+        """Validate MOSS-TTS-Nano request.
+
+        MOSS-TTS-Nano is voice-cloning-only upstream — every request must carry
+        a reference audio clip + its transcript. There are no built-in speaker
+        presets despite the ``voice`` field being part of the OpenAI schema.
+        """
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
-        if request.ref_audio is not None:
-            fmt_err = self._validate_ref_audio_format(request.ref_audio)
-            if fmt_err:
-                return fmt_err
-            if not request.ref_text or not request.ref_text.strip():
-                return "Voice cloning requires 'ref_text' (transcript of the reference audio)"
+        if request.ref_audio is None:
+            return (
+                "MOSS-TTS-Nano requires 'ref_audio' (reference audio for voice cloning); "
+                "the upstream model has no built-in voice presets."
+            )
+        fmt_err = self._validate_ref_audio_format(request.ref_audio)
+        if fmt_err:
+            return fmt_err
+        if not request.ref_text or not request.ref_text.strip():
+            return "Voice cloning requires 'ref_text' (transcript of the reference audio)"
         return None
 
     async def _build_moss_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build additional_information for MOSS-TTS-Nano.
 
-        Maps the standard /v1/audio/speech fields to MOSS-TTS-Nano's
-        additional_information keys (text, voice, mode, prompt_audio_array,
-        prompt_text, ...).  Values are wrapped in lists to match the
-        vllm-omni convention.  When ``request.ref_audio`` is provided, it is
-        resolved via MediaConnector and passed as a (wav_list, sample_rate)
-        tuple so the model owns temp-file lifecycle.
+        Resolves ``request.ref_audio`` via MediaConnector and passes it to the
+        model as a ``(wav_list, sample_rate)`` tuple so the model owns temp-file
+        lifecycle. ``request.voice`` is intentionally ignored — see
+        ``_validate_moss_tts_request``.
         """
         params: dict[str, Any] = {
             "text": [request.input],
+            "prompt_text": [request.ref_text],
         }
-        if request.voice is not None:
-            params["voice"] = [request.voice]
-        if request.ref_text is not None:
-            params["prompt_text"] = [request.ref_text]
         if request.max_new_tokens is not None:
             params["max_new_frames"] = [request.max_new_tokens]
-        if request.ref_audio is not None:
-            wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
-            params["prompt_audio_array"] = [[wav_list, sr]]
+        wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+        params["prompt_audio_array"] = [[wav_list, sr]]
         return params
 
     def _validate_fish_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
@@ -1909,7 +1912,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         if isinstance(audio_tensor, list):
             async_chunk = bool(getattr(self.engine_client.model_config, "async_chunk", False))
-            if async_chunk:
+            # MOSS-TTS-Nano is single-stage (async_chunk=false) but yields delta
+            # chunks rather than cumulative history snapshots, so concat-all is
+            # the correct assembly mode regardless of the engine flag.
+            concat_all = async_chunk or self._tts_model_type == "moss_tts_nano"
+            if concat_all:
                 non_empty_chunks = [candidate for candidate in audio_tensor if candidate.numel() > 0]
                 audio_tensor = (
                     torch.cat(non_empty_chunks, dim=-1) if non_empty_chunks else np.zeros((0,), dtype=np.float32)

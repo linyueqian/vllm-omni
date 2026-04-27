@@ -3,23 +3,21 @@
 """Offline inference example for MOSS-TTS-Nano via vLLM-Omni.
 
 Single-stage pipeline: the 0.1B AR LM and MOSS-Audio-Tokenizer-Nano codec
-both run inside one generation stage.  Output is 48 kHz stereo WAV.
+both run inside one generation stage. Output is 48 kHz stereo WAV.
 
-Supports:
-  - Built-in voice presets (--voice)
-  - Custom voice cloning via reference audio (--prompt-audio)
-  - Batch synthesis of multiple texts
-  - Reproducible output via --seed
+MOSS-TTS-Nano is voice-cloning-only — every request needs a reference audio
+clip (--prompt-audio) and its transcript (--prompt-text).
 
-Usage examples:
-  # Built-in voice
-  python end2end.py --text "Hello from MOSS-TTS-Nano."
+Usage:
+  # Voice clone with reference audio (required)
+  python end2end.py \\
+    --text "Hello!" \\
+    --prompt-audio /path/to/ref.wav \\
+    --prompt-text "Transcript of the reference clip."
 
-  # Voice clone with reference audio
-  python end2end.py --text "Hello!" --prompt-audio /path/to/ref.wav
-
-  # Batch with different voices
-  python end2end.py --batch --output-dir /tmp/moss_output
+  # Sample reference clips ship in the upstream repo:
+  #   https://github.com/OpenMOSS/MOSS-TTS-Nano/tree/main/assets/audio
+  # e.g. zh_1.wav (Chinese), en_2.wav (English), jp_2.wav (Japanese).
 """
 
 from __future__ import annotations
@@ -39,19 +37,12 @@ from vllm_omni import Omni  # noqa: E402
 
 MODEL = "OpenMOSS-Team/MOSS-TTS-Nano"
 
-BATCH_SAMPLES = [
-    {"text": "Hello, this is a test of MOSS-TTS-Nano.", "voice": "Ava", "label": "en_hello"},
-    {"text": "你好，这是 MOSS-TTS-Nano 的语音合成测试。", "voice": "Junhao", "label": "zh_hello"},
-    {"text": "Bonjour, ceci est un test de synthèse vocale.", "voice": "Bella", "label": "fr_hello"},
-]
-
 
 def build_request(
     text: str,
-    voice: str = "Junhao",
+    prompt_audio_path: str,
+    prompt_text: str,
     mode: str = "voice_clone",
-    prompt_audio_path: str | None = None,
-    prompt_text: str | None = None,
     max_new_frames: int = 375,
     seed: int | None = None,
     audio_temperature: float = 0.8,
@@ -62,18 +53,15 @@ def build_request(
     """Build an Omni request payload for MOSS-TTS-Nano."""
     additional: dict = {
         "text": [text],
-        "voice": [voice],
         "mode": [mode],
+        "prompt_audio_path": [str(prompt_audio_path)],
+        "prompt_text": [prompt_text],
         "max_new_frames": [max_new_frames],
         "audio_temperature": [audio_temperature],
         "audio_top_k": [audio_top_k],
         "audio_top_p": [audio_top_p],
         "text_temperature": [text_temperature],
     }
-    if prompt_audio_path:
-        additional["prompt_audio_path"] = [str(prompt_audio_path)]
-    if prompt_text:
-        additional["prompt_text"] = [prompt_text]
     if seed is not None:
         additional["seed"] = [seed]
 
@@ -111,26 +99,21 @@ def main(args) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.batch:
-        print(f"Running batch synthesis ({len(BATCH_SAMPLES)} samples)...")
-        inputs = [build_request(s["text"], voice=s["voice"], seed=args.seed) for s in BATCH_SAMPLES]
-        params_list = [sampling_params] * len(inputs)
-    else:
-        print(f"Synthesizing: {args.text!r}")
-        inputs = build_request(
-            text=args.text,
-            voice=args.voice,
-            mode=args.mode,
-            prompt_audio_path=args.prompt_audio,
-            prompt_text=args.prompt_text,
-            max_new_frames=args.max_new_frames,
-            seed=args.seed,
-            audio_temperature=args.audio_temperature,
-            audio_top_k=args.audio_top_k,
-            audio_top_p=args.audio_top_p,
-            text_temperature=args.text_temperature,
-        )
-        params_list = sampling_params
+    print(f"Synthesizing: {args.text!r}")
+    print(f"  ref_audio: {args.prompt_audio}")
+    inputs = build_request(
+        text=args.text,
+        prompt_audio_path=args.prompt_audio,
+        prompt_text=args.prompt_text,
+        mode=args.mode,
+        max_new_frames=args.max_new_frames,
+        seed=args.seed,
+        audio_temperature=args.audio_temperature,
+        audio_top_k=args.audio_top_k,
+        audio_top_p=args.audio_top_p,
+        text_temperature=args.text_temperature,
+    )
+    params_list = sampling_params
 
     for stage_outputs in omni.generate(inputs, params_list):
         for i, req_output in enumerate(stage_outputs.request_output):
@@ -145,8 +128,7 @@ def main(args) -> None:
                     print(f"  [req {i}] No waveform in multimodal_output.")
                     continue
                 sr = int(sr_tensor.item()) if sr_tensor is not None else 48000
-                label = BATCH_SAMPLES[i]["label"] if args.batch else f"output_{i}_{j}"
-                out_path = str(output_dir / f"{label}.wav")
+                out_path = str(output_dir / f"output_{i}_{j}.wav")
                 save_audio(audio.cpu(), out_path, sr)
 
     print("Done.")
@@ -155,18 +137,31 @@ def main(args) -> None:
 def parse_args():
     parser = FlexibleArgumentParser(description="MOSS-TTS-Nano offline inference")
     parser.add_argument("--text", default="Hello, this is MOSS-TTS-Nano speaking.", help="Text to synthesize.")
-    parser.add_argument("--voice", default="Junhao", help="Built-in voice preset name.")
+    parser.add_argument(
+        "--prompt-audio",
+        required=True,
+        help="Path to reference audio for voice cloning (required — MOSS-TTS-Nano is voice-cloning-only).",
+    )
+    parser.add_argument(
+        "--prompt-text",
+        required=True,
+        help="Exact transcript of --prompt-audio (required for voice cloning).",
+    )
     parser.add_argument("--mode", default="voice_clone", choices=["voice_clone", "continuation"])
-    parser.add_argument("--prompt-audio", default=None, help="Path to reference audio for voice cloning.")
-    parser.add_argument("--prompt-text", default=None, help="Reference transcript (continuation mode).")
     parser.add_argument("--max-new-frames", type=int, default=375, help="Max AR frames (~14s at default).")
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
     parser.add_argument("--audio-temperature", type=float, default=0.8)
     parser.add_argument("--audio-top-k", type=int, default=25)
     parser.add_argument("--audio-top-p", type=float, default=0.95)
     parser.add_argument("--text-temperature", type=float, default=1.0)
-    parser.add_argument("--batch", action="store_true", help="Run built-in batch of diverse samples.")
-    parser.add_argument("--output-dir", default="/tmp/moss_tts_nano_output", help="Directory for WAV outputs.")
+    parser.add_argument(
+        "--output-dir",
+        default=os.path.join(
+            os.environ.get("XDG_CACHE_HOME", os.path.join(os.path.expanduser("~"), ".cache")),
+            "moss_tts_nano_output",
+        ),
+        help="Directory for WAV outputs (default: ~/.cache/moss_tts_nano_output).",
+    )
     parser.add_argument(
         "--deploy-config",
         default=None,

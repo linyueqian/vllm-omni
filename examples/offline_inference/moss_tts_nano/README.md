@@ -4,10 +4,26 @@
 
 Single-stage offline TTS pipeline using the 0.1B MOSS-TTS-Nano AR LM and MOSS-Audio-Tokenizer-Nano codec. Outputs 48 kHz stereo WAV.
 
+> **Voice cloning only.** MOSS-TTS-Nano has no built-in speaker presets.
+> Every request needs `--prompt-audio` (a reference clip) and `--prompt-text`
+> (the exact transcript of that clip). Sample reference clips ship in the
+> upstream repo under
+> [`assets/audio/`](https://github.com/OpenMOSS/MOSS-TTS-Nano/tree/main/assets/audio)
+> (e.g. `zh_1.wav`, `en_2.wav`, `jp_2.wav`).
+
 ## Quick Start
 
 ```bash
-python end2end.py --text "Hello, this is MOSS-TTS-Nano."
+# Fetch a sample reference clip from upstream (one-off, user-scoped cache).
+REF_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/moss-tts-nano"
+mkdir -p "$REF_DIR"
+[ -s "$REF_DIR/zh_1.wav" ] || \
+    curl -L -o "$REF_DIR/zh_1.wav" https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS-Nano/main/assets/audio/zh_1.wav
+
+python end2end.py \
+    --text "你好，这是MOSS-TTS-Nano的语音合成演示。" \
+    --prompt-audio "$REF_DIR/zh_1.wav" \
+    --prompt-text "欢迎关注模思智能、上海创智学院与复旦大学自然语言处理实验室。"
 ```
 
 The first run downloads `OpenMOSS-Team/MOSS-TTS-Nano` and `OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano` from Hugging Face.
@@ -17,20 +33,20 @@ The first run downloads `OpenMOSS-Team/MOSS-TTS-Nano` and `OpenMOSS-Team/MOSS-Au
 ```
 python end2end.py [OPTIONS]
 
+Required:
+  --prompt-audio PATH       Reference WAV/MP3 for voice cloning
+  --prompt-text TEXT        Exact transcript of --prompt-audio
+
 Options:
   --text TEXT               Text to synthesize (default: "Hello, this is MOSS-TTS-Nano speaking.")
-  --voice VOICE             Built-in voice preset (default: Junhao). See voice table below.
   --mode MODE               voice_clone (default) or continuation
-  --prompt-audio PATH       Reference WAV/MP3 for custom voice cloning
-  --prompt-text TEXT        Reference transcript (continuation mode)
   --max-new-frames N        Max AR frames, default 375 (~14 s audio)
   --seed INT                Random seed for reproducibility
   --audio-temperature F     Audio sampling temperature (default: 0.8)
   --audio-top-k N           Audio top-k sampling (default: 25)
   --audio-top-p F           Audio top-p sampling (default: 0.95)
   --text-temperature F      Text layer temperature (default: 1.0)
-  --batch                   Run a built-in batch of diverse samples (ZH/EN/FR)
-  --output-dir DIR          Directory for WAV outputs (default: /tmp/moss_tts_nano_output)
+  --output-dir DIR          Directory for WAV outputs (default: $XDG_CACHE_HOME/moss_tts_nano_output, falls back to ~/.cache/...)
   --deploy-config PATH      Override deploy YAML (defaults to vllm_omni/deploy/moss_tts_nano.yaml)
   --stage-init-timeout INT  Timeout in seconds for stage init (default: 120)
 ```
@@ -38,44 +54,21 @@ Options:
 ## Examples
 
 ```bash
-# Built-in Chinese voice
-python end2end.py --text "你好，这是MOSS-TTS-Nano的语音合成演示。" --voice Junhao
+REF_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/moss-tts-nano"
 
-# Built-in English voice
-python end2end.py --text "Hello from MOSS-TTS-Nano." --voice Ava
-
-# Custom voice clone
+# Chinese reference clip → Chinese synthesis
 python end2end.py \
-    --text "Hello, this is a cloned voice." \
-    --prompt-audio /path/to/reference.wav \
-    --prompt-text "Exact transcript of the reference audio."
-
-# Batch synthesis (ZH/EN/FR)
-python end2end.py --batch --output-dir /tmp/batch_output
+    --text "你好，这是 MOSS-TTS-Nano 的语音合成测试。" \
+    --prompt-audio "$REF_DIR/zh_1.wav" \
+    --prompt-text "欢迎关注模思智能、上海创智学院与复旦大学自然语言处理实验室。"
 
 # Reproducible output
-python end2end.py --text "Deterministic test." --seed 42
+python end2end.py \
+    --text "Deterministic test." \
+    --prompt-audio "$REF_DIR/en_2.wav" \
+    --prompt-text "Transcript of the English reference clip." \
+    --seed 42
 ```
-
-## Built-in Voice Presets
-
-| Voice | Language |
-|-------|----------|
-| `Junhao` | ZH |
-| `Zhiming` | ZH |
-| `Weiguo` | ZH |
-| `Xiaoyu` | ZH |
-| `Yuewen` | ZH |
-| `Lingyu` | ZH |
-| `Ava` | EN |
-| `Bella` | EN |
-| `Adam` | EN |
-| `Nathan` | EN |
-| `Sakura` | JA |
-| `Yui` | JA |
-| `Aoi` | JA |
-| `Hina` | JA |
-| `Mei` | JA |
 
 ## Deploy Config
 

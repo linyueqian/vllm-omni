@@ -85,10 +85,8 @@ _DEFAULT_AUDIO_TOP_P = 0.95
 _DEFAULT_AUDIO_TOP_K = 25
 _DEFAULT_AUDIO_REPETITION_PENALTY = 1.2
 _DEFAULT_MAX_NEW_FRAMES = 375
-_DEFAULT_VOICE = "Junhao"
-# "voice_clone" mirrors the mode used by offline examples and tests:
-# built-in voices (e.g. "Junhao") are backed by preset reference audio
-# upstream, so the default produces the expected voice timbre.
+# MOSS-TTS-Nano upstream is voice-cloning-only — every request must supply
+# a reference audio + transcript via prompt_audio_path / prompt_audio_array.
 _DEFAULT_MODE = "voice_clone"
 
 
@@ -209,7 +207,7 @@ class MossTTSNanoForGeneration(nn.Module):
     # ------------------------------------------------------------------
 
     def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict]:
-        return [{"text": "hello", "voice": _DEFAULT_VOICE, "_is_dummy": True}] * num_reqs
+        return [{"text": "hello", "_is_dummy": True}] * num_reqs
 
     # ------------------------------------------------------------------
     # Streaming generator management
