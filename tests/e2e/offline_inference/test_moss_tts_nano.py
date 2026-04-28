@@ -112,7 +112,7 @@ def omni_engine():
 @hardware_test(res={"cuda": "L4"})
 def test_moss_tts_nano_english(omni_engine, ref_audio_path):
     """English voice_clone mode (no prompt_text) produces non-empty 48 kHz audio."""
-    req = _build_request("Hello, this is a test of MOSS-TTS-Nano.", ref_audio_path)
+    req = _build_request("Hello, this is a short voice cloning demo for testing.", ref_audio_path)
     audio, sr = _collect_audio(omni_engine, req)
 
     assert sr == SAMPLE_RATE, f"Expected sample_rate={SAMPLE_RATE}, got {sr}"

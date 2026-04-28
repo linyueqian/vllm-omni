@@ -53,10 +53,16 @@ def ref_audio_data_url() -> str:
 
 
 def get_prompt(prompt_type="text"):
-    """Text prompt for text-to-audio tests."""
+    """Text prompt for text-to-audio tests.
+
+    Avoid the model's own name ("MOSS-TTS-Nano") in the test input — the
+    codec consistently mispronounces it ("MOS's TTS Nano", "Wass TTS Nano",
+    etc.), which trips the transcript-similarity assertion in CI without
+    indicating a real regression. Use plain natural-sounding sentences.
+    """
     prompts = {
-        "text": "Hello, this is a test of MOSS-TTS-Nano text to speech synthesis.",
-        "chinese": "你好，这是MOSS-TTS-Nano的语音合成测试。",
+        "text": "Hello, this is a short voice cloning demo for testing.",
+        "chinese": "你好，这是一段简单的语音合成测试。",
     }
     return prompts.get(prompt_type, prompts["text"])
 
