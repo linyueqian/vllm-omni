@@ -115,6 +115,14 @@ def test_text_to_audio_002(omni_server, openai_client, ref_audio_data_url) -> No
     Output Modal: audio (48 kHz, PCM stream)
     Input Setting: stream=True
     Datasets: single request
+
+    NOTE: ``min_hnr_db=-5.0`` overrides the conftest default of 1.0 dB.
+    MOSS-TTS-Nano's voice_clone output is intrinsically noisy by that
+    metric — verified on H20, both streaming and non-streaming clips
+    measure HNR around -2 dB even when the audio sounds correct. We
+    keep the PCM-stream check in place to catch catastrophic decoder
+    failures (which produce HNR much further below 0), just with a
+    threshold MOSS can clear in normal operation.
     """
     request_config = {
         "model": omni_server.model,
@@ -122,6 +130,7 @@ def test_text_to_audio_002(omni_server, openai_client, ref_audio_data_url) -> No
         "stream": True,
         "response_format": "pcm",
         "ref_audio": ref_audio_data_url,
+        "min_hnr_db": -5.0,
     }
 
     openai_client.send_audio_speech_request(request_config)
