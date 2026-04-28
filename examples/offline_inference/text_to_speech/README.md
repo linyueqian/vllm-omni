@@ -5,7 +5,7 @@ CLI shape (`--text`, `--ref-audio`, `--ref-text`, `--output-dir`) and live
 together in this hub. Each model has its own subdirectory containing a
 single `end2end.py` script; this README is the single doc entry point.
 
-For online serving, see `examples/online_serving/<model>/`. For the full
+For online serving, see [`examples/online_serving/text_to_speech/`](../../online_serving/text_to_speech/README.md). For the full
 list of supported architectures across all modalities, see
 [Supported Models](../../../docs/models/supported_models.md).
 
@@ -284,7 +284,7 @@ python examples/offline_inference/text_to_speech/voxcpm/end2end.py \
 - `voxcpm.yaml` is the default non-streaming stage config; `voxcpm_async_chunk.yaml` enables streaming.
 - Streaming is currently single-request oriented.
 - `--ref-text` must be the real transcript of `--ref-audio`; mismatched text degrades quality.
-- For online serving, see [`examples/online_serving/voxcpm`](../../online_serving/voxcpm/README.md). For benchmark reporting, see [`benchmarks/voxcpm`](../../../benchmarks/voxcpm/README.md).
+- For online serving, see the [VoxCPM section in the online hub](../../online_serving/text_to_speech/README.md#voxcpm). For benchmark reporting, see [`benchmarks/voxcpm`](../../../benchmarks/voxcpm/README.md).
 
 ---
 
@@ -316,7 +316,7 @@ python examples/offline_inference/text_to_speech/voxcpm2/end2end.py \
 ```
 
 ### Streaming
-Streaming is exposed through the online OpenAI Speech API (`stream=true`). See `examples/online_serving/voxcpm2/gradio_demo.py` for an AudioWorklet-based gapless streaming player; the offline `end2end.py` script does not expose a streaming path.
+Streaming is exposed through the online OpenAI Speech API (`stream=true`). See [`examples/online_serving/text_to_speech/voxcpm2/gradio_demo.py`](../../online_serving/text_to_speech/voxcpm2/gradio_demo.py) for an AudioWorklet-based gapless streaming player; the offline `end2end.py` script does not expose a streaming path.
 
 ### Notes
 - Output: 48 kHz mono WAV.
