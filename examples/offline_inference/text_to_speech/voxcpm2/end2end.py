@@ -48,28 +48,16 @@ def parse_args():
         help="Path to the stage config YAML file.",
     )
     parser.add_argument(
-        "--reference-audio",
+        "--ref-audio",
         type=str,
         default=None,
-        help="Path to reference audio for voice cloning (isolated ref mode).",
-    )
-    parser.add_argument(
-        "--prompt-audio",
-        type=str,
-        default=None,
-        help="Path to prompt audio for continuation mode (requires --prompt-text).",
-    )
-    parser.add_argument(
-        "--prompt-text",
-        type=str,
-        default=None,
-        help="Text matching --prompt-audio for continuation mode.",
+        help="Path to reference audio for voice cloning.",
     )
     parser.add_argument(
         "--ref-text",
         type=str,
         default=None,
-        help="Optional transcript of --reference-audio (enables ref_continuation mode).",
+        help="Optional transcript of --ref-audio (enables continuation mode).",
     )
     return parser.parse_args()
 
@@ -120,8 +108,8 @@ def main():
     split_map = build_cjk_split_map(tokenizer)
     hf_config = engine.engine.stage_vllm_configs[0].model_config.hf_config
 
-    ref_audio_arg = args.reference_audio or args.prompt_audio
-    ref_text_arg = args.ref_text or args.prompt_text
+    ref_audio_arg = args.ref_audio
+    ref_text_arg = args.ref_text
     ref_wav, ref_sr = (None, None)
     if ref_audio_arg:
         ref_wav_arr, ref_sr = sf.read(ref_audio_arg)
