@@ -96,7 +96,7 @@ The CLI client supports:
 
 ## Inference Modes
 
-OmniVoice supports three inference modes. Currently, **auto voice** is supported through the online Speech API. Voice cloning and voice design are available via offline inference (see `examples/offline_inference/omnivoice/`).
+OmniVoice supports three inference modes. Currently, **auto voice** is supported through the online Speech API. Voice cloning and voice design are available via offline inference (see `examples/offline_inference/text_to_speech/omnivoice/`).
 
 | Mode | Description | Online API | Offline |
 |------|-------------|:----------:|:-------:|
