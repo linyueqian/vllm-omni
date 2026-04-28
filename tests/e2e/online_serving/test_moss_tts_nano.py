@@ -56,7 +56,7 @@ def get_prompt(prompt_type="text"):
     """Text prompt for text-to-audio tests.
 
     Avoid the model's own name ("MOSS-TTS-Nano") in the test input — the
-    codec consistently mispronounces it ("MOS's TTS Nano", "Wass TTS Nano",
+    codec consistently mispronounces it ("MOS's TTS Nano", "Was TTS Nano",
     etc.), which trips the transcript-similarity assertion in CI without
     indicating a real regression. Use plain natural-sounding sentences.
     """
