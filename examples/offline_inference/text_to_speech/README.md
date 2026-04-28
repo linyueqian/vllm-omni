@@ -32,7 +32,7 @@ python examples/offline_inference/text_to_speech/<model>/end2end.py \
     --ref-text  "Transcript of the reference audio."
 ```
 
-`--ref-audio` and `--ref-text` are optional (text-only synthesis works without them) and must be provided together for voice cloning. The exotic scripts — Qwen3-TTS, Voxtral TTS, CosyVoice3 — accept additional model-specific flags documented in their per-model section below.
+`--ref-audio` and `--ref-text` are optional (text-only synthesis works without them) and must be provided together for voice cloning. The exotic scripts — Qwen3-TTS, Voxtral TTS, CosyVoice3 — accept additional model-specific flags documented in their per-model section below. Qwen3-TTS in particular uses its own argparse surface (`--query-type`, `--audio-path`, etc.) and does not follow the common shape; see its section.
 
 ---
 
@@ -280,6 +280,10 @@ pip install onnxruntime-rocm
 python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-type CustomVoice
 python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-type VoiceDesign
 python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-type Base
+
+# Base with a custom reference audio (Qwen3-TTS uses --audio-path, not --ref-audio):
+python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
+    --query-type Base --audio-path /path/to/reference.wav
 
 # Base variant has an additional mode flag:
 python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-type Base --mode-tag icl       # default
