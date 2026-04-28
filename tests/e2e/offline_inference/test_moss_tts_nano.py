@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """E2E offline inference tests for MOSS-TTS-Nano single-stage pipeline.
 
-MOSS-TTS-Nano is voice-cloning-only — every request needs a reference audio
-clip. We fetch the upstream sample (assets/audio/zh_1.wav, ~50 KB) once per
-test session and reuse it for all cases.
+Every request needs a reference audio clip. We test upstream's
+recommended ``voice_clone`` mode (no transcript needed). We fetch the
+upstream sample (assets/audio/zh_1.wav, ~50 KB) once per test session
+and reuse it for all cases.
 """
 
 from __future__ import annotations
@@ -22,7 +23,6 @@ from vllm_omni import Omni
 MODEL_NAME = "OpenMOSS-Team/MOSS-TTS-Nano"
 SAMPLE_RATE = 48000
 REF_AUDIO_URL = "https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS-Nano/main/assets/audio/zh_1.wav"
-REF_AUDIO_TRANSCRIPT = "欢迎关注模思智能、上海创智学院与复旦大学自然语言处理实验室。"
 
 DEFAULT_SAMPLING = SamplingParams(
     temperature=1.0,
@@ -63,21 +63,28 @@ def ref_audio_path(tmp_path_factory) -> str:
 def _build_request(
     text: str,
     prompt_audio_path: str,
-    prompt_text: str = REF_AUDIO_TRANSCRIPT,
+    prompt_text: str | None = None,
     mode: str = "voice_clone",
     max_new_frames: int = 100,  # short for tests
     seed: int = 42,
 ) -> dict:
+    """Build a MOSS-TTS-Nano offline request.
+
+    Upstream forbids ``prompt_text`` in ``voice_clone`` mode; only forward
+    it when explicitly supplied (and typically with ``mode='continuation'``).
+    """
+    additional: dict = {
+        "text": [text],
+        "mode": [mode],
+        "prompt_audio_path": [prompt_audio_path],
+        "max_new_frames": [max_new_frames],
+        "seed": [seed],
+    }
+    if prompt_text is not None:
+        additional["prompt_text"] = [prompt_text]
     return {
         "prompt": "<|im_start|>assistant\n",
-        "additional_information": {
-            "text": [text],
-            "mode": [mode],
-            "prompt_audio_path": [prompt_audio_path],
-            "prompt_text": [prompt_text],
-            "max_new_frames": [max_new_frames],
-            "seed": [seed],
-        },
+        "additional_information": additional,
     }
 
 
@@ -104,7 +111,7 @@ def omni_engine():
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"})
 def test_moss_tts_nano_english(omni_engine, ref_audio_path):
-    """English TTS produces non-empty 48 kHz stereo audio."""
+    """English voice_clone mode (no prompt_text) produces non-empty 48 kHz audio."""
     req = _build_request("Hello, this is a test of MOSS-TTS-Nano.", ref_audio_path)
     audio, sr = _collect_audio(omni_engine, req)
 
@@ -116,7 +123,7 @@ def test_moss_tts_nano_english(omni_engine, ref_audio_path):
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"})
 def test_moss_tts_nano_chinese(omni_engine, ref_audio_path):
-    """Chinese TTS produces non-empty audio."""
+    """Chinese voice_clone mode produces non-empty audio."""
     req = _build_request("你好，这是语音合成测试。", ref_audio_path)
     audio, sr = _collect_audio(omni_engine, req)
 

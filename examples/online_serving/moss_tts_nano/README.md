@@ -4,11 +4,16 @@
 
 | Model | Description |
 |-------|-------------|
-| `OpenMOSS-Team/MOSS-TTS-Nano` | 0.1B AR LM + MOSS-Audio-Tokenizer-Nano codec, 48 kHz stereo, ZH/EN/JA |
+| `OpenMOSS-Team/MOSS-TTS-Nano` | 0.1B AR LM + MOSS-Audio-Tokenizer-Nano codec, 48 kHz mono (mixed down from upstream stereo), ZH/EN/JA |
 
-> **Note.** MOSS-TTS-Nano is voice-cloning-only — every request must include a
-> reference audio clip (`ref_audio`) and its transcript (`ref_text`). Upstream
-> ships no built-in speaker presets. The OpenAI-API `voice` field is ignored.
+> **No built-in speaker presets.** Every request must include `ref_audio`.
+> The server uses upstream's recommended `voice_clone` mode (per
+> upstream's README and `infer.py` example). The OpenAI-schema `voice`
+> and `ref_text` fields are accepted but ignored — `voice_clone` does
+> not consume a transcript, and upstream's `continuation` mode (the only
+> path that accepts `prompt_text`) emits near-silent output with a
+> reference clip + transcript pair, so it is not exposed here.
+>
 > Sample reference clips are available in the upstream repo under
 > [`assets/audio/`](https://github.com/OpenMOSS/MOSS-TTS-Nano/tree/main/assets/audio)
 > (e.g. `zh_1.wav`, `en_2.wav`, `jp_2.wav`).
@@ -46,8 +51,7 @@ Or use the convenience script:
 
 ## Send TTS Request
 
-Every request needs `ref_audio` (base64 data URL) and `ref_text` (transcript
-of that audio). Reuse a saved sample:
+Every request needs `ref_audio` (base64 data URL). Reuse a saved sample:
 
 ```bash
 # Fetch a sample reference clip from the upstream repo (one-off).
@@ -63,7 +67,6 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     -d "{
         \"input\": \"你好，这是语音合成测试。\",
         \"ref_audio\": \"data:audio/wav;base64,${REF_AUDIO}\",
-        \"ref_text\": \"欢迎关注模思智能、上海创智学院与复旦大学自然语言处理实验室。\",
         \"response_format\": \"wav\"
     }" --output output.wav
 ```
@@ -95,7 +98,6 @@ response = httpx.post(
     json={
         "input": "你好，这是语音合成测试。",
         "ref_audio": f"data:audio/wav;base64,{ref_audio_b64}",
-        "ref_text": "欢迎关注模思智能、上海创智学院与复旦大学自然语言处理实验室。",
         "response_format": "wav",
     },
     timeout=300.0,
@@ -113,13 +115,12 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     -d "{
         \"input\": \"Hello, streaming output from MOSS-TTS-Nano.\",
         \"ref_audio\": \"data:audio/wav;base64,${REF_AUDIO}\",
-        \"ref_text\": \"Exact transcript of the reference audio.\",
         \"stream\": true,
         \"response_format\": \"pcm\"
-    }" --no-buffer | play -t raw -r 48000 -e signed -b 16 -c 2 -
+    }" --no-buffer | play -t raw -r 48000 -e signed -b 16 -c 1 -
 ```
 
-**Note:** MOSS-TTS-Nano outputs at 48 kHz stereo (2-channel).
+**Note:** Output is 48 kHz mono PCM. Upstream's audio tokenizer is internally stereo at 48 kHz; the model wrapper averages the two channels into mono before reaching the engine, so playback duration / pitch are correct against the WAV header's 48 kHz rate.
 
 ## API Parameters
 
@@ -129,13 +130,14 @@ MOSS-TTS-Nano uses the standard `/v1/audio/speech` endpoint.
 |-----------|------|---------|-------------|
 | `input` | string | **required** | Text to synthesize (ZH / EN / JA) |
 | `ref_audio` | string | **required** | Base64 data URL of the reference audio clip |
-| `ref_text` | string | **required** | Transcript of `ref_audio` (used to align the cloned voice) |
+| `ref_text` | string | accepted, ignored | Schema-compatible field; voice_clone mode does not consume a transcript |
 | `response_format` | string | `"wav"` | Audio format: wav, mp3, flac, pcm |
 | `stream` | bool | false | Stream raw PCM chunks |
 | `max_new_tokens` | int | 4096 | Maximum tokens to generate |
 
-The `voice` field from the OpenAI schema is accepted but ignored — there are
-no built-in speaker presets in MOSS-TTS-Nano.
+The `voice` and `ref_text` fields from the OpenAI schema are accepted but
+ignored — there are no built-in speaker presets in MOSS-TTS-Nano, and
+upstream's voice_clone mode does not consume a transcript.
 
 ## Troubleshooting
 

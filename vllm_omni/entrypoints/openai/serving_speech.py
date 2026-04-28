@@ -1119,9 +1119,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _validate_moss_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate MOSS-TTS-Nano request.
 
-        MOSS-TTS-Nano is voice-cloning-only upstream — every request must carry
-        a reference audio clip + its transcript. There are no built-in speaker
-        presets despite the ``voice`` field being part of the OpenAI schema.
+        Every request must include ``ref_audio``; the model has no built-in
+        speaker presets, so the OpenAI ``voice`` field is accepted but
+        ignored. ``ref_text`` is also accepted but ignored — upstream's
+        ``voice_clone`` (the only mode we expose, and the recommended
+        workflow per its README/``infer.py``) does not consume a transcript,
+        and its ``continuation`` mode produces near-silent output when given
+        a reference clip + transcript pair, so routing there is not useful.
         """
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
@@ -1133,21 +1137,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         fmt_err = self._validate_ref_audio_format(request.ref_audio)
         if fmt_err:
             return fmt_err
-        if not request.ref_text or not request.ref_text.strip():
-            return "Voice cloning requires 'ref_text' (transcript of the reference audio)"
         return None
 
     async def _build_moss_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build additional_information for MOSS-TTS-Nano.
 
-        Resolves ``request.ref_audio`` via MediaConnector and passes it to the
-        model as a ``(wav_list, sample_rate)`` tuple so the model owns temp-file
-        lifecycle. ``request.voice`` is intentionally ignored — see
-        ``_validate_moss_tts_request``.
+        Always uses upstream's ``voice_clone`` mode (the recommended workflow
+        per the README / ``infer.py`` default). Upstream's
+        ``_resolve_inference_mode`` rejects ``prompt_text`` in this mode, so
+        we never forward it even if ``request.ref_text`` was supplied.
+        ``ref_audio`` is resolved via MediaConnector and passed as a
+        ``(wav_list, sample_rate)`` tuple so the model owns temp-file
+        lifecycle. ``request.voice`` and ``request.ref_text`` are
+        intentionally ignored — see ``_validate_moss_tts_request``.
         """
         params: dict[str, Any] = {
             "text": [request.input],
-            "prompt_text": [request.ref_text],
+            "mode": ["voice_clone"],
         }
         if request.max_new_tokens is not None:
             params["max_new_frames"] = [request.max_new_tokens]

@@ -4,9 +4,12 @@
 E2E Online tests for MOSS-TTS-Nano model with text input and audio output.
 
 These tests verify the /v1/audio/speech endpoint works correctly with
-actual model inference, not mocks. MOSS-TTS-Nano is voice-cloning-only —
-each request carries a base64 reference audio + transcript fetched from
-the upstream repo (assets/audio/zh_1.wav, ~50 KB).
+actual model inference, not mocks. The server uses upstream's
+``voice_clone`` mode (no transcript needed); ``ref_text`` and ``voice``
+are accepted in the OpenAI schema but ignored. One case includes a
+non-empty ``ref_text`` to verify it does not break the pipeline. The
+reference clip is fetched from the upstream repo (assets/audio/zh_1.wav,
+~50 KB).
 """
 
 import base64
@@ -76,10 +79,10 @@ tts_server_params = [
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_server, openai_client, ref_audio_data_url) -> None:
     """
-    Test text input processing and audio output via /v1/audio/speech.
+    Test voice_clone mode (no ref_text) via /v1/audio/speech.
     Deploy Setting: default yaml
-    Input Modal: text + reference audio
-    Output Modal: audio (48 kHz)
+    Input Modal: text + reference audio (no transcript)
+    Output Modal: audio (48 kHz, WAV)
     Input Setting: stream=False
     Datasets: single request
     """
@@ -89,7 +92,6 @@ def test_text_to_audio_001(omni_server, openai_client, ref_audio_data_url) -> No
         "stream": False,
         "response_format": "wav",
         "ref_audio": ref_audio_data_url,
-        "ref_text": REF_AUDIO_TRANSCRIPT,
     }
 
     openai_client.send_audio_speech_request(request_config)
@@ -101,9 +103,9 @@ def test_text_to_audio_001(omni_server, openai_client, ref_audio_data_url) -> No
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_002(omni_server, openai_client, ref_audio_data_url) -> None:
     """
-    Test streaming text-to-audio via /v1/audio/speech.
+    Test streaming voice_clone via /v1/audio/speech.
     Deploy Setting: default yaml
-    Input Modal: text + reference audio
+    Input Modal: text + reference audio (no transcript)
     Output Modal: audio (48 kHz, PCM stream)
     Input Setting: stream=True
     Datasets: single request
@@ -114,7 +116,6 @@ def test_text_to_audio_002(omni_server, openai_client, ref_audio_data_url) -> No
         "stream": True,
         "response_format": "pcm",
         "ref_audio": ref_audio_data_url,
-        "ref_text": REF_AUDIO_TRANSCRIPT,
     }
 
     openai_client.send_audio_speech_request(request_config)
@@ -126,12 +127,36 @@ def test_text_to_audio_002(omni_server, openai_client, ref_audio_data_url) -> No
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_003(omni_server, openai_client, ref_audio_data_url) -> None:
     """
-    Test Chinese text-to-audio via /v1/audio/speech.
+    Test Chinese voice_clone via /v1/audio/speech.
     Deploy Setting: default yaml
-    Input Modal: text (Chinese) + reference audio
-    Output Modal: audio (48 kHz)
+    Input Modal: text (Chinese) + reference audio (no transcript)
+    Output Modal: audio (48 kHz, WAV)
     Input Setting: stream=False
     Datasets: single request
+    """
+    request_config = {
+        "model": omni_server.model,
+        "input": get_prompt("chinese"),
+        "stream": False,
+        "response_format": "wav",
+        "ref_audio": ref_audio_data_url,
+    }
+
+    openai_client.send_audio_speech_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_text_to_audio_004_ref_text_ignored(omni_server, openai_client, ref_audio_data_url) -> None:
+    """
+    Sending ``ref_text`` alongside ``ref_audio`` is accepted but ignored.
+
+    The OpenAI ``ref_text`` field is part of the schema, so clients may
+    send it. The server uses upstream's voice_clone mode regardless and
+    drops the transcript; this case verifies the request still completes
+    and produces audio.
     """
     request_config = {
         "model": omni_server.model,

@@ -3,17 +3,27 @@
 """Offline inference example for MOSS-TTS-Nano via vLLM-Omni.
 
 Single-stage pipeline: the 0.1B AR LM and MOSS-Audio-Tokenizer-Nano codec
-both run inside one generation stage. Output is 48 kHz stereo WAV.
+both run inside one generation stage. Output is 48 kHz mono WAV (the
+upstream tokenizer is stereo at 48 kHz; the wrapper mixes down to mono so
+the existing single-channel audio writer in vLLM-Omni stays correct).
 
-MOSS-TTS-Nano is voice-cloning-only — every request needs a reference audio
-clip (--prompt-audio) and its transcript (--prompt-text).
+MOSS-TTS-Nano upstream supports two modes (matching ``infer.py``):
+
+* ``voice_clone`` (recommended): only ``--prompt-audio`` is required.
+* ``continuation``: ``--prompt-audio`` + ``--prompt-text`` together.
 
 Usage:
-  # Voice clone with reference audio (required)
+  # Voice clone (recommended): ref audio only, no transcript needed.
+  python end2end.py \\
+    --text "Hello!" \\
+    --prompt-audio /path/to/ref.wav
+
+  # Continuation: ref audio + its transcript.
   python end2end.py \\
     --text "Hello!" \\
     --prompt-audio /path/to/ref.wav \\
-    --prompt-text "Transcript of the reference clip."
+    --prompt-text "Transcript of the reference clip." \\
+    --mode continuation
 
   # Sample reference clips ship in the upstream repo:
   #   https://github.com/OpenMOSS/MOSS-TTS-Nano/tree/main/assets/audio
@@ -41,7 +51,7 @@ MODEL = "OpenMOSS-Team/MOSS-TTS-Nano"
 def build_request(
     text: str,
     prompt_audio_path: str,
-    prompt_text: str,
+    prompt_text: str | None = None,
     mode: str = "voice_clone",
     max_new_frames: int = 375,
     seed: int | None = None,
@@ -50,18 +60,25 @@ def build_request(
     audio_top_p: float = 0.95,
     text_temperature: float = 1.0,
 ) -> dict:
-    """Build an Omni request payload for MOSS-TTS-Nano."""
+    """Build an Omni request payload for MOSS-TTS-Nano.
+
+    Upstream's ``_resolve_inference_mode`` forbids ``prompt_text`` in
+    ``voice_clone`` mode and requires it in ``continuation`` mode (with
+    ``prompt_audio_path``), so we only forward ``prompt_text`` when it is
+    actually supplied.
+    """
     additional: dict = {
         "text": [text],
         "mode": [mode],
         "prompt_audio_path": [str(prompt_audio_path)],
-        "prompt_text": [prompt_text],
         "max_new_frames": [max_new_frames],
         "audio_temperature": [audio_temperature],
         "audio_top_k": [audio_top_k],
         "audio_top_p": [audio_top_p],
         "text_temperature": [text_temperature],
     }
+    if prompt_text is not None and prompt_text.strip():
+        additional["prompt_text"] = [prompt_text]
     if seed is not None:
         additional["seed"] = [seed]
 
@@ -72,10 +89,13 @@ def build_request(
 
 
 def save_audio(waveform: torch.Tensor, path: str, sample_rate: int = 48000) -> None:
+    """Write the model's mono waveform to ``path`` at ``sample_rate``.
+
+    The model wrapper mixes the upstream tokenizer's stereo output down to
+    mono before reaching the engine, so ``waveform`` is always 1-D here —
+    no extra interleave/reshape is needed.
+    """
     audio_np = waveform.float().numpy()
-    # Reshape stereo: inference_stream yields interleaved [samples*2]; reshape to [samples, 2]
-    if audio_np.ndim == 1 and audio_np.shape[0] % 2 == 0:
-        audio_np = audio_np.reshape(-1, 2)
     sf.write(path, audio_np, sample_rate)
     print(f"  Saved {path} ({audio_np.shape}, {sample_rate} Hz)")
 
@@ -140,12 +160,15 @@ def parse_args():
     parser.add_argument(
         "--prompt-audio",
         required=True,
-        help="Path to reference audio for voice cloning (required — MOSS-TTS-Nano is voice-cloning-only).",
+        help="Path to reference audio for voice cloning / continuation (required).",
     )
     parser.add_argument(
         "--prompt-text",
-        required=True,
-        help="Exact transcript of --prompt-audio (required for voice cloning).",
+        default=None,
+        help=(
+            "Optional transcript of --prompt-audio. Required (and only meaningful) "
+            "in --mode continuation; rejected by upstream in --mode voice_clone."
+        ),
     )
     parser.add_argument("--mode", default="voice_clone", choices=["voice_clone", "continuation"])
     parser.add_argument("--max-new-frames", type=int, default=375, help="Max AR frames (~14s at default).")

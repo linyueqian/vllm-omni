@@ -317,19 +317,22 @@ def build_payload(
     response_format: str = "pcm",
     stream: bool = True,
 ) -> dict:
-    """Build the /v1/audio/speech request payload."""
+    """Build the /v1/audio/speech request payload.
+
+    The server uses upstream's voice_clone mode and ignores ``ref_text``,
+    so we drop it from the payload entirely. The textbox is kept in the
+    UI for users coming from voice-cloning systems that do consume a
+    transcript (e.g. Qwen3-TTS), so the same UX habits transfer.
+    """
     if not text or not text.strip():
         raise gr.Error("Please enter text to synthesize.")
     if ref_audio is None:
         raise gr.Error("Reference audio is required. Upload a 10-30 s clip in the Reference Audio panel.")
-    ref_text_stripped = ref_text.strip() if ref_text else ""
-    if not ref_text_stripped:
-        raise gr.Error("Reference Audio Transcript is required for voice cloning.")
+    del ref_text  # accepted in the form but not forwarded
 
     return {
         "input": text.strip(),
         "ref_audio": encode_audio_to_base64(ref_audio),
-        "ref_text": ref_text_stripped,
         "response_format": "pcm" if stream else response_format,
         "stream": stream,
     }
@@ -479,8 +482,11 @@ def create_app(api_base: str):
                 )
 
                 gr.Markdown(
-                    "MOSS-TTS-Nano is voice-cloning-only. Upload a 10-30 s "
-                    "reference audio clip and provide its exact transcript."
+                    "Upload a 10-30 s reference audio clip. MOSS-TTS-Nano "
+                    "uses upstream's voice_clone mode, which does not "
+                    "consume a transcript — the transcript box below is "
+                    "kept for UX consistency with other TTS systems but is "
+                    "not sent to the model."
                 )
                 ref_audio = gr.Audio(
                     label="Reference Audio (required)",
@@ -488,8 +494,8 @@ def create_app(api_base: str):
                     sources=["upload", "microphone"],
                 )
                 ref_text = gr.Textbox(
-                    label="Reference Audio Transcript (required)",
-                    placeholder="Exact transcript of the reference audio...",
+                    label="Reference Audio Transcript (ignored by MOSS-TTS-Nano)",
+                    placeholder="Optional. The MOSS-TTS-Nano voice_clone mode does not use a transcript.",
                     lines=2,
                 )
 
