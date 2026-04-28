@@ -85,9 +85,29 @@ _DEFAULT_AUDIO_TOP_P = 0.95
 _DEFAULT_AUDIO_TOP_K = 25
 _DEFAULT_AUDIO_REPETITION_PENALTY = 1.2
 _DEFAULT_MAX_NEW_FRAMES = 375
-# MOSS-TTS-Nano upstream is voice-cloning-only — every request must supply
-# a reference audio + transcript via prompt_audio_path / prompt_audio_array.
+# MOSS-TTS-Nano upstream supports two modes (voice_clone / continuation).
+# voice_clone is the recommended workflow; the serving layer routes by
+# whether ref_text was supplied (see _build_moss_tts_params in
+# vllm_omni/entrypoints/openai/serving_speech.py).
 _DEFAULT_MODE = "voice_clone"
+
+
+def _to_mono_1d(waveform: Any) -> torch.Tensor:
+    """Convert an upstream waveform event to a 1-D float32 mono tensor.
+
+    The MOSS audio tokenizer is configured for stereo (number_channels=2)
+    and emits ``(channels, samples)`` tensors. The downstream serving path
+    writes a single-channel WAV at the tokenizer's sample rate, so we mix
+    multi-channel audio down to mono via mean. Naively flattening with
+    ``.T.reshape(-1)`` interleaves L/R into a 2N-length stream that gets
+    re-interpreted at 1× the sample rate — playback ends up 2× too slow.
+    """
+    chunk = torch.as_tensor(waveform, dtype=torch.float32).cpu()
+    if chunk.ndim == 2:
+        if chunk.shape[0] > 1:
+            return chunk.mean(dim=0).contiguous()
+        return chunk.reshape(-1)
+    return chunk.reshape(-1)
 
 
 def _pick(info: dict, key: str, default):
@@ -314,11 +334,7 @@ class MossTTSNanoForGeneration(nn.Module):
                 if event_type == "audio":
                     waveform = event.get("waveform")
                     if waveform is not None:
-                        chunk = torch.as_tensor(waveform, dtype=torch.float32).cpu()
-                        if chunk.ndim == 2:
-                            chunk = chunk.T.reshape(-1)
-                        else:
-                            chunk = chunk.reshape(-1)
+                        chunk = _to_mono_1d(waveform)
                         audio_chunks.append(chunk)
                         # Yield each chunk as it arrives (is_last=False).
                         yield chunk, False
@@ -326,7 +342,7 @@ class MossTTSNanoForGeneration(nn.Module):
                     if not audio_chunks:
                         waveform = event.get("waveform")
                         if waveform is not None:
-                            chunk = torch.as_tensor(waveform, dtype=torch.float32).cpu().reshape(-1)
+                            chunk = _to_mono_1d(waveform)
                             yield chunk, True
                             return
         except Exception:
