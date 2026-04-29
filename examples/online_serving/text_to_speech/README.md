@@ -204,7 +204,7 @@ To opt out of chunked streaming, pass `--no-async-chunk` instead — the pipelin
 python qwen3_tts/openai_speech_client.py \
     --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --text "今天天气真好" \
-    --voice ryan \
+    --speaker ryan \
     --instructions "用开心的语气说"
 
 # VoiceDesign with a style description
@@ -265,10 +265,6 @@ python qwen3_tts/streaming_speech_client.py --text "..." --simulate-stt --stt-de
 ./qwen3_tts/run_gradio_demo.sh                              # CustomVoice (default)
 ./qwen3_tts/run_gradio_demo.sh --task-type VoiceDesign
 ./qwen3_tts/run_gradio_demo.sh --task-type Base
-
-# FastRTC variant (gapless WebRTC streaming):
-pip install fastrtc
-python qwen3_tts/gradio_fastrtc_demo.py --api-base http://localhost:8000
 ```
 
 ### Speaker embedding interpolation
