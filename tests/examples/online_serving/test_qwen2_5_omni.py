@@ -4,16 +4,15 @@ See examples/online_serving/qwen2_5_omni/README.md
 """
 
 import os
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
 from pathlib import Path
 
 import pytest
 
 from tests.examples.helpers import (
     extract_content_after_keyword,
+    extract_last_audio_saved_path,
     run_cmd,
+    strip_audio_saved_to_lines,
     strip_trailing_audio_saved_line,
 )
 from tests.helpers.mark import hardware_test
@@ -21,7 +20,9 @@ from tests.helpers.media import convert_audio_file_to_text, cosine_similarity_te
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.example]
+pytestmark = [pytest.mark.full_model, pytest.mark.example, pytest.mark.omni]
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 models = ["Qwen/Qwen2.5-Omni-7B"]
 
@@ -40,8 +41,6 @@ test_params = [
 common_args = ["python", os.path.join(example_dir, "openai_chat_completion_client_for_multimodal_generation.py")]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_send_multimodal_request_001(omni_server) -> None:
@@ -58,8 +57,8 @@ def test_send_multimodal_request_001(omni_server) -> None:
     text_content = strip_trailing_audio_saved_line(text_content_tmp)
 
     # Verify text output same as audio output
-    wav_path = extract_content_after_keyword("Audio saved to", result)
-    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path.strip()}")
+    wav_path = extract_last_audio_saved_path(result)
+    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path}")
     print(f"text content is: {text_content}")
     print(f"audio content is: {audio_content}")
 
@@ -77,8 +76,6 @@ def test_send_multimodal_request_001(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_send_multimodal_request_002(omni_server) -> None:
@@ -96,8 +93,8 @@ def test_send_multimodal_request_002(omni_server) -> None:
     text_content = strip_trailing_audio_saved_line(text_content_tmp)
 
     # Verify text output same as audio output
-    wav_path = extract_content_after_keyword("Audio saved to", result)
-    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path.strip()}")
+    wav_path = extract_last_audio_saved_path(result)
+    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path}")
     print(f"text content is: {text_content}")
     assert all(keyword in text_content for keyword in ["baby", "book"]), (
         "The output does not contain any of the keywords in video description."
@@ -114,8 +111,6 @@ def test_send_multimodal_request_002(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_send_multimodal_request_003(omni_server) -> None:
@@ -141,8 +136,6 @@ def test_send_multimodal_request_003(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_modality_control_001(omni_server) -> None:
@@ -171,8 +164,6 @@ def test_modality_control_001(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_modality_control_002(omni_server) -> None:
@@ -187,8 +178,8 @@ def test_modality_control_002(omni_server) -> None:
 
     result = run_cmd(command)
     # Verify text output same as audio output
-    wav_path = extract_content_after_keyword("Audio saved to", result)
-    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path.strip()}")
+    wav_path = extract_last_audio_saved_path(result)
+    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path}")
     print(f"audio content is: {audio_content}")
     assert all(keyword in audio_content for keyword in ["baby", "book"]), (
         "The output does not contain any of the keywords in video description."
@@ -200,8 +191,6 @@ def test_modality_control_002(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_modality_control_003(omni_server) -> None:
@@ -220,8 +209,8 @@ def test_modality_control_003(omni_server) -> None:
     text_content = strip_trailing_audio_saved_line(text_content_tmp)
 
     # Verify text output same as audio output
-    wav_path = extract_content_after_keyword("Audio saved to", result)
-    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path.strip()}")
+    wav_path = extract_last_audio_saved_path(result)
+    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path}")
     print(f"text content is: {text_content}")
     assert all(keyword in text_content for keyword in ["baby", "book"]), (
         "The output does not contain any of the keywords in video description."
@@ -238,8 +227,6 @@ def test_modality_control_003(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_stream_001(omni_server) -> None:
@@ -254,11 +241,11 @@ def test_stream_001(omni_server) -> None:
     result = run_cmd(command)
 
     text_content_tmp = extract_content_after_keyword("content:", result)
-    text_content = strip_trailing_audio_saved_line(text_content_tmp)
+    text_content = strip_audio_saved_to_lines(text_content_tmp)
 
     # Verify text output same as audio output
-    wav_path = extract_content_after_keyword("Audio saved to", result)
-    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path.strip()}")
+    wav_path = extract_last_audio_saved_path(result)
+    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path}")
     print(f"text content is: {text_content}")
     assert all(keyword in text_content for keyword in ["baby", "book"]), (
         "The output does not contain any of the keywords in video description."
