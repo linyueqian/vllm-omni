@@ -16,7 +16,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni import Omni
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_STAGE_CONFIGS_PATH = str(REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "voxcpm2.yaml")
 SAMPLE_RATE = 48_000
 
