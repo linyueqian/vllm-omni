@@ -1943,7 +1943,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
         if is_moss:
-            audio_tensor = torch.cat(moss_chunks, dim=-1) if moss_chunks else np.zeros((0,), dtype=np.float32)
+            # Prefer the engine's own consolidated audio when present. After the
+            # vllm 0.20 rebase non-stream requests resolve to FINAL_ONLY, so
+            # final_output already carries the full concatenated waveform; the
+            # delta-accumulator below is kept as a fallback for DELTA-style
+            # engines that surface chunks one yield at a time.
+            if isinstance(audio_tensor, list):
+                non_empty_final = [c for c in audio_tensor if hasattr(c, "numel") and c.numel() > 0]
+                final_audio = torch.cat(non_empty_final, dim=-1) if non_empty_final else None
+            elif hasattr(audio_tensor, "numel") and audio_tensor.numel() > 0:
+                final_audio = audio_tensor
+            else:
+                final_audio = None
+
+            if final_audio is not None:
+                audio_tensor = final_audio
+            elif moss_chunks:
+                audio_tensor = torch.cat(moss_chunks, dim=-1)
+            else:
+                audio_tensor = np.zeros((0,), dtype=np.float32)
             if moss_sample_rate is not None:
                 sample_rate = moss_sample_rate
         elif isinstance(audio_tensor, list):
