@@ -10,11 +10,7 @@ import pytest
 
 # Import the slerp function from the example script.
 _examples_dir = str(
-    Path(__file__).parent.parent.parent
-    / "examples"
-    / "online_serving"
-    / "text_to_speech"
-    / "qwen3_tts"
+    Path(__file__).parent.parent.parent / "examples" / "online_serving" / "text_to_speech" / "qwen3_tts"
 )
 sys.path.insert(0, _examples_dir)
 from speaker_embedding_interpolation import slerp  # noqa: E402

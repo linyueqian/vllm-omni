@@ -21,11 +21,7 @@ import numpy as np
 import pytest
 
 _examples_dir = str(
-    Path(__file__).parent.parent.parent.parent
-    / "examples"
-    / "offline_inference"
-    / "text_to_speech"
-    / "qwen3_tts"
+    Path(__file__).parent.parent.parent.parent / "examples" / "offline_inference" / "text_to_speech" / "qwen3_tts"
 )
 sys.path.insert(0, _examples_dir)
 from end2end import _estimate_prompt_len  # noqa: E402
