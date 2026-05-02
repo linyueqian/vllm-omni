@@ -194,6 +194,39 @@ class MossTTSNanoForGeneration(nn.Module):
                     logger.info("MOSS-TTS-Nano using sdpa (flash_attn not installed)")
             lm.to(device=device)
             lm.eval()
+
+            # Re-initialise upstream rotary_emb.inv_freq buffers. They are
+            # registered with persistent=False, so transformers>=5.0's
+            # init_empty_weights / meta-device path used inside
+            # from_pretrained(torch_dtype=...) materialises them as
+            # uninitialised GPU memory (shape/dtype correct, but values are
+            # whatever was in the page), instead of running the formula
+            # 1.0 / 10000^(arange(0, head_dim, 2) / head_dim) from the
+            # MossTTSNanoGPT2RotaryEmbedding __init__. Garbage values
+            # like -1.7e38 make cos() / sin() produce NaN, so
+            # the very first text-LM forward emits all-NaN logits and
+            # trips upstream's _ensure_finite_generation_logits. We
+            # recompute every rotary_emb.inv_freq in place using the same
+            # base=10000.0 formula the upstream class declares.
+            _moss_rope_base = 10000.0
+            _n_fixed = 0
+            for _name, _mod in lm.named_modules():
+                if not _name.endswith("rotary_emb"):
+                    continue
+                _ifq = getattr(_mod, "inv_freq", None)
+                if not isinstance(_ifq, torch.Tensor) or _ifq.ndim != 1:
+                    continue
+                _head_dim = _ifq.numel() * 2
+                _new_ifq = 1.0 / (
+                    _moss_rope_base
+                    ** (torch.arange(0, _head_dim, 2, dtype=torch.float32, device=_ifq.device) / _head_dim)
+                )
+                with torch.no_grad():
+                    _ifq.copy_(_new_ifq.to(dtype=_ifq.dtype))
+                _n_fixed += 1
+            if _n_fixed > 0:
+                logger.info("MOSS-TTS-Nano: re-initialised %d rotary_emb.inv_freq buffers (transformers>=5.0 meta-device buffer materialisation produces garbage for non-persistent buffers)", _n_fixed)
+
             self._lm = lm
             logger.info("MOSS-TTS-Nano LM loaded on %s", device)
 
