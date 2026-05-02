@@ -205,9 +205,7 @@ class MossTTSNanoForGeneration(nn.Module):
             # for the full mechanism and reproduction.
             n_fixed = reinit_rotary_inv_freq(lm, base=10000.0)
             if n_fixed > 0:
-                logger.info(
-                    "MOSS-TTS-Nano: re-initialised %d rotary_emb.inv_freq buffers", n_fixed
-                )
+                logger.info("MOSS-TTS-Nano: re-initialised %d rotary_emb.inv_freq buffers", n_fixed)
 
             self._lm = lm
             logger.info("MOSS-TTS-Nano LM loaded on %s", device)
