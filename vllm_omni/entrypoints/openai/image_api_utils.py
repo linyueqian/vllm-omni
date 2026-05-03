@@ -15,6 +15,7 @@ from PIL import Image
 
 SUPPORTED_LAYERED_RESOLUTIONS = (640, 1024)
 SUPPORTED_LAYERED_LAYERS_RANGE = range(3, 11)
+SUPPORTED_OUTPUT_FORMATS = frozenset({"png", "jpeg", "jpg", "webp"})
 
 
 def parse_size(size_str: str) -> tuple[int, int]:
@@ -53,25 +54,34 @@ def parse_size(size_str: str) -> tuple[int, int]:
     return width, height
 
 
-def encode_image_base64_with_compression(image: Image.Image, format: str = "png", output_compression: int = 100) -> str:
+def encode_image_base64(image: Image.Image, format: str = "png", output_compression: int = 100) -> str:
     """Encode PIL Image to a base64 image string.
 
     Args:
-        image: PIL Image object
-        format: Output image format (e.g., "PNG", "JPEG", "WEBP")
-        output_compression: Compression level (0-100%), 100 for best quality
-    Returns:
-        Base64-encoded image as string
-    """
-    buffer = io.BytesIO()
-    image = _prepare_image_for_output_format(image, format)
-    save_kwargs = {}
-    if format in ("jpg", "jpeg", "webp"):
-        save_kwargs["quality"] = output_compression
-    elif format == "png":
-        save_kwargs["compress_level"] = max(0, min(9, 9 - output_compression // 11))  # Map 0-100 to 9-0
+        image: PIL Image object.
+        format: Output image format. One of ``png``, ``jpeg``/``jpg``, ``webp``.
+        output_compression: Quality (1-100). 100 means best quality / least compression.
 
-    image.save(buffer, format=format, **save_kwargs)
+    Returns:
+        Base64-encoded image bytes as a UTF-8 string.
+    """
+    fmt = (format or "png").lower()
+    if fmt not in SUPPORTED_OUTPUT_FORMATS:
+        raise ValueError(f"Unsupported output format: {format!r}. Supported: {sorted(SUPPORTED_OUTPUT_FORMATS)}")
+    # PIL's save handler doesn't recognize 'JPG'; normalize to 'JPEG'.
+    pil_fmt = "jpeg" if fmt == "jpg" else fmt
+
+    image = _prepare_image_for_output_format(image, pil_fmt)
+
+    save_kwargs: dict = {}
+    if pil_fmt in {"jpeg", "webp"}:
+        save_kwargs["quality"] = output_compression
+    elif pil_fmt == "png":
+        # Map quality 0-100 → PNG compress_level 9-0 (PIL accepts 0..9, higher = more compression)
+        save_kwargs["compress_level"] = max(0, min(9, 9 - output_compression // 11))
+
+    buffer = io.BytesIO()
+    image.save(buffer, format=pil_fmt, **save_kwargs)
     buffer.seek(0)
     return base64.b64encode(buffer.read()).decode("utf-8")
 
@@ -94,18 +104,24 @@ def _prepare_image_for_output_format(image: Image.Image, format: str) -> Image.I
 
 
 def choose_output_format(output_format: str | None, background: str | None) -> str:
-    # Normalize and choose extension
+    """Resolve a final image format from the request's output_format / background.
+
+    Falls back to PNG if transparency is requested, otherwise JPEG.
+    """
     fmt = (output_format or "").lower()
-    if fmt in {"jpg", "png", "webp", "jpeg"}:
+    if fmt in SUPPORTED_OUTPUT_FORMATS:
         return fmt
-    # If transparency requested, prefer png
     if (background or "auto").lower() == "transparent":
         return "png"
-    # Default
     return "jpeg"
 
 
-def get_vllm_image_params(vllm_xargs: dict | None):
+def get_vllm_image_params(vllm_xargs: dict | None) -> tuple[str, int, str]:
+    """Extract image (format, compression, background) from chat-completion ``vllm_xargs``.
+
+    Invalid or missing values fall back to safe defaults (png / 100 / auto).
+    Compression is clamped into [1, 100].
+    """
     if not vllm_xargs:
         return "png", 100, "auto"
 
@@ -113,15 +129,16 @@ def get_vllm_image_params(vllm_xargs: dict | None):
     image_compression = vllm_xargs.get("image_compression")
     image_background = vllm_xargs.get("image_background")
 
-    # format：must not empty
-    if not isinstance(image_format, str) or not image_format.strip():
+    if not isinstance(image_format, str) or image_format.strip().lower() not in SUPPORTED_OUTPUT_FORMATS:
         image_format = "png"
+    else:
+        image_format = image_format.strip().lower()
 
-    # compression：must > 0 and < 100
-    if not isinstance(image_compression, (int, float)) or image_compression <= 0:
+    if isinstance(image_compression, bool) or not isinstance(image_compression, (int, float)):
         image_compression = 100
+    else:
+        image_compression = int(max(1, min(100, image_compression)))
 
-    # background：str（"white" / "#FFFFFF" / "transparent"）
     if not isinstance(image_background, str) or not image_background.strip():
         image_background = "auto"
 

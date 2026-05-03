@@ -87,7 +87,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.image_api_utils import (
     choose_output_format,
-    encode_image_base64_with_compression,
+    encode_image_base64,
     get_vllm_image_params,
     validate_layered_layers,
 )
@@ -2076,7 +2076,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         fmt = choose_output_format(fmt, background)
         image_contents = []
         for img in images:
-            img_base64 = encode_image_base64_with_compression(img, fmt, compression)
+            img_base64 = encode_image_base64(img, fmt, compression)
             image_contents.append(
                 {
                     "type": "image_url",
@@ -2561,7 +2561,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             fmt, compression, background = get_vllm_image_params(request.vllm_xargs)
             fmt = choose_output_format(fmt, background)
             for img in flat_images:
-                img_base64 = encode_image_base64_with_compression(img, fmt, compression)
+                img_base64 = encode_image_base64(img, fmt, compression)
                 image_contents.append(
                     {
                         "type": "image_url",

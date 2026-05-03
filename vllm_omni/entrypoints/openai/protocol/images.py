@@ -8,12 +8,11 @@ for text-to-image generation, with vllm-omni specific extensions.
 """
 
 from enum import Enum
-from typing import Annotated, Any
+from typing import Any
 
-from fastapi import Form
 from pydantic import BaseModel, Field, field_validator
 
-from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
+from vllm_omni.entrypoints.openai.image_api_utils import SUPPORTED_OUTPUT_FORMATS, validate_layered_layers
 
 
 class ResponseFormat(str, Enum):
@@ -47,12 +46,17 @@ class ImageGenerationRequest(BaseModel):
     response_format: ResponseFormat = Field(default=ResponseFormat.B64_JSON, description="Format of the returned image")
     output_format: str | None = Field(
         default=None,
-        description="The image output format, availables: png, jpeg, webp",
+        description="Output image format: 'png', 'jpeg'/'jpg', or 'webp'. Defaults to 'png'.",
     )
-    background: str | None = Form("auto")
-    output_compression: Annotated[int, Form(ge=0, le=100)] = Field(
+    output_compression: int | None = Field(
         default=None,
-        description="Number of output layers for layered image models. Supported range: 3-10.",
+        ge=1,
+        le=100,
+        description="Quality (1-100) for JPEG/WebP output, or PNG zlib level mapping. 100 = best quality.",
+    )
+    background: str | None = Field(
+        default="auto",
+        description="Background handling: 'auto', 'transparent', or a CSS color. 'transparent' forces PNG output.",
     )
     user: str | None = Field(default=None, description="User identifier for tracking")
     layers: int | None = Field(
@@ -88,6 +92,17 @@ class ImageGenerationRequest(BaseModel):
     def validate_layers(cls, v):
         """Validate the layers parameter for layered image models."""
         return validate_layered_layers(v)
+
+    @field_validator("output_format")
+    @classmethod
+    def validate_output_format(cls, v):
+        """Validate output format against the supported set."""
+        if v is None:
+            return None
+        normalized = v.strip().lower()
+        if normalized not in SUPPORTED_OUTPUT_FORMATS:
+            raise ValueError(f"Invalid output_format: {v!r}. Must be one of {sorted(SUPPORTED_OUTPUT_FORMATS)}.")
+        return normalized
 
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the image")
@@ -148,12 +163,6 @@ class ImageGenerationRequest(BaseModel):
     # VAE memory optimizations (set at model init, included for completeness)
     vae_use_slicing: bool | None = Field(default=False, description="Enable VAE slicing")
     vae_use_tiling: bool | None = Field(default=False, description="Enable VAE tiling")
-
-    # Output format for generated images
-    output_format: str | None = Field(
-        default=None,
-        description="Output image format: 'png', 'jpeg', or 'webp'. Defaults to 'png'.",
-    )
 
 
 class ImageData(BaseModel):

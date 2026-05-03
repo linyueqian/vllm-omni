@@ -92,7 +92,7 @@ from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
     SUPPORTED_LAYERED_RESOLUTIONS,
     choose_output_format,
-    encode_image_base64_with_compression,
+    encode_image_base64,
     parse_size,
     validate_layered_layers,
 )
@@ -1496,16 +1496,8 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
     try:
         # Unify request construction for any multi-stage pipeline to avoid
         # divergence between /v1/images and /v1/chat/completions.
-        output_format = "png"
-        output_compression = 100
-        background = "auto"
-        if request.output_format is not None:
-            output_format = request.output_format
-        if request.output_compression is not None:
-            output_compression = request.output_compression
-        if request.background is not None:
-            background = request.background
-        output_format = choose_output_format(output_format, background)
+        output_compression = request.output_compression if request.output_compression is not None else 100
+        output_format = choose_output_format(request.output_format or "png", request.background or "auto")
         if len(stage_configs) > 1:
             chat_handler = getattr(raw_request.app.state, "openai_serving_chat", None)
             if chat_handler is None:
@@ -1553,7 +1545,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             flat_images, _, _ = generation_result
             image_data = [
                 ImageData(
-                    b64_json=encode_image_base64_with_compression(
+                    b64_json=encode_image_base64(
                         img,
                         format=output_format,
                         output_compression=output_compression,
@@ -1647,7 +1639,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         # Encode images to base64
         image_data = [
             ImageData(
-                b64_json=encode_image_base64_with_compression(
+                b64_json=encode_image_base64(
                     img,
                     format=output_format,
                     output_compression=output_compression,
@@ -1953,7 +1945,7 @@ async def edit_images(
         # Encode images to base64
         image_data = [
             ImageData(
-                b64_json=encode_image_base64_with_compression(
+                b64_json=encode_image_base64(
                     img, format=output_format, output_compression=output_compression
                 ),
                 revised_prompt=None,
