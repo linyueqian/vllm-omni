@@ -439,7 +439,16 @@ class MossTTSNanoForGeneration(nn.Module):
                 last_chunk_flags.append(True)
                 continue
 
-            request_key = str(info.get("_omni_req_id", "0"))
+            # Per-request key so concurrent / consecutive requests don't
+            # share a generator. ``global_request_id`` is set by the engine
+            # (see info keys ``['text', 'mode', 'prompt_audio_array',
+            # 'global_request_id', 'omni_final_stage_id', 'generated_len']``).
+            # ``_omni_req_id`` is a legacy fallback that is never set in
+            # the current engine; falling back to a constant collapses all
+            # requests onto one generator and lets a stale generator from
+            # request N replay its remaining chunks for request N+1, which
+            # surfaces as request N+1's audio matching request N's input.
+            request_key = str(info.get("global_request_id") or info.get("_omni_req_id") or id(info))
 
             # Create generator on first call for this request.
             if request_key not in self._stream_gens:
