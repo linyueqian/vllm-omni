@@ -77,8 +77,15 @@ def _patch_torchaudio_load() -> None:
         logger.warning("Could not patch torchaudio: %s", e)
 
 
-# Default sampling parameters matching the upstream demo defaults.
-_DEFAULT_TEXT_TEMPERATURE = 1.0
+# Default sampling parameters. Audio-side defaults match upstream's
+# voice_clone demo. Text-side temperature is reduced from upstream's
+# 1.5 (and our previous 1.0) to 0.6 because the text head's job is
+# almost entirely to keep emitting ``audio_assistant_slot_token_id``
+# until the utterance is over; high temperature lets it stochastically
+# sample some other token, which immediately ends generation in
+# upstream's ``should_continue = next_text_tokens.eq(audio_assistant_slot)``
+# loop and produces truncated audio.
+_DEFAULT_TEXT_TEMPERATURE = 0.6
 _DEFAULT_TEXT_TOP_P = 1.0
 _DEFAULT_TEXT_TOP_K = 50
 _DEFAULT_AUDIO_TEMPERATURE = 0.8
