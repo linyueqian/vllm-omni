@@ -106,9 +106,13 @@ def _prepare_image_for_output_format(image: Image.Image, format: str) -> Image.I
 def choose_output_format(output_format: str | None, background: str | None) -> str:
     """Resolve a final image format from the request's output_format / background.
 
+    Returns one of {"png", "jpeg", "webp"} — "jpg" is canonicalised to "jpeg" so
+    downstream MIME types (e.g. ``image/jpeg``) follow the IANA spelling.
     Falls back to PNG if transparency is requested, otherwise JPEG.
     """
     fmt = (output_format or "").lower()
+    if fmt == "jpg":
+        return "jpeg"
     if fmt in SUPPORTED_OUTPUT_FORMATS:
         return fmt
     if (background or "auto").lower() == "transparent":

@@ -158,9 +158,11 @@ def test_encode_image_base64_rejects_unsupported_format():
 
 
 def test_choose_output_format_passthrough():
-    for fmt in SUPPORTED_OUTPUT_FORMATS:
-        assert choose_output_format(fmt, "auto") == fmt
-        assert choose_output_format(fmt.upper(), "auto") == fmt
+    # "jpg" is canonicalised to "jpeg" so downstream MIME types use the IANA name.
+    expected = {"png": "png", "jpeg": "jpeg", "jpg": "jpeg", "webp": "webp"}
+    for fmt, expect in expected.items():
+        assert choose_output_format(fmt, "auto") == expect
+        assert choose_output_format(fmt.upper(), "auto") == expect
 
 
 def test_choose_output_format_transparent_prefers_png():
