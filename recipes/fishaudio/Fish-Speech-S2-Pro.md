@@ -124,16 +124,6 @@ stages so concurrencies above 8 don't queue, and reduces
 `connector_get_sleep_s` from 10 ms to 1 ms so DAC chunks aren't held in
 the connector once they're ready.
 
-#### Throughput (H20x2, 100 unique prompts)
-
-| concurrency | req/s | audio/s | mean E2E ms | p99 E2E ms | mean TTFP ms | p99 TTFP ms | mean RTF |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-|  1 | 0.86 |  4.06 | 1166 | 2109 |  67 |   74 | 0.246 |
-|  4 | 2.88 | 13.59 | 1368 | 1884 |  94 |  127 | 0.290 |
-| 16 | 4.92 | 22.74 | 3151 | 8241 | 312 | 5615 | 0.689 |
-| 32 | 7.06 | 32.92 | 4249 | 5325 | 528 |  781 | 0.926 |
-| 64 | 8.34 | 39.47 | 6377 | 9254 | 732 | 1356 | 1.361 |
-
-For H100x2 numbers under an earlier configuration of this profile, see
-the original benchmark in vllm-project/vllm-omni#2515 (comment by
-@Sy0307).
+For benchmark numbers see the discussion in
+vllm-project/vllm-omni#2515 (initial H100x2 sweep by @Sy0307) and
+vllm-project/vllm-omni#3323 (H20x2 sweep with the shipped config).
