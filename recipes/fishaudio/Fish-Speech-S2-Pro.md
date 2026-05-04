@@ -118,19 +118,22 @@ CUDA_VISIBLE_DEVICES=0,1 vllm serve fishaudio/s2-pro --omni --port 8091 \
     --deploy-config vllm_omni/deploy/fish_qwen3_omni_2gpu.yaml
 ```
 
-This profile pins Stage0 (Slow/Fast AR) to GPU 0 and Stage1 (DAC decoder) to
-GPU 1 to remove AR/DAC contention. It also enlarges Stage0 batching
-(`max_num_seqs=8`) and lets Stage1 consume DAC chunks in parallel
-(`max_num_seqs=4`), and reduces `connector_get_sleep_s` from 10 ms to 1 ms.
+This profile pins Stage0 (Slow/Fast AR) to GPU 0 and Stage1 (DAC decoder)
+to GPU 1 to remove AR/DAC contention, sets `max_num_seqs=64` on both
+stages so concurrencies above 8 don't queue, and reduces
+`connector_get_sleep_s` from 10 ms to 1 ms so DAC chunks aren't held in
+the connector once they're ready.
 
-#### Throughput (H100x2)
+#### Throughput (H20x2, 100 unique prompts)
 
-| concurrency | req/s | audio/s | mean E2E ms | p99 E2E ms | mean TTFP ms | p99 TTFP ms | mean RTF | p99 RTF |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1  | 0.63 | 2.95  | 1578.70 | 1922.99 | 97.47  | 110.82  | 0.339 | 0.362 |
-| 2  | 1.17 | 5.46  | 1710.66 | 2248.20 | 121.16 | 202.01  | 0.367 | 0.395 |
-| 4  | 2.11 | 9.83  | 1839.65 | 2520.31 | 138.05 | 298.55  | 0.395 | 0.451 |
-| 8  | 3.60 | 16.93 | 2095.23 | 2807.10 | 163.04 | 242.78  | 0.445 | 0.459 |
-| 10 | 3.67 | 17.26 | 2538.12 | 3933.99 | 598.81 | 1744.61 | 0.549 | 0.933 |
+| concurrency | req/s | audio/s | mean E2E ms | p99 E2E ms | mean TTFP ms | p99 TTFP ms | mean RTF |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+|  1 | 0.86 |  4.06 | 1166 | 2109 |  67 |   74 | 0.246 |
+|  4 | 2.88 | 13.59 | 1368 | 1884 |  94 |  127 | 0.290 |
+| 16 | 4.92 | 22.74 | 3151 | 8241 | 312 | 5615 | 0.689 |
+| 32 | 7.06 | 32.92 | 4249 | 5325 | 528 |  781 | 0.926 |
+| 64 | 8.34 | 39.47 | 6377 | 9254 | 732 | 1356 | 1.361 |
 
-Source: vllm-project/vllm-omni#2515 (comment by @Sy0307).
+For H100x2 numbers under an earlier configuration of this profile, see
+the original benchmark in vllm-project/vllm-omni#2515 (comment by
+@Sy0307).

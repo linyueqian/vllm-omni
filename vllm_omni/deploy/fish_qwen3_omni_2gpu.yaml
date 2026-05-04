@@ -34,7 +34,7 @@ connectors:
 
 stages:
   - stage_id: 0
-    max_num_seqs: 8
+    max_num_seqs: 64
     gpu_memory_utilization: 0.75
     enforce_eager: false
     async_scheduling: false
@@ -54,7 +54,7 @@ stages:
       repetition_penalty: 1.0
 
   - stage_id: 1
-    max_num_seqs: 4
+    max_num_seqs: 64
     gpu_memory_utilization: 0.2
     enforce_eager: true
     async_scheduling: false
