@@ -20,7 +20,7 @@ list of supported architectures across all modalities, see
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | single (AR + codec) | ✓ (required) | ✓ | voice_clone, continuation | 48 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
-| VoxCPM | local model dir | split | ✓ | ✓ | — | 24 kHz |
+| VoxCPM | `openbmb/VoxCPM-0.5B` | split | ✓ | ✓ | — | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
 

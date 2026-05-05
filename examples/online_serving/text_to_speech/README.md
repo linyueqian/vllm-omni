@@ -19,7 +19,7 @@ For the full list of supported architectures across all modalities, see
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
-| VoxCPM | local model dir | ✓ | ✓ (PCM stream) | — | — |
+| VoxCPM | `openbmb/VoxCPM-0.5B` | ✓ | ✓ (PCM stream) | — | — |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
