@@ -163,9 +163,9 @@ Override the default text per case with `--text`, write to a custom path with `-
 
 ## MOSS-TTS-Nano
 
-Single-stage 0.1B AR LM + MOSS-Audio-Tokenizer-Nano codec at 48 kHz mono (mixed down from upstream stereo). ZH / EN / JA. Every request requires a reference clip (`--ref-audio` in the offline CLI is `--prompt-audio` here).
+Single-stage 0.1B AR LM + MOSS-Audio-Tokenizer-Nano codec at 48 kHz mono (mixed down from upstream stereo). ZH / EN / JA. Every request requires a reference clip via `--ref-audio`.
 
-> **No built-in speaker presets.** `--prompt-audio` is required on every call. Default `--mode voice_clone` matches upstream's recommended workflow; `--mode continuation` is exposed for completeness but upstream's continuation-with-prompt path emits very short / near-silent output, so it is rarely useful in practice. Sample reference clips ship in the upstream repo under [`assets/audio/`](https://github.com/OpenMOSS/MOSS-TTS-Nano/tree/main/assets/audio) (e.g. `zh_1.wav`, `en_2.wav`, `jp_2.wav`).
+> **No built-in speaker presets.** `--ref-audio` is required on every call. Default `--mode voice_clone` matches upstream's recommended workflow; `--mode continuation` is exposed for completeness but upstream's continuation-with-prompt path emits very short / near-silent output, so it is rarely useful in practice. Sample reference clips ship in the upstream repo under [`assets/audio/`](https://github.com/OpenMOSS/MOSS-TTS-Nano/tree/main/assets/audio) (e.g. `zh_1.wav`, `en_2.wav`, `jp_2.wav`).
 
 ### Quick start
 ```bash
@@ -177,7 +177,7 @@ mkdir -p "$REF_DIR"
 
 python examples/offline_inference/text_to_speech/moss_tts_nano/end2end.py \
     --text "你好，这是MOSS-TTS-Nano的语音合成演示。" \
-    --prompt-audio "$REF_DIR/zh_1.wav"
+    --ref-audio "$REF_DIR/zh_1.wav"
 ```
 The first run downloads `OpenMOSS-Team/MOSS-TTS-Nano` and `OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano` from Hugging Face.
 
@@ -185,7 +185,7 @@ The first run downloads `OpenMOSS-Team/MOSS-TTS-Nano` and `OpenMOSS-Team/MOSS-Au
 ```bash
 python examples/offline_inference/text_to_speech/moss_tts_nano/end2end.py \
     --text "Deterministic test." \
-    --prompt-audio "$REF_DIR/en_2.wav" \
+    --ref-audio "$REF_DIR/en_2.wav" \
     --seed 42
 ```
 
@@ -193,7 +193,7 @@ python examples/offline_inference/text_to_speech/moss_tts_nano/end2end.py \
 - Output: 48 kHz mono WAV (the tokenizer is internally stereo at 48 kHz; the wrapper averages to mono before reaching the engine).
 - Deploy config: `vllm_omni/deploy/moss_tts_nano.yaml` (auto-loaded; override with `--deploy-config`).
 - Default `--max-new-frames 375` ≈ 14 s of audio; raise for longer outputs.
-- `--prompt-text` is rejected in `voice_clone` mode and required only with `--mode continuation`.
+- `--ref-text` is rejected in `voice_clone` mode and required only with `--mode continuation`.
 - Run `--help` for the full sampling-knob surface (`--audio-temperature`, `--audio-top-k`, `--audio-top-p`, `--text-temperature`).
 
 ---
