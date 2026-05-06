@@ -176,10 +176,7 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
                         audio_field = audio_field[0]
                     elif len(audio_field) > 1:
                         return DiffusionOutput(
-                            error=(
-                                "OmniVoice voice cloning supports a single "
-                                f"reference audio; got {len(audio_field)}"
-                            )
+                            error=f"OmniVoice voice cloning supports a single reference audio; got {len(audio_field)}"
                         )
                     else:
                         audio_field = None
