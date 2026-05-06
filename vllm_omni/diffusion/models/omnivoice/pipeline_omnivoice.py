@@ -166,6 +166,23 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             mm_kwargs = prompt.get("mm_processor_kwargs") or {}
             if ref_audio is None:
                 audio_field = mm_data.get("audio")
+                # Standard multimodal shape allows a list of audios; OmniVoice
+                # voice cloning conditions on a single reference clip, so
+                # unwrap a length-1 list and reject multi-reference prompts up
+                # front (otherwise a list would later crash inside
+                # ``_encode_ref_audio`` when it calls ``audio.dim()``).
+                if isinstance(audio_field, list):
+                    if len(audio_field) == 1:
+                        audio_field = audio_field[0]
+                    elif len(audio_field) > 1:
+                        return DiffusionOutput(
+                            error=(
+                                "OmniVoice voice cloning supports a single "
+                                f"reference audio; got {len(audio_field)}"
+                            )
+                        )
+                    else:
+                        audio_field = None
                 if audio_field is not None:
                     if isinstance(audio_field, tuple) and len(audio_field) == 2:
                         ref_audio = audio_field
