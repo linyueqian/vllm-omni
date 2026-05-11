@@ -8,7 +8,7 @@
       {
         "task": "voice_clone",
         "eval_phase": "latency",
-        "enabled": false,
+        "enabled": true,
         "dataset_name": "seed-tts",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
@@ -24,7 +24,7 @@
       {
         "task": "voice_clone",
         "eval_phase": "throughput",
-        "enabled": false,
+        "enabled": true,
         "dataset_name": "seed-tts",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
@@ -41,7 +41,7 @@
       {
         "task": "voice_clone",
         "eval_phase": "quality",
-        "enabled": false,
+        "enabled": true,
         "dataset_name": "seed-tts",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
