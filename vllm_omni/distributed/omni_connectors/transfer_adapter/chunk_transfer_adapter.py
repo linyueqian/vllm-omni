@@ -426,6 +426,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if not external_req_id:
                 kept.append(request)
                 continue
+            # Skip the gate while prefill is still running. Some pipelines
+            # (e.g. Qwen3-TTS voice_clone) build prefill-only state during
+            # multi-step prefill that decode depends on; pausing the request
+            # mid-prefill leaves that state half-initialized.
+            num_computed = getattr(request, "num_computed_tokens", 0)
+            prompt_len = len(getattr(request, "prompt_token_ids", None) or ())
+            if num_computed < prompt_len:
+                kept.append(request)
+                continue
             cap = self._effective_cap(request, external_req_id)
             if cap <= 0:
                 kept.append(request)

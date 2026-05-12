@@ -687,6 +687,36 @@ def test_stage0_gate_no_op_when_cap_disabled(build_adapter):
     assert running == [req]
 
 
+def test_stage0_gate_skips_requests_still_in_prefill(build_adapter):
+    """Prefill must not be interrupted: gate is a no-op while
+    ``num_computed_tokens < len(prompt_token_ids)``. Some pipelines build
+    state during multi-step prefill that the decode path depends on."""
+    import uuid
+
+    ext_id = f"ws4-prefill-{uuid.uuid4().hex[:8]}"
+    adapter, _ = _build_adapter_with_cap(build_adapter, stage_id=0, cap=2)
+    try:
+        req = _req("r-prefill", RequestStatus.RUNNING, external_req_id=ext_id)
+        req.prompt_token_ids = [1, 2, 3, 4]
+        req.num_computed_tokens = 2  # prefill still in progress
+        adapter.credit_registry.inc_put(ext_id)
+        adapter.credit_registry.inc_put(ext_id)
+        assert adapter.credit_registry.is_blocked(ext_id)
+
+        running: list = [req]
+        held = adapter.gate_backpressured_streams(running)
+        assert held == 0, "must not gate during prefill"
+        assert running == [req]
+
+        # Same request, prefill done: gate now applies.
+        req.num_computed_tokens = 4
+        held = adapter.gate_backpressured_streams(running)
+        assert held == 1
+        assert running == []
+    finally:
+        adapter.credit_registry.drop(ext_id)
+
+
 def test_stage0_gate_per_request_override(build_adapter):
     import uuid
 
