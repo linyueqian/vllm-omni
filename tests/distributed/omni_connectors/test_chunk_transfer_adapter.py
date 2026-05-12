@@ -44,7 +44,13 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
 
 @pytest.fixture
 def build_adapter(monkeypatch, mocker: MockerFixture):
-    def _build(*, stage_id: int = 1, model_mode: str = "ar", max_num_seqs: int = 2):
+    def _build(
+        *,
+        stage_id: int = 1,
+        model_mode: str = "ar",
+        max_num_seqs: int = 2,
+        stage1_active_window: int = 0,
+    ):
         connector = mocker.MagicMock()
         connector.stage_id = stage_id
         connector.get.return_value = None
@@ -68,7 +74,11 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             classmethod(lambda cls, _model_config: connector),
         )
 
-        model_config = SimpleNamespace(worker_type=model_mode)
+        model_config = SimpleNamespace(
+            worker_type=model_mode,
+            max_num_seqs=max_num_seqs,
+            stage1_active_window=stage1_active_window,
+        )
         scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs)
         adapter = OmniChunkTransferAdapter(
             SimpleNamespace(model_config=model_config, scheduler_config=scheduler_config)
@@ -267,6 +277,68 @@ def test_process_and_restore_queues(build_adapter):
     assert adapter.waiting_for_chunk_running_requests == deque()
 
 
+def test_fifo_promotion(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, max_num_seqs=2, stage1_active_window=2)
+    reqs = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(1, 5)]
+    waiting_queue = DummyWaitingQueue(reqs)
+    running_queue = []
+
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert list(adapter._active_streams) == ["req-1", "req-2"]
+    assert waiting_queue == reqs[2:]
+    assert reqs[0].status == RequestStatus.WAITING_FOR_CHUNK
+    assert reqs[1].status == RequestStatus.WAITING_FOR_CHUNK
+    assert reqs[2].status == RequestStatus.WAITING
+
+    adapter.finished_requests.add("req-1")
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert list(adapter._active_streams) == ["req-2", "req-3"]
+    assert reqs[2].status == RequestStatus.WAITING
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+    assert reqs[2].status == RequestStatus.WAITING_FOR_CHUNK
+
+
+def test_legacy_k0(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, max_num_seqs=1, stage1_active_window=0)
+    waiting_req = _req("waiting", RequestStatus.WAITING)
+    running_req_1 = _req("running-1", RequestStatus.RUNNING)
+    running_req_2 = _req("running-2", RequestStatus.RUNNING)
+    waiting_queue = DummyWaitingQueue([waiting_req])
+    running_queue = [running_req_1, running_req_2]
+
+    adapter.requests_with_ready_chunks.update({"running-1", "running-2"})
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert waiting_req.status == RequestStatus.WAITING_FOR_CHUNK
+    assert adapter.waiting_for_chunk_waiting_requests == deque([waiting_req])
+    assert running_queue == [running_req_1]
+    assert waiting_queue == [running_req_2]
+    assert running_req_2.status == RequestStatus.PREEMPTED
+    assert adapter._active_streams == {}
+
+
+def test_finished_releases_slot(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, max_num_seqs=1, stage1_active_window=1)
+    req_1 = _req("req-1", RequestStatus.WAITING)
+    req_2 = _req("req-2", RequestStatus.WAITING)
+    waiting_queue = DummyWaitingQueue([req_1, req_2])
+    running_queue = []
+
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+    assert list(adapter._active_streams) == ["req-1"]
+    assert waiting_queue == [req_2]
+
+    adapter.finished_requests.add("req-1")
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert list(adapter._active_streams) == ["req-2"]
+    assert req_2.status == RequestStatus.WAITING
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+    assert req_2.status == RequestStatus.WAITING_FOR_CHUNK
+
+
 def test_postprocess_scheduler_output(build_adapter):
     adapter, _ = build_adapter()
     adapter.requests_with_ready_chunks = {"new-ready", "cached-ready", "leftover"}
@@ -293,6 +365,7 @@ def test_postprocess_scheduler_output(build_adapter):
 def _populate_adapter_state(adapter, req_id="req-1", ext_id="ext-1"):
     """Fill every per-request structure so cleanup can be verified."""
     adapter.finished_requests.add(req_id)
+    adapter._active_streams[req_id] = SimpleNamespace(request_id=req_id)
     adapter.get_req_chunk[req_id] = 3
     adapter.requests_with_ready_chunks.add(req_id)
     adapter.request_ids_mapping[req_id] = ext_id
@@ -313,6 +386,7 @@ def test_cleanup_clears_all_state(build_adapter):
     adapter.cleanup(req_id, ext_id)
 
     assert req_id not in adapter.finished_requests
+    assert req_id not in adapter._active_streams
     assert req_id not in adapter.get_req_chunk
     assert req_id not in adapter.requests_with_ready_chunks
     assert req_id not in adapter.request_ids_mapping

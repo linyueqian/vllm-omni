@@ -40,6 +40,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        stage1_active_window = int(getattr(model_config, "stage1_active_window", 0) or 0)
+        model_max_num_seqs = int(getattr(model_config, "max_num_seqs", self.scheduler_max_num_seqs) or 0)
+        if model_max_num_seqs <= 0:
+            model_max_num_seqs = self.scheduler_max_num_seqs
+        self._active_window = min(stage1_active_window, model_max_num_seqs) if stage1_active_window > 0 else 0
         self.connector = self.create_connector(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
@@ -62,6 +67,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
         self.requests_origin_status = {}
+        self._active_streams: dict[str, Any] = {}
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -308,6 +314,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
         self.finished_requests.discard(request_id)
+        self._active_streams.pop(request_id, None)
         self.get_req_chunk.pop(request_id, None)
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
@@ -366,16 +373,103 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """
         if self.connector.stage_id == 0:
             return
+        if self._active_window <= 0:
+            self._process_chunk_queue_legacy(
+                waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
+            )
+            self._process_chunk_queue_legacy(
+                running_queue,
+                self.waiting_for_chunk_running_requests,
+                RequestStatus.RUNNING,
+                self._finished_load_reqs,
+            )
+            while len(running_queue) > self.scheduler_max_num_seqs:
+                request = running_queue.pop()
+                request.status = RequestStatus.PREEMPTED
+                waiting_queue.prepend_requests([request])
+            return
+
+        self._promote_active_streams(running_queue)
+        self._promote_active_streams(waiting_queue)
         self._process_chunk_queue(
             waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
         )
         self._process_chunk_queue(
             running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, self._finished_load_reqs
         )
-        while len(running_queue) > self.scheduler_max_num_seqs:
-            request = running_queue.pop()
+        self._evict_finished_active_streams()
+        self._promote_active_streams(waiting_queue)
+        self._preempt_non_active_running(waiting_queue, running_queue)
+
+    def _evict_finished_active_streams(self) -> None:
+        for request_id in list(self._active_streams):
+            if request_id in self.finished_requests:
+                self._active_streams.pop(request_id, None)
+
+    def _promote_active_streams(self, queue: Any) -> None:
+        if len(self._active_streams) >= self._active_window:
+            return
+        for request in list(queue):
+            if len(self._active_streams) >= self._active_window:
+                return
+            request_id = request.request_id
+            if request_id in self._active_streams or request_id in self.finished_requests:
+                continue
+            # Iterating the existing queue preserves FIFO admission.
+            self._active_streams[request_id] = request
+
+    def _ensure_active_stream(self, request: Request) -> bool:
+        if self._active_window <= 0:
+            return True
+        request_id = request.request_id
+        if request_id in self._active_streams:
+            self._active_streams[request_id] = request
+            return True
+        if request_id in self.finished_requests or len(self._active_streams) >= self._active_window:
+            return False
+        self._active_streams[request_id] = request
+        return True
+
+    def _preempt_non_active_running(self, waiting_queue: Any, running_queue: list[Request]) -> None:
+        index = len(running_queue) - 1
+        while index >= 0:
+            request = running_queue[index]
+            if request.request_id in self._active_streams:
+                index -= 1
+                continue
+            request = running_queue.pop(index)
             request.status = RequestStatus.PREEMPTED
             waiting_queue.prepend_requests([request])
+            index -= 1
+
+    def _process_chunk_queue_legacy(
+        self,
+        queue: Any,
+        waiting_for_chunk_list: deque[Any],
+        target_status: RequestStatus,
+        finished_load_reqs: set[str],
+    ) -> None:
+        queue_snapshot = list(queue)
+        for request in queue_snapshot:
+            if request.status != RequestStatus.WAITING_FOR_CHUNK:
+                if request.request_id in self.requests_with_ready_chunks:
+                    # Requests that have loaded chunk from last round
+                    # of schedule, but have not scheduled
+                    continue
+                if request.request_id in self.finished_requests:
+                    continue
+                # Requests that waiting for chunk
+                self.load_async(request)
+                request.status = RequestStatus.WAITING_FOR_CHUNK
+            else:
+                if request.request_id in finished_load_reqs:
+                    request.status = target_status
+                    finished_load_reqs.remove(request.request_id)
+                    self.requests_with_ready_chunks.add(request.request_id)
+                    continue
+            queue.remove(request)
+            self.requests_origin_status[request.request_id] = target_status
+            waiting_for_chunk_list.append(request)
 
     def restore_queues(self, waiting_queue: Any, running_queue: list[Request]) -> None:
         """
@@ -424,6 +518,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     ) -> None:
         queue_snapshot = list(queue)
         for request in queue_snapshot:
+            if not self._ensure_active_stream(request):
+                continue
             if request.status != RequestStatus.WAITING_FOR_CHUNK:
                 if request.request_id in self.requests_with_ready_chunks:
                     # Requests that have loaded chunk from last round
