@@ -455,6 +455,9 @@ class DeployConfig:
     """
 
     async_chunk: bool = True
+    # WS-4: per-stream cap on unconsumed chunks between adjacent stages.
+    # 0 disables the gate (legacy). See WS-4 in RFC #3535.
+    stage_credit_per_stream: int = 0
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
     stages: list[StageDeployConfig] = field(default_factory=list)
@@ -786,6 +789,9 @@ def _build_engine_args(
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)
+    # WS-4: pipeline-wide credit cap propagates to every stage's model_config
+    # so producer (Stage 0) and consumer (Stage 1) agree on K.
+    engine_args["stage_credit_per_stream"] = int(getattr(deploy, "stage_credit_per_stream", 0))
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     return engine_args

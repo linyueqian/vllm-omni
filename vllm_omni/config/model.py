@@ -119,6 +119,11 @@ class OmniModelConfig(ModelConfig):
 
     stage_id: int = 0
     async_chunk: bool = False
+    # WS-4: per-stream cap on unconsumed chunks held between Stage 0 and
+    # Stage 1. 0 disables the gate (legacy unlimited behavior). When >0,
+    # Stage 0 skips an LM step for any stream whose
+    # ``puts - gets >= stage_credit_per_stream``.
+    stage_credit_per_stream: int = 0
     model_stage: str = "thinker"
     model_arch: str | None = None
     worker_type: str | None = None

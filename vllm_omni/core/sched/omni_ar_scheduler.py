@@ -192,6 +192,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+            # WS-4: hold aside streams whose downstream queue is full so the
+            # vLLM scheduler doesn't run an LM step for them this tick.
+            self.chunk_transfer_adapter.gate_backpressured_streams(self.running)
 
         try:
             scheduler_output = super().schedule()

@@ -14,6 +14,7 @@ from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec
 from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
+from .credit_registry import StreamCreditRegistry
 
 logger = get_connector_logger(__name__)
 
@@ -61,6 +62,22 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
         self.requests_origin_status = {}
+
+        # WS-4: per-stream credit gate. cap=0 → registry is a no-op.
+        default_cap = int(getattr(model_config, "stage_credit_per_stream", 0))
+        self._default_credit_cap = max(0, default_cap)
+        if self._default_credit_cap > 0 and self.connector.stage_id == 0:
+            # Sender side owns segment lifecycle; clean up anything left over
+            # from a previous crashed run before we start counting.
+            StreamCreditRegistry.gc_orphaned_segments()
+        self.credit_registry = StreamCreditRegistry(self._default_credit_cap)
+        # Per-request cap override, populated lazily by the scheduler from
+        # ``request.additional_information``. Falls back to ``_default_credit_cap``.
+        self._req_credit_cap: dict[str, int] = {}
+        # Stats: per-stream skip count surfaced through scheduler.make_stats.
+        self._credit_skip_count: dict[str, int] = defaultdict(int)
+        # Stage 0 side queue used by ``gate_backpressured_streams``.
+        self._backpressured_running: deque[Any] = deque()
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -151,6 +168,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if payload_data:
             # Update connector state
             self.get_req_chunk[req_id] += 1
+            self.credit_registry.inc_get(external_req_id)
 
             meta = payload_data.get("meta", {})
             if self.model_mode == "ar":
@@ -257,6 +275,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if success:
             self.put_req_chunk[external_req_id] += 1
+            self.credit_registry.inc_put(external_req_id)
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
             finished_flag = payload_data.get("meta", {}).get("finished", payload_data.get("finished"))
             is_payload_finished = False
@@ -309,6 +328,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
+        # WS-4: credit segment lives until the terminal chunk has been put,
+        # at which point sender-side cleanup is the right moment to drop it.
+        self.credit_registry.drop(external_req_id)
+        self._req_credit_cap.pop(external_req_id, None)
+        self._credit_skip_count.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
@@ -371,6 +395,82 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if self.waiting_for_chunk_running_requests:
             running_queue.extend(self.waiting_for_chunk_running_requests)
         self.waiting_for_chunk_running_requests = deque()
+
+        # WS-4: re-attach Stage 0 streams that were held aside this step.
+        if self._backpressured_running:
+            running_queue.extend(self._backpressured_running)
+            self._backpressured_running = deque()
+
+    def gate_backpressured_streams(self, running_queue: list[Request]) -> int:
+        """Stage 0 gate: hold aside streams whose downstream queue is full.
+
+        Called by ``OmniARScheduler.schedule`` before the underlying vLLM
+        scheduler runs. Each call:
+
+        1. Reads the per-request cap (per-request override > default), and
+        2. For each running stream where ``outstanding(stream) >= cap``,
+           pops it out of ``running_queue`` into a side deque.
+
+        ``restore_queues`` puts them back at the end of the scheduler step
+        so the next tick re-evaluates. Returns the number of streams held.
+
+        No-op when ``stage_id != 0`` or when the credit registry is disabled.
+        """
+        if self.connector.stage_id != 0 or not self.credit_registry.enabled:
+            return 0
+
+        held = 0
+        kept: list[Request] = []
+        for request in running_queue:
+            external_req_id = getattr(request, "external_req_id", None)
+            if not external_req_id:
+                kept.append(request)
+                continue
+            cap = self._effective_cap(request, external_req_id)
+            if cap <= 0:
+                kept.append(request)
+                continue
+            if self.credit_registry.outstanding(external_req_id) < cap:
+                kept.append(request)
+                continue
+            self._backpressured_running.append(request)
+            self._credit_skip_count[external_req_id] += 1
+            held += 1
+
+        if held:
+            # In-place rewrite so callers holding the same list see the change.
+            running_queue[:] = kept
+        return held
+
+    def _effective_cap(self, request: Request, external_req_id: str) -> int:
+        """Return the effective per-stream cap for ``request``.
+
+        Caches per-request lookups to avoid re-reading
+        ``additional_information`` on every scheduler tick.
+        """
+        cached = self._req_credit_cap.get(external_req_id)
+        if cached is not None:
+            return cached
+        cap = self._default_credit_cap
+        info = getattr(request, "additional_information", None)
+        if isinstance(info, dict):
+            override = info.get("stage_credit_per_stream")
+            if override is not None:
+                try:
+                    cap = max(0, int(override))
+                except (TypeError, ValueError):
+                    logger.debug(
+                        "credit_registry: ignoring non-int stage_credit_per_stream override for %s",
+                        external_req_id,
+                    )
+        self._req_credit_cap[external_req_id] = cap
+        return cap
+
+    def credit_stats(self) -> dict[str, int]:
+        """Snapshot of per-stream skip counts. Consumed by scheduler stats."""
+        if not self._credit_skip_count:
+            return {}
+        return dict(self._credit_skip_count)
 
     def postprocess_scheduler_output(
         self,

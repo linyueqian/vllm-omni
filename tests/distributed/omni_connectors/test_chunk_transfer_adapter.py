@@ -604,3 +604,126 @@ def test_omni_ar_scheduler_finish_requests(mocker: MockerFixture):
         OmniARScheduler.finish_requests(sched, ["r1"], RequestStatus.FINISHED_ABORTED)
 
     assert order == ["adapter", "super"]
+
+
+# --- WS-4: credit registry + Stage 0 gate ---
+
+
+def _build_adapter_with_cap(build_adapter, *, stage_id: int, cap: int):
+    """Helper: build adapter and reinitialize its credit registry with ``cap``."""
+    from vllm_omni.distributed.omni_connectors.transfer_adapter.credit_registry import (
+        StreamCreditRegistry,
+    )
+
+    adapter, connector = build_adapter(stage_id=stage_id, model_mode="ar")
+    adapter._default_credit_cap = cap
+    adapter.credit_registry = StreamCreditRegistry(cap)
+    return adapter, connector
+
+
+def test_credit_registry_cap_zero_is_no_op(build_adapter):
+    adapter, _ = _build_adapter_with_cap(build_adapter, stage_id=0, cap=0)
+    adapter.credit_registry.inc_put("ext-zero")
+    adapter.credit_registry.inc_get("ext-zero")
+    assert adapter.credit_registry.outstanding("ext-zero") == 0
+    assert not adapter.credit_registry.is_blocked("ext-zero")
+
+
+def test_credit_registry_outstanding_and_drop(build_adapter):
+    import uuid
+
+    ext_id = f"ws4-test-{uuid.uuid4().hex[:8]}"
+    adapter, _ = _build_adapter_with_cap(build_adapter, stage_id=0, cap=4)
+    try:
+        for _ in range(3):
+            adapter.credit_registry.inc_put(ext_id)
+        assert adapter.credit_registry.outstanding(ext_id) == 3
+        assert not adapter.credit_registry.is_blocked(ext_id)
+
+        adapter.credit_registry.inc_put(ext_id)
+        assert adapter.credit_registry.is_blocked(ext_id)
+
+        adapter.credit_registry.inc_get(ext_id)
+        assert adapter.credit_registry.outstanding(ext_id) == 3
+    finally:
+        adapter.credit_registry.drop(ext_id)
+        assert adapter.credit_registry.outstanding(ext_id) == 0
+
+
+def test_stage0_gate_holds_aside_backpressured_streams(build_adapter):
+    import uuid
+
+    ext_open = f"ws4-open-{uuid.uuid4().hex[:8]}"
+    ext_full = f"ws4-full-{uuid.uuid4().hex[:8]}"
+    adapter, _ = _build_adapter_with_cap(build_adapter, stage_id=0, cap=2)
+    try:
+        open_req = _req("r-open", RequestStatus.RUNNING, external_req_id=ext_open)
+        full_req = _req("r-full", RequestStatus.RUNNING, external_req_id=ext_full)
+        adapter.credit_registry.inc_put(ext_open)
+        for _ in range(2):
+            adapter.credit_registry.inc_put(ext_full)
+
+        running: list = [open_req, full_req]
+        held = adapter.gate_backpressured_streams(running)
+        assert held == 1
+        assert running == [open_req]
+        assert ext_full in adapter._credit_skip_count
+
+        waiting = DummyWaitingQueue()
+        adapter.restore_queues(waiting, running)
+        assert running == [open_req, full_req]
+        assert len(adapter._backpressured_running) == 0
+    finally:
+        adapter.credit_registry.drop(ext_open)
+        adapter.credit_registry.drop(ext_full)
+
+
+def test_stage0_gate_no_op_when_cap_disabled(build_adapter):
+    adapter, _ = _build_adapter_with_cap(build_adapter, stage_id=0, cap=0)
+    req = _req("r-off", RequestStatus.RUNNING, external_req_id="ext-off")
+    running: list = [req]
+    held = adapter.gate_backpressured_streams(running)
+    assert held == 0
+    assert running == [req]
+
+
+def test_stage0_gate_per_request_override(build_adapter):
+    import uuid
+
+    ext_tight = f"ws4-tight-{uuid.uuid4().hex[:8]}"
+    adapter, _ = _build_adapter_with_cap(build_adapter, stage_id=0, cap=8)
+    try:
+        req = _req("r-tight", RequestStatus.RUNNING, external_req_id=ext_tight)
+        req.additional_information = {"stage_credit_per_stream": 1}
+        adapter.credit_registry.inc_put(ext_tight)
+
+        running: list = [req]
+        held = adapter.gate_backpressured_streams(running)
+        assert held == 1
+        assert running == []
+    finally:
+        adapter.credit_registry.drop(ext_tight)
+
+
+def test_stage1_gate_is_no_op(build_adapter):
+    adapter, _ = _build_adapter_with_cap(build_adapter, stage_id=1, cap=4)
+    req = _req("r-s1", RequestStatus.RUNNING, external_req_id="ext-s1")
+    running: list = [req]
+    held = adapter.gate_backpressured_streams(running)
+    assert held == 0
+    assert running == [req]
+
+
+def test_cleanup_sender_drops_credit_segment(build_adapter):
+    import uuid
+
+    ext_id = f"ws4-clean-{uuid.uuid4().hex[:8]}"
+    adapter, _ = _build_adapter_with_cap(build_adapter, stage_id=0, cap=2)
+    adapter.credit_registry.inc_put(ext_id)
+    adapter._req_credit_cap[ext_id] = 2
+    adapter._credit_skip_count[ext_id] += 1
+
+    adapter.cleanup_sender(ext_id)
+    assert adapter.credit_registry.outstanding(ext_id) == 0
+    assert ext_id not in adapter._req_credit_cap
+    assert ext_id not in adapter._credit_skip_count
