@@ -68,6 +68,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_with_ready_chunks = set()
         self.requests_origin_status = {}
         self._active_streams: dict[str, Any] = {}
+        # Private hold-queue for non-active running requests. Restored to
+        # running_queue inside restore_queues(). Avoids calling
+        # waiting_queue.prepend_requests mid-step, which trips vllm's
+        # per-step LogitsProcessor invariant
+        # ("Cannot register new removed request after self.removed has
+        #   been read").
+        self._held_non_active: deque[Any] = deque()
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -431,6 +438,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return True
 
     def _preempt_non_active_running(self, waiting_queue: Any, running_queue: list[Request]) -> None:
+        # Hold non-active running requests in a private deque rather than
+        # routing them back through waiting_queue. Routing through the
+        # vllm RequestQueue mid-step triggers
+        #   "Cannot register new removed request after self.removed has
+        #    been read"
+        # in vllm.v1.sample.logits_processor.state when the persistent
+        # batch was already snapshotted. They are returned to
+        # running_queue in restore_queues() so the next scheduler tick
+        # re-evaluates them through _promote_active_streams.
         index = len(running_queue) - 1
         while index >= 0:
             request = running_queue[index]
@@ -438,8 +454,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 index -= 1
                 continue
             request = running_queue.pop(index)
-            request.status = RequestStatus.PREEMPTED
-            waiting_queue.prepend_requests([request])
+            self._held_non_active.append(request)
             index -= 1
 
     def _process_chunk_queue_legacy(
@@ -483,6 +498,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if self.waiting_for_chunk_running_requests:
             running_queue.extend(self.waiting_for_chunk_running_requests)
         self.waiting_for_chunk_running_requests = deque()
+
+        if self._held_non_active:
+            running_queue.extend(self._held_non_active)
+            self._held_non_active = deque()
 
     def postprocess_scheduler_output(
         self,
