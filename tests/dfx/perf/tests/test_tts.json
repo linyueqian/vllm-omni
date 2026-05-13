@@ -77,23 +77,6 @@
       },
       {
         "task": "voice_clone",
-        "eval_phase": "throughput",
-        "dataset_name": "seed-tts",
-        "backend": "openai-audio-speech",
-        "endpoint": "/v1/audio/speech",
-        "dataset_path": "linyueqian/seed-tts-eval-subset",
-        "num_prompts": [512],
-        "max_concurrency": [256],
-        "seed_tts_locale": "en",
-        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
-        "baseline": {
-          "median_audio_ttfp_ms": [22000],
-          "median_audio_rtf": [4.5],
-          "audio_throughput": [55.0]
-        }
-      },
-      {
-        "task": "voice_clone",
         "eval_phase": "quality",
         "enabled": false,
         "dataset_name": "seed-tts",
@@ -189,24 +172,6 @@
           "median_audio_ttfp_ms": [5500],
           "median_audio_rtf": [1.0],
           "audio_throughput": [120.0]
-        }
-      },
-      {
-        "task": "default_voice",
-        "eval_phase": "throughput",
-        "dataset_name": "seed-tts-text",
-        "backend": "openai-audio-speech",
-        "endpoint": "/v1/audio/speech",
-        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
-        "num_prompts": [512],
-        "max_concurrency": [256],
-        "seed_tts_locale": "en",
-        "extra_body": {"voice": "Vivian", "language": "English", "task_type": "CustomVoice"},
-        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
-        "baseline": {
-          "median_audio_ttfp_ms": [10000],
-          "median_audio_rtf": [2.0],
-          "audio_throughput": [130.0]
         }
       },
       {
@@ -314,24 +279,6 @@
           "median_audio_ttfp_ms": [6000],
           "median_audio_rtf": [1.2],
           "audio_throughput": [100.0]
-        }
-      },
-      {
-        "task": "voice_design",
-        "eval_phase": "throughput",
-        "dataset_name": "seed-tts-design",
-        "backend": "openai-audio-speech",
-        "endpoint": "/v1/audio/speech",
-        "dataset_path": "benchmarks/build_dataset/seed_tts_design",
-        "num_prompts": [512],
-        "max_concurrency": [256],
-        "seed_tts_locale": "en",
-        "extra_body": {"task_type": "VoiceDesign", "language": "English"},
-        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
-        "baseline": {
-          "median_audio_ttfp_ms": [11000],
-          "median_audio_rtf": [2.2],
-          "audio_throughput": [110.0]
         }
       },
       {
