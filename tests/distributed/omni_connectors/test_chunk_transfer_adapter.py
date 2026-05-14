@@ -49,7 +49,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         stage_id: int = 1,
         model_mode: str = "ar",
         max_num_seqs: int = 2,
-        stage1_active_window: int = 0,
+        active_stream_window: int = 0,
     ):
         connector = mocker.MagicMock()
         connector.stage_id = stage_id
@@ -77,7 +77,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         model_config = SimpleNamespace(
             worker_type=model_mode,
             max_num_seqs=max_num_seqs,
-            stage1_active_window=stage1_active_window,
+            active_stream_window=active_stream_window,
         )
         scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs)
         adapter = OmniChunkTransferAdapter(
@@ -278,7 +278,7 @@ def test_process_and_restore_queues(build_adapter):
 
 
 def test_fifo_promotion(build_adapter):
-    adapter, _ = build_adapter(stage_id=1, max_num_seqs=2, stage1_active_window=2)
+    adapter, _ = build_adapter(stage_id=1, max_num_seqs=2, active_stream_window=2)
     reqs = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(1, 5)]
     waiting_queue = DummyWaitingQueue(reqs)
     running_queue = []
@@ -301,7 +301,7 @@ def test_fifo_promotion(build_adapter):
 
 
 def test_legacy_k0(build_adapter):
-    adapter, _ = build_adapter(stage_id=1, max_num_seqs=1, stage1_active_window=0)
+    adapter, _ = build_adapter(stage_id=1, max_num_seqs=1, active_stream_window=0)
     waiting_req = _req("waiting", RequestStatus.WAITING)
     running_req_1 = _req("running-1", RequestStatus.RUNNING)
     running_req_2 = _req("running-2", RequestStatus.RUNNING)
@@ -320,7 +320,7 @@ def test_legacy_k0(build_adapter):
 
 
 def test_finished_releases_slot(build_adapter):
-    adapter, _ = build_adapter(stage_id=1, max_num_seqs=1, stage1_active_window=1)
+    adapter, _ = build_adapter(stage_id=1, max_num_seqs=1, active_stream_window=1)
     req_1 = _req("req-1", RequestStatus.WAITING)
     req_2 = _req("req-2", RequestStatus.WAITING)
     waiting_queue = DummyWaitingQueue([req_1, req_2])

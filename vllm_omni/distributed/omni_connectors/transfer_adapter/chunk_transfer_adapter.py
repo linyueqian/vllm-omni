@@ -40,11 +40,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        stage1_active_window = int(getattr(model_config, "stage1_active_window", 0) or 0)
+        active_stream_window = int(getattr(model_config, "active_stream_window", 0) or 0)
         model_max_num_seqs = int(getattr(model_config, "max_num_seqs", self.scheduler_max_num_seqs) or 0)
         if model_max_num_seqs <= 0:
             model_max_num_seqs = self.scheduler_max_num_seqs
-        self._active_window = min(stage1_active_window, model_max_num_seqs) if stage1_active_window > 0 else 0
+        self._active_window = min(active_stream_window, model_max_num_seqs) if active_stream_window > 0 else 0
         if self._active_window > 0:
             logger.info(
                 "Bounded active-stream window enabled: K=%d. "

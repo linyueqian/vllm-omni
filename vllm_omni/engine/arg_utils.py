@@ -141,7 +141,7 @@ class OmniEngineArgs(EngineArgs):
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
     # Must be declared here so engine_args dict propagation does not silently
     # drop the value when constructing OmniEngineArgs from kwargs.
-    stage1_active_window: int = 0
+    active_stream_window: int = 0
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
@@ -336,7 +336,7 @@ class OmniEngineArgs(EngineArgs):
             # All kwargs below are Omni specific
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,
-            stage1_active_window=self.stage1_active_window,
+            active_stream_window=self.active_stream_window,
             model_stage=self.model_stage,
             model_arch=self.model_arch,
             worker_type=self.worker_type,

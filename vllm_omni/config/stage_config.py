@@ -456,7 +456,7 @@ class DeployConfig:
 
     async_chunk: bool = True
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
-    stage1_active_window: int = 0
+    active_stream_window: int = 0
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
     stages: list[StageDeployConfig] = field(default_factory=list)
@@ -613,7 +613,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
 
     kwargs: dict[str, Any] = {
         "async_chunk": raw_dict.get("async_chunk", True),
-        "stage1_active_window": int(raw_dict.get("stage1_active_window", 0) or 0),
+        "active_stream_window": int(raw_dict.get("active_stream_window", 0) or 0),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
         "stages": stages,
@@ -789,7 +789,7 @@ def _build_engine_args(
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)
-    engine_args["stage1_active_window"] = int(getattr(deploy, "stage1_active_window", 0) or 0)
+    engine_args["active_stream_window"] = int(getattr(deploy, "active_stream_window", 0) or 0)
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     return engine_args
