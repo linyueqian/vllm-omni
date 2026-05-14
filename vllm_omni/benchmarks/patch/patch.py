@@ -47,7 +47,6 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSTextDataset,
 )
 
-
 _AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
 _DEFAULT_AUDIO_CONTINUITY_THRESHOLD_S = 0.1
 
@@ -73,6 +72,7 @@ def _audio_continuity_threshold_s() -> float:
         )
         return _DEFAULT_AUDIO_CONTINUITY_THRESHOLD_S
     return max(value, 0.0)
+
 
 get_samples_old = datasets.get_samples
 

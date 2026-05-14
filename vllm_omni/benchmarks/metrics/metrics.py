@@ -349,12 +349,8 @@ def calculate_metrics(
         mean_audio_underrun_s=np.mean(audio_underruns or 0),
         std_audio_underrun_s=np.std(audio_underruns or 0),
         median_audio_underrun_s=np.median(audio_underruns or 0),
-        percentiles_audio_underrun_s=[
-            (p, np.percentile(audio_underruns or 0, p)) for p in selected_percentiles
-        ],
-        audio_continuity_ok_rate=(sum(audio_continuity_ok) / len(audio_continuity_ok))
-        if audio_continuity_ok
-        else 1.0,
+        percentiles_audio_underrun_s=[(p, np.percentile(audio_underruns or 0, p)) for p in selected_percentiles],
+        audio_continuity_ok_rate=(sum(audio_continuity_ok) / len(audio_continuity_ok)) if audio_continuity_ok else 1.0,
         mean_tpot_ms=np.mean(tpots or 0) * 1000,
         std_tpot_ms=np.std(tpots or 0) * 1000,
         median_tpot_ms=np.median(tpots or 0) * 1000,
