@@ -45,6 +45,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if model_max_num_seqs <= 0:
             model_max_num_seqs = self.scheduler_max_num_seqs
         self._active_window = min(stage1_active_window, model_max_num_seqs) if stage1_active_window > 0 else 0
+        if self._active_window > 0:
+            logger.info(
+                "Bounded active-stream window enabled: K=%d. "
+                "Multi-replica deployments require sticky per-stream routing across Stage 1 "
+                "replicas (each replica owns an independent active-set; without sticky routing, "
+                "a stream can be active on one replica and non-active on another and both will "
+                "race to evict it).",
+                self._active_window,
+            )
         self.connector = self.create_connector(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
