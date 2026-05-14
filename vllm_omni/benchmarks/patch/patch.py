@@ -36,6 +36,7 @@ from vllm.tokenizers import TokenizerLike
 
 logger = init_logger(__name__)
 
+from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
 from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
@@ -45,6 +46,33 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSSampleRequest,
     SeedTTSTextDataset,
 )
+
+
+_AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
+_DEFAULT_AUDIO_CONTINUITY_THRESHOLD_S = 0.1
+
+
+def _audio_continuity_threshold_s() -> float:
+    """Return the per-request underrun budget (s).
+
+    Read from ``VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S`` so users can
+    re-aim the SLO without rebuilding. Defaults to 100 ms - the standard
+    "audible gap" budget for streaming TTS.
+    """
+    raw = os.environ.get(_AUDIO_CONTINUITY_THRESHOLD_ENV)
+    if not raw:
+        return _DEFAULT_AUDIO_CONTINUITY_THRESHOLD_S
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default %.3fs",
+            _AUDIO_CONTINUITY_THRESHOLD_ENV,
+            raw,
+            _DEFAULT_AUDIO_CONTINUITY_THRESHOLD_S,
+        )
+        return _DEFAULT_AUDIO_CONTINUITY_THRESHOLD_S
+    return max(value, 0.0)
 
 get_samples_old = datasets.get_samples
 
@@ -315,6 +343,16 @@ class MixRequestFuncOutput(RequestFuncOutput):
     audio_frames: int = 0
     audio_rtf: float = 0.0
     text_latency: float = 0.0
+    #: Worst-case streaming-audio underrun (wall-clock seconds the player
+    #: would have been starved). Populated by the audio-speech backend; ``0.0``
+    #: for backends that do not run continuity analysis.
+    audio_underrun_s: float = 0.0
+    #: Whether the request stayed under the continuity threshold (default
+    #: 100 ms). Mirrors ``audio_underrun_s <= threshold``.
+    audio_continuity_ok: bool = True
+    #: Number of inter-chunk intervals during which the player buffer went
+    #: negative.
+    audio_underrun_event_count: int = 0
     #: Raw PCM s16le mono at 24 kHz for Seed-TTS WER: from ``/v1/audio/speech`` stream or
     #: resampled export after ``openai-chat-omni`` audio deltas.
     tts_output_pcm_bytes: bytes | None = None
@@ -605,6 +643,8 @@ async def async_request_openai_audio_speech(
     total_pcm_bytes = 0
     capture_wer_pcm = _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False)
     pcm_capture = bytearray() if capture_wer_pcm else None
+    chunk_arrival_times_s: list[float] = []
+    chunk_sizes: list[int] = []
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == 200:
@@ -616,6 +656,8 @@ async def async_request_openai_audio_speech(
                         output.audio_ttfp = timestamp - st
                         output.ttft = output.audio_ttfp
                     total_pcm_bytes += len(chunk)
+                    chunk_arrival_times_s.append(timestamp - st)
+                    chunk_sizes.append(len(chunk))
                     if pcm_capture is not None:
                         pcm_capture.extend(chunk)
 
@@ -630,6 +672,18 @@ async def async_request_openai_audio_speech(
                 else:
                     output.audio_rtf = 0
                     logger.warning("Audio duration is zero")
+
+                continuity = compute_continuity_stats(
+                    chunk_arrival_times_s=chunk_arrival_times_s,
+                    chunk_bytes=chunk_sizes,
+                    sample_rate=sample_rate,
+                    sample_width=sample_width,
+                    channels=channels,
+                    threshold_s=_audio_continuity_threshold_s(),
+                )
+                output.audio_underrun_s = continuity.max_underrun_s
+                output.audio_continuity_ok = continuity.is_continuous
+                output.audio_underrun_event_count = continuity.underrun_event_count
                 if pcm_capture is not None and pcm_capture:
                     output.tts_output_pcm_bytes = bytes(pcm_capture)
                 elif capture_wer_pcm:
