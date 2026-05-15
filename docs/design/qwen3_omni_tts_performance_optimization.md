@@ -499,12 +499,6 @@ vllm-omni serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
 
 ```yaml
 async_chunk: true
-# Optional. Bounded-K admission control at Stage 1: cap simultaneously active
-# streams to keep per-stream chunk cadence stable under vocoder-bound overload.
-# Default 0 = legacy round-robin; set to a small positive value (e.g. 2) only
-# when measured rtf_p99 >= 1 at the target concurrency. Trades TTFP for
-# streaming continuity. See PR #3592.
-active_stream_window: 0
 stage_args:
   - stage_id: 0  # Talker (AR decoder)
     runtime:
