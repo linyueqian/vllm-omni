@@ -735,6 +735,7 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "enable_chunked_prefill",
     "data_parallel_size",
     "pipeline_parallel_size",
+    "active_stream_window",
 )
 
 
@@ -789,7 +790,6 @@ def _build_engine_args(
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)
-    engine_args["active_stream_window"] = int(getattr(deploy, "active_stream_window", 0) or 0)
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     return engine_args
