@@ -62,7 +62,17 @@ class OmniTensorPrefixCache:
         determined by the warmup.
         """
         for key, val in multimodal_outputs.items():
-            if isinstance(val, torch.Tensor) and val.shape[0] == seq_len and key not in self.mm_cache_keys:
+            # Only cache per-token feature tensors: 2D+ with first dim == seq_len.
+            # A 1D tensor of shape (seq_len,) is a broadcast scalar (per-request
+            # metadata such as ref_code_len / codec_streaming), not per-token data;
+            # caching it by slot causes a shape mismatch when a later request has a
+            # different scheduled seq length.
+            if (
+                isinstance(val, torch.Tensor)
+                and val.ndim >= 2
+                and val.shape[0] == seq_len
+                and key not in self.mm_cache_keys
+            ):
                 feat_dim = val.shape[-1]
                 self.mm_outputs_cache[key] = self._get_cache_tensor(
                     dtype=val.dtype,
