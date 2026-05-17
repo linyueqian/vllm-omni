@@ -161,17 +161,25 @@ class OmniTensorPrefixCache:
         num_scheduled_tokens: dict[str, int],
     ) -> dict[str, object]:
         """Build the multimodal passthrough data per request for
-        the object under consideration. This is identical to the case
-        for no prefix cache when we tensor does have a first dimension
-        matching the seq len.
+        the object under consideration. This mirrors the no-prefix-cache
+        path: a tensor whose first dimension matches the total scheduled
+        token count is sliced per request, so 1D (seq_len,) metadata that
+        is intentionally not cached (e.g. ref_code_len, codec_streaming)
+        is still split per request instead of leaking the whole batch.
         """
+        total_scheduled_tokens = sum(int(num_scheduled_tokens[r]) for r in input_batch.req_ids)
         elem_dict = {}
         for req_id in input_batch.req_ids:
             req_idx = input_batch.req_id_to_index[req_id]
             start = query_start_loc[req_idx]
             end = start + num_scheduled_tokens[req_id]
             elem_dict[req_id] = to_payload_element(
-                element, req_idx, start=start, end=end, pass_lists_through=True, seq_len=None
+                element,
+                req_idx,
+                start=start,
+                end=end,
+                pass_lists_through=True,
+                seq_len=total_scheduled_tokens,
             )
         return elem_dict
 

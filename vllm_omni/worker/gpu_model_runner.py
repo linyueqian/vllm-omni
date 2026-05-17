@@ -1408,9 +1408,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 # call the custom process function
                 req_infos["request_id"] = req_id
-                req_infos["num_computed_tokens"] = int(
-                    self.input_batch.num_computed_tokens_cpu[req_index]
-                )
+                req_infos["num_computed_tokens"] = int(self.input_batch.num_computed_tokens_cpu[req_index])
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
                     input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
