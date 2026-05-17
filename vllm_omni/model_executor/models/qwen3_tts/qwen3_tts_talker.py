@@ -608,9 +608,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     info_update["meta"]["ref_code_len"] = int(ref_code_len)
                 # Always return a span_len slice; if the scheduled placeholder is longer, pad with tts_pad_embed.
                 # This preserves placeholder/embedding alignment.
-                offset = 0
-                s = 0
-                e = span_len
+                offset = int(info_dict.get("num_computed_tokens", 0) or 0)
+                if offset < 0:
+                    offset = 0
+                s = max(0, min(offset, int(prompt_embeds_cpu.shape[0])))
+                e = max(0, min(offset + span_len, int(prompt_embeds_cpu.shape[0])))
                 take = prompt_embeds_cpu[s:e]
                 if int(take.shape[0]) < span_len:
                     pad_n = int(span_len - int(take.shape[0]))
