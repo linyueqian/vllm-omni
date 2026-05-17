@@ -1072,10 +1072,10 @@ async def benchmark(
         if metric_attribute_name not in selected_percentile_metrics:
             return
         is_audio_rtf = metric_attribute_name == "audio_rtf"
-        is_audio_duration = metric_attribute_name == "audio_duration"
+        is_audio_duration_or_underrun = metric_attribute_name in ("audio_duration", "audio_underrun")
 
         suffix = "_ms"
-        if is_audio_duration:
+        if is_audio_duration_or_underrun:
             suffix = "_s"
         elif is_audio_rtf:
             suffix = ""
