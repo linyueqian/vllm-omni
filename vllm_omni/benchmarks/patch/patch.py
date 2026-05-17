@@ -1086,7 +1086,7 @@ async def benchmark(
         median_attr_name = f"median_{metric_attribute_name}{suffix}"
         median_value = getattr(metrics, median_attr_name, 0.0)
         result[median_attr_name] = median_value
-        for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}{suffix}"):
+        for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}{suffix}", None) or []:
             p_word = str(int(p)) if int(p) == p else str(p)
             result[f"p{p_word}_{metric_attribute_name}{suffix}"] = value
 
