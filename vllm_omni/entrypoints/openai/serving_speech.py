@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import math
@@ -184,6 +185,34 @@ def _validate_path_within_directory(file_path: Path, directory: Path) -> bool:
         return directory_resolved in file_path_resolved.parents or directory_resolved == file_path_resolved
     except Exception:
         return False
+
+
+def _conditioning_cache_salt(request) -> str:
+    """Stable hash of the real Stage 0 conditioning for the prefix cache.
+
+    The talker's vLLM prompt is placeholder token ids; the real inputs are
+    rebuilt from text / ref_audio / ref_text into inputs_embeds. vLLM hashes
+    token ids (folded with cache_salt) for prefix caching, so without a salt
+    every request collides and a hit could reuse KV from a semantically
+    different input. Tying the salt to the conditioning keeps a hit safe:
+    identical conditioning may share the prefix, any difference never does.
+    """
+    h = hashlib.sha256()
+    for part in (
+        request.input,
+        request.task_type,
+        request.language,
+        request.voice,
+        request.ref_text,
+        request.ref_audio,
+        request.instructions,
+        request.x_vector_only_mode,
+        request.speaker_embedding,
+    ):
+        h.update(b"\x00")
+        if part is not None:
+            h.update(repr(part).encode("utf-8"))
+    return h.hexdigest()[:32]
 
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
@@ -2112,6 +2141,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     tts_params["seed"] = [sampling_params_list[0].seed]
                 prompt = tokens_input(prompt_token_ids=[1])
                 prompt["additional_information"] = tts_params
+                prompt["cache_salt"] = _conditioning_cache_salt(request)
             else:
                 tts_params = self._build_tts_params(request)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
@@ -2127,6 +2157,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 ph_len = await self._estimate_prompt_len_async(tts_params)
                 prompt = tokens_input(prompt_token_ids=[1] * ph_len)
                 prompt["additional_information"] = tts_params
+                prompt["cache_salt"] = _conditioning_cache_salt(request)
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The
