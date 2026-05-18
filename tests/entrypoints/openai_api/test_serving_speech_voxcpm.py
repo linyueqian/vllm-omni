@@ -140,7 +140,10 @@ class TestVoxCPMServing:
 
         voxcpm_server.engine_client.generate.assert_called_once()
         call = voxcpm_server.engine_client.generate.call_args
-        assert call.kwargs["prompt"] == {
+        prompt = dict(call.kwargs["prompt"])
+        cache_salt = prompt.pop("cache_salt")
+        assert isinstance(cache_salt, str) and len(cache_salt) == 32
+        assert prompt == {
             "prompt_token_ids": [1],
             "additional_information": tts_params,
             "type": "token",
@@ -172,7 +175,10 @@ class TestVoxCPMServing:
 
         voxcpm_server._resolve_ref_audio.assert_awaited_once_with("data:audio/wav;base64,QUJD")
         call = voxcpm_server.engine_client.generate.call_args
-        assert call.kwargs["prompt"] == {
+        prompt = dict(call.kwargs["prompt"])
+        cache_salt = prompt.pop("cache_salt")
+        assert isinstance(cache_salt, str) and len(cache_salt) == 32
+        assert prompt == {
             "prompt_token_ids": [1],
             "additional_information": tts_params,
             "type": "token",
