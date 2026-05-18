@@ -187,7 +187,7 @@ def _validate_path_within_directory(file_path: Path, directory: Path) -> bool:
         return False
 
 
-def _conditioning_cache_salt(request) -> str:
+def _conditioning_cache_salt(request, tts_params: dict | None = None) -> str:
     """Stable hash of the real Stage 0 conditioning for the prefix cache.
 
     The talker's vLLM prompt is placeholder token ids; the real inputs are
@@ -196,6 +196,14 @@ def _conditioning_cache_salt(request) -> str:
     every request collides and a hit could reuse KV from a semantically
     different input. Tying the salt to the conditioning keeps a hit safe:
     identical conditioning may share the prefix, any difference never does.
+
+    Raw request fields alone are not enough for uploaded voices: the request
+    only carries the voice *name* (ref_audio/ref_text/task_type are resolved
+    from stored voice data into ``tts_params``). Delete + re-upload under the
+    same name leaves every raw field identical, so the resolved conditioning
+    must also be folded in. ``voice_created_at`` bumps on every (re-)upload,
+    which uniquely identifies the resolved reference artifact together with
+    the voice name; the decoded ref_audio array itself need not be hashed.
     """
     h = hashlib.sha256()
     for part in (
@@ -212,6 +220,19 @@ def _conditioning_cache_salt(request) -> str:
         h.update(b"\x00")
         if part is not None:
             h.update(repr(part).encode("utf-8"))
+    # Fold resolved conditioning that is auto-derived for uploaded voices and
+    # absent from the raw request.
+    for key in (
+        "voice_created_at",
+        "task_type",
+        "speaker",
+        "ref_text",
+        "x_vector_only_mode",
+    ):
+        h.update(b"\x00")
+        value = tts_params.get(key) if tts_params is not None else None
+        if value is not None:
+            h.update(repr(value).encode("utf-8"))
     return h.hexdigest()[:32]
 
 
@@ -2141,7 +2162,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     tts_params["seed"] = [sampling_params_list[0].seed]
                 prompt = tokens_input(prompt_token_ids=[1])
                 prompt["additional_information"] = tts_params
-                prompt["cache_salt"] = _conditioning_cache_salt(request)
+                prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
             else:
                 tts_params = self._build_tts_params(request)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
@@ -2157,7 +2178,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 ph_len = await self._estimate_prompt_len_async(tts_params)
                 prompt = tokens_input(prompt_token_ids=[1] * ph_len)
                 prompt["additional_information"] = tts_params
-                prompt["cache_salt"] = _conditioning_cache_salt(request)
+                prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The
