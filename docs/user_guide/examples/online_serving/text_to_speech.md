@@ -21,7 +21,6 @@ For the full list of supported architectures across all modalities, see
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
-| VoxCPM | local model dir | ✓ | ✓ (PCM stream) | — | — |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
@@ -335,66 +334,6 @@ python qwen3_tts/gradio_fastrtc_demo.py --api-base http://localhost:8000
 
 ---
 
-## VoxCPM
-
-Split-stage TTS at 24 kHz.
-
-### Prerequisites
-```bash
-pip install voxcpm
-# or use a local source tree:
-export VLLM_OMNI_VOXCPM_CODE_PATH=/path/to/VoxCPM/src
-```
-
-If the native VoxCPM `config.json` lacks HF `model_type`, set up an HF-compatible config dir:
-```bash
-export VOXCPM_MODEL=/path/to/voxcpm-model
-export VLLM_OMNI_VOXCPM_HF_CONFIG_PATH=/tmp/voxcpm_hf_config
-mkdir -p "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH"
-cp "$VOXCPM_MODEL/config.json" "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH/config.json"
-cp "$VOXCPM_MODEL/generation_config.json" "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH/generation_config.json" 2>/dev/null || true
-python3 -c 'import json, os; p=os.path.join(os.environ["VLLM_OMNI_VOXCPM_HF_CONFIG_PATH"], "config.json"); cfg=json.load(open(p, "r", encoding="utf-8")); cfg["model_type"]="voxcpm"; cfg.setdefault("architectures", ["VoxCPMForConditionalGeneration"]); json.dump(cfg, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)'
-```
-
-### Launch
-```bash
-export VOXCPM_MODEL=/path/to/voxcpm-model
-./voxcpm/run_server.sh                # async-chunk streaming (default)
-./voxcpm/run_server.sh sync           # non-streaming
-```
-Or directly:
-```bash
-vllm serve "$VOXCPM_MODEL" \
-    --stage-configs-path vllm_omni/deploy/voxcpm_async_chunk.yaml \
-    --trust-remote-code --enforce-eager --omni --port 8091
-```
-
-### Sending requests
-```bash
-# Basic TTS
-python voxcpm/openai_speech_client.py \
-    --model "$VOXCPM_MODEL" \
-    --text "This is a VoxCPM online text-to-speech example."
-
-# Voice cloning
-python voxcpm/openai_speech_client.py \
-    --model "$VOXCPM_MODEL" \
-    --text "This sentence is synthesized with a cloned voice." \
-    --ref-audio /path/to/reference.wav \
-    --ref-text "The exact transcript spoken in reference.wav."
-
-# Streaming PCM
-python voxcpm/openai_speech_client.py \
-    --model "$VOXCPM_MODEL" \
-    --text "This is a streaming VoxCPM request." \
-    --stream --output voxcpm_stream.pcm
-```
-
-### Notes
-- `voxcpm.yaml` for one-shot decode; `voxcpm_async_chunk.yaml` for single-request streaming. Do not use the async-chunk config for concurrent requests or `/v1/audio/speech/batch`.
-- Generic TTS fields not supported by VoxCPM: `voice`, `instructions`, `language`, `speaker_embedding`, `x_vector_only_mode`.
-- For benchmark measurement, see [`benchmarks/voxcpm`](https://github.com/vllm-project/vllm-omni/tree/main/benchmarks/voxcpm/README.md).
-
 ---
 
 ## VoxCPM2
@@ -519,14 +458,6 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
 ??? abstract "qwen3_tts/tts_common.py"
     ``````py
     --8<-- "examples/online_serving/text_to_speech/qwen3_tts/tts_common.py"
-    ``````
-??? abstract "voxcpm/openai_speech_client.py"
-    ``````py
-    --8<-- "examples/online_serving/text_to_speech/voxcpm/openai_speech_client.py"
-    ``````
-??? abstract "voxcpm/run_server.sh"
-    ``````sh
-    --8<-- "examples/online_serving/text_to_speech/voxcpm/run_server.sh"
     ``````
 ??? abstract "voxcpm2/gradio_demo.py"
     ``````py
