@@ -17,6 +17,7 @@ For the full list of supported architectures across all modalities, see
 
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 |---|---|---|---|---|---|
+| CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
@@ -24,7 +25,7 @@ For the full list of supported architectures across all modalities, see
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
-CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/README.md#cosyvoice3) instead.
+For offline inference of any of these models, see the [offline TTS hub](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/README.md).
 
 ## Common Quick Start
 
@@ -90,9 +91,57 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
 
-Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 24 kHz for the others).
+Adjust the player's sample rate to match the model (22.05 kHz for CosyVoice3, 44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 24 kHz for the others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](https://github.com/vllm-project/vllm-omni/tree/main/docs/serving/speech_api.md).
+
+---
+
+## CosyVoice3
+
+2-stage TTS (`talker` + flow-matching `code2wav`) at 22.05 kHz. Voice cloning only — every request needs `ref_audio` + `ref_text`; there are no built-in voice presets.
+
+### Prerequisites
+```bash
+huggingface-cli download FunAudioLLM/Fun-CosyVoice3-0.5B-2512
+```
+
+If your downloaded checkpoint lacks `config.json`, add one with `{"model_type": "cosyvoice3", "architectures": ["CosyVoice3Model"]}` (the loader reads `model_type` to select the class).
+
+### Launch
+```bash
+vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remote-code
+# or:
+./cosyvoice3/run_server.sh
+```
+
+Streaming is on by default via `async_chunk: true` in `vllm_omni/deploy/cosyvoice3.yaml`. Pass `--no-async-chunk` (or `NO_ASYNC_CHUNK=1 ./cosyvoice3/run_server.sh`) for the legacy synchronous path.
+
+### CLI client
+The client defaults to the official upstream zero-shot prompt, so it runs without extra flags:
+```bash
+cd examples/online_serving/text_to_speech/cosyvoice3
+python speech_client.py --text "收到好友从远方寄来的生日礼物。"
+```
+
+Pass your own reference clip and transcript for a different voice:
+```bash
+python speech_client.py --text "Hello, this is a cloned voice." \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "Transcript of the reference audio."
+```
+
+Stream PCM instead of WAV:
+```bash
+python speech_client.py --text "Hello world" --stream --output output.pcm
+```
+
+The client supports `--api-base`, `--model`, `--text`, `--ref-audio`, `--ref-text`, `--response-format`, `--stream`, `--output`.
+
+### Notes
+- Stage 0 (`talker`) emits speech tokens; stage 1 (`code2wav`) runs flow matching + HiFiGAN to synthesize waveform.
+- Deploy config auto-loads from `vllm_omni/deploy/cosyvoice3.yaml` based on HF `model_type`. Pass `--deploy-config <path>` to override.
+- For offline inference and the end-to-end script, see the [offline CosyVoice3 section](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/README.md#cosyvoice3).
 
 ---
 
@@ -406,6 +455,14 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
 - A standalone CLI client is not yet shipped; the gradio demo is the canonical reference for now.
 
 ## Example materials
+
+??? abstract "cosyvoice3/run_server.sh"
+
+    --8<-- "examples/online_serving/text_to_speech/cosyvoice3/run_server.sh"
+
+??? abstract "cosyvoice3/speech_client.py"
+
+    --8<-- "examples/online_serving/text_to_speech/cosyvoice3/speech_client.py"
 
 ??? abstract "fish_speech/gradio_demo.py"
     ``````py
