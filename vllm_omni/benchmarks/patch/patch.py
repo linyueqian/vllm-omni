@@ -1074,9 +1074,7 @@ async def benchmark(
             return
         # No text tokens generated (e.g. pure TTS speech endpoint): per-token
         # latency metrics (ttft/tpot/itl) are undefined, so skip them.
-        is_text_token_metric = not (
-            metric_attribute_name == "e2el" or metric_attribute_name.startswith("audio")
-        )
+        is_text_token_metric = not (metric_attribute_name == "e2el" or metric_attribute_name.startswith("audio"))
         if is_text_token_metric and getattr(metrics, "total_output", 0) == 0:
             return
         is_audio_rtf = metric_attribute_name == "audio_rtf"
