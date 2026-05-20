@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import io
 import os
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 from urllib.parse import urlparse
@@ -40,6 +42,7 @@ logger = init_logger(__name__)
 _TRAILING_TEXT_COMPACT_MIN_FRAMES = 64
 _PRECOMPUTED_REF_CODE_KEY = "precomputed_ref"
 _NORMALIZED_REF_AUDIO_KEY = "_qwen3_tts_normalized_ref_audio"
+_REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
 _PRECOMPUTED_TEXT_IDS_KEY = "_qwen3_tts_text_ids"
 _PRECOMPUTED_REF_IDS_KEY = "_qwen3_tts_ref_ids"
 
@@ -443,6 +446,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
 
         self._speaker_cache = get_speaker_cache()
+        self._ref_audio_artifact_cache_max_entries = 256
+        self._ref_audio_artifact_cache: OrderedDict[str, dict[str, torch.Tensor | bool]] = OrderedDict()
         raw_subtalker_sampling = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
         self._subtalker_sampling_params: dict[str, Any] = (
             dict(raw_subtalker_sampling) if isinstance(raw_subtalker_sampling, Mapping) else {}
@@ -582,6 +587,15 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 is_prefill = int(info_dict["_omni_num_computed_tokens"]) < int(info_dict["_omni_prompt_len"])
             except Exception:
                 is_prefill = span_len > 1
+        logger.debug(
+            "Qwen3-TTS preprocess prefix-cache state: request_id=%s span_len=%d "
+            "num_computed_tokens=%s prompt_len=%s is_prefill=%s",
+            info_dict.get("request_id", "unknown"),
+            span_len,
+            info_dict.get("_omni_num_computed_tokens"),
+            info_dict.get("_omni_prompt_len"),
+            is_prefill,
+        )
 
         text_list = info_dict.get("text")
         if not isinstance(text_list, list) or not text_list or not text_list[0]:
@@ -1275,6 +1289,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         return wav_np, sr
 
     def _extract_speaker_embedding(self, wav: np.ndarray, sr: int) -> torch.Tensor:
+        logger.debug(
+            "Qwen3-TTS voice_clone speaker embedding extraction RUN: wav_samples=%d sr=%d",
+            int(wav.size),
+            int(sr),
+        )
         # vLLM workers do not automatically move arbitrary torch.nn.Modules to
         # CUDA. Ensure the speaker encoder is on the same device/dtype as the
         # main model before running it.
@@ -1318,6 +1337,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             hann_window=hann_window,
         ).transpose(1, 2)
         spk = self.speaker_encoder(mels.to(dtype=torch.bfloat16))[0]
+        logger.debug(
+            "Qwen3-TTS voice_clone speaker embedding extraction DONE: mel_shape=%s embedding_shape=%s",
+            tuple(mels.shape),
+            tuple(spk.shape),
+        )
         return spk.to(dtype=torch.bfloat16)
 
     def _get_speaker_mel_buffers(
@@ -1386,6 +1410,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         return tok
 
     def _encode_ref_audio_to_code(self, wav: np.ndarray, sr: int) -> torch.Tensor:
+        logger.debug(
+            "Qwen3-TTS voice_clone ref audio encode RUN: wav_samples=%d sr=%d",
+            int(wav.size),
+            int(sr),
+        )
         tok = self._ensure_speech_tokenizer_loaded()
         enc = tok.encode(wav, sr=int(sr), return_dict=True)
         ref_code = getattr(enc, "audio_codes", None)
@@ -1395,8 +1424,50 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             # 12Hz: likely [T, Q] or [B, T, Q]
             if ref_code.ndim == 3:
                 ref_code = ref_code[0]
-            return ref_code.to(device=next(self.parameters()).device, dtype=torch.long)
+            out = ref_code.to(device=next(self.parameters()).device, dtype=torch.long)
+            logger.debug("Qwen3-TTS voice_clone ref audio encode DONE: ref_code_shape=%s", tuple(out.shape))
+            return out
         raise ValueError("SpeechTokenizer.encode did not return audio_codes tensor")
+
+    @staticmethod
+    def _make_ref_audio_cache_key(wav: np.ndarray, sr: int) -> str:
+        wav_f32 = wav.astype(np.float32, copy=False).reshape(-1)
+        h = hashlib.sha1()
+        h.update(int(sr).to_bytes(4, byteorder="little", signed=False))
+        h.update(int(wav_f32.size).to_bytes(8, byteorder="little", signed=False))
+        h.update(wav_f32.tobytes(order="C"))
+        return h.hexdigest()
+
+    def _get_ref_audio_artifacts(self, cache_key: str) -> dict[str, torch.Tensor | bool] | None:
+        entry = self._ref_audio_artifact_cache.get(cache_key)
+        if entry is None:
+            return None
+        # Touch for LRU.
+        self._ref_audio_artifact_cache.move_to_end(cache_key, last=True)
+        return entry
+
+    def _put_ref_audio_artifacts(
+        self,
+        cache_key: str,
+        *,
+        ref_code: torch.Tensor | None = None,
+        ref_spk_embedding: torch.Tensor | None = None,
+    ) -> None:
+        if not cache_key:
+            return
+        entry = self._ref_audio_artifact_cache.get(cache_key)
+        if entry is None:
+            entry = {}
+        if isinstance(ref_code, torch.Tensor):
+            entry["ref_code"] = ref_code.detach().to("cpu", dtype=torch.long).contiguous()
+        if isinstance(ref_spk_embedding, torch.Tensor):
+            entry["ref_spk_embedding"] = ref_spk_embedding.detach().to("cpu", dtype=torch.bfloat16).reshape(-1)
+        if not entry:
+            return
+        self._ref_audio_artifact_cache[cache_key] = entry
+        self._ref_audio_artifact_cache.move_to_end(cache_key, last=True)
+        while len(self._ref_audio_artifact_cache) > self._ref_audio_artifact_cache_max_entries:
+            self._ref_audio_artifact_cache.popitem(last=False)
 
     @staticmethod
     def _first_value(value: object, default: object = None) -> object:
@@ -1512,6 +1583,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         device: torch.device,
     ) -> None:
         """Batch Base voice-clone ref-audio codec extraction for current prefill requests."""
+        logger.debug("Qwen3-TTS preprocess_batch inspect: req_count=%d", len(req_ids))
         pending_text: list[tuple[dict[str, Any], str]] = []
         pending_ref_text: list[tuple[dict[str, Any], str]] = []
         groups: dict[int, list[tuple[dict[str, Any], np.ndarray, int]]] = {}
@@ -1546,7 +1618,27 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 # invalid ref_audio errors with its existing messages.
                 continue
             info_dict[_NORMALIZED_REF_AUDIO_KEY] = (wav, sr)
+            cache_key = self._make_ref_audio_cache_key(wav, sr)
+            info_dict[_REF_AUDIO_CACHE_KEY] = cache_key
+            cached = self._get_ref_audio_artifacts(cache_key)
+            if cached is not None:
+                cached_ref_code = self._coerce_ref_code_tensor(cached.get("ref_code"), device=device)
+                if isinstance(cached_ref_code, torch.Tensor):
+                    info_dict.setdefault("codes", {})[_PRECOMPUTED_REF_CODE_KEY] = cached_ref_code
+                    logger.debug(
+                        "Qwen3-TTS preprocess_batch ref_audio artifact cache HIT(ref_code): request_id=%s key=%s ref_code_shape=%s",
+                        req_id,
+                        cache_key,
+                        tuple(cached_ref_code.shape),
+                    )
+                    continue
             groups.setdefault(int(sr), []).append((info_dict, wav, int(sr)))
+            logger.debug(
+                "Qwen3-TTS preprocess_batch candidate: request_id=%s sr=%d wav_samples=%d",
+                req_id,
+                int(sr),
+                int(wav.size),
+            )
 
         if pending_text or pending_ref_text:
             tok_text = self._get_tokenizer()
@@ -1567,14 +1659,31 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 for (info_dict, _), ids in zip(items, input_ids, strict=True):
                     if isinstance(ids, list) and ids:
                         info_dict[key] = torch.tensor(ids, dtype=torch.long)
+                logger.debug(
+                    "Qwen3-TTS preprocess_batch text ids cached: key=%s count=%d",
+                    key,
+                    len(items),
+                )
 
+        raw_group_sizes = {sr: len(items) for sr, items in groups.items()}
         groups = {sr: items for sr, items in groups.items() if len(items) >= 2}
         if not groups:
+            if raw_group_sizes:
+                logger.debug(
+                    "Qwen3-TTS preprocess_batch no batched ref_code encode: raw_group_sizes=%s",
+                    raw_group_sizes,
+                )
             return
 
         tok = self._ensure_speech_tokenizer_loaded()
         for sr, items in groups.items():
             wavs = [wav for _, wav, _ in items]
+            logger.debug(
+                "Qwen3-TTS preprocess_batch batched ref_code encode RUN: sr=%d batch=%d wav_samples=%s",
+                int(sr),
+                len(items),
+                [int(wav.size) for wav in wavs],
+            )
             try:
                 enc = tok.encode(wavs, sr=int(sr), return_dict=True)
                 ref_codes = self._split_ref_code_batch(getattr(enc, "audio_codes", None), len(items))
@@ -1589,6 +1698,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     continue
                 info_dict.setdefault("codes", {})[_PRECOMPUTED_REF_CODE_KEY] = ref_code_t
                 info_dict[_NORMALIZED_REF_AUDIO_KEY] = (wav, item_sr)
+                cache_key = info_dict.get(_REF_AUDIO_CACHE_KEY)
+                if isinstance(cache_key, str) and cache_key:
+                    self._put_ref_audio_artifacts(cache_key, ref_code=ref_code_t)
+                logger.debug(
+                    "Qwen3-TTS preprocess_batch batched ref_code cached: sr=%d ref_code_shape=%s",
+                    int(item_sr),
+                    tuple(ref_code_t.shape),
+                )
 
     def _generate_icl_prompt(
         self,
@@ -1770,11 +1887,20 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         if task_type == "Base":
             # Base supports voice clone prompt with in-context mode.
+            request_id = str(info_dict.get("request_id", "unknown"))
             xvec_only = bool((info_dict.get("x_vector_only_mode") or [False])[0])
             in_context_mode = not xvec_only
             voice_clone_prompt = _normalize_voice_clone_prompt(info_dict.get("voice_clone_prompt"))
             ref_audio_wav: np.ndarray | None = None
             ref_audio_sr: int | None = None
+            ref_audio_cache_key: str | None = None
+            logger.debug(
+                "Qwen3-TTS Base voice_clone prompt build: request_id=%s in_context=%s xvec_only=%s voice_clone_prompt=%s",
+                request_id,
+                in_context_mode,
+                xvec_only,
+                voice_clone_prompt is not None,
+            )
 
             def _get_ref_audio() -> tuple[np.ndarray, int]:
                 nonlocal ref_audio_wav, ref_audio_sr
@@ -1787,12 +1913,50 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     ):
                         ref_audio_wav = normalized_ref_audio[0]
                         ref_audio_sr = int(normalized_ref_audio[1])
+                        logger.debug(
+                            "Qwen3-TTS Base voice_clone ref_audio reused from preprocess_batch: request_id=%s sr=%d wav_samples=%d",
+                            request_id,
+                            int(ref_audio_sr),
+                            int(ref_audio_wav.size),
+                        )
                         return ref_audio_wav, ref_audio_sr
                     ref_audio_list = info_dict.get("ref_audio")
                     if not isinstance(ref_audio_list, list) or not ref_audio_list:
                         raise ValueError("Base requires `ref_audio`.")
                     ref_audio_wav, ref_audio_sr = self._normalize_ref_audio(ref_audio_list[0])
+                    logger.debug(
+                        "Qwen3-TTS Base voice_clone ref_audio normalized in prompt build: request_id=%s sr=%d wav_samples=%d",
+                        request_id,
+                        int(ref_audio_sr),
+                        int(ref_audio_wav.size),
+                    )
                 return ref_audio_wav, ref_audio_sr
+
+            def _get_ref_audio_cache_key() -> str:
+                nonlocal ref_audio_cache_key
+                if isinstance(ref_audio_cache_key, str) and ref_audio_cache_key:
+                    return ref_audio_cache_key
+                cached_key = info_dict.get(_REF_AUDIO_CACHE_KEY)
+                if isinstance(cached_key, str) and cached_key:
+                    ref_audio_cache_key = cached_key
+                    return ref_audio_cache_key
+                wav_np, sr = _get_ref_audio()
+                ref_audio_cache_key = self._make_ref_audio_cache_key(wav_np, sr)
+                info_dict[_REF_AUDIO_CACHE_KEY] = ref_audio_cache_key
+                return ref_audio_cache_key
+
+            def _try_get_ref_audio_cache_key() -> str | None:
+                nonlocal ref_audio_cache_key
+                if isinstance(ref_audio_cache_key, str) and ref_audio_cache_key:
+                    return ref_audio_cache_key
+                cached_key = info_dict.get(_REF_AUDIO_CACHE_KEY)
+                if isinstance(cached_key, str) and cached_key:
+                    ref_audio_cache_key = cached_key
+                    return ref_audio_cache_key
+                ref_audio_list = info_dict.get("ref_audio")
+                if isinstance(ref_audio_list, list) and ref_audio_list:
+                    return _get_ref_audio_cache_key()
+                return None
 
             # Speaker cache: only for uploaded (named) speakers
             _speaker_cache_key = None
@@ -1811,6 +1975,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     )
                     _cached = self._speaker_cache.get(_speaker_cache_key)
                     if _cached is not None:
+                        logger.debug(
+                            "Qwen3-TTS speaker cache HIT: request_id=%s key=%s has_ref_code=%s has_spk=%s",
+                            request_id,
+                            _speaker_cache_key,
+                            isinstance(_cached.get("ref_code"), torch.Tensor),
+                            isinstance(_cached.get("ref_spk_embedding"), torch.Tensor),
+                        )
                         # Transfer cached tensors to current device
                         ref_code_cached = _cached.get("ref_code")
                         ref_spk_embed_cached = _cached.get("ref_spk_embedding")
@@ -1824,6 +1995,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                             "icl_mode": _cached.get("icl_mode"),
                         }
                         _speaker_cache_key = None  # hit → don't store again
+                    else:
+                        logger.debug("Qwen3-TTS speaker cache MISS: request_id=%s key=%s", request_id, _speaker_cache_key)
 
             # Official implementation may pass `voice_clone_prompt.icl_mode`.
             if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt:
@@ -1844,19 +2017,48 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     ref_code_t = ref_code_t[0]
                 ref_code_t = ref_code_t.to(device=input_ids.device, dtype=torch.long)
                 ref_code_len = int(ref_code_t.shape[0])
+                logger.debug(
+                    "Qwen3-TTS ref_code reused from voice_clone_prompt/cache: request_id=%s ref_code_shape=%s",
+                    request_id,
+                    tuple(ref_code_t.shape),
+                )
             else:
                 codes = info_dict.get("codes")
                 precomputed_ref_code = codes.get(_PRECOMPUTED_REF_CODE_KEY) if isinstance(codes, dict) else None
                 ref_code_t = self._coerce_ref_code_tensor(precomputed_ref_code, device=input_ids.device)
                 if isinstance(ref_code_t, torch.Tensor):
                     ref_code_len = int(ref_code_t.shape[0])
+                    logger.debug(
+                        "Qwen3-TTS ref_code reused from preprocess_batch precomputed_ref: request_id=%s ref_code_shape=%s",
+                        request_id,
+                        tuple(ref_code_t.shape),
+                    )
             if ref_code_t is None and in_context_mode:
-                # Compute ref_code from ref_audio if not provided.
-                wav_np, sr = _get_ref_audio()
-                ref_code_t = self._encode_ref_audio_to_code(wav_np, sr).to(device=input_ids.device)
-                ref_code_len = int(ref_code_t.shape[0])
+                cache_key = _get_ref_audio_cache_key()
+                cached = self._get_ref_audio_artifacts(cache_key)
+                cached_ref_code = None
+                if isinstance(cached, dict):
+                    cached_ref_code = cached.get("ref_code")
+                ref_code_t = self._coerce_ref_code_tensor(cached_ref_code, device=input_ids.device)
+                if isinstance(ref_code_t, torch.Tensor):
+                    ref_code_len = int(ref_code_t.shape[0])
+                    logger.debug(
+                        "Qwen3-TTS ref_audio artifact cache HIT(ref_code): request_id=%s key=%s ref_code_shape=%s",
+                        request_id,
+                        cache_key,
+                        tuple(ref_code_t.shape),
+                    )
+                else:
+                    logger.debug("Qwen3-TTS ref_code cache/precompute MISS, serial encode next: request_id=%s", request_id)
+                    wav_np, sr = _get_ref_audio()
+                    ref_code_t = self._encode_ref_audio_to_code(wav_np, sr).to(device=input_ids.device)
+                    ref_code_len = int(ref_code_t.shape[0])
+                    self._put_ref_audio_artifacts(cache_key, ref_code=ref_code_t)
             if isinstance(ref_code_t, torch.Tensor):
                 ref_code_prompt = ref_code_t
+                cache_key = _try_get_ref_audio_cache_key()
+                if isinstance(cache_key, str) and cache_key:
+                    self._put_ref_audio_artifacts(cache_key, ref_code=ref_code_prompt)
 
             # Speaker embedding: use prompt embed if provided; otherwise extract from audio.
             # NOTE: Do NOT use _as_singleton here — the embedding may be a plain
@@ -1867,15 +2069,51 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 spk = voice_clone_prompt.get("ref_spk_embedding")
             if isinstance(spk, torch.Tensor):
                 speaker_embed = spk.to(device=input_ids.device, dtype=torch.bfloat16).view(1, 1, -1)
+                logger.debug(
+                    "Qwen3-TTS speaker embedding reused from tensor prompt/cache: request_id=%s embedding_shape=%s",
+                    request_id,
+                    tuple(speaker_embed.shape),
+                )
             elif isinstance(spk, (list, np.ndarray)):
                 # Plain list/array from API (survived msgspec IPC serialization).
                 speaker_embed = torch.tensor(spk, dtype=torch.bfloat16, device=input_ids.device).view(1, 1, -1)
+                logger.debug(
+                    "Qwen3-TTS speaker embedding reused from list/array prompt: request_id=%s embedding_shape=%s",
+                    request_id,
+                    tuple(speaker_embed.shape),
+                )
             else:
-                wav_np, sr = _get_ref_audio()
-                speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
+                cache_key = _get_ref_audio_cache_key()
+                cached = self._get_ref_audio_artifacts(cache_key)
+                cached_spk = None
+                if isinstance(cached, dict):
+                    cached_spk = cached.get("ref_spk_embedding")
+                if isinstance(cached_spk, torch.Tensor):
+                    speaker_embed = cached_spk.to(device=input_ids.device, dtype=torch.bfloat16).view(1, 1, -1)
+                    logger.debug(
+                        "Qwen3-TTS ref_audio artifact cache HIT(ref_spk_embedding): request_id=%s key=%s embedding_shape=%s",
+                        request_id,
+                        cache_key,
+                        tuple(speaker_embed.shape),
+                    )
+                else:
+                    logger.debug(
+                        "Qwen3-TTS speaker embedding cache/precompute MISS, extraction next: request_id=%s",
+                        request_id,
+                    )
+                    wav_np, sr = _get_ref_audio()
+                    speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
+                    self._put_ref_audio_artifacts(cache_key, ref_spk_embedding=speaker_embed)
 
             # Cache miss: store extraction result
             if _speaker_cache_key is not None and speaker_embed is not None:
+                logger.debug(
+                    "Qwen3-TTS speaker cache PUT: request_id=%s key=%s has_ref_code=%s speaker_shape=%s",
+                    request_id,
+                    _speaker_cache_key,
+                    isinstance(ref_code_prompt, torch.Tensor),
+                    tuple(speaker_embed.shape),
+                )
                 self._speaker_cache.put(
                     _speaker_cache_key,
                     {
