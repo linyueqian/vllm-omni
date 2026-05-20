@@ -245,10 +245,10 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8091
 ./qwen3_tts/run_server.sh Base
 ```
 
-### Choosing an executor backend (uniproc vs mp)
-Stage configs ship with the chunked-streaming default. To use the uniproc executor (lower IPC overhead for the Base cloning task), pass `--stage-configs-path vllm_omni/deploy/qwen3_tts_uniproc.yaml`. See [#2603](https://github.com/vllm-project/vllm-omni/issues/2603) and [#2604](https://github.com/vllm-project/vllm-omni/pull/2604) for the full investigation.
+### Executor backend
+Single-GPU serves now default to the uniproc executor (lower IPC overhead, the Base cloning use case from [#2603](https://github.com/vllm-project/vllm-omni/issues/2603) / [#2604](https://github.com/vllm-project/vllm-omni/pull/2604)). `vllm_omni/deploy/qwen3_tts.yaml` is the only Qwen3-TTS deploy config; pass `--deploy-config <path>` to override.
 
-To opt out of chunked streaming, pass `--no-async-chunk` instead — the pipeline auto-dispatches to the end-to-end codec processor.
+To opt out of chunked streaming, pass `--no-async-chunk` — the pipeline auto-dispatches to the end-to-end codec processor.
 
 ### Sending requests
 ```bash
@@ -330,7 +330,7 @@ python qwen3_tts/gradio_fastrtc_demo.py --api-base http://localhost:8000
 `qwen3_tts/batch_speech_client.py` issues many concurrent requests for throughput measurement.
 
 ### Notes
-- Base voice cloning has uniproc-vs-mp tradeoffs depending on per-request reference audio cost; see the executor-backend section above.
+- Base voice cloning has per-request reference-audio cost; the uniproc default keeps IPC overhead off the critical path. See the executor-backend section above for background.
 - `vllm_omni/deploy/qwen3_tts.yaml` is the default deploy config (loaded by HF `model_type`); per-stage runtime overrides are available via `--stage-N-<field> <value>`.
 
 ---
