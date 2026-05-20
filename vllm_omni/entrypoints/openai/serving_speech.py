@@ -1568,6 +1568,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id: str,
         response_format: str = "pcm",
         raw_request: Request | None = None,
+        request_start_s: float | None = None,
     ):
         """Generate audio chunks for streaming response.
 
@@ -1588,6 +1589,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         prev_count = 0
         sample_rate_val = 24000
         first_chunk = True
+        first_audio_chunk_s: float | None = None
+        stream_start_s = request_start_s if request_start_s is not None else time.perf_counter()
 
         try:
             async for res in generator:
@@ -1639,11 +1642,40 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         stream_format="audio",
                         base64_encode=False,
                     )
+                    if first_audio_chunk_s is None:
+                        first_audio_chunk_s = time.perf_counter()
                     yield self.create_audio(audio_obj).audio_data
+            total_ms = (time.perf_counter() - stream_start_s) * 1000.0
+            if first_audio_chunk_s is not None:
+                first_chunk_ms = (first_audio_chunk_s - stream_start_s) * 1000.0
+                logger.info(
+                    "[SpeechE2E] request_id=%s stream=true status=ok total_ms=%.2f first_chunk_ms=%.2f",
+                    request_id,
+                    total_ms,
+                    first_chunk_ms,
+                )
+            else:
+                logger.info(
+                    "[SpeechE2E] request_id=%s stream=true status=ok total_ms=%.2f first_chunk_ms=NA",
+                    request_id,
+                    total_ms,
+                )
         except asyncio.CancelledError:
+            total_ms = (time.perf_counter() - stream_start_s) * 1000.0
+            logger.info(
+                "[SpeechE2E] request_id=%s stream=true status=cancelled total_ms=%.2f",
+                request_id,
+                total_ms,
+            )
             logger.info("Streaming request %s cancelled by client", request_id)
             raise
         except EngineDeadError as e:
+            total_ms = (time.perf_counter() - stream_start_s) * 1000.0
+            logger.error(
+                "[SpeechE2E] request_id=%s stream=true status=engine_dead total_ms=%.2f",
+                request_id,
+                total_ms,
+            )
             logger.error(
                 "EngineDeadError during streaming speech for %s: %s",
                 request_id,
@@ -1657,6 +1689,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
             raise
         except Exception as e:
+            total_ms = (time.perf_counter() - stream_start_s) * 1000.0
+            logger.exception(
+                "[SpeechE2E] request_id=%s stream=true status=error total_ms=%.2f error=%s",
+                request_id,
+                total_ms,
+                e,
+            )
             logger.exception("Streaming speech generation failed for %s: %s", request_id, e)
             raise
 
@@ -2567,6 +2606,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return error_check_ret
 
         request_id = f"speech-{random_uuid()}"
+        request_start_s = time.perf_counter()
         if raw_request:
             raw_request.state.request_metadata = RequestResponseMetadata(
                 request_id=request_id,
@@ -2599,20 +2639,58 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         request_id,
                         response_format,
                         raw_request=raw_request,
+                        request_start_s=request_start_s,
                     ),
                     media_type=media_type,
                 )
 
             audio_bytes, media_type = await self._generate_audio_bytes(request, request_id=request_id)
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.info(
+                "[SpeechE2E] request_id=%s stream=false status=ok total_ms=%.2f response_bytes=%d",
+                request_id,
+                total_ms,
+                len(audio_bytes) if isinstance(audio_bytes, (bytes, bytearray)) else len(str(audio_bytes)),
+            )
             return Response(content=audio_bytes, media_type=media_type)
 
         except asyncio.CancelledError:
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.info(
+                "[SpeechE2E] request_id=%s stream=%s status=cancelled total_ms=%.2f",
+                request_id,
+                bool(request.stream),
+                total_ms,
+            )
             return self.create_error_response("Client disconnected")
         except (EngineGenerateError, EngineDeadError):
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.error(
+                "[SpeechE2E] request_id=%s stream=%s status=engine_error total_ms=%.2f",
+                request_id,
+                bool(request.stream),
+                total_ms,
+            )
             raise  # Propagate to the global Omni exception handler
         except ValueError as e:
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.warning(
+                "[SpeechE2E] request_id=%s stream=%s status=bad_request total_ms=%.2f error=%s",
+                request_id,
+                bool(request.stream),
+                total_ms,
+                e,
+            )
             return self.create_error_response(e)
         except Exception as e:
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.exception(
+                "[SpeechE2E] request_id=%s stream=%s status=error total_ms=%.2f error=%s",
+                request_id,
+                bool(request.stream),
+                total_ms,
+                e,
+            )
             logger.exception("Speech generation failed: %s", e)
             return self.create_error_response(f"Speech generation failed: {e}")
 
