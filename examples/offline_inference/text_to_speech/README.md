@@ -14,7 +14,7 @@ list of supported architectures across all modalities, see
 
 | Model | HuggingFace repo | Stages | Voice cloning | Streaming | Special modes | Sample rate |
 |---|---|---|---|---|---|---|
-| CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 22.05 kHz |
+| CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | single (talker only) | — (caption-controlled) | — | style / IP / basic captions | 44.1 kHz |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | single (AR + codec) | ✓ (required) | ✓ | voice_clone, continuation | 48 kHz |
@@ -41,7 +41,7 @@ python examples/offline_inference/text_to_speech/<model>/end2end.py \
 
 ## CosyVoice3
 
-2-stage TTS pipeline (`talker` + `code2wav`) at 22.05 kHz.
+2-stage TTS pipeline (`talker` + `code2wav`) at 24 kHz.
 
 ### Prerequisites
 ```bash
