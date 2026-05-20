@@ -91,7 +91,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
 
-Adjust the player's sample rate to match the model (22.05 kHz for CosyVoice3, 44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 24 kHz for the others).
+Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 24 kHz for the others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](https://github.com/vllm-project/vllm-omni/tree/main/docs/serving/speech_api.md).
 
@@ -99,7 +99,7 @@ For full request-shape documentation (all parameters, response formats, error co
 
 ## CosyVoice3
 
-2-stage TTS (`talker` + flow-matching `code2wav`) at 22.05 kHz. Voice cloning only — every request needs `ref_audio` + `ref_text`; there are no built-in voice presets.
+2-stage TTS (`talker` + flow-matching `code2wav`) at 24 kHz. Voice cloning only — every request needs `ref_audio` + `ref_text`; there are no built-in voice presets.
 
 ### Prerequisites
 ```bash
