@@ -653,8 +653,9 @@ async def async_request_openai_audio_speech(
                         continue
                     timestamp = time.perf_counter()
                     if output.audio_ttfp == 0.0:
+                        # TTS speech endpoint emits no text tokens, so TTFT is
+                        # not defined here; only audio TTFP is meaningful.
                         output.audio_ttfp = timestamp - st
-                        output.ttft = output.audio_ttfp
                     total_pcm_bytes += len(chunk)
                     chunk_arrival_times_s.append(timestamp - st)
                     chunk_sizes.append(len(chunk))
@@ -1070,6 +1071,13 @@ async def benchmark(
         # This function prints and adds statistics of the specified
         # metric.
         if metric_attribute_name not in selected_percentile_metrics:
+            return
+        # No text tokens generated (e.g. pure TTS speech endpoint): per-token
+        # latency metrics (ttft/tpot/itl) are undefined, so skip them.
+        is_text_token_metric = not (
+            metric_attribute_name == "e2el" or metric_attribute_name.startswith("audio")
+        )
+        if is_text_token_metric and getattr(metrics, "total_output", 0) == 0:
             return
         is_audio_rtf = metric_attribute_name == "audio_rtf"
         is_audio_duration_or_underrun = metric_attribute_name in ("audio_duration", "audio_underrun")
