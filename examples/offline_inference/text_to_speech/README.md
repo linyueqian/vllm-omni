@@ -341,7 +341,7 @@ Pass `--streaming` together with the legacy async-chunk stage config:
 python examples/offline_inference/text_to_speech/voxcpm/end2end.py \
     --model openbmb/VoxCPM-0.5B \
     --streaming \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/voxcpm_async_chunk.yaml \
+    --stage-configs-path vllm_omni/deploy/voxcpm_async_chunk.yaml \
     --text "This is a split-stage VoxCPM streaming example running on vLLM Omni."
 ```
 

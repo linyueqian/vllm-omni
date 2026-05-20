@@ -115,7 +115,7 @@ Pass the async-chunk stage config:
 ```bash
 python examples/offline_inference/text_to_speech/voxcpm/end2end.py \
     --model "$VOXCPM_MODEL" \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/voxcpm_async_chunk.yaml \
+    --stage-configs-path vllm_omni/deploy/voxcpm_async_chunk.yaml \
     --text "This is a split-stage VoxCPM streaming example running on vLLM Omni."
 ```
 

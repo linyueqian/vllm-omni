@@ -295,7 +295,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8091
 ```
 
 ### Choosing an executor backend (uniproc vs mp)
-Stage configs ship with the chunked-streaming default. To use the uniproc executor (lower IPC overhead for the Base cloning task), pass `--stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts_uniproc.yaml`. See [#2603](https://github.com/vllm-project/vllm-omni/issues/2603) and [#2604](https://github.com/vllm-project/vllm-omni/pull/2604) for the full investigation.
+Stage configs ship with the chunked-streaming default. To use the uniproc executor (lower IPC overhead for the Base cloning task), pass `--stage-configs-path vllm_omni/deploy/qwen3_tts_uniproc.yaml`. See [#2603](https://github.com/vllm-project/vllm-omni/issues/2603) and [#2604](https://github.com/vllm-project/vllm-omni/pull/2604) for the full investigation.
 
 To opt out of chunked streaming, pass `--no-async-chunk` instead — the pipeline auto-dispatches to the end-to-end codec processor.
 
@@ -410,7 +410,7 @@ export VOXCPM_MODEL=/path/to/voxcpm-model
 Or directly:
 ```bash
 vllm serve "$VOXCPM_MODEL" \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/voxcpm_async_chunk.yaml \
+    --stage-configs-path vllm_omni/deploy/voxcpm_async_chunk.yaml \
     --trust-remote-code --enforce-eager --omni --port 8091
 ```
 

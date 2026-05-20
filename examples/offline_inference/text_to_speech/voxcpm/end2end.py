@@ -171,7 +171,7 @@ def parse_args():
         default=None,
         help=(
             "Legacy stage_args yaml path. Required for streaming "
-            "(vllm_omni/model_executor/stage_configs/voxcpm_async_chunk.yaml); "
+            "(vllm_omni/deploy/voxcpm_async_chunk.yaml); "
             "leave unset for non-streaming to use the auto-resolved deploy config."
         ),
     )
