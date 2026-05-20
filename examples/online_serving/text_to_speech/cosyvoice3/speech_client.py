@@ -28,9 +28,7 @@ DEFAULT_API_KEY = "EMPTY"
 DEFAULT_MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 
 # Official CosyVoice zero-shot prompt and its transcript.
-DEFAULT_REF_AUDIO = (
-    "https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav"
-)
+DEFAULT_REF_AUDIO = "https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav"
 DEFAULT_REF_TEXT = "希望你以后能够做的比我还好呦。"
 
 
