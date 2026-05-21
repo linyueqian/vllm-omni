@@ -357,6 +357,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
+        # Qwen3-TTS postprocess() only reads hidden_states[-1, :]. On a prefix-
+        # cache hit, the last hidden state is in the newly computed tail, so
+        # reconstructing the full cached_prefix + new_tail span is wasted work.
+        # Opt out of the per-step GPU->CPU hidden-state cache write and merged-
+        # tensor read; postprocess receives the tail-only slice instead, which
+        # avoids ~18 ms merge + ~6 ms write per step (Sy0307 profile, #3665).
+        self.requires_full_prefix_cached_hidden_states = False
         # Used by OmniGPUModelRunner for the GPU-side MTP fast-path.
         self.mtp_hidden_size = int(self.talker_config.hidden_size)
         # OmniGPUModelRunner will store talker_mtp output under this key in

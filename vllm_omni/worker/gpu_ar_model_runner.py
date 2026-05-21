@@ -250,6 +250,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         finally:
             set_cudagraph_capturing_enabled(False)
 
+    def _model_needs_full_prefix_hidden_states(self) -> bool:
+        """Opt-out hook for models whose postprocess only consumes the tail.
+
+        When False, we skip both the per-step GPU->CPU hidden-state write into
+        OmniTensorPrefixCache and the merged-tensor reconstruction on hits;
+        postprocess receives the normal scheduled-token slice instead. Models
+        that need the full cached_prefix + new_tail span (default) are not
+        affected.
+        """
+        model = getattr(self, "model", None)
+        return bool(getattr(model, "requires_full_prefix_cached_hidden_states", True))
+
     def _maybe_update_prefix_cache(
         self,
         hidden_states: torch.Tensor,
@@ -272,8 +284,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     type(multimodal_outputs),
                 )
 
+            hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
             self.omni_prefix_cache.update_omni_tensor_prefix_cache(
-                hidden_states=hidden_states,
+                hidden_states=hs_for_cache,
                 multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
                 slot_mapping=self.input_batch.block_table[0].slot_mapping.cpu,
@@ -293,12 +306,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # the prefix cached hidden states and multimodal states.
         combined_hidden_states, combined_multimodal_outputs = None, None
         if self.omni_prefix_cache is not None:
-            combined_hidden_states = self.omni_prefix_cache.get_merged_hidden_states(
-                query_start_loc=self.query_start_loc.cpu,
-                input_batch=self.input_batch,
-                hidden_states=hidden_states,
-                num_scheduled_tokens=num_scheduled_tokens,
-            )
+            if self._model_needs_full_prefix_hidden_states():
+                combined_hidden_states = self.omni_prefix_cache.get_merged_hidden_states(
+                    query_start_loc=self.query_start_loc.cpu,
+                    input_batch=self.input_batch,
+                    hidden_states=hidden_states,
+                    num_scheduled_tokens=num_scheduled_tokens,
+                )
             combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
                 query_start_loc=self.query_start_loc.cpu,
                 input_batch=self.input_batch,
