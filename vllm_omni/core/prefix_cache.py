@@ -201,9 +201,7 @@ class OmniTensorPrefixCache:
                 computed_end = int(input_batch.num_computed_tokens_cpu[req_idx])
                 token_start = max(0, computed_end - sched)
                 chunk = mm_state[start:end].detach()
-                self._deferred_mm_outputs.setdefault(req_id, {}).setdefault(mm_key, []).append(
-                    (token_start, chunk)
-                )
+                self._deferred_mm_outputs.setdefault(req_id, {}).setdefault(mm_key, []).append((token_start, chunk))
 
     def commit_deferred_mm_outputs(
         self,

@@ -992,9 +992,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 )
             # Otherwise we don't have the mm CPU data yet, so we still need to build it
             if self.omni_prefix_cache is None or combined_multimodal_outputs is None:
-                mm_cpu = build_mm_cpu(
-                    flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
-                )
+                mm_cpu = build_mm_cpu(flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs)
 
             self._process_additional_information_updates(
                 hidden_states,

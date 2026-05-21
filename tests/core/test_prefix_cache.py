@@ -22,12 +22,14 @@ class MockInputBatch:
         # we don't actually need to add valid values here since
         # we patch the table when testing.
         if block_table is None:
+
             class _DummyBlockTable:
                 pass
 
             self.block_table = _DummyBlockTable()
             self.block_table.block_tables = [None]
         else:
+
             class _TensorWrapper:
                 def __init__(self, tensor):
                     self.cpu = tensor
