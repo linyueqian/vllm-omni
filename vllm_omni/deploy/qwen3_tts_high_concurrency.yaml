@@ -22,9 +22,11 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 72
-      # Stage0 code-predictor prefix CUDA graphs for the c64 hot path.
-      # These keys are consumed by Qwen3-TTS talker and ignored by Code2Wav.
-      code_predictor_prefix_graphs: true
+      # Stage0 code-predictor prefix CUDA graphs. Off by default; the path
+      # currently regresses default_voice c=64 TTFP. Voice_clone deployments
+      # that want the captured prefix graphs can flip this back to true in a
+      # downstream yaml. Keys are consumed by the talker and ignored by Code2Wav.
+      code_predictor_prefix_graphs: false
       code_predictor_prefix_graph_buckets: [64]
       code_predictor_prefix_graph_seq_lens: [2, 3, 4, 5, 6, 7, 8]
       # Keep voice-clone reference context bounded so Stage1 chunk lengths are
@@ -36,7 +38,9 @@ connectors:
       #   no-ref first/steady chunks: 25 / 97 frames
       #   Base ref-context first/steady chunks: 73 / 169 frames
       #   decoder internal non-streaming chunks: 325 frames
-      decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+      # 49, 145 cover the default_voice shapes that v021 hit but PR #3662 left
+      # uncaptured. The full set is 7 shapes - well under Stage1's 12-shape cap.
+      decode_cudagraph_capture_sizes: [25, 49, 73, 97, 145, 169, 325]
       # Keep B>1 captures opt-in; c64 e2e validation did not show a stable win.
       decode_cudagraph_batch_sizes: [1]
       decode_compile_shapes: []

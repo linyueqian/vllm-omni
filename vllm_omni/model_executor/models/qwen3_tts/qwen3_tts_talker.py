@@ -37,7 +37,9 @@ from .qwen3_tts_tokenizer import Qwen3TTSTokenizer
 
 logger = init_logger(__name__)
 
-_TRAILING_TEXT_COMPACT_MIN_FRAMES = 64
+_TRAILING_TEXT_COMPACT_MIN_FRAMES = 64  # legacy default (overridable via connector_extra)
+_DEFAULT_SCALAR_DECODE_PREPROCESS_THRESHOLD = 8
+_DEFAULT_TRAILING_TEXT_COMPACT_MIN_FRAMES = 256
 _PRECOMPUTED_REF_CODE_KEY = "precomputed_ref"
 _NORMALIZED_REF_AUDIO_KEY = "_qwen3_tts_normalized_ref_audio"
 _PRECOMPUTED_TEXT_IDS_KEY = "_qwen3_tts_text_ids"
@@ -448,6 +450,36 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             dict(raw_subtalker_sampling) if isinstance(raw_subtalker_sampling, Mapping) else {}
         )
 
+        extra_cfg = self._stage_connector_extra_config(vllm_config)
+        self._scalar_decode_preprocess_threshold = self._parse_non_negative_int(
+            extra_cfg.get("scalar_decode_preprocess_threshold"),
+            _DEFAULT_SCALAR_DECODE_PREPROCESS_THRESHOLD,
+        )
+        self._trailing_text_compact_min_frames = self._parse_non_negative_int(
+            extra_cfg.get("trailing_text_compact_min_frames"),
+            _DEFAULT_TRAILING_TEXT_COMPACT_MIN_FRAMES,
+        )
+
+    @staticmethod
+    def _stage_connector_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
+        model_cfg = getattr(vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        if isinstance(connector_cfg, dict):
+            extra_cfg = connector_cfg.get("extra", connector_cfg)
+        else:
+            extra_cfg = getattr(connector_cfg, "extra", None)
+        return extra_cfg if isinstance(extra_cfg, dict) else {}
+
+    @staticmethod
+    def _parse_non_negative_int(value: object, default: int) -> int:
+        if value is None:
+            return default
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed >= 0 else default
+
     # -------------------- vLLM required hooks --------------------
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -702,7 +734,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 )
                 next_text_offset = text_offset + 1
                 should_compact_tail = next_text_offset >= tail_len or (
-                    next_text_offset >= _TRAILING_TEXT_COMPACT_MIN_FRAMES and next_text_offset * 2 >= tail_len
+                    next_text_offset >= self._trailing_text_compact_min_frames and next_text_offset * 2 >= tail_len
                 )
                 if should_compact_tail:
                     if next_text_offset >= tail_len:
@@ -742,6 +774,80 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         return input_ids, inputs_embeds_out, info_update
 
     def preprocess_decode_batch(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        req_infos: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        if self._should_use_scalar_decode_preprocess(req_infos):
+            return self._preprocess_decode_batch_scalar(input_ids=input_ids, req_infos=req_infos)
+        return self._preprocess_decode_batch_impl(input_ids=input_ids, req_infos=req_infos)
+
+    def _should_use_scalar_decode_preprocess(self, req_infos: list[dict[str, Any]]) -> bool:
+        threshold = self._scalar_decode_preprocess_threshold
+        if threshold > 0 and len(req_infos) <= threshold:
+            return True
+        # No task_type=Base request -> batched path saves nothing.
+        for info in req_infos:
+            extra = info.get("additional_information")
+            if isinstance(extra, dict):
+                task_field = extra.get("task_type")
+            else:
+                task_field = info.get("task_type")
+            if isinstance(task_field, list):
+                task_type = task_field[0] if task_field else None
+            else:
+                task_type = task_field
+            if task_type == "Base":
+                return False
+        return True
+
+    def _preprocess_decode_batch_scalar(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        req_infos: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        """Loop ``preprocess`` per request and stack the outputs."""
+        input_ids_flat = input_ids.reshape(-1)
+        if int(input_ids_flat.numel()) != len(req_infos):
+            raise ValueError(
+                f"preprocess_decode_batch expected {len(req_infos)} input ids, got {int(input_ids_flat.numel())}"
+            )
+
+        inputs_embeds_list: list[torch.Tensor] = []
+        past_hidden_list: list[torch.Tensor] = []
+        text_step_list: list[torch.Tensor] = []
+        updates: list[dict[str, Any]] = []
+
+        for i, info_dict in enumerate(req_infos):
+            single_input_ids = input_ids_flat[i : i + 1]
+            _, single_inputs_embeds, single_update = self.preprocess(
+                single_input_ids,
+                None,
+                **info_dict,
+            )
+            mtp_inputs = single_update.pop("mtp_inputs", None)
+            if mtp_inputs is None:
+                raise RuntimeError("scalar decode preprocess: missing mtp_inputs in update")
+            past_hidden, text_step = mtp_inputs
+            inputs_embeds_list.append(single_inputs_embeds.reshape(1, -1))
+            past_hidden_list.append(past_hidden.reshape(1, -1))
+            text_step_list.append(text_step.reshape(1, -1))
+            updates.append(single_update)
+
+        inputs_embeds_out = torch.cat(inputs_embeds_list, dim=0)
+        past_hidden_out = torch.cat(past_hidden_list, dim=0)
+        text_step_out = torch.cat(text_step_list, dim=0)
+        return (
+            input_ids_flat,
+            inputs_embeds_out,
+            past_hidden_out,
+            text_step_out,
+            updates,
+        )
+
+    def _preprocess_decode_batch_impl(
         self,
         *,
         input_ids: torch.Tensor,
@@ -806,7 +912,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     text_step = tail[text_offset : text_offset + 1].to(device=device, dtype=dtype).reshape(1, -1)
                     next_text_offset = text_offset + 1
                     should_compact_tail = next_text_offset >= tail_len or (
-                        next_text_offset >= _TRAILING_TEXT_COMPACT_MIN_FRAMES and next_text_offset * 2 >= tail_len
+                        next_text_offset >= self._trailing_text_compact_min_frames and next_text_offset * 2 >= tail_len
                     )
                     if should_compact_tail:
                         if next_text_offset >= tail_len:
