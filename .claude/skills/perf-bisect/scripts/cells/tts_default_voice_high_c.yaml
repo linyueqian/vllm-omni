@@ -1,0 +1,32 @@
+# Cell: Qwen3-TTS CustomVoice default_voice c=64 N=512 with high-concurrency deploy.
+#
+# This cell is the canonical witness for a class of regressions that only
+# manifests when qwen3_tts_high_concurrency.yaml is loaded (it enables
+# code_predictor_prefix_graphs and a larger Stage-0 batch). The default
+# qwen3_tts.yaml does NOT exercise the regressed code path.
+#
+# Hardware shape: 2-GPU H20-class host, Stage 0 on GPU 0 + Stage 1 on GPU 1
+# (S0=64, S1=10 in the high-c YAML).
+
+model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+deploy_yaml: vllm_omni/deploy/qwen3_tts_high_concurrency.yaml
+
+# Bench client args (passed to `vllm bench serve --omni`)
+backend: openai-audio-speech
+endpoint: /v1/audio/speech
+dataset_name: seed-tts-text
+dataset_path: benchmarks/build_dataset/seed_tts_smoke
+extra_body: '{"voice":"Vivian","language":"English","task_type":"CustomVoice"}'
+num_prompts: 512
+num_warmups: 8
+max_concurrency: 64
+request_rate: inf
+percentile_metrics: ttft,e2el,audio_rtf,audio_ttfp,audio_duration
+
+# Known baselines in ms (single-run on 2-GPU H20-class host; ±3% variance at
+# N=512 W=8). Sourced from PR #3839's bench; refresh when the model checkpoint
+# or vllm version moves significantly.
+known_baselines:
+  v0.21.0rc1: 736
+  main_HEAD_post_pr3662_regression: 1604
+  pr3839_fix: 710

@@ -1,0 +1,37 @@
+# Cell: Qwen3-TTS Base voice_clone c=64 N=128 with default deploy (nightly parity)
+#
+# Matches what the kanban nightly bench measures. Use this when you want
+# to cross-check against the public daily H100 series.
+#
+# Note: this cell does NOT load qwen3_tts_high_concurrency.yaml, so it will
+# NOT show high-c-yaml-specific regressions (like the PR #3839 default_voice
+# regression). Use default_voice_high_c.yaml for that.
+#
+# Hardware: any 2-GPU TTS setup (Stage 0 GPU 0, Stage 1 GPU 1).
+#
+# Source: tests/dfx/perf/tests/test_tts.json (the existing nightly spec).
+
+model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+deploy_yaml: null                         # use default stage_overrides only
+stage_overrides:
+  "1":
+    devices: "1"
+
+backend: openai-audio-speech
+endpoint: /v1/audio/speech
+dataset_name: seed-tts
+dataset_path: linyueqian/seed-tts-eval-subset
+extra_body: null                          # voice_clone has no extra_body knobs
+num_prompts: 128
+num_warmups: 0                            # kanban default; bumps to 8 for tighter bisect
+max_concurrency: 64
+request_rate: inf
+seed_tts_locale: en
+percentile_metrics: ttft,e2el,audio_rtf,audio_ttfp,audio_duration
+
+# Known baselines (kanban H100 nightlies + H20 spot check). Numbers in ms;
+# refresh from the kanban when the underlying model checkpoint or vllm version
+# moves significantly.
+known_baselines:
+  H100_post_pr3662_steady_state: "6000-6400"
+  H20_main_HEAD_spot_check: 5784

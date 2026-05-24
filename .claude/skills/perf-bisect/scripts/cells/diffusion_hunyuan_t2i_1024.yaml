@@ -1,0 +1,27 @@
+# Cell: HunyuanImage-3.0 text-to-image at 1024² resolution.
+#
+# Representative diffusion-image cell. Image latency at 1024² scales
+# ~quadratically with resolution; if a regression report references 512² or
+# 2048², copy this file and adjust width/height + num_inference_steps.
+#
+# Hardware shape: 1+ GPU; HunyuanImage3 supports VAE / DiT / text-encoder
+# partitioning via stage_overrides on multi-GPU hosts.
+
+model: tencent/HunyuanImage-3.0
+deploy_yaml: vllm_omni/deploy/hunyuan_image3.yaml
+
+# Bench client args (passed to `vllm bench serve --omni`)
+backend: openai-images
+endpoint: /v1/images/generations
+dataset_name: random-image-prompts
+dataset_path: null
+extra_body: '{"width":1024,"height":1024,"num_inference_steps":28,"guidance_scale":7.5}'
+num_prompts: 32
+num_warmups: 4
+max_concurrency: 4
+request_rate: inf
+percentile_metrics: ttft,e2el,image_latency
+
+# Known baselines: fill in once the kanban or a PR comment provides a number.
+# Refresh whenever the underlying checkpoint or vllm version moves significantly.
+known_baselines: {}

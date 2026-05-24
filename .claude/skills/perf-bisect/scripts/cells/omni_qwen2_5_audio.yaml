@@ -1,0 +1,26 @@
+# Cell: Qwen2.5-Omni audio-only inference (audio-in, audio-out).
+#
+# Representative omni-audio cell. The Qwen2.5-Omni stack shares the
+# stage-0 talker + stage-1 vocoder split with the Qwen3-TTS family, so
+# TTFP and audio_throughput are the headline metrics here too.
+#
+# For audio+video runs, set the dataset to a multimodal one and bump
+# max_num_audios / max_num_videos in extra_body.
+#
+# Hardware shape: 2-GPU (talker GPU 0 + vocoder GPU 1) at minimum.
+
+model: Qwen/Qwen2.5-Omni-7B
+deploy_yaml: vllm_omni/deploy/qwen2_5_omni.yaml
+
+backend: openai-audio-speech
+endpoint: /v1/audio/speech
+dataset_name: audiocaps
+dataset_path: null
+extra_body: '{}'
+num_prompts: 128
+num_warmups: 4
+max_concurrency: 16
+request_rate: inf
+percentile_metrics: ttft,e2el,audio_rtf,audio_ttfp,audio_duration
+
+known_baselines: {}
