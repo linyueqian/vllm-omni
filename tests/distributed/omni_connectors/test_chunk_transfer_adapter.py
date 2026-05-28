@@ -374,11 +374,15 @@ def test_fifo_promotion(build_adapter):
     assert reqs[2].status == RequestStatus.WAITING
 
     adapter.finished_requests.add("req-1")
+    # Eviction is deferred to postprocess_scheduler_output in the runtime path
+    # (commit c4d95fd9 — otherwise the terminal chunk deadlocks at c=8 K=2).
+    # Simulate it here so promotion can pick up the freed slot.
+    adapter._evict_finished_active_streams({"req-1"})
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
     assert list(adapter._active_streams) == ["req-2", "req-3"]
-    assert reqs[2].status == RequestStatus.WAITING
-    adapter.process_pending_chunks(waiting_queue, running_queue)
+    # Promotion + chunk processing happen in the same call, so req-3 is
+    # already WAITING_FOR_CHUNK by the time we check.
     assert reqs[2].status == RequestStatus.WAITING_FOR_CHUNK
 
 
@@ -413,11 +417,14 @@ def test_finished_releases_slot(build_adapter):
     assert waiting_queue == [req_2]
 
     adapter.finished_requests.add("req-1")
+    # Eviction is deferred to postprocess_scheduler_output in the runtime path
+    # (commit c4d95fd9). Simulate it so promotion can pick up the freed slot.
+    adapter._evict_finished_active_streams({"req-1"})
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
     assert list(adapter._active_streams) == ["req-2"]
-    assert req_2.status == RequestStatus.WAITING
-    adapter.process_pending_chunks(waiting_queue, running_queue)
+    # Promotion + chunk processing happen in the same call, so req-2 is
+    # already WAITING_FOR_CHUNK by the time we check.
     assert req_2.status == RequestStatus.WAITING_FOR_CHUNK
 
 
