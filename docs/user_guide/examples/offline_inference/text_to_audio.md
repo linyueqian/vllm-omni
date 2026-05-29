@@ -152,4 +152,3 @@ Outputs land in `<output-dir>/<task>.wav` as 16-bit stereo WAV.
     --8<-- "examples/offline_inference/text_to_audio/stable_audio/README.md"
 ??? abstract "stable_audio/end2end.py"
     Large file omitted from the rendered docs. View it on GitHub: <https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/text_to_audio/stable_audio/end2end.py>.
-
