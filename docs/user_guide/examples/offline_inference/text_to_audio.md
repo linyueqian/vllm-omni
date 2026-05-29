@@ -5,14 +5,14 @@ Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inf
 
 vLLM-Omni supports diffusion-based audio generation models. Each model
 lives in its own subdirectory and ships a single `end2end.py` script;
-this page is the single doc entry point for offline inference of all
+this README is the single doc entry point for offline inference of all
 of them.
 
-For online serving, see [Text-To-Audio (Online Serving)](../online_serving/text_to_audio.md).
+For online serving, see [`examples/online_serving/text_to_audio/`](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_audio/README.md).
 For the full list of supported architectures across all modalities, see
 [Supported Models](https://github.com/vllm-project/vllm-omni/tree/main/docs/models/supported_models.md).
 
-For text-to-speech (autoregressive TTS), see [Text-To-Speech](text_to_speech.md).
+For text-to-speech (autoregressive TTS), see [`examples/offline_inference/text_to_speech/`](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/README.md).
 
 ## Supported Models
 
@@ -59,6 +59,7 @@ python examples/offline_inference/text_to_audio/stable_audio/end2end.py \
     --guidance-scale 7.0 \
     --audio-length 10.0 \
     --num-inference-steps 100 \
+    --cache-backend tea_cache \
     --output stable_audio_output.wav
 ```
 
@@ -82,19 +83,17 @@ python examples/offline_inference/text_to_audio/stable_audio/end2end.py \
 
 ### Key arguments
 
-- `--prompt`: text description (string).
+- `--prompt`: text description.
 - `--negative-prompt`: negative prompt for classifier-free guidance.
 - `--seed`: integer seed for deterministic generation.
 - `--guidance-scale`: classifier-free guidance scale.
 - `--audio-length`: audio duration in seconds (max ~47 s for `stable-audio-open-1.0`).
 - `--num-inference-steps`: diffusion sampling steps (more steps = higher quality, slower).
-- `--use-hsdp`: enable HSDP weight sharding for the Stable Audio DiT.
+- `--use-hsdp`: enable HSDP weight sharding for the DiT.
 - `--hsdp-shard-size`: number of GPUs used for HSDP sharding.
 - `--hsdp-replicate-size`: number of HSDP replica groups.
-- `--cache-backend`: cache acceleration backend (currently supports `tea_cache`).
+- `--cache-backend`: cache acceleration backend. Stable Audio currently supports `tea_cache`.
 - `--output`: path to save the generated WAV file.
-- `--enable-cpu-offload`: enable model-wise offloading to save GPU memory.
-- `--enable-layerwise-offload`: enable layerwise offloading to save GPU memory.
 
 ---
 
@@ -143,11 +142,14 @@ Outputs land in `<output-dir>/<task>.wav` as 16-bit stereo WAV.
 
 ## Example materials
 
-??? abstract "stable_audio/end2end.py"
-    ``````py
-    --8<-- "examples/offline_inference/text_to_audio/stable_audio/end2end.py"
-    ``````
+??? abstract "audiox/README.md"
+    --8<-- "examples/offline_inference/text_to_audio/audiox/README.md"
 ??? abstract "audiox/end2end.py"
     ``````py
     --8<-- "examples/offline_inference/text_to_audio/audiox/end2end.py"
     ``````
+??? abstract "stable_audio/README.md"
+    --8<-- "examples/offline_inference/text_to_audio/stable_audio/README.md"
+??? abstract "stable_audio/end2end.py"
+    Large file omitted from the rendered docs. View it on GitHub: <https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/text_to_audio/stable_audio/end2end.py>.
+
