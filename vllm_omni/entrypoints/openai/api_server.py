@@ -345,6 +345,23 @@ def _create_engine_error_json_response(
     return JSONResponse(content=payload, status_code=status_code)
 
 
+def _error_response_to_json_response(
+    err: ErrorResponse,
+    *,
+    status_code: HTTPStatus | int | None = None,
+    default_status_code: HTTPStatus | int = HTTPStatus.BAD_REQUEST,
+) -> JSONResponse:
+    resolved_status = int(
+        status_code
+        if status_code is not None
+        else (err.error.code if err.error and err.error.code is not None else default_status_code)
+    )
+    payload = err.model_dump()
+    if err.error:
+        payload["error"]["code"] = resolved_status
+    return JSONResponse(content=payload, status_code=resolved_status)
+
+
 def _create_speech_error_json_response(
     raw_request: Request,
     message: str,
@@ -357,10 +374,7 @@ def _create_speech_error_json_response(
         err_type=err_type,
         status_code=status_code,
     )
-    return JSONResponse(
-        content=err.model_dump(),
-        status_code=err.error.code if err.error else HTTPStatus.BAD_REQUEST.value,
-    )
+    return _error_response_to_json_response(err, status_code=status_code)
 
 
 class _DiffusionServingModels:
@@ -1243,10 +1257,7 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
     try:
         result = await handler.create_speech(request, raw_request)
         if isinstance(result, ErrorResponse):
-            return JSONResponse(
-                content=result.model_dump(),
-                status_code=result.error.code if result.error else 400,
-            )
+            return _error_response_to_json_response(result)
         return result
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
@@ -1505,9 +1516,11 @@ async def delete_voice(name: str, raw_request: Request):
         # Delete the voice
         success = await handler.delete_voice(name)
         if not success:
-            return JSONResponse(
-                content={"success": False, "error": f"Voice '{name}' not found"},
-                status_code=HTTPStatus.NOT_FOUND.value,
+            return _create_speech_error_json_response(
+                raw_request,
+                f"Voice '{name}' not found",
+                err_type="NotFoundError",
+                status_code=HTTPStatus.NOT_FOUND,
             )
 
         return JSONResponse(content={"success": True, "message": f"Voice '{name}' deleted successfully"})

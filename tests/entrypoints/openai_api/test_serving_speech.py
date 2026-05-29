@@ -2066,8 +2066,7 @@ def test_api_server_create_speech_wraps_error_response_status(mocker: MockerFixt
 
     response = asyncio.run(api_server_module.create_speech(request, raw_request))
 
-    assert isinstance(response, JSONResponse)
-    assert response.status_code == 400
+    _assert_openai_error_response(response, status_code=400, message="bad request")
 
 
 def _make_api_server_request(handler, *, method: str = "POST", path: str = "/v1/audio/voices") -> Request:
@@ -2244,6 +2243,22 @@ def test_api_server_delete_voice_value_error_returns_400(mocker: MockerFixture):
     response = asyncio.run(api_server_module.delete_voice("probe", raw_request))
 
     _assert_openai_error_response(response, status_code=400, message="Invalid voice name")
+
+
+def test_api_server_delete_voice_not_found_returns_404(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    handler = mocker.MagicMock()
+    handler.delete_voice = mocker.AsyncMock(return_value=False)
+    raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/missing")
+
+    response = asyncio.run(api_server_module.delete_voice("missing", raw_request))
+
+    _assert_openai_error_response(
+        response,
+        status_code=404,
+        message="Voice 'missing' not found",
+        err_type="NotFoundError",
+    )
 
 
 def test_api_server_delete_voice_exception_returns_500(mocker: MockerFixture):
