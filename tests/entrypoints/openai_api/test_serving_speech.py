@@ -1747,26 +1747,205 @@ def test_api_server_create_speech_wraps_error_response_status(mocker: MockerFixt
         )
     )
 
-    app = FastAPI()
-    app.state.openai_serving_speech = handler
-    scope = {
-        "type": "http",
-        "app": app,
-        "method": "POST",
-        "path": "/v1/audio/speech",
-        "headers": [],
-        "query_string": b"",
-        "client": ("127.0.0.1", 12345),
-        "server": ("testserver", 80),
-        "scheme": "http",
-    }
-    raw_request = Request(scope)
+    raw_request = _make_api_server_request(handler, path="/v1/audio/speech")
     request = OpenAICreateSpeechRequest(input="Hello")
 
     response = asyncio.run(api_server_module.create_speech(request, raw_request))
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 400
+
+
+def _make_api_server_request(handler, *, method: str = "POST", path: str = "/v1/audio/voices") -> Request:
+    app = FastAPI()
+    app.state.openai_serving_speech = handler
+    scope = {
+        "type": "http",
+        "app": app,
+        "method": method,
+        "path": path,
+        "headers": [],
+        "query_string": b"",
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+    }
+    return Request(scope)
+
+
+def _patch_api_server_base(mocker: MockerFixture):
+    def _fake_create_error_response(message, err_type="BadRequestError", status_code=400, param=None):
+        return ErrorResponse(
+            error=ErrorInfo(
+                message=message,
+                type=err_type,
+                param=param,
+                code=getattr(status_code, "value", status_code),
+            )
+        )
+
+    fake_base = mocker.MagicMock()
+    fake_base.create_error_response.side_effect = _fake_create_error_response
+    mocker.patch.object(api_server_module, "base", return_value=fake_base)
+    return fake_base
+
+
+def _assert_openai_error_response(
+    response: JSONResponse,
+    *,
+    status_code: int,
+    message: str,
+    err_type: str = "BadRequestError",
+) -> None:
+    assert isinstance(response, JSONResponse)
+    assert response.status_code == status_code
+    body = json.loads(response.body)
+    assert body["error"]["code"] == status_code
+    assert body["error"]["type"] == err_type
+    assert message in body["error"]["message"]
+
+
+def test_api_server_list_voices_without_speech_handler_returns_404(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    raw_request = _make_api_server_request(None, method="GET")
+
+    response = asyncio.run(api_server_module.list_voices(raw_request))
+
+    _assert_openai_error_response(
+        response, status_code=404, message="does not support Speech API", err_type="NotFoundError"
+    )
+
+
+def test_api_server_upload_voice_value_error_returns_400(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    handler = mocker.MagicMock()
+    handler.upload_voice = mocker.AsyncMock(side_effect=ValueError("Unsupported MIME type: audio/x-m4a"))
+    raw_request = _make_api_server_request(handler)
+
+    response = asyncio.run(
+        api_server_module.upload_voice(
+            raw_request,
+            audio_sample=mocker.MagicMock(),
+            speaker_embedding=None,
+            consent="cons_test",
+            name="probe",
+        )
+    )
+
+    _assert_openai_error_response(response, status_code=400, message="Unsupported MIME type")
+
+
+def test_api_server_upload_voice_without_speech_handler_returns_404(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    raw_request = _make_api_server_request(None)
+
+    response = asyncio.run(
+        api_server_module.upload_voice(
+            raw_request,
+            consent="cons_test",
+            name="probe",
+        )
+    )
+
+    _assert_openai_error_response(
+        response, status_code=404, message="does not support Speech API", err_type="NotFoundError"
+    )
+
+
+def test_api_server_upload_voice_without_input_returns_400(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    raw_request = _make_api_server_request(mocker.MagicMock())
+
+    response = asyncio.run(
+        api_server_module.upload_voice(
+            raw_request,
+            audio_sample=None,
+            speaker_embedding=None,
+            consent="cons_test",
+            name="probe",
+        )
+    )
+
+    _assert_openai_error_response(response, status_code=400, message="must be provided")
+
+
+def test_api_server_upload_voice_with_audio_and_embedding_returns_400(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    raw_request = _make_api_server_request(mocker.MagicMock())
+
+    response = asyncio.run(
+        api_server_module.upload_voice(
+            raw_request,
+            audio_sample=mocker.MagicMock(),
+            speaker_embedding="[0.1]",
+            consent="cons_test",
+            name="probe",
+        )
+    )
+
+    _assert_openai_error_response(response, status_code=400, message="mutually exclusive")
+
+
+def test_api_server_upload_voice_exception_returns_500(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    handler = mocker.MagicMock()
+    handler.upload_voice = mocker.AsyncMock(side_effect=RuntimeError("disk failed"))
+    raw_request = _make_api_server_request(handler)
+
+    response = asyncio.run(
+        api_server_module.upload_voice(
+            raw_request,
+            audio_sample=mocker.MagicMock(),
+            speaker_embedding=None,
+            consent="cons_test",
+            name="probe",
+        )
+    )
+
+    _assert_openai_error_response(
+        response,
+        status_code=500,
+        message="Failed to upload voice",
+        err_type="InternalServerError",
+    )
+
+
+def test_api_server_delete_voice_without_speech_handler_returns_404(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    raw_request = _make_api_server_request(None, method="DELETE", path="/v1/audio/voices/probe")
+
+    response = asyncio.run(api_server_module.delete_voice("probe", raw_request))
+
+    _assert_openai_error_response(
+        response, status_code=404, message="does not support Speech API", err_type="NotFoundError"
+    )
+
+
+def test_api_server_delete_voice_value_error_returns_400(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    handler = mocker.MagicMock()
+    handler.delete_voice = mocker.AsyncMock(side_effect=ValueError("Invalid voice name"))
+    raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/probe")
+
+    response = asyncio.run(api_server_module.delete_voice("probe", raw_request))
+
+    _assert_openai_error_response(response, status_code=400, message="Invalid voice name")
+
+
+def test_api_server_delete_voice_exception_returns_500(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    handler = mocker.MagicMock()
+    handler.delete_voice = mocker.AsyncMock(side_effect=RuntimeError("disk failed"))
+    raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/probe")
+
+    response = asyncio.run(api_server_module.delete_voice("probe", raw_request))
+
+    _assert_openai_error_response(
+        response,
+        status_code=500,
+        message="Failed to delete voice",
+        err_type="InternalServerError",
+    )
 
 
 def test_api_server_create_speech_engine_error_response_includes_request_and_stage_id(mocker: MockerFixture):
@@ -1780,26 +1959,13 @@ def test_api_server_create_speech_engine_error_response_includes_request_and_sta
 
     terminate_mock = mocker.patch.object(api_server_module, "terminate_if_errored")
 
-    app = FastAPI()
-    app.state.args = SimpleNamespace(log_error_stack=False)
-    app.state.openai_serving_speech = handler
-    app.state.engine_client = SimpleNamespace(
+    raw_request = _make_api_server_request(handler, path="/v1/audio/speech")
+    raw_request.app.state.args = SimpleNamespace(log_error_stack=False)
+    raw_request.app.state.engine_client = SimpleNamespace(
         engine=SimpleNamespace(is_alive=lambda: False),
         errored=True,
     )
-    app.state.server = SimpleNamespace()
-    scope = {
-        "type": "http",
-        "app": app,
-        "method": "POST",
-        "path": "/v1/audio/speech",
-        "headers": [],
-        "query_string": b"",
-        "client": ("127.0.0.1", 12345),
-        "server": ("testserver", 80),
-        "scheme": "http",
-    }
-    raw_request = Request(scope)
+    raw_request.app.state.server = SimpleNamespace()
     raw_request.state.request_metadata = SimpleNamespace(request_id="speech-req-1")
     request = OpenAICreateSpeechRequest(input="Hello")
 

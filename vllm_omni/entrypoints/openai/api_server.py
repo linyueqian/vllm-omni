@@ -288,6 +288,24 @@ def _create_engine_error_json_response(
     return JSONResponse(content=payload, status_code=status_code)
 
 
+def _create_speech_error_json_response(
+    raw_request: Request,
+    message: str,
+    *,
+    err_type: str = "BadRequestError",
+    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+) -> JSONResponse:
+    err = base(raw_request).create_error_response(
+        message=message,
+        err_type=err_type,
+        status_code=status_code,
+    )
+    return JSONResponse(
+        content=err.model_dump(),
+        status_code=err.error.code if err.error else HTTPStatus.BAD_REQUEST.value,
+    )
+
+
 class _DiffusionServingModels:
     """Minimal OpenAIServingModels implementation for diffusion-only servers.
 
@@ -1193,7 +1211,12 @@ async def list_voices(raw_request: Request):
     """
     handler = Omnispeech(raw_request)
     if handler is None:
-        return base(raw_request).create_error_response(message="The model does not support Speech API")
+        return _create_speech_error_json_response(
+            raw_request,
+            "The model does not support Speech API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
 
     # Get all speakers (both model built-in and uploaded)
     speakers = sorted(handler.supported_speakers) if handler.supported_speakers else []
@@ -1225,6 +1248,7 @@ async def list_voices(raw_request: Request):
     responses={
         HTTPStatus.OK.value: {"model": dict},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
 )
@@ -1266,12 +1290,17 @@ async def upload_voice(
     """
     handler = Omnispeech(raw_request)
     if handler is None:
-        return base(raw_request).create_error_response(message="The model does not support Speech API")
+        return _create_speech_error_json_response(
+            raw_request,
+            "The model does not support Speech API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
 
     try:
         if speaker_embedding is not None and audio_sample is not None:
-            return base(raw_request).create_error_response(
-                message="'audio_sample' and 'speaker_embedding' are mutually exclusive"
+            return _create_speech_error_json_response(
+                raw_request, "'audio_sample' and 'speaker_embedding' are mutually exclusive"
             )
         if speaker_embedding is not None:
             result = await handler.upload_voice_embedding(speaker_embedding, consent, name)
@@ -1284,23 +1313,29 @@ async def upload_voice(
                 speaker_description=speaker_description,
             )
         else:
-            return base(raw_request).create_error_response(
-                message="Either 'audio_sample' or 'speaker_embedding' must be provided"
+            return _create_speech_error_json_response(
+                raw_request, "Either 'audio_sample' or 'speaker_embedding' must be provided"
             )
 
         return JSONResponse(content={"success": True, "voice": result})
 
     except ValueError as e:
-        return base(raw_request).create_error_response(message=str(e))
+        return _create_speech_error_json_response(raw_request, str(e))
     except Exception as e:
         logger.exception(f"Failed to upload voice: {e}")
-        return base(raw_request).create_error_response(message=f"Failed to upload voice: {str(e)}")
+        return _create_speech_error_json_response(
+            raw_request,
+            f"Failed to upload voice: {str(e)}",
+            err_type="InternalServerError",
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
 
 
 @router.delete(
     "/v1/audio/voices/{name}",
     responses={
         HTTPStatus.OK.value: {"model": dict},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
@@ -1320,7 +1355,12 @@ async def delete_voice(name: str, raw_request: Request):
     """
     handler = Omnispeech(raw_request)
     if handler is None:
-        return base(raw_request).create_error_response(message="The model does not support Speech API")
+        return _create_speech_error_json_response(
+            raw_request,
+            "The model does not support Speech API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
 
     try:
         # Delete the voice
@@ -1334,10 +1374,15 @@ async def delete_voice(name: str, raw_request: Request):
         return JSONResponse(content={"success": True, "message": f"Voice '{name}' deleted successfully"})
 
     except ValueError as e:
-        return base(raw_request).create_error_response(message=str(e))
+        return _create_speech_error_json_response(raw_request, str(e))
     except Exception as e:
         logger.exception(f"Failed to delete voice '{name}': {e}")
-        return base(raw_request).create_error_response(message=f"Failed to delete voice: {str(e)}")
+        return _create_speech_error_json_response(
+            raw_request,
+            f"Failed to delete voice: {str(e)}",
+            err_type="InternalServerError",
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
 
 
 @router.websocket("/v1/audio/speech/stream")
