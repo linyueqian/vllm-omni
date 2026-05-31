@@ -12,6 +12,9 @@ from examples.online_serving.text_to_speech.qwen3_tts.concurrency_demo.orchestra
     Orchestrator,
     StreamConfig,
 )
+from examples.online_serving.text_to_speech.qwen3_tts.concurrency_demo.runtime import (
+    load_ref_audio_b64,
+)
 
 
 def _mock_transport_factory(chunks: list[bytes]) -> httpx.MockTransport:
@@ -67,3 +70,9 @@ async def test_run_burst_records_reference_and_runs_n_parallel() -> None:
     assert snap.serial_eta_s > 0
     # No failures.
     assert snap.any_failed is False
+
+
+def test_load_ref_audio_b64_returns_nonempty_string() -> None:
+    b64 = load_ref_audio_b64()
+    assert isinstance(b64, str)
+    assert len(b64) > 100  # arbitrary; clone_2.wav is ~757 KB
