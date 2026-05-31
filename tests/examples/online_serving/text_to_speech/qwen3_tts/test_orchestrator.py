@@ -43,3 +43,27 @@ async def test_run_one_stream_emits_first_chunks_done_events() -> None:
     s0 = snap.per_stream[0]
     assert s0.status == "done"
     assert s0.bytes_received == 9600  # 2 chunks * 4800 bytes
+
+
+@pytest.mark.asyncio
+async def test_run_burst_records_reference_and_runs_n_parallel() -> None:
+    aggregator = MetricsAggregator(n=4)
+    transport = _mock_transport_factory([b"\x00" * 9600])  # ~0.2 s of audio per request
+    orchestrator = Orchestrator(
+        api_base="http://stub",
+        ref_audio_b64="UExBQ0VIT0xERVI=",
+        transport=transport,
+    )
+    await orchestrator.run_burst(
+        n=4,
+        prompt="hello world",
+        aggregator=aggregator,
+    )
+    snap = aggregator.snapshot(now=10.0)
+    # All 4 streams must be done.
+    assert snap.completed == 4
+    # serial_eta must be populated (reference ran).
+    assert snap.serial_eta_s is not None
+    assert snap.serial_eta_s > 0
+    # No failures.
+    assert snap.any_failed is False
