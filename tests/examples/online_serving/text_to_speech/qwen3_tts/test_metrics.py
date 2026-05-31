@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 from examples.online_serving.text_to_speech.qwen3_tts.concurrency_demo.metrics import (
+    MetricsAggregator,
     MetricsSnapshot,
     StreamEvent,
     StreamState,
@@ -47,13 +50,6 @@ def test_metrics_snapshot_is_frozen() -> None:
         assert "frozen" in str(e).lower() or "cannot assign" in str(e).lower()
     else:
         raise AssertionError("MetricsSnapshot must be frozen")
-
-
-import pytest
-
-from examples.online_serving.text_to_speech.qwen3_tts.concurrency_demo.metrics import (
-    MetricsAggregator,
-)
 
 
 def test_aggregator_first_chunk_marks_streaming_and_locks_ttfb() -> None:
