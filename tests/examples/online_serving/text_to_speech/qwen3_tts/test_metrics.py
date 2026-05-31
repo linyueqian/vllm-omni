@@ -97,3 +97,50 @@ def test_aggregator_error_event_marks_failed() -> None:
     assert snap.per_stream[0].status == "error"
     assert snap.per_stream[0].error_message == "boom"
     assert snap.any_failed is True
+
+
+def test_aggregator_snapshot_throughput_after_complete_run() -> None:
+    agg = MetricsAggregator(n=2)
+    agg.mark_burst_start(ts=0.0)
+    for i in (0, 1):
+        agg.mark_request_sent(stream_id=i, ts=0.0)
+        agg.apply(StreamEvent.first(stream_id=i, ts=0.2))
+        # Each stream produces 48_000 bytes => 1.0 s of audio.
+        agg.apply(StreamEvent.chunk(stream_id=i, ts=0.5, byte_count=48_000))
+        agg.apply(StreamEvent.done(stream_id=i, ts=0.5))
+    snap = agg.snapshot(now=0.5)
+    # Sum audio = 2.0 s; wall = 0.5 s => 4x real-time throughput.
+    assert snap.throughput_x == pytest.approx(4.0)
+    assert snap.completed == 2
+    assert snap.active == 0
+
+
+def test_aggregator_snapshot_serial_and_speedup() -> None:
+    agg = MetricsAggregator(n=4)
+    agg.set_reference(t_observed_s=2.0)  # c=1 reference: 2 s wall time.
+    agg.mark_burst_start(ts=10.0)
+    for i in range(4):
+        agg.mark_request_sent(stream_id=i, ts=10.0)
+        agg.apply(StreamEvent.first(stream_id=i, ts=10.2))
+        agg.apply(StreamEvent.chunk(stream_id=i, ts=12.0, byte_count=48_000 * 2))
+        agg.apply(StreamEvent.done(stream_id=i, ts=12.0))
+    snap = agg.snapshot(now=12.0)
+    # serial_eta = 4 * 2.0 = 8.0 s; parallel_eta = 12.0 - 10.0 = 2.0 s.
+    assert snap.serial_eta_s == pytest.approx(8.0)
+    assert snap.parallel_eta_s == pytest.approx(2.0)
+    assert snap.speedup_x == pytest.approx(4.0)
+
+
+def test_aggregator_speedup_suppressed_if_any_failed() -> None:
+    agg = MetricsAggregator(n=2)
+    agg.set_reference(t_observed_s=1.0)
+    agg.mark_burst_start(ts=0.0)
+    agg.mark_request_sent(stream_id=0, ts=0.0)
+    agg.apply(StreamEvent.first(stream_id=0, ts=0.2))
+    agg.apply(StreamEvent.chunk(stream_id=0, ts=0.5, byte_count=48_000))
+    agg.apply(StreamEvent.done(stream_id=0, ts=0.5))
+    agg.mark_request_sent(stream_id=1, ts=0.0)
+    agg.apply(StreamEvent.error(stream_id=1, ts=0.3, message="boom"))
+    snap = agg.snapshot(now=0.5)
+    assert snap.any_failed is True
+    assert snap.speedup_x is None

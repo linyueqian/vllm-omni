@@ -2,12 +2,27 @@
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass, field
 from typing import Literal
 
 EventKind = Literal["first", "chunk", "done", "error"]
 StreamStatus = Literal["pending", "streaming", "done", "error"]
+
+
+def _percentile(sorted_values: list[float], p: float) -> float | None:
+    """Linear-interpolation percentile, p in [0, 1]."""
+    if not sorted_values:
+        return None
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    k = (len(sorted_values) - 1) * p
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return sorted_values[int(k)]
+    return sorted_values[f] + (sorted_values[c] - sorted_values[f]) * (k - f)
 
 
 @dataclass(frozen=True)
@@ -135,3 +150,63 @@ class MetricsAggregator:
                 s.status = "error"
                 s.error_message = ev.error_message
                 s.last_chunk_s = ev.ts
+
+    def snapshot(self, now: float) -> MetricsSnapshot:
+        """Return an immutable snapshot of current state + derived metrics."""
+        with self._lock:
+            per_stream = tuple(
+                StreamState(
+                    stream_id=s.stream_id,
+                    status=s.status,
+                    request_sent_s=s.request_sent_s,
+                    first_chunk_s=s.first_chunk_s,
+                    last_chunk_s=s.last_chunk_s,
+                    bytes_received=s.bytes_received,
+                    error_message=s.error_message,
+                )
+                for s in self._states
+            )
+            burst_start = self._burst_start_s
+            ref_t = self._ref_t_observed_s
+            n = self._n
+
+        completed = sum(1 for s in per_stream if s.status == "done")
+        active = sum(1 for s in per_stream if s.status == "streaming")
+        any_failed = any(s.status == "error" for s in per_stream)
+
+        total_audio_s = sum(s.audio_seconds for s in per_stream)
+        elapsed = (now - burst_start) if burst_start is not None else 0.0
+        throughput_x = (total_audio_s / elapsed) if elapsed > 0 else 0.0
+
+        ttfb_values = sorted(s.ttfb_s * 1000.0 for s in per_stream if s.ttfb_s is not None)
+        rtf_values = sorted(s.final_rtf for s in per_stream if s.final_rtf is not None)
+        ttfb_p99_ms = _percentile(ttfb_values, 0.99)
+        rtf_p99 = _percentile(rtf_values, 0.99)
+
+        serial_eta_s = (n * ref_t) if ref_t is not None else None
+
+        if completed == n and burst_start is not None and not any_failed:
+            last = max((s.last_chunk_s or burst_start) for s in per_stream)
+            parallel_eta_s = last - burst_start
+        else:
+            parallel_eta_s = None
+
+        if serial_eta_s is not None and parallel_eta_s is not None and parallel_eta_s > 0 and not any_failed:
+            speedup_x = serial_eta_s / parallel_eta_s
+        else:
+            speedup_x = None
+
+        return MetricsSnapshot(
+            wall_s=elapsed,
+            burst_start_s=burst_start,
+            per_stream=per_stream,
+            completed=completed,
+            active=active,
+            throughput_x=throughput_x,
+            ttfb_p99_ms=ttfb_p99_ms,
+            rtf_p99=rtf_p99,
+            serial_eta_s=serial_eta_s,
+            parallel_eta_s=parallel_eta_s,
+            speedup_x=speedup_x,
+            any_failed=any_failed,
+        )
