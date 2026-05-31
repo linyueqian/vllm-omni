@@ -19,7 +19,7 @@ except ImportError:
 from .metrics import MetricsAggregator, MetricsSnapshot
 from .orchestrator import Orchestrator
 from .prompts import DEMO_PROMPT
-from .runtime import WorkerLoop, load_ref_audio_b64
+from .runtime import REF_TEXT, WorkerLoop, load_ref_audio_b64
 from .views import render_counters_html, render_grid_html, render_row_html
 
 logger = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ def _log_burst_exception(future) -> None:
 def build_ui(api_base: str) -> gr.Blocks:
     worker = WorkerLoop()
     ref_b64 = load_ref_audio_b64()
-    orchestrator = Orchestrator(api_base=api_base, ref_audio_b64=ref_b64)
+    orchestrator = Orchestrator(api_base=api_base, ref_audio_b64=ref_b64, ref_text=REF_TEXT)
     agg_a = MetricsAggregator(n=N_PAGE_A)
     agg_b = MetricsAggregator(n=N_PAGE_B)
 

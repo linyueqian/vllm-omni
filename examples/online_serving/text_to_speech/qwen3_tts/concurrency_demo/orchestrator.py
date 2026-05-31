@@ -29,23 +29,28 @@ class Orchestrator:
         api_base: str,
         ref_audio_b64: str,
         *,
+        ref_text: str = "",
         timeout_s: float = 60.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._api_base = api_base.rstrip("/")
         self._ref_audio_b64 = ref_audio_b64
+        self._ref_text = ref_text
         self._timeout_s = timeout_s
         self._transport = transport
         self._client: httpx.AsyncClient | None = None
 
     def _build_payload(self, text: str) -> dict:
-        return {
+        payload: dict = {
             "input": text,
             "response_format": "pcm",
             "stream": True,
             "task_type": "Base",
             "ref_audio": f"data:audio/wav;base64,{self._ref_audio_b64}",
         }
+        if self._ref_text:
+            payload["ref_text"] = self._ref_text
+        return payload
 
     def _get_client(self) -> httpx.AsyncClient:
         """Return the shared httpx.AsyncClient, creating it on first use."""

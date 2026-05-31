@@ -16,6 +16,7 @@ from examples.online_serving.text_to_speech.qwen3_tts.concurrency_demo.prompts i
     DEMO_PROMPT,
 )
 from examples.online_serving.text_to_speech.qwen3_tts.concurrency_demo.runtime import (
+    REF_TEXT,
     load_ref_audio_b64,
 )
 
@@ -25,7 +26,7 @@ pytestmark = pytest.mark.full_model
 @pytest.mark.asyncio
 async def test_run_burst_n8_against_live_server() -> None:
     api_base = os.environ.get("QWEN3_TTS_API_BASE", "http://localhost:8000")
-    orchestrator = Orchestrator(api_base=api_base, ref_audio_b64=load_ref_audio_b64())
+    orchestrator = Orchestrator(api_base=api_base, ref_audio_b64=load_ref_audio_b64(), ref_text=REF_TEXT)
     aggregator = MetricsAggregator(n=8)
     await orchestrator.run_burst(n=8, prompt=DEMO_PROMPT, aggregator=aggregator)
     snap = aggregator.snapshot(now=9999.0)
