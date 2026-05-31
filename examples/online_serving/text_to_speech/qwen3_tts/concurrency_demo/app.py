@@ -16,7 +16,7 @@ try:
 except ImportError:
     raise ImportError("gradio is required to run this demo. Install with: pip install 'vllm-omni[demo]'") from None
 
-from .metrics import MetricsAggregator
+from .metrics import MetricsAggregator, MetricsSnapshot
 from .orchestrator import Orchestrator
 from .prompts import DEMO_PROMPT
 from .runtime import WorkerLoop, load_ref_audio_b64
@@ -28,6 +28,12 @@ N_PAGE_A = 8
 N_PAGE_B = 64
 
 
+def _log_burst_exception(future) -> None:
+    exc = future.exception()
+    if exc is not None:
+        logger.exception("Concurrency-demo burst failed", exc_info=exc)
+
+
 def build_ui(api_base: str) -> gr.Blocks:
     worker = WorkerLoop()
     ref_b64 = load_ref_audio_b64()
@@ -35,7 +41,7 @@ def build_ui(api_base: str) -> gr.Blocks:
     agg_a = MetricsAggregator(n=N_PAGE_A)
     agg_b = MetricsAggregator(n=N_PAGE_B)
 
-    def _eta_label(snap):
+    def _eta_label(snap: MetricsSnapshot) -> str:
         serial = snap.serial_eta_s
         parallel = snap.parallel_eta_s
         speedup = snap.speedup_x
@@ -51,7 +57,8 @@ def build_ui(api_base: str) -> gr.Blocks:
     def _on_start(which: str):
         agg = agg_a if which == "A" else agg_b
         n = N_PAGE_A if which == "A" else N_PAGE_B
-        worker.submit(orchestrator.run_burst(n=n, prompt=DEMO_PROMPT, aggregator=agg))
+        future = worker.submit(orchestrator.run_burst(n=n, prompt=DEMO_PROMPT, aggregator=agg))
+        future.add_done_callback(_log_burst_exception)
         return gr.update(value=f"Started N={n}…")
 
     def _on_reset(which: str):
@@ -82,7 +89,7 @@ def build_ui(api_base: str) -> gr.Blocks:
                 timer_a = gr.Timer(0.1)
                 start_a.click(fn=lambda: _on_start("A"), outputs=status_a)
                 reset_a.click(fn=lambda: _on_reset("A"), outputs=status_a)
-                timer_a.tick(fn=_tick_a, outputs=[rows_a, eta_a])
+                timer_a.tick(fn=_tick_a, outputs=[rows_a, eta_a], queue=False)
             with gr.Tab("Page B — N=64"):
                 status_b = gr.Markdown("Idle.")
                 eta_b = gr.HTML()
@@ -93,7 +100,7 @@ def build_ui(api_base: str) -> gr.Blocks:
                 timer_b = gr.Timer(0.2)
                 start_b.click(fn=lambda: _on_start("B"), outputs=status_b)
                 reset_b.click(fn=lambda: _on_reset("B"), outputs=status_b)
-                timer_b.tick(fn=_tick_b, outputs=[counters_b, grid_b, eta_b])
+                timer_b.tick(fn=_tick_b, outputs=[counters_b, grid_b, eta_b], queue=False)
 
     return ui
 

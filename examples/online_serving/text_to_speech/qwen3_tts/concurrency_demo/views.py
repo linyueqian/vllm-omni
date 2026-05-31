@@ -20,7 +20,7 @@ def render_row_html(snap: MetricsSnapshot, stream_id: int) -> str:
     label = f"#{stream_id + 1}"
     status = s.status
     pct = _row_progress_pct(s)
-    ttfb_str = f"{int(s.ttfb_s * 1000)} ms" if s.ttfb_s else "—"
+    ttfb_str = f"{int(s.ttfb_s * 1000)} ms" if s.ttfb_s is not None else "—"
     rtf = s.final_rtf
     rtf_str = f"{rtf:.2f}" if rtf is not None else "—"
     color = {

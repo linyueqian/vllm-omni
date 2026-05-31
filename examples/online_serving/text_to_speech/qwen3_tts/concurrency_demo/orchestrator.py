@@ -9,20 +9,16 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Literal
 
 import httpx
 
 from .metrics import MetricsAggregator, StreamEvent
-
-PayloadKind = Literal["reference", "parallel"]
 
 
 @dataclass(frozen=True)
 class StreamConfig:
     stream_id: int
     text: str
-    payload_kind: PayloadKind
 
 
 class Orchestrator:
@@ -57,6 +53,7 @@ class Orchestrator:
             self._client = httpx.AsyncClient(
                 timeout=self._timeout_s,
                 transport=self._transport,
+                limits=httpx.Limits(max_connections=128, max_keepalive_connections=128),
             )
         return self._client
 
@@ -76,7 +73,6 @@ class Orchestrator:
         aggregator.mark_request_sent(stream_id=cfg.stream_id, ts=sent_at)
         payload = self._build_payload(cfg.text)
         first_seen = False
-        bytes_total = 0
         client = self._get_client()
         try:
             async with client.stream(
@@ -98,7 +94,6 @@ class Orchestrator:
                         aggregator.apply(StreamEvent.first(cfg.stream_id, now))
                         first_seen = True
                     aggregator.apply(StreamEvent.chunk(cfg.stream_id, now, byte_count=len(chunk)))
-                    bytes_total += len(chunk)
         except (httpx.HTTPError, asyncio.CancelledError) as exc:
             aggregator.apply(StreamEvent.error(cfg.stream_id, time.perf_counter(), str(exc)))
             return time.perf_counter() - sent_at
@@ -131,11 +126,8 @@ class Orchestrator:
     ) -> None:
         """Run one c=1 reference, then N concurrent streams of the same prompt."""
         aggregator.reset()
-        try:
-            t_ref = await self._measure_reference(prompt, aggregator)
-            aggregator.set_reference(t_ref)
-            aggregator.mark_burst_start(time.perf_counter())
-            configs = [StreamConfig(stream_id=i, text=prompt, payload_kind="parallel") for i in range(n)]
-            await asyncio.gather(*(self._run_one(cfg, aggregator) for cfg in configs))
-        finally:
-            await self.aclose()
+        t_ref = await self._measure_reference(prompt, aggregator)
+        aggregator.set_reference(t_ref)
+        aggregator.mark_burst_start(time.perf_counter())
+        configs = [StreamConfig(stream_id=i, text=prompt) for i in range(n)]
+        await asyncio.gather(*(self._run_one(cfg, aggregator) for cfg in configs))

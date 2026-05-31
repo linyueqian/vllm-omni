@@ -40,7 +40,7 @@ async def test_run_one_stream_emits_first_chunks_done_events() -> None:
         ref_audio_b64="UExBQ0VIT0xERVI=",
         transport=transport,
     )
-    cfg = StreamConfig(stream_id=0, text="hello", payload_kind="parallel")
+    cfg = StreamConfig(stream_id=0, text="hello")
     await orchestrator._run_one(cfg, aggregator)
     snap = aggregator.snapshot(now=1.0)
     s0 = snap.per_stream[0]
