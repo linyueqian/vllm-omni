@@ -36,16 +36,16 @@ def build_ui(api_base: str) -> gr.Blocks:
     agg_b = MetricsAggregator(n=N_PAGE_B)
 
     def _eta_label(snap):
-        ser = snap.serial_eta_s
-        par = snap.parallel_eta_s
-        sx = snap.speedup_x
-        ser_s = f"{ser:.1f} s" if ser is not None else "—"
-        par_s = f"{par:.1f} s" if par is not None else "—"
-        sx_s = f"{sx:.1f}×" if sx is not None else "—"
+        serial = snap.serial_eta_s
+        parallel = snap.parallel_eta_s
+        speedup = snap.speedup_x
+        serial_str = f"{serial:.1f} s" if serial is not None else "—"
+        parallel_str = f"{parallel:.1f} s" if parallel is not None else "—"
+        speedup_str = f"{speedup:.1f}×" if speedup is not None else "—"
         return (
-            f"<b>Serial ETA</b>&nbsp;{ser_s}"
-            f"&nbsp;&nbsp;<b>Parallel ETA</b>&nbsp;{par_s}"
-            f"&nbsp;&nbsp;<b>Speedup</b>&nbsp;{sx_s}"
+            f"<b>Serial ETA</b>&nbsp;{serial_str}"
+            f"&nbsp;&nbsp;<b>Parallel ETA</b>&nbsp;{parallel_str}"
+            f"&nbsp;&nbsp;<b>Speedup</b>&nbsp;{speedup_str}"
         )
 
     def _on_start(which: str):
