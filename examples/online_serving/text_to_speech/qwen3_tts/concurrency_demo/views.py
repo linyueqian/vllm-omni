@@ -9,14 +9,14 @@ from .metrics import MetricsSnapshot, StreamState
 
 _ROW_COLORS = {
     "pending": "#9ca3af",
-    "streaming": "#3b82f6",
+    "streaming": "#4A90D9",
     "done": "#22c55e",
     "error": "#ef4444",
 }
 
 _GRID_COLORS = {
     "pending": "#1f2937",
-    "streaming": "#3b82f6",
+    "streaming": "#4A90D9",
     "done": "#22c55e",
     "error": "#ef4444",
 }
