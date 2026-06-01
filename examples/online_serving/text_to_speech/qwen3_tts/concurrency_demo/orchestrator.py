@@ -11,8 +11,36 @@ import time
 from dataclasses import dataclass
 
 import httpx
+import numpy as np
 
 from .metrics import MetricsAggregator, StreamEvent
+
+# Number of (min, max) peak windows extracted per streamed chunk for the
+# waveform renderer. Higher = more detail per chunk but bigger snapshots.
+PEAKS_PER_CHUNK = 4
+
+
+def _compute_peaks(chunk: bytes, n_windows: int = PEAKS_PER_CHUNK) -> tuple[tuple[float, float], ...]:
+    """Return ``n_windows`` (min, max) pairs in [-1, 1] over the int16 PCM chunk.
+
+    If the chunk has fewer samples than ``n_windows`` we shrink the window
+    count to avoid empty slices. Returns ``()`` if the chunk is empty or has
+    an odd byte count we can't decode as int16 frames.
+    """
+    if not chunk or len(chunk) % 2 != 0:
+        return ()
+    samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+    if samples.size == 0:
+        return ()
+    windows = min(n_windows, samples.size)
+    edges = np.linspace(0, samples.size, windows + 1, dtype=np.int64)
+    out = []
+    for i in range(windows):
+        seg = samples[edges[i] : edges[i + 1]]
+        if seg.size == 0:
+            continue
+        out.append((float(seg.min()), float(seg.max())))
+    return tuple(out)
 
 
 @dataclass(frozen=True)
@@ -98,7 +126,14 @@ class Orchestrator:
                     if not first_seen:
                         aggregator.apply(StreamEvent.first(cfg.stream_id, now))
                         first_seen = True
-                    aggregator.apply(StreamEvent.chunk(cfg.stream_id, now, byte_count=len(chunk)))
+                    aggregator.apply(
+                        StreamEvent.chunk(
+                            cfg.stream_id,
+                            now,
+                            byte_count=len(chunk),
+                            peaks=_compute_peaks(chunk),
+                        )
+                    )
         except (httpx.HTTPError, asyncio.CancelledError) as exc:
             aggregator.apply(StreamEvent.error(cfg.stream_id, time.perf_counter(), str(exc)))
             return time.perf_counter() - sent_at

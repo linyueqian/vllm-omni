@@ -10,6 +10,11 @@ from typing import Literal
 EventKind = Literal["first", "chunk", "done", "error"]
 StreamStatus = Literal["pending", "streaming", "done", "error"]
 
+# Ring-buffer cap for per-stream audio peaks used by the waveform renderer.
+# Each entry is one (min, max) pair covering a short window of samples; the
+# orchestrator emits ~4 entries per streamed chunk.
+MAX_WAVEFORM_PEAKS = 200
+
 
 def _percentile(sorted_values: list[float], p: float) -> float | None:
     """Linear-interpolation percentile, p in [0, 1]."""
@@ -34,14 +39,20 @@ class StreamEvent:
     ts: float
     byte_count: int = 0
     error_message: str = ""
+    peaks: tuple[tuple[float, float], ...] = ()
 
     @staticmethod
     def first(stream_id: int, ts: float) -> StreamEvent:
         return StreamEvent(stream_id=stream_id, kind="first", ts=ts)
 
     @staticmethod
-    def chunk(stream_id: int, ts: float, byte_count: int) -> StreamEvent:
-        return StreamEvent(stream_id=stream_id, kind="chunk", ts=ts, byte_count=byte_count)
+    def chunk(
+        stream_id: int,
+        ts: float,
+        byte_count: int,
+        peaks: tuple[tuple[float, float], ...] = (),
+    ) -> StreamEvent:
+        return StreamEvent(stream_id=stream_id, kind="chunk", ts=ts, byte_count=byte_count, peaks=peaks)
 
     @staticmethod
     def done(stream_id: int, ts: float) -> StreamEvent:
@@ -63,6 +74,7 @@ class StreamState:
     last_chunk_s: float | None = None
     bytes_received: int = 0
     error_message: str = ""
+    waveform_peaks: tuple[tuple[float, float], ...] = ()
 
     @property
     def ttfb_s(self) -> float | None:
@@ -143,6 +155,11 @@ class MetricsAggregator:
             elif ev.kind == "chunk":
                 s.bytes_received += ev.byte_count
                 s.last_chunk_s = ev.ts
+                if ev.peaks:
+                    combined = s.waveform_peaks + ev.peaks
+                    if len(combined) > MAX_WAVEFORM_PEAKS:
+                        combined = combined[-MAX_WAVEFORM_PEAKS:]
+                    s.waveform_peaks = combined
             elif ev.kind == "done":
                 s.last_chunk_s = ev.ts
                 s.status = "done"
@@ -163,6 +180,7 @@ class MetricsAggregator:
                     last_chunk_s=s.last_chunk_s,
                     bytes_received=s.bytes_received,
                     error_message=s.error_message,
+                    waveform_peaks=s.waveform_peaks,
                 )
                 for s in self._states
             )

@@ -18,10 +18,7 @@ REF_AUDIO_PATH = REPO_ROOT / "tests" / "assets" / "qwen3_tts" / "clone_2.wav"
 # Transcript of REF_AUDIO_PATH. Qwen3-TTS-Base rejects requests without it
 # unless x_vector_only_mode is set. Same constant used by
 # tests/e2e/online_serving/test_qwen3_tts_base.py.
-REF_TEXT = (
-    "Okay. Yeah. I resent you. I love you. I respect you. "
-    "But you know what? You blew it! And thanks to you."
-)
+REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 
 
 def load_ref_audio_b64() -> str:
