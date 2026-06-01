@@ -15,34 +15,33 @@ import numpy as np
 
 from .metrics import MetricsAggregator, StreamEvent
 
-# Number of peak-picked samples extracted per streamed PCM chunk for the
-# waveform renderer. Each window keeps the absolute-max sample (with sign).
-SAMPLES_PER_CHUNK = 16
+# Number of (min, max) envelope windows extracted per streamed PCM chunk for
+# the waveform renderer. Higher = more detail per chunk at the cost of slightly
+# bigger snapshots.
+SAMPLES_PER_CHUNK = 32
 
 
-def _compute_samples(chunk: bytes, n_windows: int = SAMPLES_PER_CHUNK) -> tuple[float, ...]:
-    """Decimate one PCM chunk into ``n_windows`` peak-picked samples in [-1, 1].
+def _compute_samples(chunk: bytes, n_windows: int = SAMPLES_PER_CHUNK) -> tuple[tuple[float, float], ...]:
+    """Return ``n_windows`` (min, max) pairs in [-1, 1] over one PCM chunk.
 
-    Each output element is the sample with the largest absolute value inside
-    its window, preserving sign — visually closer to an oscilloscope trace
-    than naive every-Nth-sample decimation. Returns ``()`` if the chunk is
-    empty or has an odd byte count we can't decode as int16 frames.
+    Each pair preserves both the negative and positive peak of its window so
+    the renderer can paint a true min/max envelope ("audio thumbnail") rather
+    than a thin centre-line. Returns ``()`` if the chunk is empty or has an
+    odd byte count we can't decode as int16 frames.
     """
     if not chunk or len(chunk) % 2 != 0:
         return ()
     pcm = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
     if pcm.size == 0:
         return ()
-    if pcm.size <= n_windows:
-        return tuple(float(v) for v in pcm)
-    edges = np.linspace(0, pcm.size, n_windows + 1, dtype=np.int64)
-    out: list[float] = []
-    for i in range(n_windows):
+    n = min(n_windows, pcm.size)
+    edges = np.linspace(0, pcm.size, n + 1, dtype=np.int64)
+    out: list[tuple[float, float]] = []
+    for i in range(n):
         seg = pcm[edges[i] : edges[i + 1]]
         if seg.size == 0:
             continue
-        idx = int(np.argmax(np.abs(seg)))
-        out.append(float(seg[idx]))
+        out.append((float(seg.min()), float(seg.max())))
     return tuple(out)
 
 

@@ -10,10 +10,11 @@ from typing import Literal
 EventKind = Literal["first", "chunk", "done", "error"]
 StreamStatus = Literal["pending", "streaming", "done", "error"]
 
-# Ring-buffer cap for the per-stream decimated PCM samples used by the
-# waveform renderer. Each entry is a single normalised sample in [-1, 1];
-# the orchestrator emits ~16 peak-picked samples per streamed chunk.
-MAX_WAVEFORM_SAMPLES = 256
+# Cap on the per-stream (min, max) envelope buffer. The orchestrator emits a
+# fixed number of pairs per chunk; once the buffer exceeds this cap we halve
+# it via pair-wise extreme reduction so the buffer always covers the FULL
+# utterance, just at progressively coarser resolution as audio grows.
+MAX_WAVEFORM_SAMPLES = 512
 
 
 def _percentile(sorted_values: list[float], p: float) -> float | None:
@@ -39,7 +40,7 @@ class StreamEvent:
     ts: float
     byte_count: int = 0
     error_message: str = ""
-    samples: tuple[float, ...] = ()
+    samples: tuple[tuple[float, float], ...] = ()
 
     @staticmethod
     def first(stream_id: int, ts: float) -> StreamEvent:
@@ -50,7 +51,7 @@ class StreamEvent:
         stream_id: int,
         ts: float,
         byte_count: int,
-        samples: tuple[float, ...] = (),
+        samples: tuple[tuple[float, float], ...] = (),
     ) -> StreamEvent:
         return StreamEvent(stream_id=stream_id, kind="chunk", ts=ts, byte_count=byte_count, samples=samples)
 
@@ -74,7 +75,7 @@ class StreamState:
     last_chunk_s: float | None = None
     bytes_received: int = 0
     error_message: str = ""
-    waveform_samples: tuple[float, ...] = ()
+    waveform_samples: tuple[tuple[float, float], ...] = ()
 
     @property
     def ttfb_s(self) -> float | None:
@@ -169,9 +170,19 @@ class MetricsAggregator:
                 s.bytes_received += ev.byte_count
                 s.last_chunk_s = ev.ts
                 if ev.samples:
-                    combined = s.waveform_samples + ev.samples
-                    if len(combined) > MAX_WAVEFORM_SAMPLES:
-                        combined = combined[-MAX_WAVEFORM_SAMPLES:]
+                    combined: tuple[tuple[float, float], ...] = s.waveform_samples + ev.samples
+                    # Halve via pair-wise extreme reduction while we're over
+                    # cap. Preserves the full utterance shape; the envelope
+                    # just gets coarser as more audio accumulates.
+                    while len(combined) > MAX_WAVEFORM_SAMPLES:
+                        reduced: list[tuple[float, float]] = []
+                        for i in range(0, len(combined) - 1, 2):
+                            lo_a, hi_a = combined[i]
+                            lo_b, hi_b = combined[i + 1]
+                            reduced.append((min(lo_a, lo_b), max(hi_a, hi_b)))
+                        if len(combined) % 2 == 1:
+                            reduced.append(combined[-1])
+                        combined = tuple(reduced)
                     s.waveform_samples = combined
             elif ev.kind == "done":
                 s.last_chunk_s = ev.ts

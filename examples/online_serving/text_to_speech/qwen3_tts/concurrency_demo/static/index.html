@@ -162,7 +162,7 @@
     countersB.appendChild(c);
   });
 
-  // ---- Waveform draw ----
+  // ---- Waveform draw (filled min/max envelope, auto-normalised) ----
   function drawWave(canvas, samples, color) {
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, WAVE_W, WAVE_H);
@@ -173,20 +173,41 @@
     ctx.lineTo(WAVE_W, WAVE_H / 2);
     ctx.stroke();
     if (!samples || samples.length === 0) return;
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 1.4;
-    ctx.lineJoin = 'round';
-    ctx.lineCap = 'round';
-    ctx.beginPath();
+
     const n = samples.length;
     const half = (WAVE_H / 2) - 3;
+    // Auto-normalise so quiet utterances still fill the strip.
+    let peak = 0;
     for (let i = 0; i < n; i++) {
-      const x = ((i + 1) / n) * WAVE_W;
-      const v = Math.max(-1, Math.min(1, samples[i]));
-      const y = WAVE_H / 2 - v * half;
+      const lo = samples[i][0], hi = samples[i][1];
+      const m = Math.max(Math.abs(lo), Math.abs(hi));
+      if (m > peak) peak = m;
+    }
+    const scale = peak > 0.001 ? 0.92 / peak : 1.0;
+
+    // Draw the filled mirror polygon.
+    ctx.fillStyle = color + '55';   // ~33% alpha fill
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    // Top edge: max line, left to right.
+    for (let i = 0; i < n; i++) {
+      const x = ((i + 0.5) / n) * WAVE_W;
+      const hi = Math.max(-1, Math.min(1, samples[i][1] * scale));
+      const y = WAVE_H / 2 - hi * half;
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     }
+    // Bottom edge: min line, right to left.
+    for (let i = n - 1; i >= 0; i--) {
+      const x = ((i + 0.5) / n) * WAVE_W;
+      const lo = Math.max(-1, Math.min(1, samples[i][0] * scale));
+      const y = WAVE_H / 2 - lo * half;
+      ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.fill();
     ctx.stroke();
   }
 

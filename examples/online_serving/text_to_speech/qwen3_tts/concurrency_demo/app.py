@@ -59,7 +59,7 @@ def _snapshot_to_dict(snap: MetricsSnapshot) -> dict[str, Any]:
                 "ttfb_s": s.ttfb_s,
                 "audio_seconds": s.audio_seconds,
                 "final_rtf": s.final_rtf,
-                "samples": list(s.waveform_samples),
+                "samples": [[lo, hi] for (lo, hi) in s.waveform_samples],
             }
             for s in snap.per_stream
         ],
