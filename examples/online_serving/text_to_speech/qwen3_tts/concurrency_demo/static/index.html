@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwen3-TTS Concurrency Demo</title>
+<style>
+  :root {
+    --brand: #4A90D9;
+    --text: #1f2937;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --panel: #0b1220;
+    --grid-line: #1f2937;
+    --bg: #fafbfc;
+    --chip-bg: #eef2f7;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--text); background: var(--bg); }
+  header { display: flex; align-items: center; gap: 16px; padding: 14px 24px; border-bottom: 1px solid var(--line); background: #fff; }
+  header img { height: 42px; }
+  header h1 { margin: 0; font-size: 1.5em; line-height: 1.2; }
+  header .sub { font-size: 0.85em; color: var(--muted); margin-top: 2px; }
+  header .sub code { background: var(--chip-bg); padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+  header a.brand { color: var(--brand); font-weight: 600; text-decoration: none; }
+  header a.brand:hover { text-decoration: underline; }
+
+  main { max-width: 1280px; margin: 0 auto; padding: 16px 24px 48px; }
+
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 18px; }
+  .tab { padding: 10px 18px; cursor: pointer; border-bottom: 2px solid transparent; color: var(--muted); font-weight: 500; font-size: 14px; }
+  .tab.active { border-bottom-color: var(--brand); color: var(--brand); font-weight: 600; }
+
+  .page { display: none; }
+  .page.active { display: block; }
+
+  .btn-row { display: flex; gap: 8px; margin-top: 16px; }
+  .btn { padding: 10px 18px; border-radius: 6px; border: none; cursor: pointer; font-weight: 500; font-size: 14px; transition: filter 0.1s; }
+  .btn:hover { filter: brightness(1.05); }
+  .btn.primary { background: var(--brand); color: #fff; }
+  .btn.secondary { background: var(--chip-bg); color: var(--text); }
+
+  .eta-row { display: flex; gap: 10px; align-items: center; margin: 10px 0 14px; flex-wrap: wrap; }
+  .chip { display: inline-flex; align-items: baseline; gap: 6px; padding: 4px 12px; border-radius: 999px; background: var(--chip-bg); font-family: ui-monospace, SF Mono, monospace; font-size: 13px; }
+  .chip-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .chip.speedup { background: #fff; border: 1px solid var(--brand); padding: 4px 14px; }
+  .chip.speedup b { color: var(--brand); font-size: 16px; }
+  .arrow { color: #cbd5e1; font-size: 14px; }
+
+  .row { display: flex; align-items: center; gap: 10px; font-family: ui-monospace, SF Mono, monospace; font-size: 12px; padding: 4px 0; }
+  .row .label { width: 32px; color: var(--muted); text-align: right; }
+  .row .wave-wrap { flex: 1; min-width: 0; }
+  .row canvas { width: 100%; height: 44px; background: var(--panel); border-radius: 6px; display: block; }
+  .row .ttfb, .row .rtf { width: 88px; color: var(--muted); }
+  .row .status { width: 72px; font-weight: 600; }
+
+  .counters { display: flex; gap: 10px; margin: 14px 0; }
+  .counter { flex: 1; padding: 10px 14px; background: var(--panel); border-radius: 8px; color: #e5e7eb; font-family: ui-monospace, SF Mono, monospace; }
+  .counter .clabel { color: #9ca3af; font-size: 11px; letter-spacing: 0.04em; }
+  .counter .cvalue { font-size: 24px; font-weight: 600; margin-top: 2px; }
+
+  .skyline { display: flex; align-items: flex-end; gap: 2px; height: 200px; padding: 8px; background: var(--panel); border-radius: 8px; box-shadow: inset 0 0 0 1px var(--grid-line); }
+  .skyline .bar { flex: 1; border-radius: 2px 2px 0 0; transition: height 0.25s cubic-bezier(0.22,1,0.36,1), background 0.2s linear; min-height: 1px; }
+
+  .status-line { font-size: 12px; color: var(--muted); margin-top: 6px; min-height: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <img src="https://raw.githubusercontent.com/vllm-project/vllm-omni/main/docs/source/logos/vllm-omni-logo.png" alt="vLLM-Omni">
+  <div>
+    <h1>Qwen3-TTS Concurrency Demo</h1>
+    <div class="sub">
+      Served by <a class="brand" href="https://github.com/vllm-project/vllm-omni" target="_blank" rel="noopener">vLLM-Omni</a>
+      &middot; <code id="api-base">…</code>
+      &middot; parallel-vs-serial throughput visualisation
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="tabs">
+    <div class="tab active" data-tab="A">Page A — N=8</div>
+    <div class="tab" data-tab="B">Page B — N=64</div>
+  </div>
+
+  <section class="page active" id="pageA">
+    <div class="eta-row" id="etaA"></div>
+    <div id="rowsA"></div>
+    <div class="btn-row">
+      <button class="btn primary" id="startA">▶ Start 8-stream race</button>
+      <button class="btn secondary" id="resetA">Reset</button>
+    </div>
+    <div class="status-line" id="statusA"></div>
+  </section>
+
+  <section class="page" id="pageB">
+    <div class="eta-row" id="etaB"></div>
+    <div class="counters" id="countersB"></div>
+    <div class="skyline" id="skylineB"></div>
+    <div class="btn-row">
+      <button class="btn primary" id="startB">▶ Start 64-stream race</button>
+      <button class="btn secondary" id="resetB">Reset</button>
+    </div>
+    <div class="status-line" id="statusB"></div>
+  </section>
+</main>
+
+<script>
+(() => {
+  const COLORS = { pending: '#9ca3af', streaming: '#4A90D9', done: '#22c55e', error: '#ef4444' };
+  const GRID_COLORS = { pending: '#1f2937', streaming: '#4A90D9', done: '#22c55e', error: '#ef4444' };
+  const N = { A: 8, B: 64 };
+  const WAVE_W = 320, WAVE_H = 44;
+
+  // Resolve config once for the header API-base badge.
+  fetch('/api/config').then(r => r.json()).then(cfg => {
+    document.getElementById('api-base').textContent = cfg.api_base;
+  }).catch(() => {});
+
+  // ---- Tabs ----
+  document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+      tab.classList.add('active');
+      document.getElementById('page' + tab.dataset.tab).classList.add('active');
+    });
+  });
+
+  // ---- Build Page A row scaffolding ----
+  const rowsA = document.getElementById('rowsA');
+  for (let i = 0; i < N.A; i++) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML =
+      `<span class="label">#${i + 1}</span>` +
+      `<div class="wave-wrap"><canvas id="canvas-A-${i}" width="${WAVE_W}" height="${WAVE_H}"></canvas></div>` +
+      `<span class="ttfb" id="ttfb-A-${i}">TTFB —</span>` +
+      `<span class="rtf" id="rtf-A-${i}">RTF —</span>` +
+      `<span class="status" id="status-A-${i}" style="color:${COLORS.pending}">pending</span>`;
+    rowsA.appendChild(row);
+  }
+
+  // ---- Build Page B skyline + counters ----
+  const skyB = document.getElementById('skylineB');
+  for (let i = 0; i < N.B; i++) {
+    const bar = document.createElement('div');
+    bar.className = 'bar';
+    bar.id = `bar-B-${i}`;
+    bar.style.height = '0%';
+    bar.style.background = GRID_COLORS.pending;
+    skyB.appendChild(bar);
+  }
+  const countersDef = ['ACTIVE', 'DONE', 'THROUGHPUT', 'TTFB p99', 'RTF p99'];
+  const countersB = document.getElementById('countersB');
+  countersDef.forEach((label, idx) => {
+    const c = document.createElement('div');
+    c.className = 'counter';
+    c.innerHTML = `<div class="clabel">${label}</div><div class="cvalue" id="counter-${idx}">—</div>`;
+    countersB.appendChild(c);
+  });
+
+  // ---- Waveform draw ----
+  function drawWave(canvas, samples, color) {
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, WAVE_W, WAVE_H);
+    ctx.strokeStyle = '#1f2937';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, WAVE_H / 2);
+    ctx.lineTo(WAVE_W, WAVE_H / 2);
+    ctx.stroke();
+    if (!samples || samples.length === 0) return;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.4;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    const n = samples.length;
+    const half = (WAVE_H / 2) - 3;
+    for (let i = 0; i < n; i++) {
+      const x = ((i + 1) / n) * WAVE_W;
+      const v = Math.max(-1, Math.min(1, samples[i]));
+      const y = WAVE_H / 2 - v * half;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  // ---- ETA chip row ----
+  function formatEta(snap) {
+    const s = (v, unit) => v != null ? `${v.toFixed(1)}${unit}` : '—';
+    const ser = s(snap.serial_eta_s, ' s');
+    const par = s(snap.parallel_eta_s, ' s');
+    const sp = snap.speedup_x != null ? `${snap.speedup_x.toFixed(1)}×` : '—';
+    return (
+      `<span class="chip"><span class="chip-label">Serial</span><b>${ser}</b></span>` +
+      `<span class="arrow">→</span>` +
+      `<span class="chip"><span class="chip-label">Parallel</span><b>${par}</b></span>` +
+      `<span class="arrow">→</span>` +
+      `<span class="chip speedup"><span class="chip-label">Speedup</span><b>${sp}</b></span>`
+    );
+  }
+
+  // ---- Apply snapshots ----
+  function applyA(snap) {
+    document.getElementById('etaA').innerHTML = formatEta(snap);
+    for (let i = 0; i < N.A; i++) {
+      const stream = snap.streams[i];
+      const canvas = document.getElementById(`canvas-A-${i}`);
+      drawWave(canvas, stream.samples, COLORS[stream.status]);
+      document.getElementById(`ttfb-A-${i}`).textContent = `TTFB ${stream.ttfb_s != null ? Math.round(stream.ttfb_s * 1000) + ' ms' : '—'}`;
+      document.getElementById(`rtf-A-${i}`).textContent = `RTF ${stream.final_rtf != null ? stream.final_rtf.toFixed(2) : '—'}`;
+      const s = document.getElementById(`status-A-${i}`);
+      s.textContent = stream.status;
+      s.style.color = COLORS[stream.status];
+    }
+  }
+  function applyB(snap) {
+    document.getElementById('etaB').innerHTML = formatEta(snap);
+    document.getElementById('counter-0').textContent = snap.active;
+    document.getElementById('counter-1').textContent = snap.completed;
+    document.getElementById('counter-2').textContent = (snap.throughput_x || 0).toFixed(1) + '×';
+    document.getElementById('counter-3').textContent = snap.ttfb_p99_ms != null ? Math.round(snap.ttfb_p99_ms) + ' ms' : '— ms';
+    document.getElementById('counter-4').textContent = snap.rtf_p99 != null ? snap.rtf_p99.toFixed(2) : '—';
+    for (let i = 0; i < N.B; i++) {
+      const stream = snap.streams[i];
+      const bar = document.getElementById(`bar-B-${i}`);
+      const audio = stream.audio_seconds || 0;
+      const pct = stream.status === 'done' ? 100 : Math.min(99, Math.max(0, (audio / 7.0) * 100));
+      bar.style.height = pct.toFixed(1) + '%';
+      bar.style.background = GRID_COLORS[stream.status];
+    }
+  }
+
+  // ---- Connect SSE for both pages ----
+  function connect(page, apply) {
+    const es = new EventSource(`/api/stream/${page}`);
+    es.onmessage = (e) => {
+      try { apply(JSON.parse(e.data)); }
+      catch (err) { console.error('snapshot parse failed', err); }
+    };
+    es.onerror = () => {
+      document.getElementById(`status${page}`).textContent = 'stream disconnected — retrying…';
+      // EventSource auto-reconnects; just surface the gap to the user.
+    };
+    return es;
+  }
+  connect('A', applyA);
+  connect('B', applyB);
+
+  // ---- Buttons ----
+  function wireButtons(page) {
+    document.getElementById(`start${page}`).addEventListener('click', async () => {
+      const r = await fetch(`/api/start/${page}`, { method: 'POST' });
+      const j = await r.json();
+      document.getElementById(`status${page}`).textContent = `Started N=${j.started}…`;
+    });
+    document.getElementById(`reset${page}`).addEventListener('click', async () => {
+      await fetch(`/api/reset/${page}`, { method: 'POST' });
+      document.getElementById(`status${page}`).textContent = `Reset N=${N[page]}`;
+    });
+  }
+  wireButtons('A');
+  wireButtons('B');
+})();
+</script>
+</body>
+</html>
