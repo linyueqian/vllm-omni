@@ -15,31 +15,34 @@ import numpy as np
 
 from .metrics import MetricsAggregator, StreamEvent
 
-# Number of (min, max) peak windows extracted per streamed chunk for the
-# waveform renderer. Higher = more detail per chunk but bigger snapshots.
-PEAKS_PER_CHUNK = 4
+# Number of peak-picked samples extracted per streamed PCM chunk for the
+# waveform renderer. Each window keeps the absolute-max sample (with sign).
+SAMPLES_PER_CHUNK = 16
 
 
-def _compute_peaks(chunk: bytes, n_windows: int = PEAKS_PER_CHUNK) -> tuple[tuple[float, float], ...]:
-    """Return ``n_windows`` (min, max) pairs in [-1, 1] over the int16 PCM chunk.
+def _compute_samples(chunk: bytes, n_windows: int = SAMPLES_PER_CHUNK) -> tuple[float, ...]:
+    """Decimate one PCM chunk into ``n_windows`` peak-picked samples in [-1, 1].
 
-    If the chunk has fewer samples than ``n_windows`` we shrink the window
-    count to avoid empty slices. Returns ``()`` if the chunk is empty or has
-    an odd byte count we can't decode as int16 frames.
+    Each output element is the sample with the largest absolute value inside
+    its window, preserving sign — visually closer to an oscilloscope trace
+    than naive every-Nth-sample decimation. Returns ``()`` if the chunk is
+    empty or has an odd byte count we can't decode as int16 frames.
     """
     if not chunk or len(chunk) % 2 != 0:
         return ()
-    samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
-    if samples.size == 0:
+    pcm = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+    if pcm.size == 0:
         return ()
-    windows = min(n_windows, samples.size)
-    edges = np.linspace(0, samples.size, windows + 1, dtype=np.int64)
-    out = []
-    for i in range(windows):
-        seg = samples[edges[i] : edges[i + 1]]
+    if pcm.size <= n_windows:
+        return tuple(float(v) for v in pcm)
+    edges = np.linspace(0, pcm.size, n_windows + 1, dtype=np.int64)
+    out: list[float] = []
+    for i in range(n_windows):
+        seg = pcm[edges[i] : edges[i + 1]]
         if seg.size == 0:
             continue
-        out.append((float(seg.min()), float(seg.max())))
+        idx = int(np.argmax(np.abs(seg)))
+        out.append(float(seg[idx]))
     return tuple(out)
 
 
@@ -131,7 +134,7 @@ class Orchestrator:
                             cfg.stream_id,
                             now,
                             byte_count=len(chunk),
-                            peaks=_compute_peaks(chunk),
+                            samples=_compute_samples(chunk),
                         )
                     )
         except (httpx.HTTPError, asyncio.CancelledError) as exc:

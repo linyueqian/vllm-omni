@@ -36,48 +36,35 @@ def _row_progress_pct(s: StreamState, est_total_audio_s: float = 7.0) -> float:
 
 
 def _render_waveform_svg(s: StreamState) -> str:
-    """Render one stream's recent audio as a centered min/max-peak waveform.
+    """Render one stream's recent audio as an oscilloscope polyline trace.
 
-    The waveform draws one vertical line per (min, max) pair stored in
-    ``s.waveform_peaks``, scaled to fit ``_WAVE_W x _WAVE_H``. Pre-roll
-    streams render as an empty axis line; error streams render in red.
+    Draws a single ``<polyline>`` through ``s.waveform_samples`` scaled to
+    ``_WAVE_W x _WAVE_H``. Pre-roll streams render as an empty axis line so
+    each row keeps a stable height before audio arrives.
     """
     color = _ROW_COLORS[s.status]
-    peaks = s.waveform_peaks
-    if not peaks:
-        # Idle axis line so the row keeps its height even before audio arrives.
-        return (
-            f'<svg viewBox="0 0 {_WAVE_W} {_WAVE_H}" '
-            f'preserveAspectRatio="none" '
-            f'style="width:100%;height:{_WAVE_H}px;background:#0b1220;border-radius:6px">'
-            f'<line x1="0" y1="{_WAVE_MID}" x2="{_WAVE_W}" y2="{_WAVE_MID}" '
-            f'stroke="#1f2937" stroke-width="1"/></svg>'
-        )
-
-    n = len(peaks)
-    half = _WAVE_MID - _WAVE_MARGIN
-    lines = []
-    for i, (lo, hi) in enumerate(peaks):
-        # x positions evenly spaced; one vertical stroke per window.
-        x = (i + 0.5) / n * _WAVE_W
-        y_hi = _WAVE_MID - max(-1.0, min(1.0, hi)) * half
-        y_lo = _WAVE_MID - max(-1.0, min(1.0, lo)) * half
-        # Ensure visible 1px line even when |lo|==|hi|==0.
-        if abs(y_hi - y_lo) < 1.0:
-            y_lo += 0.5
-            y_hi -= 0.5
-        lines.append(
-            f'<line x1="{x:.1f}" y1="{y_hi:.1f}" x2="{x:.1f}" y2="{y_lo:.1f}" '
-            f'stroke="{color}" stroke-width="1.6" stroke-linecap="round"/>'
-        )
-    return (
-        f'<svg viewBox="0 0 {_WAVE_W} {_WAVE_H}" '
-        f'preserveAspectRatio="none" '
+    samples = s.waveform_samples
+    baseline = f'<line x1="0" y1="{_WAVE_MID}" x2="{_WAVE_W}" y2="{_WAVE_MID}" stroke="#1f2937" stroke-width="1"/>'
+    svg_open = (
+        f'<svg viewBox="0 0 {_WAVE_W} {_WAVE_H}" preserveAspectRatio="none" '
         f'style="width:100%;height:{_WAVE_H}px;background:#0b1220;border-radius:6px">'
-        f'<line x1="0" y1="{_WAVE_MID}" x2="{_WAVE_W}" y2="{_WAVE_MID}" '
-        f'stroke="#1f2937" stroke-width="1"/>'
-        f"{''.join(lines)}</svg>"
     )
+    if not samples:
+        return f"{svg_open}{baseline}</svg>"
+
+    n = len(samples)
+    half = _WAVE_MID - _WAVE_MARGIN
+    pts = []
+    for i, v in enumerate(samples):
+        # Right-align: newest sample at the right edge so the trace scrolls.
+        x = (i + 1) / n * _WAVE_W
+        y = _WAVE_MID - max(-1.0, min(1.0, v)) * half
+        pts.append(f"{x:.1f},{y:.1f}")
+    polyline = (
+        f'<polyline points="{" ".join(pts)}" stroke="{color}" stroke-width="1.4" '
+        f'fill="none" stroke-linejoin="round" stroke-linecap="round"/>'
+    )
+    return f"{svg_open}{baseline}{polyline}</svg>"
 
 
 def render_row_html(snap: MetricsSnapshot, stream_id: int) -> str:

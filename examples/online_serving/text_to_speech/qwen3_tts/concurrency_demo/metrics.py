@@ -10,10 +10,10 @@ from typing import Literal
 EventKind = Literal["first", "chunk", "done", "error"]
 StreamStatus = Literal["pending", "streaming", "done", "error"]
 
-# Ring-buffer cap for per-stream audio peaks used by the waveform renderer.
-# Each entry is one (min, max) pair covering a short window of samples; the
-# orchestrator emits ~4 entries per streamed chunk.
-MAX_WAVEFORM_PEAKS = 200
+# Ring-buffer cap for the per-stream decimated PCM samples used by the
+# waveform renderer. Each entry is a single normalised sample in [-1, 1];
+# the orchestrator emits ~16 peak-picked samples per streamed chunk.
+MAX_WAVEFORM_SAMPLES = 256
 
 
 def _percentile(sorted_values: list[float], p: float) -> float | None:
@@ -39,7 +39,7 @@ class StreamEvent:
     ts: float
     byte_count: int = 0
     error_message: str = ""
-    peaks: tuple[tuple[float, float], ...] = ()
+    samples: tuple[float, ...] = ()
 
     @staticmethod
     def first(stream_id: int, ts: float) -> StreamEvent:
@@ -50,9 +50,9 @@ class StreamEvent:
         stream_id: int,
         ts: float,
         byte_count: int,
-        peaks: tuple[tuple[float, float], ...] = (),
+        samples: tuple[float, ...] = (),
     ) -> StreamEvent:
-        return StreamEvent(stream_id=stream_id, kind="chunk", ts=ts, byte_count=byte_count, peaks=peaks)
+        return StreamEvent(stream_id=stream_id, kind="chunk", ts=ts, byte_count=byte_count, samples=samples)
 
     @staticmethod
     def done(stream_id: int, ts: float) -> StreamEvent:
@@ -74,7 +74,7 @@ class StreamState:
     last_chunk_s: float | None = None
     bytes_received: int = 0
     error_message: str = ""
-    waveform_peaks: tuple[tuple[float, float], ...] = ()
+    waveform_samples: tuple[float, ...] = ()
 
     @property
     def ttfb_s(self) -> float | None:
@@ -124,28 +124,41 @@ class MetricsAggregator:
         self._states: list[StreamState] = [StreamState(stream_id=i) for i in range(n)]
         self._burst_start_s: float | None = None
         self._ref_t_observed_s: float | None = None
+        # Monotonically increases on every state-mutating call so UI timers can
+        # cheaply detect whether anything happened since the previous tick.
+        self._seq: int = 0
+
+    @property
+    def seq(self) -> int:
+        with self._lock:
+            return self._seq
 
     def reset(self) -> None:
         with self._lock:
             self._states = [StreamState(stream_id=i) for i in range(self._n)]
             self._burst_start_s = None
             self._ref_t_observed_s = None
+            self._seq += 1
 
     def mark_burst_start(self, ts: float) -> None:
         with self._lock:
             self._burst_start_s = ts
+            self._seq += 1
 
     def set_reference(self, t_observed_s: float) -> None:
         with self._lock:
             self._ref_t_observed_s = t_observed_s
+            self._seq += 1
 
     def mark_request_sent(self, stream_id: int, ts: float) -> None:
         with self._lock:
             s = self._states[stream_id]
             s.request_sent_s = ts
+            self._seq += 1
 
     def apply(self, ev: StreamEvent) -> None:
         with self._lock:
+            self._seq += 1
             s = self._states[ev.stream_id]
             if ev.kind == "first":
                 s.first_chunk_s = ev.ts
@@ -155,11 +168,11 @@ class MetricsAggregator:
             elif ev.kind == "chunk":
                 s.bytes_received += ev.byte_count
                 s.last_chunk_s = ev.ts
-                if ev.peaks:
-                    combined = s.waveform_peaks + ev.peaks
-                    if len(combined) > MAX_WAVEFORM_PEAKS:
-                        combined = combined[-MAX_WAVEFORM_PEAKS:]
-                    s.waveform_peaks = combined
+                if ev.samples:
+                    combined = s.waveform_samples + ev.samples
+                    if len(combined) > MAX_WAVEFORM_SAMPLES:
+                        combined = combined[-MAX_WAVEFORM_SAMPLES:]
+                    s.waveform_samples = combined
             elif ev.kind == "done":
                 s.last_chunk_s = ev.ts
                 s.status = "done"
@@ -180,7 +193,7 @@ class MetricsAggregator:
                     last_chunk_s=s.last_chunk_s,
                     bytes_received=s.bytes_received,
                     error_message=s.error_message,
-                    waveform_peaks=s.waveform_peaks,
+                    waveform_samples=s.waveform_samples,
                 )
                 for s in self._states
             )

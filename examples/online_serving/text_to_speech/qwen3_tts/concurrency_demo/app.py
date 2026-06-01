@@ -41,6 +41,13 @@ def build_ui(api_base: str) -> gr.Blocks:
     agg_a = MetricsAggregator(n=N_PAGE_A)
     agg_b = MetricsAggregator(n=N_PAGE_B)
 
+    # Mutable closure cells holding the sequence number of the last snapshot
+    # rendered into the DOM. When the aggregator's seq has not changed since
+    # the previous tick we return ``gr.skip()`` so Gradio does not push a
+    # redundant update and the page stays visually idle between bursts.
+    _last_seq_a = [-1]
+    _last_seq_b = [-1]
+
     def _eta_label(snap: MetricsSnapshot) -> str:
         serial = snap.serial_eta_s
         parallel = snap.parallel_eta_s
@@ -80,12 +87,22 @@ def build_ui(api_base: str) -> gr.Blocks:
         return gr.update(value=f"Reset N={N_PAGE_A if which == 'A' else N_PAGE_B}")
 
     def _tick_a():
+        seq = agg_a.seq
+        if seq == _last_seq_a[0]:
+            # Nothing changed since the last tick — skip the update so Gradio
+            # doesn't repaint the row strip while the page sits idle.
+            return gr.skip(), gr.skip()
+        _last_seq_a[0] = seq
         now = time.perf_counter()
         snap = agg_a.snapshot(now=now)
         rows_html = "".join(render_row_html(snap, i) for i in range(N_PAGE_A))
         return rows_html, _eta_label(snap)
 
     def _tick_b():
+        seq = agg_b.seq
+        if seq == _last_seq_b[0]:
+            return gr.skip(), gr.skip(), gr.skip()
+        _last_seq_b[0] = seq
         now = time.perf_counter()
         snap = agg_b.snapshot(now=now)
         return render_counters_html(snap), render_grid_html(snap), _eta_label(snap)
