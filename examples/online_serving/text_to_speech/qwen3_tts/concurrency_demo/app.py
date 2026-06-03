@@ -108,6 +108,8 @@ def _race_speedup(
     serial_done = serial.completed == n and not serial.any_failed
     parallel_done = parallel.completed == n and not parallel.any_failed
 
+    # The badges show the lane's real clock: live while running, frozen at
+    # actual completion time (max(last_chunk) - burst_start) when done.
     serial_elapsed = _lane_elapsed(serial, n)
     parallel_elapsed = _lane_elapsed(parallel, n)
 
@@ -115,21 +117,19 @@ def _race_speedup(
     if serial_done and parallel_done and parallel_elapsed and parallel_elapsed > 0 and serial_elapsed:
         speedup = serial_elapsed / parallel_elapsed
     elif parallel_done and parallel_elapsed and parallel_elapsed > 0:
-        if locked_projection is not None:
-            # Freeze projection at the moment parallel finished.
+        # Parallel is the headline; speedup uses a projected serial finish
+        # time so it can lock in immediately at parallel-done. The badge
+        # value (serial_elapsed) stays live so the user still sees serial's
+        # real clock tick up while the lane grinds in the background.
+        if locked_projection is not None and locked_projection["serial_completed"] > 0:
             wall = locked_projection["serial_wall"]
             comp = locked_projection["serial_completed"]
-            if comp > 0:
-                per_stream_s = wall / comp
-                projected_serial = per_stream_s * n
-                speedup = projected_serial / parallel_elapsed
-                serial_elapsed = projected_serial
+            projected_serial = (wall / comp) * n
+            speedup = projected_serial / parallel_elapsed
         elif serial.completed > 0:
-            # Live projection (used until the snapshot the caller locks in).
             per_stream_s = (serial.wall_s or 0.0) / max(1, serial.completed)
             projected_serial = per_stream_s * n
             speedup = projected_serial / parallel_elapsed
-            serial_elapsed = projected_serial
     return serial_elapsed, parallel_elapsed, speedup
 
 
