@@ -45,9 +45,26 @@ N_PAGE_B = 64
 STATIC_DIR = Path(__file__).parent / "static"
 
 
-def _lane_snapshot_to_dict(snap: MetricsSnapshot) -> dict[str, Any]:
+def _lane_elapsed(snap: MetricsSnapshot, n: int) -> float | None:
+    """Effective lane wall time: frozen at completion, live while running.
+
+    ``snap.wall_s`` is ``now - burst_start_s`` and keeps climbing forever once
+    the burst is done. Once all N streams have finished, freeze at the lane's
+    actual completion time = ``max(last_chunk) - burst_start`` (already
+    computed as ``snap.parallel_eta_s`` by the aggregator). While the lane is
+    still running, keep returning the live wall clock.
+    """
+    if snap.burst_start_s is None:
+        return None
+    is_done = snap.completed == n and not snap.any_failed
+    if is_done and snap.parallel_eta_s is not None:
+        return snap.parallel_eta_s
+    return snap.wall_s
+
+
+def _lane_snapshot_to_dict(snap: MetricsSnapshot, n: int) -> dict[str, Any]:
     return {
-        "wall_s": snap.wall_s,
+        "wall_s": _lane_elapsed(snap, n) or 0.0,
         "completed": snap.completed,
         "active": snap.active,
         "throughput_x": snap.throughput_x,
@@ -73,19 +90,21 @@ def _race_speedup(
 ) -> tuple[float | None, float | None, float | None]:
     """Return (serial_elapsed, parallel_elapsed, speedup_x).
 
-    Each lane's elapsed clock is its observed wall time so far. Speedup is
-    computed once the PARALLEL lane has fully drained (all N done). The
-    SERIAL lane may still be running — its bar keeps growing on the page.
+    Lane elapsed uses ``_lane_elapsed`` so both the live and the frozen
+    case stay accurate. Speedup is computed once the PARALLEL lane has
+    fully drained; if the SERIAL lane is still grinding (N=64), we project
+    its finish time from its observed per-stream rate so the headline
+    Speedup × locks in as soon as parallel is done.
     """
     serial_done = serial.completed == n and not serial.any_failed
     parallel_done = parallel.completed == n and not parallel.any_failed
 
-    serial_elapsed: float | None = serial.wall_s if serial.burst_start_s is not None else None
-    parallel_elapsed: float | None = parallel.wall_s if parallel.burst_start_s is not None else None
+    serial_elapsed = _lane_elapsed(serial, n)
+    parallel_elapsed = _lane_elapsed(parallel, n)
 
     speedup: float | None = None
-    if serial_done and parallel_done and parallel_elapsed and parallel_elapsed > 0:
-        speedup = serial_elapsed / parallel_elapsed if serial_elapsed else None
+    if serial_done and parallel_done and parallel_elapsed and parallel_elapsed > 0 and serial_elapsed:
+        speedup = serial_elapsed / parallel_elapsed
     elif parallel_done and parallel_elapsed and parallel_elapsed > 0 and serial.completed > 0:
         # Parallel finished, serial still running — project from observed rate.
         per_stream_s = (serial.wall_s or 0.0) / max(1, serial.completed)
@@ -166,8 +185,8 @@ def build_app(api_base_serial: str, api_base_parallel: str) -> FastAPI:
             serial_eta, parallel_eta, speedup = _race_speedup(snap_s, snap_p, n)
             payload = {
                 "n": n,
-                "serial": _lane_snapshot_to_dict(snap_s),
-                "parallel": _lane_snapshot_to_dict(snap_p),
+                "serial": _lane_snapshot_to_dict(snap_s, n),
+                "parallel": _lane_snapshot_to_dict(snap_p, n),
                 "serial_eta_s": serial_eta,
                 "parallel_eta_s": parallel_eta,
                 "speedup_x": speedup,
