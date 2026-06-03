@@ -86,15 +86,24 @@ def _lane_snapshot_to_dict(snap: MetricsSnapshot, n: int) -> dict[str, Any]:
 
 
 def _race_speedup(
-    serial: MetricsSnapshot, parallel: MetricsSnapshot, n: int
+    serial: MetricsSnapshot,
+    parallel: MetricsSnapshot,
+    n: int,
+    *,
+    locked_projection: dict[str, float] | None = None,
 ) -> tuple[float | None, float | None, float | None]:
     """Return (serial_elapsed, parallel_elapsed, speedup_x).
 
     Lane elapsed uses ``_lane_elapsed`` so both the live and the frozen
     case stay accurate. Speedup is computed once the PARALLEL lane has
-    fully drained; if the SERIAL lane is still grinding (N=64), we project
-    its finish time from its observed per-stream rate so the headline
-    Speedup × locks in as soon as parallel is done.
+    fully drained.
+
+    When serial finishes too, the speedup is just serial_wall / parallel_wall.
+    When serial is still running (the N=64 case), we project its finish time
+    from its observed per-stream rate at the moment parallel completed --
+    the moment is captured by the caller and passed in as ``locked_projection``
+    so the headline value stays stable instead of drifting as serial warms
+    up its ref-audio cache and the per-stream rate falls.
     """
     serial_done = serial.completed == n and not serial.any_failed
     parallel_done = parallel.completed == n and not parallel.any_failed
@@ -105,12 +114,22 @@ def _race_speedup(
     speedup: float | None = None
     if serial_done and parallel_done and parallel_elapsed and parallel_elapsed > 0 and serial_elapsed:
         speedup = serial_elapsed / parallel_elapsed
-    elif parallel_done and parallel_elapsed and parallel_elapsed > 0 and serial.completed > 0:
-        # Parallel finished, serial still running — project from observed rate.
-        per_stream_s = (serial.wall_s or 0.0) / max(1, serial.completed)
-        projected_serial = per_stream_s * n
-        speedup = projected_serial / parallel_elapsed
-        serial_elapsed = projected_serial
+    elif parallel_done and parallel_elapsed and parallel_elapsed > 0:
+        if locked_projection is not None:
+            # Freeze projection at the moment parallel finished.
+            wall = locked_projection["serial_wall"]
+            comp = locked_projection["serial_completed"]
+            if comp > 0:
+                per_stream_s = wall / comp
+                projected_serial = per_stream_s * n
+                speedup = projected_serial / parallel_elapsed
+                serial_elapsed = projected_serial
+        elif serial.completed > 0:
+            # Live projection (used until the snapshot the caller locks in).
+            per_stream_s = (serial.wall_s or 0.0) / max(1, serial.completed)
+            projected_serial = per_stream_s * n
+            speedup = projected_serial / parallel_elapsed
+            serial_elapsed = projected_serial
     return serial_elapsed, parallel_elapsed, speedup
 
 
@@ -133,6 +152,9 @@ def build_app(api_base_serial: str, api_base_parallel: str) -> FastAPI:
         "B": {"serial": MetricsAggregator(n=N_PAGE_B), "parallel": MetricsAggregator(n=N_PAGE_B)},
     }
     sizes = {"A": N_PAGE_A, "B": N_PAGE_B}
+    # Per-page projection lock for the speedup x. Populated the first tick
+    # after the parallel lane finishes, cleared on reset/start.
+    speedup_locks: dict[str, dict[str, float] | None] = {"A": None, "B": None}
 
     @app.get("/")
     def index() -> FileResponse:
@@ -152,6 +174,7 @@ def build_app(api_base_serial: str, api_base_parallel: str) -> FastAPI:
         if page not in aggs:
             return {"error": f"unknown page {page!r}"}
         n = sizes[page]
+        speedup_locks[page] = None
         f_serial = worker.submit(
             orch_serial.run_burst(n=n, prompt=DEMO_PROMPT, aggregator=aggs[page]["serial"], concurrency=1)
         )
@@ -168,6 +191,7 @@ def build_app(api_base_serial: str, api_base_parallel: str) -> FastAPI:
             return {"error": f"unknown page {page!r}"}
         aggs[page]["serial"].reset()
         aggs[page]["parallel"].reset()
+        speedup_locks[page] = None
         return {"ok": True, "page": page}
 
     @app.get("/api/race/{page}")
@@ -182,7 +206,20 @@ def build_app(api_base_serial: str, api_base_parallel: str) -> FastAPI:
             now = time.perf_counter()
             snap_s = agg_s.snapshot(now=now)
             snap_p = agg_p.snapshot(now=now)
-            serial_eta, parallel_eta, speedup = _race_speedup(snap_s, snap_p, n)
+            # Latch the projection the first tick parallel completes so the
+            # headline speedup stops drifting as serial warms up.
+            parallel_done = snap_p.completed == n and not snap_p.any_failed
+            if parallel_done and speedup_locks[page] is None:
+                speedup_locks[page] = {
+                    "serial_wall": float(snap_s.wall_s or 0.0),
+                    "serial_completed": float(snap_s.completed),
+                }
+            serial_eta, parallel_eta, speedup = _race_speedup(
+                snap_s,
+                snap_p,
+                n,
+                locked_projection=speedup_locks[page],
+            )
             payload = {
                 "n": n,
                 "serial": _lane_snapshot_to_dict(snap_s, n),

@@ -226,7 +226,16 @@ class MetricsAggregator:
 
         total_audio_s = sum(s.audio_seconds for s in per_stream)
         elapsed = (now - burst_start) if burst_start is not None else 0.0
-        throughput_x = (total_audio_s / elapsed) if elapsed > 0 else 0.0
+        # Once the lane fully drains, freeze the throughput denominator at the
+        # lane's actual completion time (parallel_eta_s, computed below) so it
+        # doesn't decay every tick as wall-time grows.
+        lane_done_locally = completed == n and burst_start is not None and not any_failed
+        if lane_done_locally:
+            last_chunk_max = max((s.last_chunk_s or burst_start) for s in per_stream)
+            lane_wall_s = max(0.0, last_chunk_max - burst_start)
+            throughput_x = (total_audio_s / lane_wall_s) if lane_wall_s > 0 else 0.0
+        else:
+            throughput_x = (total_audio_s / elapsed) if elapsed > 0 else 0.0
 
         ttfb_values = sorted(s.ttfb_s * 1000.0 for s in per_stream if s.ttfb_s is not None)
         rtf_values = sorted(s.final_rtf for s in per_stream if s.final_rtf is not None)
