@@ -199,6 +199,25 @@
   // covers the full width and starts compressing.
   const EXPECTED_AUDIO_S = 7.5;
 
+  // Per-(page,lane,id) latched status. Once a stream reaches "done" or
+  // "error" we never let the UI fall back to a lower-rung status. Without
+  // this latch, an out-of-order SSE snapshot or a fresh connection that
+  // re-reads aggregator state mid-tick can momentarily flip a green bar
+  // back to blue, which the user (rightly) called out as wrong.
+  const latched = {
+    A: { serial: {}, parallel: {} },
+    B: { serial: {}, parallel: {} },
+  };
+  function latchStatus(page, lane, id, incoming) {
+    const prev = latched[page][lane][id];
+    if (prev === 'done' || prev === 'error') return prev;
+    latched[page][lane][id] = incoming;
+    return incoming;
+  }
+  function resetLatch(page) {
+    latched[page] = { serial: {}, parallel: {} };
+  }
+
   // ---- Config ----
   fetch('/api/config').then(r => r.json()).then(cfg => {
     document.getElementById('api-serial').textContent = cfg.api_base_serial;
@@ -327,13 +346,14 @@
     document.getElementById(`elapsed-A-${lane}`).textContent = fmtSec(snap.wall_s);
     for (let i = 0; i < N.A; i++) {
       const stream = snap.streams[i];
-      const progress = stream.status === 'done' ? 1.0 : (stream.audio_seconds || 0) / EXPECTED_AUDIO_S;
-      drawWave(document.getElementById(`canvas-A-${lane}-${i}`), stream.samples, COLORS[stream.status], progress);
+      const status = latchStatus('A', lane, i, stream.status);
+      const progress = status === 'done' ? 1.0 : (stream.audio_seconds || 0) / EXPECTED_AUDIO_S;
+      drawWave(document.getElementById(`canvas-A-${lane}-${i}`), stream.samples, COLORS[status], progress);
       document.getElementById(`ttfb-A-${lane}-${i}`).textContent = stream.ttfb_s != null ? `${Math.round(stream.ttfb_s * 1000)}ms` : '—';
       document.getElementById(`rtf-A-${lane}-${i}`).textContent = stream.final_rtf != null ? `RTF ${stream.final_rtf.toFixed(2)}` : '—';
       const s = document.getElementById(`status-A-${lane}-${i}`);
-      s.textContent = stream.status;
-      s.style.color = COLORS[stream.status];
+      s.textContent = status;
+      s.style.color = COLORS[status];
     }
   }
 
@@ -346,11 +366,12 @@
     document.getElementById(`counter-B-${lane}-3`).textContent = snap.ttfb_p99_ms != null ? Math.round(snap.ttfb_p99_ms) + 'ms' : '—';
     for (let i = 0; i < N.B; i++) {
       const stream = snap.streams[i];
+      const status = latchStatus('B', lane, i, stream.status);
       const audio = stream.audio_seconds || 0;
-      const pct = stream.status === 'done' ? 100 : Math.min(99, Math.max(0, (audio / 7.0) * 100));
+      const pct = status === 'done' ? 100 : Math.min(99, Math.max(0, (audio / 7.0) * 100));
       const bar = document.getElementById(`bar-B-${lane}-${i}`);
       bar.style.height = pct.toFixed(1) + '%';
-      bar.style.background = GRID[stream.status];
+      bar.style.background = GRID[status];
     }
   }
 
@@ -396,12 +417,14 @@
   // ---- Buttons ----
   function wireButtons(page) {
     document.getElementById(`start${page}`).addEventListener('click', async () => {
+      resetLatch(page);
       const r = await fetch(`/api/start/${page}`, { method: 'POST' });
       const j = await r.json();
       document.getElementById(`status${page}`).textContent = `Started N=${j.started} on both lanes…`;
     });
     document.getElementById(`reset${page}`).addEventListener('click', async () => {
       await fetch(`/api/reset/${page}`, { method: 'POST' });
+      resetLatch(page);
       document.getElementById(`status${page}`).textContent = `Reset N=${N[page]}`;
     });
   }

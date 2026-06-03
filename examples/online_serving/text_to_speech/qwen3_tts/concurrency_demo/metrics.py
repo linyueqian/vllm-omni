@@ -213,7 +213,15 @@ class MetricsAggregator:
             n = self._n
 
         completed = sum(1 for s in per_stream if s.status == "done")
-        active = sum(1 for s in per_stream if s.status == "streaming")
+        # "active" = in-flight from the client's perspective: the request has
+        # been dispatched but the stream hasn't reached a terminal state yet.
+        # This includes streams that are queued behind the server's batching
+        # cap (e.g. Stage 1 max_num_seqs) before they've produced their first
+        # byte, so for an N=64 burst against a server with batch cap 10 the
+        # counter still climbs to 64 at peak rather than capping at the cap.
+        active = sum(
+            1 for s in per_stream if s.request_sent_s is not None and s.status not in ("done", "error")
+        )
         any_failed = any(s.status == "error" for s in per_stream)
 
         total_audio_s = sum(s.audio_seconds for s in per_stream)
