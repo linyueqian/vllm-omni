@@ -49,7 +49,7 @@ async def test_run_one_stream_emits_first_chunks_done_events() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_burst_records_reference_and_runs_n_parallel() -> None:
+async def test_run_burst_parallel_completes_all_streams() -> None:
     aggregator = MetricsAggregator(n=4)
     transport = _mock_transport_factory([b"\x00" * 9600])  # ~0.2 s of audio per request
     orchestrator = Orchestrator(
@@ -61,14 +61,31 @@ async def test_run_burst_records_reference_and_runs_n_parallel() -> None:
         n=4,
         prompt="hello world",
         aggregator=aggregator,
+        concurrency=None,  # full parallel
     )
     snap = aggregator.snapshot(now=10.0)
-    # All 4 streams must be done.
     assert snap.completed == 4
-    # serial_eta must be populated (reference ran).
-    assert snap.serial_eta_s is not None
-    assert snap.serial_eta_s > 0
-    # No failures.
+    assert snap.burst_start_s is not None
+    assert snap.any_failed is False
+
+
+@pytest.mark.asyncio
+async def test_run_burst_serial_concurrency_one_completes_all_streams() -> None:
+    aggregator = MetricsAggregator(n=4)
+    transport = _mock_transport_factory([b"\x00" * 9600])
+    orchestrator = Orchestrator(
+        api_base="http://stub",
+        ref_audio_b64="UExBQ0VIT0xERVI=",
+        transport=transport,
+    )
+    await orchestrator.run_burst(
+        n=4,
+        prompt="hello world",
+        aggregator=aggregator,
+        concurrency=1,
+    )
+    snap = aggregator.snapshot(now=10.0)
+    assert snap.completed == 4
     assert snap.any_failed is False
 
 

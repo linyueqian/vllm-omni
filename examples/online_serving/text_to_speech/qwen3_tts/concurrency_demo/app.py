@@ -1,15 +1,20 @@
-"""FastAPI app for the Qwen3-TTS concurrency demo.
+"""FastAPI app for the Qwen3-TTS concurrency race.
 
-Replaces the earlier Gradio prototype: serves one static index.html with
-inline JS+canvas, exposes ``/api/start/{page}`` and ``/api/reset/{page}``
-POST endpoints, and pushes seq-deduped snapshots over an SSE stream at
-``/api/stream/{page}``. The browser drives all rendering, so the page
-sits visually still between bursts.
+Runs two side-by-side lanes against two independent vLLM-Omni servers:
+- SERIAL lane: ``concurrency=1`` against ``--api-base-serial``
+- PARALLEL lane: full ``asyncio.gather`` against ``--api-base-parallel``
+
+A single SSE endpoint ``/api/race/{page}`` pushes one combined snapshot per
+seq-bump so the browser can render both lanes (and the headline Speedup x
+banner) from a single connection. The page sits visually still between
+bursts because the SSE only fires when an aggregator actually changes.
 
 Launch::
 
     python -m examples.online_serving.text_to_speech.qwen3_tts.concurrency_demo.app \\
-        --api-base http://localhost:8000 --port 7860
+        --api-base-serial   http://localhost:8000 \\
+        --api-base-parallel http://localhost:8001 \\
+        --port 7860
 """
 
 from __future__ import annotations
@@ -40,7 +45,7 @@ N_PAGE_B = 64
 STATIC_DIR = Path(__file__).parent / "static"
 
 
-def _snapshot_to_dict(snap: MetricsSnapshot) -> dict[str, Any]:
+def _lane_snapshot_to_dict(snap: MetricsSnapshot) -> dict[str, Any]:
     return {
         "wall_s": snap.wall_s,
         "completed": snap.completed,
@@ -48,9 +53,6 @@ def _snapshot_to_dict(snap: MetricsSnapshot) -> dict[str, Any]:
         "throughput_x": snap.throughput_x,
         "ttfb_p99_ms": snap.ttfb_p99_ms,
         "rtf_p99": snap.rtf_p99,
-        "serial_eta_s": snap.serial_eta_s,
-        "parallel_eta_s": snap.parallel_eta_s,
-        "speedup_x": snap.speedup_x,
         "any_failed": snap.any_failed,
         "streams": [
             {
@@ -66,20 +68,51 @@ def _snapshot_to_dict(snap: MetricsSnapshot) -> dict[str, Any]:
     }
 
 
+def _race_speedup(
+    serial: MetricsSnapshot, parallel: MetricsSnapshot, n: int
+) -> tuple[float | None, float | None, float | None]:
+    """Return (serial_elapsed, parallel_elapsed, speedup_x).
+
+    Each lane's elapsed clock is its observed wall time so far. Speedup is
+    computed once the PARALLEL lane has fully drained (all N done). The
+    SERIAL lane may still be running — its bar keeps growing on the page.
+    """
+    serial_done = serial.completed == n and not serial.any_failed
+    parallel_done = parallel.completed == n and not parallel.any_failed
+
+    serial_elapsed: float | None = serial.wall_s if serial.burst_start_s is not None else None
+    parallel_elapsed: float | None = parallel.wall_s if parallel.burst_start_s is not None else None
+
+    speedup: float | None = None
+    if serial_done and parallel_done and parallel_elapsed and parallel_elapsed > 0:
+        speedup = serial_elapsed / parallel_elapsed if serial_elapsed else None
+    elif parallel_done and parallel_elapsed and parallel_elapsed > 0 and serial.completed > 0:
+        # Parallel finished, serial still running — project from observed rate.
+        per_stream_s = (serial.wall_s or 0.0) / max(1, serial.completed)
+        projected_serial = per_stream_s * n
+        speedup = projected_serial / parallel_elapsed
+        serial_elapsed = projected_serial
+    return serial_elapsed, parallel_elapsed, speedup
+
+
 def _log_burst_exception(future: Future) -> None:
     exc = future.exception()
     if exc is not None:
         logger.exception("Concurrency-demo burst failed", exc_info=exc)
 
 
-def build_app(api_base: str) -> FastAPI:
-    app = FastAPI(title="Qwen3-TTS Concurrency Demo")
+def build_app(api_base_serial: str, api_base_parallel: str) -> FastAPI:
+    app = FastAPI(title="Qwen3-TTS Concurrency Race")
     worker = WorkerLoop()
     ref_b64 = load_ref_audio_b64()
-    orchestrator = Orchestrator(api_base=api_base, ref_audio_b64=ref_b64, ref_text=REF_TEXT)
-    agg_a = MetricsAggregator(n=N_PAGE_A)
-    agg_b = MetricsAggregator(n=N_PAGE_B)
-    aggs = {"A": agg_a, "B": agg_b}
+    orch_serial = Orchestrator(api_base=api_base_serial, ref_audio_b64=ref_b64, ref_text=REF_TEXT)
+    orch_parallel = Orchestrator(api_base=api_base_parallel, ref_audio_b64=ref_b64, ref_text=REF_TEXT)
+
+    # Per page, one aggregator per lane.
+    aggs: dict[str, dict[str, MetricsAggregator]] = {
+        "A": {"serial": MetricsAggregator(n=N_PAGE_A), "parallel": MetricsAggregator(n=N_PAGE_A)},
+        "B": {"serial": MetricsAggregator(n=N_PAGE_B), "parallel": MetricsAggregator(n=N_PAGE_B)},
+    }
     sizes = {"A": N_PAGE_A, "B": N_PAGE_B}
 
     @app.get("/")
@@ -88,45 +121,71 @@ def build_app(api_base: str) -> FastAPI:
 
     @app.get("/api/config")
     def config() -> dict[str, Any]:
-        return {"api_base": api_base, "n_a": N_PAGE_A, "n_b": N_PAGE_B}
+        return {
+            "api_base_serial": api_base_serial,
+            "api_base_parallel": api_base_parallel,
+            "n_a": N_PAGE_A,
+            "n_b": N_PAGE_B,
+        }
 
     @app.post("/api/start/{page}")
     def start(page: str) -> dict[str, Any]:
         if page not in aggs:
             return {"error": f"unknown page {page!r}"}
-        future = worker.submit(orchestrator.run_burst(n=sizes[page], prompt=DEMO_PROMPT, aggregator=aggs[page]))
-        future.add_done_callback(_log_burst_exception)
-        return {"started": sizes[page], "page": page}
+        n = sizes[page]
+        f_serial = worker.submit(
+            orch_serial.run_burst(n=n, prompt=DEMO_PROMPT, aggregator=aggs[page]["serial"], concurrency=1)
+        )
+        f_parallel = worker.submit(
+            orch_parallel.run_burst(n=n, prompt=DEMO_PROMPT, aggregator=aggs[page]["parallel"], concurrency=None)
+        )
+        f_serial.add_done_callback(_log_burst_exception)
+        f_parallel.add_done_callback(_log_burst_exception)
+        return {"started": n, "page": page}
 
     @app.post("/api/reset/{page}")
     def reset(page: str) -> dict[str, Any]:
         if page not in aggs:
             return {"error": f"unknown page {page!r}"}
-        aggs[page].reset()
+        aggs[page]["serial"].reset()
+        aggs[page]["parallel"].reset()
         return {"ok": True, "page": page}
 
-    @app.get("/api/stream/{page}")
-    async def stream(page: str) -> StreamingResponse:
+    @app.get("/api/race/{page}")
+    async def race(page: str) -> StreamingResponse:
         if page not in aggs:
             return StreamingResponse(iter(()), media_type="text/event-stream")
-        agg = aggs[page]
+        agg_s = aggs[page]["serial"]
+        agg_p = aggs[page]["parallel"]
+        n = sizes[page]
+
+        def _build_payload() -> str:
+            now = time.perf_counter()
+            snap_s = agg_s.snapshot(now=now)
+            snap_p = agg_p.snapshot(now=now)
+            serial_eta, parallel_eta, speedup = _race_speedup(snap_s, snap_p, n)
+            payload = {
+                "n": n,
+                "serial": _lane_snapshot_to_dict(snap_s),
+                "parallel": _lane_snapshot_to_dict(snap_p),
+                "serial_eta_s": serial_eta,
+                "parallel_eta_s": parallel_eta,
+                "speedup_x": speedup,
+                "milestones": [m for m in (8, 16, 32, 64) if m <= n and snap_p.completed >= m],
+            }
+            return f"data: {json.dumps(payload)}\n\n"
 
         async def gen():
-            # Send the current state immediately so the client paints on connect.
-            snap = agg.snapshot(now=time.perf_counter())
-            yield f"data: {json.dumps(_snapshot_to_dict(snap))}\n\n"
-            last_seq = agg.seq
+            yield _build_payload()
+            last = (agg_s.seq, agg_p.seq)
             keepalive_at = time.monotonic() + 15.0
             while True:
-                current = agg.seq
-                if current != last_seq:
-                    last_seq = current
-                    snap = agg.snapshot(now=time.perf_counter())
-                    yield f"data: {json.dumps(_snapshot_to_dict(snap))}\n\n"
+                cur = (agg_s.seq, agg_p.seq)
+                if cur != last:
+                    last = cur
+                    yield _build_payload()
                     keepalive_at = time.monotonic() + 15.0
                 elif time.monotonic() >= keepalive_at:
-                    # SSE keepalive comment so intermediaries don't drop the
-                    # idle connection. Browsers ignore comment-only events.
                     yield ": keepalive\n\n"
                     keepalive_at = time.monotonic() + 15.0
                 await asyncio.sleep(0.05)
@@ -138,7 +197,16 @@ def build_app(api_base: str) -> FastAPI:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--api-base", default="http://localhost:8000")
+    p.add_argument(
+        "--api-base-serial",
+        default="http://localhost:8000",
+        help="vLLM-Omni server URL for the serial (concurrency=1) lane",
+    )
+    p.add_argument(
+        "--api-base-parallel",
+        default="http://localhost:8001",
+        help="vLLM-Omni server URL for the parallel (concurrency=N) lane",
+    )
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=7860)
     return p.parse_args()
@@ -147,7 +215,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     args = parse_args()
-    app = build_app(api_base=args.api_base)
+    app = build_app(
+        api_base_serial=args.api_base_serial,
+        api_base_parallel=args.api_base_parallel,
+    )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

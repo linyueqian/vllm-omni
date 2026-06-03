@@ -142,34 +142,32 @@ class Orchestrator:
         aggregator.apply(StreamEvent.done(cfg.stream_id, time.perf_counter()))
         return time.perf_counter() - sent_at
 
-    async def _measure_reference(self, prompt: str, aggregator: MetricsAggregator) -> float:
-        """Run one c=1 stream against the same server BEFORE the parallel burst."""
-        sent_at = time.perf_counter()
-        payload = self._build_payload(prompt)
-        client = self._get_client()
-        async with client.stream(
-            "POST",
-            f"{self._api_base}/v1/audio/speech",
-            json=payload,
-            headers={"Authorization": "Bearer EMPTY"},
-        ) as response:
-            if response.status_code != 200:
-                body = await response.aread()
-                raise RuntimeError(f"Reference c=1 stream failed: HTTP {response.status_code}: {body[:200]!r}")
-            async for _chunk in response.aiter_bytes():
-                pass
-        return time.perf_counter() - sent_at
-
     async def run_burst(
         self,
         n: int,
         prompt: str,
         aggregator: MetricsAggregator,
+        *,
+        concurrency: int | None = None,
     ) -> None:
-        """Run one c=1 reference, then N concurrent streams of the same prompt."""
+        """Run ``n`` streams of ``prompt`` with at most ``concurrency`` in flight.
+
+        ``concurrency=1`` runs the requests serially (one at a time) and is what
+        the SERIAL lane uses to set a real, measurable baseline. ``concurrency``
+        of ``None`` (or ``>= n``) is fully parallel — the PARALLEL lane. The
+        burst always starts a fresh aggregator; mark_burst_start is recorded
+        immediately so wall-clock metrics include any per-stream warm-up.
+        """
         aggregator.reset()
-        t_ref = await self._measure_reference(prompt, aggregator)
-        aggregator.set_reference(t_ref)
         aggregator.mark_burst_start(time.perf_counter())
         configs = [StreamConfig(stream_id=i, text=prompt) for i in range(n)]
-        await asyncio.gather(*(self._run_one(cfg, aggregator) for cfg in configs))
+        if concurrency is None or concurrency >= n:
+            await asyncio.gather(*(self._run_one(cfg, aggregator) for cfg in configs))
+            return
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _gated(cfg: StreamConfig) -> float:
+            async with sem:
+                return await self._run_one(cfg, aggregator)
+
+        await asyncio.gather(*(_gated(cfg) for cfg in configs))
