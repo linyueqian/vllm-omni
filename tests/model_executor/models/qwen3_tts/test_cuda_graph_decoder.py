@@ -74,6 +74,14 @@ class SyntheticDecoder(nn.Module):
         return self.out(x).clamp(min=-1, max=1)
 
 
+class ShortOutputDecoder(SyntheticDecoder):
+    """Decoder variant that returns fewer samples than seq_len * total_upsample."""
+
+    def forward(self, codes):
+        out = super().forward(codes)
+        return out[..., :-5] if out.shape[-1] > 5 else out
+
+
 @pytest.fixture(scope="module")
 def decoder():
     """Create a synthetic decoder on CUDA with fixed weights."""
@@ -226,6 +234,35 @@ def test_chunked_decode_output_survives_later_replay(wrapper):
         _ = wrapper.decode(overwrite_codes)
 
     torch.testing.assert_close(graph_out, expected, atol=0, rtol=0)
+
+
+def test_chunked_decode_preserves_short_chunk_concat_semantics():
+    """Chunked decode must allow shorter-than-nominal chunk outputs.
+
+    Qwen3-Omni non-async startup can hit a decoder path where a chunk returns
+    fewer waveform samples than ``code_len * total_upsample``. The wrapper must
+    preserve the original eager concat behavior instead of copying into exact
+    nominal slices.
+    """
+    torch.manual_seed(123)
+    short_decoder = ShortOutputDecoder().to(DEVICE).eval()
+    short_wrapper = CUDAGraphDecoderWrapper(
+        decoder=short_decoder,
+        capture_sizes=[50],
+        capture_batch_sizes=[1],
+        num_quantizers=NUM_QUANTIZERS,
+        enabled=True,
+    )
+    short_wrapper.warmup(DEVICE)
+    codes = _random_codes(100)
+
+    with torch.no_grad():
+        eager_out = _eager_chunked(short_decoder, codes, chunk_size=50, left_context_size=0)
+        graph_out = short_wrapper.chunked_decode_with_cudagraph(codes, chunk_size=50, left_context_size=0)
+
+    assert graph_out.shape == eager_out.shape
+    assert graph_out.shape[-1] < 100 * TOTAL_UPSAMPLE
+    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
 
 
 def test_batched_chunked_decode_variable_lengths_matches_per_request_eager(decoder, wrapper):
@@ -441,19 +478,29 @@ def test_compute_capture_sizes(kwargs, expected_in, not_expected):
     "batch,channels,seq_len",
     [(2, 64, 1000), (1, 32, 1), (1, 32, 7), (1, 32, 128), (1, 32, 1024), (1, 32, 4096)],
 )
-def test_snakebeta_triton_vs_eager(batch, channels, seq_len):
-    """Fused Triton SnakeBeta kernel must match eager PyTorch output."""
+@pytest.mark.parametrize(
+    "dtype,atol,rtol",
+    [
+        (torch.float32, 1e-5, 1e-5),
+        (torch.bfloat16, 1e-2, 1e-2),
+        (torch.float16, 1e-3, 1e-3),
+    ],
+    ids=["fp32", "bf16", "fp16"],
+)
+def test_snakebeta_triton_vs_eager(batch, channels, seq_len, dtype, atol, rtol):
+    """Fused Triton SnakeBeta kernel must match eager PyTorch output across dtypes."""
     from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 
     if not SnakeBeta._init_triton():
         pytest.skip("Triton not available")
 
     torch.manual_seed(42)
-    snake = SnakeBeta(in_features=channels).to(DEVICE).eval()
-    x = torch.randn(batch, channels, seq_len, device=DEVICE)
+    snake = SnakeBeta(in_features=channels).to(DEVICE).to(dtype).eval()
+    x = torch.randn(batch, channels, seq_len, device=DEVICE, dtype=dtype)
 
     with torch.no_grad():
         eager_out = snake._eager_forward(x)
         triton_out = snake._triton_forward(x)
 
-    torch.testing.assert_close(triton_out, eager_out, atol=1e-5, rtol=1e-5)
+    assert triton_out.dtype == x.dtype
+    torch.testing.assert_close(triton_out, eager_out, atol=atol, rtol=rtol)

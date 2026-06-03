@@ -32,6 +32,14 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     dist_backend: str = "hccl"
 
     @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        super().set_device(device)
+        # Ascend quantized weights are converted from ND to FRACTAL_NZ
+        # after loading. Enable internal format so the NZ storage layout
+        # is preserved for fused NPU kernels.
+        torch.npu.config.allow_internal_format = True
+
+    @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
         return "vllm_omni.platforms.npu.worker.npu_ar_worker.NPUARWorker"
 
@@ -145,3 +153,27 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def get_profiler_cls(cls) -> str:
         return "vllm_omni.platforms.npu.profiler.NPUTorchProfilerWrapper"
+
+    @classmethod
+    def get_graph_wrapper_cls(cls) -> type:
+        from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+
+        return ACLGraphWrapper
+
+    @classmethod
+    def set_forward_context(
+        cls,
+        attn_metadata,
+        vllm_config,
+        *,
+        cudagraph_runtime_mode,
+        batch_descriptor,
+    ):
+        from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+
+        return set_ascend_forward_context(
+            attn_metadata,
+            vllm_config,
+            aclgraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
+        )
