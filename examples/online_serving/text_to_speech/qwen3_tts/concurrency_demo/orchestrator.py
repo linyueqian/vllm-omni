@@ -108,6 +108,13 @@ class Orchestrator:
         aggregator.mark_request_sent(stream_id=cfg.stream_id, ts=sent_at)
         payload = self._build_payload(cfg.text)
         first_seen = False
+        # PCM is int16 little-endian, so we must hand _compute_samples an
+        # even-byte buffer. Under high concurrency the server may emit chunks
+        # at odd byte boundaries; carry the trailing byte forward into the
+        # next chunk instead of silently discarding it, which previously left
+        # some streams with a flat-zero waveform even though audio_seconds
+        # grew correctly. See debug notes in the design spec for context.
+        leftover = b""
         client = self._get_client()
         try:
             async with client.stream(
@@ -128,12 +135,20 @@ class Orchestrator:
                     if not first_seen:
                         aggregator.apply(StreamEvent.first(cfg.stream_id, now))
                         first_seen = True
+                    aligned = leftover + chunk
+                    aligned_len = len(aligned) - (len(aligned) % 2)
+                    if aligned_len:
+                        samples_chunk = _compute_samples(aligned[:aligned_len])
+                        leftover = aligned[aligned_len:]
+                    else:
+                        samples_chunk = ()
+                        leftover = aligned
                     aggregator.apply(
                         StreamEvent.chunk(
                             cfg.stream_id,
                             now,
                             byte_count=len(chunk),
-                            samples=_compute_samples(chunk),
+                            samples=samples_chunk,
                         )
                     )
         except (httpx.HTTPError, asyncio.CancelledError) as exc:
