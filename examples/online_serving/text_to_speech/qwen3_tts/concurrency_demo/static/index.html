@@ -67,8 +67,7 @@
   .row canvas { width: 100%; height: 36px; background: var(--panel); border-radius: 6px; display: block; }
   .row .ttfb, .row .rtf { width: 78px; color: var(--muted); }
   .row .status { width: 64px; font-weight: 600; }
-  .row.audible canvas { box-shadow: 0 0 0 2px var(--brand); }
-  .row.audible::before { content: "▶"; color: var(--brand); margin-right: 4px; }
+  /* Audible-spotlight CSS removed; live audio playback is not wired up yet. */
 
   .counters { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 10px 0; }
   .counter { padding: 8px 10px; background: var(--panel); border-radius: 8px; color: #e5e7eb; font-family: ui-monospace, SF Mono, monospace; }
@@ -192,9 +191,13 @@
   const GRID = { pending: '#1f2937', streaming: '#4A90D9', done: '#22c55e', error: '#ef4444' };
   const N = { A: 8, B: 64 };
   const WAVE_W = 320, WAVE_H = 36;
-  const AUDIBLE_ID = 0;  // parallel-lane stream id chosen as visual spotlight
   const COUNTER_DEF = ['ACTIVE', 'DONE', 'TPUT', 'TTFB p99'];
   const MILESTONES = [8, 16, 32, 64];
+  // Estimated full utterance length used to scale the waveform's x-axis.
+  // Lets the polyline grow left->right as audio arrives, instead of always
+  // rescaling to fill the strip; once audio_seconds >= this, the trace
+  // covers the full width and starts compressing.
+  const EXPECTED_AUDIO_S = 7.5;
 
   // ---- Config ----
   fetch('/api/config').then(r => r.json()).then(cfg => {
@@ -219,8 +222,6 @@
       const row = document.createElement('div');
       row.className = 'row';
       row.id = `row-A-${lane}-${i}`;
-      const isAudible = lane === 'parallel' && i === AUDIBLE_ID;
-      if (isAudible) row.classList.add('audible');
       row.innerHTML =
         `<span class="label">#${i + 1}</span>` +
         `<div class="wave-wrap"><canvas id="canvas-A-${lane}-${i}" width="${WAVE_W}" height="${WAVE_H}"></canvas></div>` +
@@ -261,7 +262,11 @@
   });
 
   // ---- Canvas waveform ----
-  function drawWave(canvas, samples, color) {
+  // Renders a filled min/max envelope. ``progress`` (0..1) controls how far
+  // across the canvas the trace extends, so the line grows left-to-right as
+  // audio arrives instead of rescaling to the full strip each tick. Once
+  // progress >= 1, the envelope fills the whole width.
+  function drawWave(canvas, samples, color, progress) {
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, WAVE_W, WAVE_H);
     ctx.strokeStyle = '#1f2937';
@@ -273,6 +278,8 @@
     if (!samples || samples.length === 0) return;
     const n = samples.length;
     const half = (WAVE_H / 2) - 2;
+    const filled = Math.max(0.02, Math.min(1.0, progress || 1.0));
+    const drawW = WAVE_W * filled;
     let peak = 0;
     for (let i = 0; i < n; i++) {
       const m = Math.max(Math.abs(samples[i][0]), Math.abs(samples[i][1]));
@@ -285,14 +292,14 @@
     ctx.lineJoin = 'round';
     ctx.beginPath();
     for (let i = 0; i < n; i++) {
-      const x = ((i + 0.5) / n) * WAVE_W;
+      const x = ((i + 0.5) / n) * drawW;
       const hi = Math.max(-1, Math.min(1, samples[i][1] * scale));
       const y = WAVE_H / 2 - hi * half;
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     }
     for (let i = n - 1; i >= 0; i--) {
-      const x = ((i + 0.5) / n) * WAVE_W;
+      const x = ((i + 0.5) / n) * drawW;
       const lo = Math.max(-1, Math.min(1, samples[i][0] * scale));
       const y = WAVE_H / 2 - lo * half;
       ctx.lineTo(x, y);
@@ -300,6 +307,15 @@
     ctx.closePath();
     ctx.fill();
     ctx.stroke();
+    // Faint "playhead" tick where the trace currently ends, hinting at live progress.
+    if (filled < 1.0) {
+      ctx.strokeStyle = color + '88';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(drawW, WAVE_H / 2 - half);
+      ctx.lineTo(drawW, WAVE_H / 2 + half);
+      ctx.stroke();
+    }
   }
 
   // ---- Format helpers ----
@@ -311,7 +327,8 @@
     document.getElementById(`elapsed-A-${lane}`).textContent = fmtSec(snap.wall_s);
     for (let i = 0; i < N.A; i++) {
       const stream = snap.streams[i];
-      drawWave(document.getElementById(`canvas-A-${lane}-${i}`), stream.samples, COLORS[stream.status]);
+      const progress = stream.status === 'done' ? 1.0 : (stream.audio_seconds || 0) / EXPECTED_AUDIO_S;
+      drawWave(document.getElementById(`canvas-A-${lane}-${i}`), stream.samples, COLORS[stream.status], progress);
       document.getElementById(`ttfb-A-${lane}-${i}`).textContent = stream.ttfb_s != null ? `${Math.round(stream.ttfb_s * 1000)}ms` : '—';
       document.getElementById(`rtf-A-${lane}-${i}`).textContent = stream.final_rtf != null ? `RTF ${stream.final_rtf.toFixed(2)}` : '—';
       const s = document.getElementById(`status-A-${lane}-${i}`);
