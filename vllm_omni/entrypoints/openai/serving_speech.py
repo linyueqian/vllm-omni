@@ -63,6 +63,7 @@ from vllm_omni.utils.speaker_cache import (
 )
 
 logger = init_logger(__name__)
+_HIGGS_AUDIO_V3_PROFILE_ENABLED = bool(os.getenv("HIGGS_AUDIO_V3_PROFILE"))
 
 # TTS Configuration
 _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
@@ -1927,7 +1928,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         adapter = await self._resolve_higgs_audio_v3_adapter()
 
         if request.ref_audio is None:
+            start_s = time.perf_counter()
             prompt_ids = adapter.build_prompt(request.input)
+            if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
+                elapsed_ms = (time.perf_counter() - start_s) * 1000.0
+                logger.info(
+                    "[HiggsAudioV3Profile] name=serving.higgs_v3.build_plain_prompt count=1 "
+                    "total_ms=%.3f mean_ms=%.3f max_ms=%.3f",
+                    elapsed_ms,
+                    elapsed_ms,
+                    elapsed_ms,
+                )
             return tokens_input(prompt_token_ids=prompt_ids)
 
         # Voice clone
@@ -1936,16 +1947,46 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             encode_reference_audio,
         )
 
+        start_s = time.perf_counter()
         wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
         wav = np.asarray(wav_list, dtype=np.float32)
+        if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
+            elapsed_ms = (time.perf_counter() - start_s) * 1000.0
+            logger.info(
+                "[HiggsAudioV3Profile] name=serving.higgs_v3.resolve_ref_audio count=1 "
+                "total_ms=%.3f mean_ms=%.3f max_ms=%.3f",
+                elapsed_ms,
+                elapsed_ms,
+                elapsed_ms,
+            )
+        start_s = time.perf_counter()
         ref_codes_raw = await asyncio.to_thread(encode_reference_audio, wav, int(sr))
         ref_codes_delayed = apply_delay_pattern(ref_codes_raw)
+        if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
+            elapsed_ms = (time.perf_counter() - start_s) * 1000.0
+            logger.info(
+                "[HiggsAudioV3Profile] name=serving.higgs_v3.encode_ref_audio count=1 "
+                "total_ms=%.3f mean_ms=%.3f max_ms=%.3f",
+                elapsed_ms,
+                elapsed_ms,
+                elapsed_ms,
+            )
 
+        start_s = time.perf_counter()
         prompt_ids = adapter.build_prompt(
             request.input,
             num_ref_tokens=int(ref_codes_delayed.shape[0]),
             reference_text=request.ref_text or None,
         )
+        if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
+            elapsed_ms = (time.perf_counter() - start_s) * 1000.0
+            logger.info(
+                "[HiggsAudioV3Profile] name=serving.higgs_v3.build_clone_prompt count=1 "
+                "total_ms=%.3f mean_ms=%.3f max_ms=%.3f",
+                elapsed_ms,
+                elapsed_ms,
+                elapsed_ms,
+            )
         prompt = tokens_input(prompt_token_ids=prompt_ids)
         import torch
 

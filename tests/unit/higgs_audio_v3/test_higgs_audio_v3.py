@@ -348,10 +348,14 @@ class TestFeedbackMethods:
 
         class FakeTalker:
             _last_audio_codes = torch.tensor([[100, 200, 300, 400, 500, 600, 700, 800]])
+            _last_audio_code_valid = [True]
+            _last_audio_host_staging = None
+            _last_audio_staging_event = None
             _postprocess_cursor = 0
 
         t = FakeTalker()
         t.postprocess = mod.HiggsAudioV3TalkerForConditionalGeneration.postprocess.__get__(t)
+        t._postprocess_impl = mod.HiggsAudioV3TalkerForConditionalGeneration._postprocess_impl.__get__(t)
         result = t.postprocess(torch.zeros(1, 64))
         assert "codes" in result
         assert "audio" in result["codes"]
@@ -363,10 +367,14 @@ class TestFeedbackMethods:
 
         class FakeTalker:
             _last_audio_codes = torch.tensor([[-1, -1, -1, -1, -1, -1, -1, -1]])
+            _last_audio_code_valid = [False]
+            _last_audio_host_staging = None
+            _last_audio_staging_event = None
             _postprocess_cursor = 0
 
         t = FakeTalker()
         t.postprocess = mod.HiggsAudioV3TalkerForConditionalGeneration.postprocess.__get__(t)
+        t._postprocess_impl = mod.HiggsAudioV3TalkerForConditionalGeneration._postprocess_impl.__get__(t)
         result = t.postprocess(torch.zeros(1, 64))
         assert result == {}
 
@@ -378,10 +386,14 @@ class TestFeedbackMethods:
             _last_audio_codes = torch.tensor(
                 [[100, 200, 300, 400, 500, 600, 700, 800], [-1, -1, -1, -1, -1, -1, -1, -1]]
             )
+            _last_audio_code_valid = [True, False]
+            _last_audio_host_staging = None
+            _last_audio_staging_event = None
             _postprocess_cursor = 0
 
         t = FakeTalker()
         t.postprocess = mod.HiggsAudioV3TalkerForConditionalGeneration.postprocess.__get__(t)
+        t._postprocess_impl = mod.HiggsAudioV3TalkerForConditionalGeneration._postprocess_impl.__get__(t)
         r1 = t.postprocess(torch.zeros(1, 64))
         assert "codes" in r1
         r2 = t.postprocess(torch.zeros(1, 64))
@@ -406,6 +418,9 @@ class TestAudioFeedback:
             _audio_continuation_id = 99999  # fake audio token
             _last_step_query_start_loc = None
             _audio_state = {}
+            _decode_active_audio_count = 0
+            _decode_last_codes = torch.zeros(4, 8, dtype=torch.long)
+            _decode_has_codes = torch.zeros(4, dtype=torch.bool)
             multimodal_embedding = embed
             model = type("M", (), {"embed_tokens": lambda self, ids: torch.zeros(ids.shape[0], 16)})()
 
@@ -426,7 +441,11 @@ class TestAudioFeedback:
         """Audio position with state should have its embedding replaced."""
         t = self._make_feedback_talker()
         audio_id = t._audio_continuation_id
-        t._audio_state[1] = {"last_codes": torch.zeros(8, dtype=torch.long)}
+        t._decode_last_codes[1] = torch.zeros(8, dtype=torch.long)
+        t._decode_has_codes[1] = True
+        t._decode_active_audio_count = 1
+        t._is_single_token_decode_step = lambda num_rows: True
+        t._ensure_decode_state_capacity = lambda min_bs, device: None
         input_ids = torch.tensor([1, audio_id, 3])
         hidden = torch.zeros(3, 16)
         result = t._apply_audio_feedback(hidden, input_ids)

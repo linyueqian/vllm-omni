@@ -16,6 +16,7 @@ import importlib
 import inspect
 import os
 import threading
+import time
 from collections import defaultdict, deque
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -44,6 +45,58 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+_HIGGS_AUDIO_V3_PROFILE_ENABLED = bool(os.getenv("HIGGS_AUDIO_V3_PROFILE"))
+_HIGGS_AUDIO_V3_PROFILE_SYNC = os.getenv("HIGGS_AUDIO_V3_PROFILE_SYNC", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+_HIGGS_AUDIO_V3_PROFILE_SUMMARY_EVERY = max(
+    1,
+    int(os.getenv("HIGGS_AUDIO_V3_PROFILE_SUMMARY_EVERY", "50")),
+)
+_HIGGS_AUDIO_V3_PROFILE_STATS: dict[str, list[float]] = {}
+_HIGGS_AUDIO_V3_PROFILE_EVENTS = 0
+
+
+class _HiggsAudioV3ProfileScope:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.start = 0.0
+
+    def __enter__(self) -> _HiggsAudioV3ProfileScope:
+        if _HIGGS_AUDIO_V3_PROFILE_SYNC and torch.cuda.is_available():
+            torch.accelerator.synchronize()
+        self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if _HIGGS_AUDIO_V3_PROFILE_SYNC and torch.cuda.is_available():
+            torch.accelerator.synchronize()
+        _record_higgs_audio_v3_profile(self.name, (time.perf_counter() - self.start) * 1000.0)
+
+
+def _record_higgs_audio_v3_profile(name: str, elapsed_ms: float) -> None:
+    global _HIGGS_AUDIO_V3_PROFILE_EVENTS
+    if not _HIGGS_AUDIO_V3_PROFILE_ENABLED:
+        return
+    stats = _HIGGS_AUDIO_V3_PROFILE_STATS.setdefault(name, [0.0, 0.0, 0.0])
+    stats[0] += 1
+    stats[1] += elapsed_ms
+    stats[2] = max(stats[2], elapsed_ms)
+    _HIGGS_AUDIO_V3_PROFILE_EVENTS += 1
+    if _HIGGS_AUDIO_V3_PROFILE_EVENTS % _HIGGS_AUDIO_V3_PROFILE_SUMMARY_EVERY != 0:
+        return
+    for stat_name, (count, total_ms, max_ms) in sorted(_HIGGS_AUDIO_V3_PROFILE_STATS.items()):
+        logger.info(
+            "[HiggsAudioV3Profile] name=%s count=%d total_ms=%.3f mean_ms=%.3f max_ms=%.3f",
+            stat_name,
+            int(count),
+            total_ms,
+            total_ms / max(count, 1),
+            max_ms,
+        )
 
 
 def should_accumulate_full_payload_output(model_config, custom_process_func) -> bool:
@@ -560,10 +613,17 @@ class OmniConnectorModelRunnerMixin:
     ) -> Any:
         """Receive one ordinary non-KV stage payload on the local leader rank only."""
         tp_group = self._get_local_tp_group()
+        scope_name = f"connector.stage{self._stage_id}.get"
         if tp_group is None or getattr(tp_group, "world_size", 1) <= 1:
+            if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
+                with _HiggsAudioV3ProfileScope(scope_name):
+                    return connector.get(from_stage, to_stage, connector_get_key)
             return connector.get(from_stage, to_stage, connector_get_key)
         if not self.is_data_transfer_rank():
             return None
+        if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
+            with _HiggsAudioV3ProfileScope(scope_name):
+                return connector.get(from_stage, to_stage, connector_get_key)
         return connector.get(from_stage, to_stage, connector_get_key)
 
     def _recv_full_payload_result(
@@ -702,18 +762,35 @@ class OmniConnectorModelRunnerMixin:
             tp_group is None or getattr(tp_group, "world_size", 1) <= 1
         ) and not self._full_payload_pending_broadcast_req_ids:
             return None
-        with self._lock:
-            results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
-        results = self._broadcast_tp_payload_packet(results)
+        if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
+            with _HiggsAudioV3ProfileScope(f"connector.stage{self._stage_id}.collect_full_payload"):
+                with self._lock:
+                    results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
+            with _HiggsAudioV3ProfileScope(f"connector.stage{self._stage_id}.broadcast_full_payload"):
+                results = self._broadcast_tp_payload_packet(results)
+        else:
+            with self._lock:
+                results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
+            results = self._broadcast_tp_payload_packet(results)
         if not results:
             return None
-        with self._lock:
-            self._stage_recv_req_ids.update(results.keys())
-            for req_id in results:
-                self._pending_load_reqs.pop(req_id, None)
-            self._apply_staged_payloads_locked(results)
-            for req_id, payload in results.items():
-                self._local_request_metadata[req_id] = self._extract_scheduling_metadata(payload)
+        if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
+            with _HiggsAudioV3ProfileScope(f"connector.stage{self._stage_id}.apply_full_payload"):
+                with self._lock:
+                    self._stage_recv_req_ids.update(results.keys())
+                    for req_id in results:
+                        self._pending_load_reqs.pop(req_id, None)
+                    self._apply_staged_payloads_locked(results)
+                    for req_id, payload in results.items():
+                        self._local_request_metadata[req_id] = self._extract_scheduling_metadata(payload)
+        else:
+            with self._lock:
+                self._stage_recv_req_ids.update(results.keys())
+                for req_id in results:
+                    self._pending_load_reqs.pop(req_id, None)
+                self._apply_staged_payloads_locked(results)
+                for req_id, payload in results.items():
+                    self._local_request_metadata[req_id] = self._extract_scheduling_metadata(payload)
         logger.info(
             "[Stage-%s] recv_full_payload_inputs: consumed %s reqs: %s, stage_recv_req_ids now=%s",
             self._stage_id,
@@ -929,7 +1006,11 @@ class OmniConnectorModelRunnerMixin:
         for req_id in finished_req_ids:
             entry = self._pending_full_payload_send.pop(req_id, None)
             if entry is not None:
-                to_send[req_id] = self._materialize_full_payload_entry(entry)
+                if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
+                    with _HiggsAudioV3ProfileScope(f"connector.stage{self._stage_id}.materialize_full_payload"):
+                        to_send[req_id] = self._materialize_full_payload_entry(entry)
+                else:
+                    to_send[req_id] = self._materialize_full_payload_entry(entry)
         logger.info("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
         if to_send:
             self.send_full_payload_outputs(scheduler_output=None, outputs=to_send)
@@ -969,11 +1050,19 @@ class OmniConnectorModelRunnerMixin:
 
             payload = raw_output
             if self._custom_process_func is not None:
-                payload = self._build_custom_process_payload(
-                    request_id=req_id,
-                    request=request,
-                    pooling_output=raw_output,
-                )
+                if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
+                    with _HiggsAudioV3ProfileScope(f"connector.stage{self._stage_id}.build_send_payload"):
+                        payload = self._build_custom_process_payload(
+                            request_id=req_id,
+                            request=request,
+                            pooling_output=raw_output,
+                        )
+                else:
+                    payload = self._build_custom_process_payload(
+                        request_id=req_id,
+                        request=request,
+                        pooling_output=raw_output,
+                    )
                 if payload is None:
                     continue
             if payload is None:
@@ -1853,15 +1942,27 @@ class OmniConnectorModelRunnerMixin:
                 engine_inputs = payload_data.get("engine_inputs", payload_data)
             else:
                 engine_inputs = payload_data
-            with self._lock:
-                self._local_stage_payload_cache[req_id] = self._snapshot_payload(engine_inputs)
-                # Publish full-payload readiness only after the aligned TP broadcast
-                # path in recv_full_payload_inputs() has materialized the payload on all
-                # local ranks. Publishing metadata / stage_recv from the background recv
-                # thread can let the scheduler observe a request before the payload is
-                # actually visible to the model thread.
-                self._full_payload_pending_broadcast_req_ids.add(req_id)
-                self._pending_load_reqs.pop(req_id, None)
+            if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
+                with _HiggsAudioV3ProfileScope(f"connector.stage{self._stage_id}.stage_full_payload_cache"):
+                    with self._lock:
+                        self._local_stage_payload_cache[req_id] = self._snapshot_payload(engine_inputs)
+                        # Publish full-payload readiness only after the aligned TP broadcast
+                        # path in recv_full_payload_inputs() has materialized the payload on all
+                        # local ranks. Publishing metadata / stage_recv from the background recv
+                        # thread can let the scheduler observe a request before the payload is
+                        # actually visible to the model thread.
+                        self._full_payload_pending_broadcast_req_ids.add(req_id)
+                        self._pending_load_reqs.pop(req_id, None)
+            else:
+                with self._lock:
+                    self._local_stage_payload_cache[req_id] = self._snapshot_payload(engine_inputs)
+                    # Publish full-payload readiness only after the aligned TP broadcast
+                    # path in recv_full_payload_inputs() has materialized the payload on all
+                    # local ranks. Publishing metadata / stage_recv from the background recv
+                    # thread can let the scheduler observe a request before the payload is
+                    # actually visible to the model thread.
+                    self._full_payload_pending_broadcast_req_ids.add(req_id)
+                    self._pending_load_reqs.pop(req_id, None)
             logger.info(
                 "[Stage-%s] full_payload recv complete: req=%s key=%s payload_type=%s",
                 self._stage_id,
@@ -1961,19 +2062,36 @@ class OmniConnectorModelRunnerMixin:
         request_id = task.get("request_id")
         payload_data = task.get("data")
         if payload_data is None and task.get("request") is not None:
-            payload_data = self._build_custom_process_payload(
-                request_id=request_id,
-                request=task.get("request"),
-                pooling_output=task.get("pooling_output"),
-            )
+            if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
+                with _HiggsAudioV3ProfileScope(f"connector.stage{self._stage_id}.build_send_payload"):
+                    payload_data = self._build_custom_process_payload(
+                        request_id=request_id,
+                        request=task.get("request"),
+                        pooling_output=task.get("pooling_output"),
+                    )
+            else:
+                payload_data = self._build_custom_process_payload(
+                    request_id=request_id,
+                    request=task.get("request"),
+                    pooling_output=task.get("pooling_output"),
+                )
         put_key = task.get("put_key")
 
-        success, _size, _metadata = connector.put(
-            from_stage=str(task["stage_id"]),
-            to_stage=str(task["next_stage_id"]),
-            put_key=put_key,
-            data=payload_data,
-        )
+        if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
+            with _HiggsAudioV3ProfileScope(f"connector.stage{self._stage_id}.put"):
+                success, _size, _metadata = connector.put(
+                    from_stage=str(task["stage_id"]),
+                    to_stage=str(task["next_stage_id"]),
+                    put_key=put_key,
+                    data=payload_data,
+                )
+        else:
+            success, _size, _metadata = connector.put(
+                from_stage=str(task["stage_id"]),
+                to_stage=str(task["next_stage_id"]),
+                put_key=put_key,
+                data=payload_data,
+            )
         logger.info(
             "[Stage-%s] _send_single_request: put_key=%s success=%s size=%s",
             task["stage_id"],

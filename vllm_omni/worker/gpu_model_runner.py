@@ -1290,6 +1290,12 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             traceback.print_exc()
 
+        try:
+            num_reqs = len(self.input_batch.req_ids)
+            model_kwargs_extra["omni_query_start_loc"] = self.query_start_loc.gpu[: num_reqs + 1]
+        except Exception as e:
+            logger.debug("[OMNI DEBUG] Failed to attach query_start_loc: %s", e)
+
         if getattr(self.model_config, "has_sampling_extra_args", False):
             extra_args_list: list[dict] = []
             for req_id in self.input_batch.req_ids:
