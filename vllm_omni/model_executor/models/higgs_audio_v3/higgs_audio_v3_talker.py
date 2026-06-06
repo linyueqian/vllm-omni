@@ -1205,10 +1205,12 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         if fast_fallback_reason == "disabled" and not _FAST_AUDIO_CPU_METADATA_FALLBACK:
             use_gpu_audio_mode = True
 
+        steady_direct_audio_batch = False
         if fast_fallback_reason is None:
             direct_audio_batch = decode_only and (self._fast_audio_direct_rows == num_rows or assume_full_audio_decode)
 
             if direct_audio_batch:
+                steady_direct_audio_batch = not assume_full_audio_decode
                 self._fast_audio_direct_rows = num_rows
                 audio_tokens = torch.full((num_rows,), int(audio_id), dtype=torch.int32, device=hidden.device)
                 if self._eos_token_id is not None:
@@ -1307,33 +1309,34 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 self._decode_eoc_countdown[:num_rows],
             )
 
-            boc_frames = self._get_boc_frames(num_rows, hidden.device)
-            seed_mask_2d = seed_mask_1d.unsqueeze(1)
-            self._decode_last_codes[:num_rows] = torch.where(
-                seed_mask_2d,
-                boc_frames,
-                self._decode_last_codes[:num_rows],
-            )
-            self._decode_has_codes[:num_rows] = torch.where(
-                seed_mask_1d,
-                torch.ones_like(self._decode_has_codes[:num_rows]),
-                self._decode_has_codes[:num_rows],
-            )
-            self._decode_delay_count[:num_rows] = torch.where(
-                seed_mask_1d,
-                torch.zeros_like(self._decode_delay_count[:num_rows]),
-                self._decode_delay_count[:num_rows],
-            )
-            self._decode_eoc_countdown[:num_rows] = torch.where(
-                seed_mask_1d,
-                torch.full_like(self._decode_eoc_countdown[:num_rows], -1),
-                self._decode_eoc_countdown[:num_rows],
-            )
-            self._decode_generation_done[:num_rows] = torch.where(
-                seed_mask_1d,
-                torch.zeros_like(self._decode_generation_done[:num_rows]),
-                self._decode_generation_done[:num_rows],
-            )
+            if not steady_direct_audio_batch:
+                boc_frames = self._get_boc_frames(num_rows, hidden.device)
+                seed_mask_2d = seed_mask_1d.unsqueeze(1)
+                self._decode_last_codes[:num_rows] = torch.where(
+                    seed_mask_2d,
+                    boc_frames,
+                    self._decode_last_codes[:num_rows],
+                )
+                self._decode_has_codes[:num_rows] = torch.where(
+                    seed_mask_1d,
+                    torch.ones_like(self._decode_has_codes[:num_rows]),
+                    self._decode_has_codes[:num_rows],
+                )
+                self._decode_delay_count[:num_rows] = torch.where(
+                    seed_mask_1d,
+                    torch.zeros_like(self._decode_delay_count[:num_rows]),
+                    self._decode_delay_count[:num_rows],
+                )
+                self._decode_eoc_countdown[:num_rows] = torch.where(
+                    seed_mask_1d,
+                    torch.full_like(self._decode_eoc_countdown[:num_rows], -1),
+                    self._decode_eoc_countdown[:num_rows],
+                )
+                self._decode_generation_done[:num_rows] = torch.where(
+                    seed_mask_1d,
+                    torch.zeros_like(self._decode_generation_done[:num_rows]),
+                    self._decode_generation_done[:num_rows],
+                )
             self._decode_active_audio_count = max(self._decode_active_audio_count, num_rows)
 
         if fast_fallback_reason is not None and audio_row_tensor.numel() == 0:
@@ -1839,13 +1842,13 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             self._decode_has_codes.index_copy_(0, rows, write_has_codes)
 
         codes_full = self._get_audio_codes_buffer(num_rows, device)
-        codes_full.fill_(-1)
         staged_codes = torch.where(update_mask.unsqueeze(1), output_codes, torch.full_like(output_codes, -1))
         if all_rows:
             codes_full[:num_audio_rows].copy_(staged_codes)
             valid_full = valid
             done_full = done
         else:
+            codes_full.fill_(-1)
             codes_full.index_copy_(0, rows, staged_codes)
             valid_full = torch.zeros(num_rows, dtype=torch.bool, device=device)
             done_full = torch.zeros(num_rows, dtype=torch.bool, device=device)
