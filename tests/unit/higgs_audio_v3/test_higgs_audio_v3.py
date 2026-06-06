@@ -6,6 +6,10 @@ AC-5 (delay pattern), AC-7 (stage processor), and AC-10 (registry)
 without requiring the actual checkpoint or GPU.
 """
 
+import asyncio
+import time
+from collections import OrderedDict
+
 import pytest
 import torch
 
@@ -1020,3 +1024,91 @@ class TestPromptBuilder:
         # Should not contain ref_audio or ref_text token IDs
         assert 151703 not in ids  # <|ref_audio|>
         assert 151704 not in ids  # <|ref_text|>
+
+
+class TestVoiceCloneReferenceCache:
+    def test_audio_tokenizer_dir_env_accepts_parent_or_subdir(self, tmp_path, monkeypatch):
+        from vllm_omni.model_executor.models.higgs_audio_v2 import higgs_audio_v2_tokenizer as tok
+
+        parent = tmp_path / "OmniVoice"
+        subdir = parent / "audio_tokenizer"
+        subdir.mkdir(parents=True)
+        (subdir / "config.json").write_text("{}", encoding="utf-8")
+
+        monkeypatch.setenv("HIGGS_AUDIO_TOKENIZER_PATH", str(parent))
+        assert tok._resolve_audio_tokenizer_dir() == str(subdir)
+
+        monkeypatch.setenv("HIGGS_AUDIO_TOKENIZER_PATH", str(subdir))
+        assert tok._resolve_audio_tokenizer_dir() == str(subdir)
+
+    def test_higgs_v3_ref_code_cache_returns_clone(self):
+        from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+
+        serving = object.__new__(OmniOpenAIServingSpeech)
+        serving._higgs_audio_v3_ref_code_cache = OrderedDict()
+        serving._higgs_audio_v3_ref_code_cache_bytes = 0
+        serving._higgs_audio_v3_ref_code_inflight = {}
+
+        codes = torch.arange(16, dtype=torch.long).reshape(2, 8)
+        serving._put_higgs_audio_v3_ref_codes("ref-a", codes)
+
+        cached = serving._get_higgs_audio_v3_ref_codes("ref-a")
+        assert cached is not None
+        cached.fill_(0)
+
+        cached_again = serving._get_higgs_audio_v3_ref_codes("ref-a")
+        assert cached_again is not None
+        assert torch.equal(cached_again, codes)
+
+    def test_higgs_v3_ref_code_inflight_deduplicates_concurrent_encode(self):
+        from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+
+        serving = object.__new__(OmniOpenAIServingSpeech)
+        serving._higgs_audio_v3_ref_code_cache = OrderedDict()
+        serving._higgs_audio_v3_ref_code_cache_bytes = 0
+        serving._higgs_audio_v3_ref_code_inflight = {}
+        calls = 0
+
+        def encode_reference_audio(_wav, _sr):
+            nonlocal calls
+            calls += 1
+            time.sleep(0.05)
+            return torch.arange(16, dtype=torch.long).reshape(2, 8)
+
+        def apply_delay_pattern(codes):
+            return codes + 1
+
+        async def run():
+            return await asyncio.gather(
+                *[
+                    serving._resolve_higgs_audio_v3_ref_codes(
+                        "ref-a",
+                        object(),
+                        24000,
+                        encode_reference_audio,
+                        apply_delay_pattern,
+                    )
+                    for _ in range(3)
+                ]
+            )
+
+        results = asyncio.run(run())
+        assert calls == 1
+        assert sum(int(inflight_wait) for _, _, inflight_wait in results) == 2
+        for codes, cache_hit, _ in results:
+            assert cache_hit is False
+            assert torch.equal(codes, torch.arange(16, dtype=torch.long).reshape(2, 8) + 1)
+
+        cached, cache_hit, inflight_wait = asyncio.run(
+            serving._resolve_higgs_audio_v3_ref_codes(
+                "ref-a",
+                object(),
+                24000,
+                encode_reference_audio,
+                apply_delay_pattern,
+            )
+        )
+        assert calls == 1
+        assert cache_hit is True
+        assert inflight_wait is False
+        assert torch.equal(cached, torch.arange(16, dtype=torch.long).reshape(2, 8) + 1)

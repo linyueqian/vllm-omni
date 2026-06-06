@@ -120,6 +120,10 @@ _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 256
 _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES = 256 * 1024 * 1024
+_HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_ENTRIES = int(os.getenv("HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_ENTRIES", "256") or 256)
+_HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_BYTES = int(
+    os.getenv("HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_BYTES", str(64 * 1024 * 1024)) or str(64 * 1024 * 1024)
+)
 _QWEN3_TTS_REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MIN = 1
@@ -284,6 +288,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._ref_audio_resolve_cache_max_bytes = _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES
         self._ref_audio_model_artifact_ready: set[str] = set()
         self._request_ref_audio_artifact_keys: dict[str, str] = {}
+        self._higgs_audio_v3_ref_code_cache: OrderedDict[str, tuple[torch.Tensor, int]] = OrderedDict()
+        self._higgs_audio_v3_ref_code_cache_bytes = 0
+        self._higgs_audio_v3_ref_code_inflight: dict[str, asyncio.Task[torch.Tensor]] = {}
         self._speaker_cache = get_speaker_cache()
         self._last_upload_ts = 0
         self._upload_lock = asyncio.Lock()
@@ -1949,6 +1956,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         start_s = time.perf_counter()
         wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+        artifact_key = self._get_resolved_ref_audio_artifact_key(request.ref_audio)
         wav = np.asarray(wav_list, dtype=np.float32)
         if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
             elapsed_ms = (time.perf_counter() - start_s) * 1000.0
@@ -1960,16 +1968,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 elapsed_ms,
             )
         start_s = time.perf_counter()
-        ref_codes_raw = await asyncio.to_thread(encode_reference_audio, wav, int(sr))
-        ref_codes_delayed = apply_delay_pattern(ref_codes_raw)
+        ref_codes_delayed, cache_hit, inflight_wait = await self._resolve_higgs_audio_v3_ref_codes(
+            artifact_key,
+            wav,
+            int(sr),
+            encode_reference_audio,
+            apply_delay_pattern,
+        )
         if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
             elapsed_ms = (time.perf_counter() - start_s) * 1000.0
             logger.info(
                 "[HiggsAudioV3Profile] name=serving.higgs_v3.encode_ref_audio count=1 "
-                "total_ms=%.3f mean_ms=%.3f max_ms=%.3f",
+                "total_ms=%.3f mean_ms=%.3f max_ms=%.3f cache_hit=%d inflight_wait=%d",
                 elapsed_ms,
                 elapsed_ms,
                 elapsed_ms,
+                int(cache_hit),
+                int(inflight_wait),
             )
 
         start_s = time.perf_counter()
@@ -1995,6 +2010,72 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "audio_input_ids_mask": torch.ones(ref_codes_delayed.shape[0], dtype=torch.bool),
         }
         return prompt
+
+    async def _resolve_higgs_audio_v3_ref_codes(
+        self,
+        artifact_key: str | None,
+        wav: np.ndarray,
+        sr: int,
+        encode_reference_audio,
+        apply_delay_pattern,
+    ) -> tuple[torch.Tensor, bool, bool]:
+        ref_codes_delayed = self._get_higgs_audio_v3_ref_codes(artifact_key)
+        if ref_codes_delayed is not None:
+            return ref_codes_delayed, True, False
+        if not artifact_key:
+            ref_codes_raw = await asyncio.to_thread(encode_reference_audio, wav, sr)
+            return apply_delay_pattern(ref_codes_raw), False, False
+
+        task = self._higgs_audio_v3_ref_code_inflight.get(artifact_key)
+        if task is not None:
+            return (await task).clone(), False, True
+
+        async def _encode_and_cache() -> torch.Tensor:
+            ref_codes_raw = await asyncio.to_thread(encode_reference_audio, wav, sr)
+            delayed = apply_delay_pattern(ref_codes_raw)
+            self._put_higgs_audio_v3_ref_codes(artifact_key, delayed)
+            cached = self._get_higgs_audio_v3_ref_codes(artifact_key)
+            return cached if cached is not None else delayed.detach().to("cpu", dtype=torch.long).contiguous()
+
+        task = asyncio.create_task(_encode_and_cache())
+        self._higgs_audio_v3_ref_code_inflight[artifact_key] = task
+        try:
+            return (await task).clone(), False, False
+        finally:
+            if self._higgs_audio_v3_ref_code_inflight.get(artifact_key) is task:
+                self._higgs_audio_v3_ref_code_inflight.pop(artifact_key, None)
+
+    def _get_higgs_audio_v3_ref_codes(self, artifact_key: str | None) -> torch.Tensor | None:
+        if not artifact_key:
+            return None
+        cached = self._higgs_audio_v3_ref_code_cache.get(artifact_key)
+        if cached is None:
+            return None
+        self._higgs_audio_v3_ref_code_cache.move_to_end(artifact_key)
+        return cached[0].clone()
+
+    def _put_higgs_audio_v3_ref_codes(self, artifact_key: str, codes: torch.Tensor) -> None:
+        if (
+            _HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_ENTRIES <= 0
+            or _HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_BYTES <= 0
+            or not artifact_key
+        ):
+            return
+        cached_codes = codes.detach().to("cpu", dtype=torch.long).contiguous()
+        size = int(cached_codes.numel() * cached_codes.element_size())
+        if size > _HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_BYTES:
+            return
+        previous = self._higgs_audio_v3_ref_code_cache.pop(artifact_key, None)
+        if previous is not None:
+            self._higgs_audio_v3_ref_code_cache_bytes -= previous[1]
+        self._higgs_audio_v3_ref_code_cache[artifact_key] = (cached_codes, size)
+        self._higgs_audio_v3_ref_code_cache_bytes += size
+        while len(self._higgs_audio_v3_ref_code_cache) > _HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_ENTRIES:
+            _, (_, old_size) = self._higgs_audio_v3_ref_code_cache.popitem(last=False)
+            self._higgs_audio_v3_ref_code_cache_bytes -= old_size
+        while self._higgs_audio_v3_ref_code_cache_bytes > _HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_BYTES:
+            _, (_, old_size) = self._higgs_audio_v3_ref_code_cache.popitem(last=False)
+            self._higgs_audio_v3_ref_code_cache_bytes -= old_size
 
     async def _resolve_higgs_audio_v3_adapter(self):
         """Lazy-load the tokenizer adapter for higgs_audio_v3."""
