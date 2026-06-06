@@ -339,8 +339,10 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         max_bs = 64  # safe upper bound; will grow if needed
         self._decode_last_codes = torch.zeros(max_bs, self.num_codebooks, dtype=torch.long)
         self._decode_has_codes = torch.zeros(max_bs, dtype=torch.bool)
-        self._decode_delay_count = torch.zeros(max_bs, dtype=torch.int32)
-        self._decode_eoc_countdown = torch.full((max_bs,), -1, dtype=torch.int32)
+        # Keep delay/ramp counters as int64 to match arange/codebook-index
+        # arithmetic in the decode hot path without per-step dtype casts.
+        self._decode_delay_count = torch.zeros(max_bs, dtype=torch.long)
+        self._decode_eoc_countdown = torch.full((max_bs,), -1, dtype=torch.long)
         self._decode_generation_done = torch.zeros(max_bs, dtype=torch.bool)
         self._td_step: int = 0
         self._td_eoc_detected: int = 0
@@ -1027,11 +1029,11 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         new_has_codes[:cur_rows].copy_(self._decode_has_codes)
         self._decode_has_codes = new_has_codes
 
-        new_delay_count = torch.zeros(new_size, dtype=torch.int32, device=state_device)
+        new_delay_count = torch.zeros(new_size, dtype=torch.long, device=state_device)
         new_delay_count[:cur_rows].copy_(self._decode_delay_count)
         self._decode_delay_count = new_delay_count
 
-        new_eoc_countdown = torch.full((new_size,), -1, dtype=torch.int32, device=state_device)
+        new_eoc_countdown = torch.full((new_size,), -1, dtype=torch.long, device=state_device)
         new_eoc_countdown[:cur_rows].copy_(self._decode_eoc_countdown)
         self._decode_eoc_countdown = new_eoc_countdown
 
@@ -1665,11 +1667,15 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         num_codebooks = self.num_codebooks
         q = self._get_codebook_indices(cb_logits.device)
         if all_rows:
-            delay = self._decode_delay_count[:num_audio_rows].to(torch.long)
-            rem = self._decode_eoc_countdown[:num_audio_rows].to(torch.long)
+            delay = self._decode_delay_count[:num_audio_rows]
+            rem = self._decode_eoc_countdown[:num_audio_rows]
         else:
-            delay = self._decode_delay_count.index_select(0, rows).to(torch.long)
-            rem = self._decode_eoc_countdown.index_select(0, rows).to(torch.long)
+            delay = self._decode_delay_count.index_select(0, rows)
+            rem = self._decode_eoc_countdown.index_select(0, rows)
+        if delay.dtype != torch.long:
+            delay = delay.to(torch.long)
+        if rem.dtype != torch.long:
+            rem = rem.to(torch.long)
         ramp = rem >= 0
 
         bos = BOC_ID
@@ -1742,17 +1748,21 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         q = self._get_codebook_indices(device)
 
         if all_rows:
-            prev_delay = self._decode_delay_count[:num_audio_rows].to(torch.long)
-            prev_rem = self._decode_eoc_countdown[:num_audio_rows].to(torch.long)
+            prev_delay = self._decode_delay_count[:num_audio_rows]
+            prev_rem = self._decode_eoc_countdown[:num_audio_rows]
             prev_done = self._decode_generation_done[:num_audio_rows].to(torch.bool)
             prev_has_codes = self._decode_has_codes[:num_audio_rows].to(torch.bool)
             prev_codes = self._decode_last_codes[:num_audio_rows]
         else:
-            prev_delay = self._decode_delay_count.index_select(0, rows).to(torch.long)
-            prev_rem = self._decode_eoc_countdown.index_select(0, rows).to(torch.long)
+            prev_delay = self._decode_delay_count.index_select(0, rows)
+            prev_rem = self._decode_eoc_countdown.index_select(0, rows)
             prev_done = self._decode_generation_done.index_select(0, rows).to(torch.bool)
             prev_has_codes = self._decode_has_codes.index_select(0, rows).to(torch.bool)
             prev_codes = self._decode_last_codes.index_select(0, rows)
+        if prev_delay.dtype != torch.long:
+            prev_delay = prev_delay.to(torch.long)
+        if prev_rem.dtype != torch.long:
+            prev_rem = prev_rem.to(torch.long)
         if code_row_mask is None:
             update_mask = torch.ones_like(prev_has_codes)
         elif all_rows:
@@ -1842,36 +1852,38 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         write_has_codes = torch.where(update_mask, valid, prev_has_codes)
 
         if all_rows:
-            self._decode_delay_count[:num_audio_rows].copy_(write_delay.to(torch.int32))
-            self._decode_eoc_countdown[:num_audio_rows].copy_(write_rem.to(torch.int32))
+            self._decode_delay_count[:num_audio_rows].copy_(write_delay.to(dtype=self._decode_delay_count.dtype))
+            self._decode_eoc_countdown[:num_audio_rows].copy_(write_rem.to(dtype=self._decode_eoc_countdown.dtype))
             self._decode_generation_done[:num_audio_rows].copy_(write_done)
             self._decode_last_codes[:num_audio_rows].copy_(write_codes)
             self._decode_has_codes[:num_audio_rows].copy_(write_has_codes)
         else:
-            self._decode_delay_count.index_copy_(0, rows, write_delay.to(torch.int32))
-            self._decode_eoc_countdown.index_copy_(0, rows, write_rem.to(torch.int32))
+            self._decode_delay_count.index_copy_(0, rows, write_delay.to(dtype=self._decode_delay_count.dtype))
+            self._decode_eoc_countdown.index_copy_(0, rows, write_rem.to(dtype=self._decode_eoc_countdown.dtype))
             self._decode_generation_done.index_copy_(0, rows, write_done)
             self._decode_last_codes.index_copy_(0, rows, write_codes)
             self._decode_has_codes.index_copy_(0, rows, write_has_codes)
 
-        codes_full = self._get_audio_codes_buffer(num_rows, device)
-        codes_full.fill_(-1)
         staged_codes = torch.where(update_mask.unsqueeze(1), output_codes, torch.full_like(output_codes, -1))
         if all_rows:
-            codes_full[:num_audio_rows].copy_(staged_codes)
             valid_full = valid
             done_full = done
+            staging = self._get_audio_gpu_staging_buffer(num_rows, device)
+            staging[:, :num_codebooks].copy_(staged_codes.to(torch.int32))
+            staging[:, num_codebooks].copy_(valid_full.to(torch.int32))
+            staging[:, num_codebooks + 1].copy_(done_full.to(torch.int32))
         else:
+            codes_full = self._get_audio_codes_buffer(num_rows, device)
+            codes_full.fill_(-1)
             codes_full.index_copy_(0, rows, staged_codes)
             valid_full = torch.zeros(num_rows, dtype=torch.bool, device=device)
             done_full = torch.zeros(num_rows, dtype=torch.bool, device=device)
             valid_full.index_copy_(0, rows, valid)
             done_full.index_copy_(0, rows, done)
-
-        staging = self._get_audio_gpu_staging_buffer(num_rows, device)
-        staging[:, :num_codebooks].copy_(codes_full.to(torch.int32))
-        staging[:, num_codebooks].copy_(valid_full.to(torch.int32))
-        staging[:, num_codebooks + 1].copy_(done_full.to(torch.int32))
+            staging = self._get_audio_gpu_staging_buffer(num_rows, device)
+            staging[:, :num_codebooks].copy_(codes_full.to(torch.int32))
+            staging[:, num_codebooks].copy_(valid_full.to(torch.int32))
+            staging[:, num_codebooks + 1].copy_(done_full.to(torch.int32))
 
         host = self._get_audio_host_staging_buffer(num_rows)
         host.copy_(staging, non_blocking=True)
@@ -1887,7 +1899,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             self._last_audio_staging_event = None
 
         self._decode_active_audio_count = max(self._decode_active_audio_count, num_rows)
-        self._last_audio_codes = codes_full
+        # Host staging is the authoritative postprocess path. Keeping another
+        # full GPU codes buffer alive adds fill/copy work on the hot path.
+        self._last_audio_codes = None
         self._last_audio_host_staging = host[:num_rows]
         self._last_audio_valid_flags = None
         self._last_audio_done_flags = None

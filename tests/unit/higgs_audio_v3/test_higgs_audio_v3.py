@@ -431,7 +431,8 @@ class TestSamplerMethods:
         assert torch.equal(all_rows._decode_generation_done, sparse._decode_generation_done)
         assert torch.equal(all_rows._decode_last_codes, sparse._decode_last_codes)
         assert torch.equal(all_rows._decode_has_codes, sparse._decode_has_codes)
-        assert torch.equal(all_rows._last_audio_codes, sparse._last_audio_codes)
+        assert all_rows._last_audio_codes is None
+        assert sparse._last_audio_codes is None
         assert torch.equal(all_rows._last_audio_host_staging, sparse._last_audio_host_staging)
 
 
