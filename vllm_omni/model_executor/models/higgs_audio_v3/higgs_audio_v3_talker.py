@@ -120,8 +120,11 @@ class _ProfileScope:
     def __init__(self, name: str):
         self.name = name
         self.start = 0.0
+        self._record_function: Any = None
 
     def __enter__(self) -> None:
+        self._record_function = torch.profiler.record_function(self.name)
+        self._record_function.__enter__()
         if _PROFILE_SYNC and torch.cuda.is_available():
             torch.accelerator.synchronize()
         self.start = time.perf_counter()
@@ -132,6 +135,9 @@ class _ProfileScope:
             torch.accelerator.synchronize()
         elapsed_ms = (time.perf_counter() - self.start) * 1000.0
         _record_profile(self.name, elapsed_ms)
+        if self._record_function is not None:
+            self._record_function.__exit__(exc_type, exc, tb)
+            self._record_function = None
 
 
 def _record_profile(name: str, elapsed_ms: float) -> None:
