@@ -294,6 +294,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._last_audio_host_staging: torch.Tensor | None = None
         self._last_audio_gpu_staging: torch.Tensor | None = None
         self._last_audio_staging_event: torch.cuda.Event | None = None
+        self._last_audio_valid_flags: list[int] | None = None
+        self._last_audio_done_flags: list[int] | None = None
         self._audio_staging_event: torch.cuda.Event | None = None
         self._row_index_cache: dict[tuple[str, int], torch.Tensor] = {}
         self._codebook_index_cache: dict[tuple[str, int], torch.Tensor] = {}
@@ -1559,8 +1561,11 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._postprocess_cursor = cursor + 1
 
         if host_staging is not None:
-            valid_flag = int(host_staging[cursor, self.num_codebooks].item())
-            done_flag = int(host_staging[cursor, self.num_codebooks + 1].item())
+            if self._last_audio_valid_flags is None or self._last_audio_done_flags is None:
+                self._last_audio_valid_flags = host_staging[:num_rows, self.num_codebooks].tolist()
+                self._last_audio_done_flags = host_staging[:num_rows, self.num_codebooks + 1].tolist()
+            valid_flag = int(self._last_audio_valid_flags[cursor])
+            done_flag = int(self._last_audio_done_flags[cursor])
             if valid_flag or done_flag:
                 self._postprocess_audio_active_rows += 1
             if cursor + 1 >= num_rows:
@@ -1878,6 +1883,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._decode_active_audio_count = max(self._decode_active_audio_count, num_rows)
         self._last_audio_codes = codes_full
         self._last_audio_host_staging = host[:num_rows]
+        self._last_audio_valid_flags = None
+        self._last_audio_done_flags = None
         self._last_audio_code_valid = []
         self._postprocess_cursor = 0
         self._postprocess_audio_rows = num_rows
