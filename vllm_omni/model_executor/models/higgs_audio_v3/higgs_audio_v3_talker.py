@@ -75,11 +75,6 @@ _LAYER_CUDAGRAPH_ALLOW_FLASHINFER = os.getenv("HIGGS_AUDIO_V3_LAYER_CUDAGRAPH_AL
     "true",
     "yes",
 }
-_MLP_CUDAGRAPH_ENABLED = os.getenv("HIGGS_AUDIO_V3_MLP_CUDAGRAPH", "").lower() in {
-    "1",
-    "true",
-    "yes",
-}
 _FAST_AUDIO_SAMPLER_ENABLED = os.getenv("HIGGS_AUDIO_V3_FAST_AUDIO_SAMPLER", "1").lower() not in {
     "0",
     "false",
@@ -110,11 +105,6 @@ _FAST_AUDIO_ASSUME_FULL_DECODE = os.getenv("HIGGS_AUDIO_V3_FAST_AUDIO_ASSUME_FUL
     "yes",
 }
 _SKIP_TEXT_LOGITS_ENABLED = os.getenv("HIGGS_AUDIO_V3_SKIP_TEXT_LOGITS", "").lower() in {
-    "1",
-    "true",
-    "yes",
-}
-_UNWRAP_FLASHINFER_API_ENABLED = os.getenv("HIGGS_AUDIO_V3_UNWRAP_FLASHINFER_API", "").lower() in {
     "1",
     "true",
     "yes",
@@ -241,14 +231,13 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        if _UNWRAP_FLASHINFER_API_ENABLED:
-            self._maybe_unwrap_flashinfer_api_wrappers()
-
         hf_config = vllm_config.model_config.hf_config
         if isinstance(hf_config, HiggsAudioV3Config):
             self.config = hf_config
         else:
             self.config = HiggsAudioV3Config(**hf_config.to_dict())
+        if self.config.enable_flashinfer_api_unwrap:
+            self._maybe_unwrap_flashinfer_api_wrappers()
 
         self.vllm_config = vllm_config
         self.num_codebooks = int(self.config.num_codebooks)
@@ -315,6 +304,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._last_audio_staging_event: torch.cuda.Event | None = None
         self._last_audio_valid_flags: list[int] | None = None
         self._last_audio_done_flags: list[int] | None = None
+        self._last_sampled_token_ids_cpu_override: list[list[int]] | None = None
         self._audio_staging_event: torch.cuda.Event | None = None
         self._row_index_cache: dict[tuple[str, int], torch.Tensor] = {}
         self._codebook_index_cache: dict[tuple[str, int], torch.Tensor] = {}
@@ -409,6 +399,20 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 setattr(cls, method_name, original)
                 patched.append(f"{cls.__name__}.{method_name}")
         logger.info("HiggsAudioV3Talker: unwrapped FlashInfer API wrappers: %s", patched)
+
+    def consume_sampled_token_ids_cpu_override(
+        self,
+        sampled_token_ids: torch.Tensor,
+    ) -> list[list[int]] | None:
+        if not self.config.enable_cpu_token_override:
+            return None
+        override = self._last_sampled_token_ids_cpu_override
+        self._last_sampled_token_ids_cpu_override = None
+        if override is None or sampled_token_ids.ndim != 2:
+            return None
+        if int(sampled_token_ids.shape[-1]) != 1 or len(override) != int(sampled_token_ids.shape[0]):
+            return None
+        return override
 
     def _resolve_token_ids(self) -> None:
         """Resolve <|audio|> and eos token IDs.
@@ -531,7 +535,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             graph_out = self._run_qwen3_layers_graph(positions, hidden_states)
             if graph_out is not None:
                 return graph_out
-        if _MLP_CUDAGRAPH_ENABLED and not _PROFILE_ENABLED:
+        if self.config.enable_mlp_cudagraph and not _PROFILE_ENABLED:
             return self._run_qwen3_layers_mlp_graph(positions, hidden_states)
 
         return self._run_qwen3_layers_eager(positions, hidden_states)
@@ -1292,6 +1296,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         and accumulate per-request state.
         """
         self._resolve_token_ids()
+        self._last_sampled_token_ids_cpu_override = None
 
         audio_id = self._audio_continuation_id
 
@@ -1396,6 +1401,13 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                     audio_tokens = torch.where(done_mask, eos_tokens, audio_tokens)
                 sampled = audio_tokens.unsqueeze(-1)
                 sampler_output = SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
+                done_flags = self._last_audio_done_flags
+                eos_id = self._eos_token_id if self._eos_token_id is not None else int(audio_id)
+                self._last_sampled_token_ids_cpu_override = [[int(audio_id)] for _ in range(num_rows)]
+                if done_flags is not None and len(done_flags) >= num_rows:
+                    self._last_sampled_token_ids_cpu_override = [
+                        [int(eos_id) if int(done_flags[row]) else int(audio_id)] for row in range(num_rows)
+                    ]
                 self._record_fast_audio_sampler_attempt("hit", batch=num_rows)
             else:
                 if _PROFILE_ENABLED:

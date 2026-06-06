@@ -1,4 +1,5 @@
 import contextlib
+import os
 from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
@@ -47,6 +48,15 @@ else:
 
 logger = init_logger(__name__)
 
+_HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS = os.getenv(
+    "HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS",
+    "",
+).lower() in {"1", "true", "yes"}
+_HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS_EVERY = max(
+    1,
+    int(os.getenv("HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS_EVERY", "100") or 100),
+)
+
 
 class OmniGPUModelRunner(GPUModelRunner):
     def __init__(self, *args, **kwargs):
@@ -57,6 +67,40 @@ class OmniGPUModelRunner(GPUModelRunner):
         # The Omni tensor prefix cache will be allocated
         # when we initialize the metadata builders if enabled
         self.omni_prefix_cache = None
+        self._higgs_cpu_token_override_total = 0
+        self._higgs_cpu_token_override_hits = 0
+        self._higgs_cpu_token_override_fallbacks = 0
+
+    def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
+        override_fn = getattr(self.model, "consume_sampled_token_ids_cpu_override", None)
+        if callable(override_fn):
+            if _HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS:
+                self._higgs_cpu_token_override_total += 1
+            sampled = override_fn(sampled_token_ids)
+            if sampled is not None:
+                if _HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS:
+                    self._higgs_cpu_token_override_hits += 1
+                    self._log_higgs_cpu_token_override_stats()
+                return sampled
+            if _HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS:
+                self._higgs_cpu_token_override_fallbacks += 1
+                self._log_higgs_cpu_token_override_stats()
+        return super()._to_list(sampled_token_ids)
+
+    def _log_higgs_cpu_token_override_stats(self) -> None:
+        if (
+            not _HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS
+            or self._higgs_cpu_token_override_total % _HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS_EVERY != 0
+        ):
+            return
+        hit_rate = 100.0 * self._higgs_cpu_token_override_hits / max(1, self._higgs_cpu_token_override_total)
+        logger.info(
+            "HiggsAudioV3 CPU token override stats: total=%d hits=%d fallbacks=%d hit_rate=%.2f%%",
+            self._higgs_cpu_token_override_total,
+            self._higgs_cpu_token_override_hits,
+            self._higgs_cpu_token_override_fallbacks,
+            hit_rate,
+        )
 
     def _omni_routed_experts_d2h(self, scheduler_output) -> None:
         """Issue routed-experts D2H copy matching upstream GPUModelRunner pattern.
