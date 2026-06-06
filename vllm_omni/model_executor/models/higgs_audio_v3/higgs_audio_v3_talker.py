@@ -69,6 +69,11 @@ _LAYER_CUDAGRAPH_STATS_ENABLED = os.getenv("HIGGS_AUDIO_V3_LAYER_CUDAGRAPH_STATS
 _LAYER_CUDAGRAPH_STATS_EVERY = max(0, int(os.getenv("HIGGS_AUDIO_V3_LAYER_CUDAGRAPH_STATS_EVERY", "1000") or 0))
 _LAYER_CUDAGRAPH_CACHE_PER_BATCH = max(1, int(os.getenv("HIGGS_AUDIO_V3_LAYER_CUDAGRAPH_CACHE_PER_BATCH", "16") or 1))
 _LAYER_CUDAGRAPH_WARMUP_RUNS = max(0, int(os.getenv("HIGGS_AUDIO_V3_LAYER_CUDAGRAPH_WARMUP_RUNS", "0") or 0))
+_LAYER_CUDAGRAPH_ALLOW_FLASHINFER = os.getenv("HIGGS_AUDIO_V3_LAYER_CUDAGRAPH_ALLOW_FLASHINFER", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 _FAST_AUDIO_SAMPLER_ENABLED = os.getenv("HIGGS_AUDIO_V3_FAST_AUDIO_SAMPLER", "1").lower() not in {
     "0",
     "false",
@@ -498,7 +503,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             "attempt",
             batch=int(hidden_states.shape[0]) if hidden_states.ndim >= 1 else None,
         )
-        if self._uses_flashinfer_attention():
+        if self._uses_flashinfer_attention() and not _LAYER_CUDAGRAPH_ALLOW_FLASHINFER:
             self._record_layer_graph_attempt("invalid")
             return None
         if (
