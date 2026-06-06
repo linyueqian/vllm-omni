@@ -250,6 +250,50 @@ class TestSamplerMethods:
         )
         return t
 
+    def _make_batched_sampler_talker(self, num_rows=4):
+        """Create a fake talker with GPU-resident sampler state helpers."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        class FakeTalker:
+            num_codebooks = 8
+            codebook_size = 1026
+
+        t = FakeTalker()
+        t._decode_last_codes = torch.arange(num_rows * t.num_codebooks, dtype=torch.long).view(
+            num_rows, t.num_codebooks
+        )
+        t._decode_has_codes = torch.tensor([True, False, True, True])[:num_rows].clone()
+        t._decode_delay_count = torch.tensor([0, 2, 7, 4], dtype=torch.int32)[:num_rows].clone()
+        t._decode_eoc_countdown = torch.tensor([-1, -1, 3, 1], dtype=torch.int32)[:num_rows].clone()
+        t._decode_generation_done = torch.tensor([False, False, False, True])[:num_rows].clone()
+        t._decode_active_audio_count = 0
+        t._codebook_index_cache = {}
+        t._row_index_cache = {}
+        t._last_audio_codes_buffer = None
+        t._last_audio_host_staging = None
+        t._last_audio_gpu_staging = None
+        t._last_audio_staging_event = None
+        t._audio_staging_event = None
+        t._last_audio_codes = None
+        t._last_audio_code_valid = []
+        t._postprocess_cursor = 0
+        t._postprocess_audio_rows = 0
+        t._postprocess_audio_active_rows = 0
+
+        cls = mod.HiggsAudioV3TalkerForConditionalGeneration
+        for name in (
+            "_ensure_decode_state_capacity",
+            "_get_codebook_indices",
+            "_get_audio_codes_buffer",
+            "_get_audio_gpu_staging_buffer",
+            "_get_audio_host_staging_buffer",
+            "_apply_delay_pattern_masking_batched",
+            "_update_delay_state_batched",
+        ):
+            setattr(t, name, getattr(cls, name).__get__(t))
+        t._device_cache_key = cls._device_cache_key
+        return t
+
     def test_sample_respects_mask(self):
         """Tokens masked to -inf must never be sampled."""
         t = self._make_minimal_talker()
@@ -336,6 +380,55 @@ class TestSamplerMethods:
         for q in range(4, 8):
             assert cb_logits[0, q, BOC_ID].item() == float("-inf")
             assert cb_logits[0, q, EOC_ID].item() == float("-inf")
+
+    def test_batched_delay_masking_all_rows_matches_sparse_path(self):
+        """The all-row fast path must preserve sparse path masking semantics."""
+        torch.manual_seed(0)
+        sparse = self._make_batched_sampler_talker()
+        all_rows = self._make_batched_sampler_talker()
+        rows = torch.arange(4, dtype=torch.long)
+        logits_sparse = torch.randn(4, 8, 1026)
+        logits_all_rows = logits_sparse.clone()
+
+        sparse._apply_delay_pattern_masking_batched(logits_sparse, rows, all_rows=False)
+        all_rows._apply_delay_pattern_masking_batched(logits_all_rows, rows, all_rows=True)
+
+        assert torch.equal(logits_all_rows, logits_sparse)
+
+    def test_delay_state_update_all_rows_matches_sparse_path(self):
+        """The all-row fast path must update state and staging like index_copy_."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            EOC_ID,
+        )
+
+        sparse = self._make_batched_sampler_talker()
+        all_rows = self._make_batched_sampler_talker()
+        rows = torch.arange(4, dtype=torch.long)
+        codes = torch.tensor(
+            [
+                [10, 11, 12, 13, 14, 15, 16, 17],
+                [20, 21, 22, 23, 24, 25, 26, 27],
+                [30, 31, EOC_ID, 33, 34, 35, 36, 37],
+                [40, 41, 42, 43, 44, 45, 46, 47],
+            ],
+            dtype=torch.long,
+        )
+        code_row_mask = torch.tensor([True, False, True, True])
+
+        sparse._update_delay_state_batched(
+            codes.clone(), rows, 4, torch.device("cpu"), code_row_mask=code_row_mask, all_rows=False
+        )
+        all_rows._update_delay_state_batched(
+            codes.clone(), rows, 4, torch.device("cpu"), code_row_mask=code_row_mask, all_rows=True
+        )
+
+        assert torch.equal(all_rows._decode_delay_count, sparse._decode_delay_count)
+        assert torch.equal(all_rows._decode_eoc_countdown, sparse._decode_eoc_countdown)
+        assert torch.equal(all_rows._decode_generation_done, sparse._decode_generation_done)
+        assert torch.equal(all_rows._decode_last_codes, sparse._decode_last_codes)
+        assert torch.equal(all_rows._decode_has_codes, sparse._decode_has_codes)
+        assert torch.equal(all_rows._last_audio_codes, sparse._last_audio_codes)
+        assert torch.equal(all_rows._last_audio_host_staging, sparse._last_audio_host_staging)
 
 
 # ---- AC-6: Feedback Method Tests ----

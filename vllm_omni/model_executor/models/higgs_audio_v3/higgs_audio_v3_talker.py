@@ -1346,16 +1346,16 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         # Per-codebook logits at audio positions
         if _PROFILE_ENABLED:
             with _ProfileScope("stage0.sample.audio_codebook_logits"):
-                cb_logits = self._audio_codebook_logits_from_rows(hidden, audio_row_tensor)
+                cb_logits = self._audio_codebook_logits_from_rows(hidden, audio_row_tensor, all_rows=use_gpu_audio_mode)
         else:
-            cb_logits = self._audio_codebook_logits_from_rows(hidden, audio_row_tensor)
+            cb_logits = self._audio_codebook_logits_from_rows(hidden, audio_row_tensor, all_rows=use_gpu_audio_mode)
 
         # Apply delay pattern masking BEFORE sampling
         if _PROFILE_ENABLED:
             with _ProfileScope("stage0.sample.delay_pattern_masking"):
-                self._apply_delay_pattern_masking_batched(cb_logits, audio_row_tensor)
+                self._apply_delay_pattern_masking_batched(cb_logits, audio_row_tensor, all_rows=use_gpu_audio_mode)
         else:
-            self._apply_delay_pattern_masking_batched(cb_logits, audio_row_tensor)
+            self._apply_delay_pattern_masking_batched(cb_logits, audio_row_tensor, all_rows=use_gpu_audio_mode)
 
         # Sample per-codebook
         cb_logits_2d = cb_logits.reshape(-1, cb_logits.shape[-1])
@@ -1369,11 +1369,21 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         if _PROFILE_ENABLED:
             with _ProfileScope("stage0.sample.delay_state_update"):
                 self._update_delay_state_batched(
-                    codes_flat, audio_row_tensor, num_rows, hidden.device, code_row_mask=code_row_mask
+                    codes_flat,
+                    audio_row_tensor,
+                    num_rows,
+                    hidden.device,
+                    code_row_mask=code_row_mask,
+                    all_rows=use_gpu_audio_mode,
                 )
         else:
             self._update_delay_state_batched(
-                codes_flat, audio_row_tensor, num_rows, hidden.device, code_row_mask=code_row_mask
+                codes_flat,
+                audio_row_tensor,
+                num_rows,
+                hidden.device,
+                code_row_mask=code_row_mask,
+                all_rows=use_gpu_audio_mode,
             )
         return sampler_output
 
@@ -1576,7 +1586,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             )
         return self.modality_head.generate(hidden_flat[mask])
 
-    def _audio_codebook_logits_from_rows(self, hidden_states: torch.Tensor, audio_rows: torch.Tensor) -> torch.Tensor:
+    def _audio_codebook_logits_from_rows(
+        self, hidden_states: torch.Tensor, audio_rows: torch.Tensor, *, all_rows: bool = False
+    ) -> torch.Tensor:
         hidden_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
         if audio_rows.numel() == 0:
             return torch.empty(
@@ -1584,6 +1596,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
+        if all_rows:
+            return self.modality_head.generate(hidden_flat[: int(audio_rows.numel())])
         return self.modality_head.generate(hidden_flat.index_select(0, audio_rows.to(hidden_flat.device)))
 
     def _apply_delay_pattern_masking(self, cb_logits: torch.Tensor, audio_row_indices: list[int]) -> None:
@@ -1623,16 +1637,23 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                     delayed.fill_(float("-inf"))
                     delayed[:, bos_pre] = boc_logits
 
-    def _apply_delay_pattern_masking_batched(self, cb_logits: torch.Tensor, audio_rows: torch.Tensor) -> None:
+    def _apply_delay_pattern_masking_batched(
+        self, cb_logits: torch.Tensor, audio_rows: torch.Tensor, *, all_rows: bool = False
+    ) -> None:
         """Vectorized delay-pattern masking using GPU-resident sampler state."""
         if cb_logits.numel() == 0:
             return
 
         rows = audio_rows.to(device=cb_logits.device, dtype=torch.long)
+        num_audio_rows = int(cb_logits.shape[0])
         num_codebooks = self.num_codebooks
         q = self._get_codebook_indices(cb_logits.device)
-        delay = self._decode_delay_count.index_select(0, rows).to(torch.long)
-        rem = self._decode_eoc_countdown.index_select(0, rows).to(torch.long)
+        if all_rows:
+            delay = self._decode_delay_count[:num_audio_rows].to(torch.long)
+            rem = self._decode_eoc_countdown[:num_audio_rows].to(torch.long)
+        else:
+            delay = self._decode_delay_count.index_select(0, rows).to(torch.long)
+            rem = self._decode_eoc_countdown.index_select(0, rows).to(torch.long)
         ramp = rem >= 0
 
         bos = BOC_ID
@@ -1688,6 +1709,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         device: torch.device,
         *,
         code_row_mask: torch.Tensor | None = None,
+        all_rows: bool = False,
     ) -> None:
         """Update delay/ramp-down state in batch and stage per-request outputs."""
         self._ensure_decode_state_capacity(num_rows, device)
@@ -1699,16 +1721,26 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             return
 
         rows = audio_rows.to(device=device, dtype=torch.long)
+        num_audio_rows = int(codes_flat.shape[0])
         num_codebooks = self.num_codebooks
         q = self._get_codebook_indices(device)
 
-        prev_delay = self._decode_delay_count.index_select(0, rows).to(torch.long)
-        prev_rem = self._decode_eoc_countdown.index_select(0, rows).to(torch.long)
-        prev_done = self._decode_generation_done.index_select(0, rows).to(torch.bool)
-        prev_has_codes = self._decode_has_codes.index_select(0, rows).to(torch.bool)
-        prev_codes = self._decode_last_codes.index_select(0, rows)
+        if all_rows:
+            prev_delay = self._decode_delay_count[:num_audio_rows].to(torch.long)
+            prev_rem = self._decode_eoc_countdown[:num_audio_rows].to(torch.long)
+            prev_done = self._decode_generation_done[:num_audio_rows].to(torch.bool)
+            prev_has_codes = self._decode_has_codes[:num_audio_rows].to(torch.bool)
+            prev_codes = self._decode_last_codes[:num_audio_rows]
+        else:
+            prev_delay = self._decode_delay_count.index_select(0, rows).to(torch.long)
+            prev_rem = self._decode_eoc_countdown.index_select(0, rows).to(torch.long)
+            prev_done = self._decode_generation_done.index_select(0, rows).to(torch.bool)
+            prev_has_codes = self._decode_has_codes.index_select(0, rows).to(torch.bool)
+            prev_codes = self._decode_last_codes.index_select(0, rows)
         if code_row_mask is None:
             update_mask = torch.ones_like(prev_has_codes)
+        elif all_rows:
+            update_mask = code_row_mask.to(device=device, dtype=torch.bool)[:num_audio_rows]
         else:
             update_mask = code_row_mask.to(device=device, dtype=torch.bool).index_select(0, rows)
         ramp = prev_rem >= 0
@@ -1793,24 +1825,32 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         write_codes = torch.where(update_mask.unsqueeze(1), codes, prev_codes)
         write_has_codes = torch.where(update_mask, valid, prev_has_codes)
 
-        self._decode_delay_count.index_copy_(0, rows, write_delay.to(torch.int32))
-        self._decode_eoc_countdown.index_copy_(0, rows, write_rem.to(torch.int32))
-        self._decode_generation_done.index_copy_(0, rows, write_done)
-        self._decode_last_codes.index_copy_(0, rows, write_codes)
-        self._decode_has_codes.index_copy_(0, rows, write_has_codes)
+        if all_rows:
+            self._decode_delay_count[:num_audio_rows].copy_(write_delay.to(torch.int32))
+            self._decode_eoc_countdown[:num_audio_rows].copy_(write_rem.to(torch.int32))
+            self._decode_generation_done[:num_audio_rows].copy_(write_done)
+            self._decode_last_codes[:num_audio_rows].copy_(write_codes)
+            self._decode_has_codes[:num_audio_rows].copy_(write_has_codes)
+        else:
+            self._decode_delay_count.index_copy_(0, rows, write_delay.to(torch.int32))
+            self._decode_eoc_countdown.index_copy_(0, rows, write_rem.to(torch.int32))
+            self._decode_generation_done.index_copy_(0, rows, write_done)
+            self._decode_last_codes.index_copy_(0, rows, write_codes)
+            self._decode_has_codes.index_copy_(0, rows, write_has_codes)
 
         codes_full = self._get_audio_codes_buffer(num_rows, device)
         codes_full.fill_(-1)
-        codes_full.index_copy_(
-            0,
-            rows,
-            torch.where(update_mask.unsqueeze(1), output_codes, torch.full_like(output_codes, -1)),
-        )
-
-        valid_full = torch.zeros(num_rows, dtype=torch.bool, device=device)
-        done_full = torch.zeros(num_rows, dtype=torch.bool, device=device)
-        valid_full.index_copy_(0, rows, valid)
-        done_full.index_copy_(0, rows, done)
+        staged_codes = torch.where(update_mask.unsqueeze(1), output_codes, torch.full_like(output_codes, -1))
+        if all_rows:
+            codes_full[:num_audio_rows].copy_(staged_codes)
+            valid_full = valid
+            done_full = done
+        else:
+            codes_full.index_copy_(0, rows, staged_codes)
+            valid_full = torch.zeros(num_rows, dtype=torch.bool, device=device)
+            done_full = torch.zeros(num_rows, dtype=torch.bool, device=device)
+            valid_full.index_copy_(0, rows, valid)
+            done_full.index_copy_(0, rows, done)
 
         staging = self._get_audio_gpu_staging_buffer(num_rows, device)
         staging[:, :num_codebooks].copy_(codes_full.to(torch.int32))
