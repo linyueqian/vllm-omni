@@ -74,6 +74,11 @@ _LAYER_CUDAGRAPH_ALLOW_FLASHINFER = os.getenv("HIGGS_AUDIO_V3_LAYER_CUDAGRAPH_AL
     "true",
     "yes",
 }
+_MLP_CUDAGRAPH_ENABLED = os.getenv("HIGGS_AUDIO_V3_MLP_CUDAGRAPH", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 _FAST_AUDIO_SAMPLER_ENABLED = os.getenv("HIGGS_AUDIO_V3_FAST_AUDIO_SAMPLER", "1").lower() not in {
     "0",
     "false",
@@ -327,6 +332,12 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._layer_graph_batch_hits: Counter[int] = Counter()
         self._layer_graph_batch_fallbacks: Counter[int] = Counter()
         self._layer_graph_signature_miss_keys: Counter[str] = Counter()
+        self._mlp_graphs: dict[tuple[int, int], dict[str, Any]] = {}
+        self._mlp_graph_disabled: set[tuple[int, int]] = set()
+        self._mlp_graph_total = 0
+        self._mlp_graph_hits = 0
+        self._mlp_graph_captures = 0
+        self._mlp_graph_failures = 0
         self._fast_audio_sampler_total = 0
         self._fast_audio_sampler_hits = 0
         self._fast_audio_sampler_fallbacks = 0
@@ -484,6 +495,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             graph_out = self._run_qwen3_layers_graph(positions, hidden_states)
             if graph_out is not None:
                 return graph_out
+        if _MLP_CUDAGRAPH_ENABLED and not _PROFILE_ENABLED:
+            return self._run_qwen3_layers_mlp_graph(positions, hidden_states)
 
         return self._run_qwen3_layers_eager(positions, hidden_states)
 
@@ -507,6 +520,106 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         if isinstance(norm_out, tuple):
             norm_out = norm_out[0]
         return norm_out
+
+    def _run_qwen3_layers_mlp_graph(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        residual: torch.Tensor | None = None
+        batch = int(hidden_states.shape[0]) if hidden_states.ndim >= 1 else 0
+        use_graph = (
+            torch.cuda.is_available()
+            and hidden_states.is_cuda
+            and hidden_states.ndim == 2
+            and positions.ndim == 1
+            and batch > 0
+            and batch <= 16
+            and int(positions.shape[0]) == batch
+            and self._is_decode_only_graph_batch(batch)
+        )
+        for layer_idx, layer in enumerate(self.model.layers):
+            if residual is None:
+                residual = hidden_states
+                hidden_states = layer.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = layer.input_layernorm(hidden_states, residual)
+            hidden_states = layer.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+            if use_graph:
+                graph_out = self._run_qwen3_mlp_graph(layer_idx, layer, hidden_states, residual)
+                if graph_out is not None:
+                    hidden_states, residual = graph_out
+                    continue
+            hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
+            hidden_states = layer.mlp(hidden_states)
+        norm_out = self.model.norm(hidden_states, residual)
+        if isinstance(norm_out, tuple):
+            norm_out = norm_out[0]
+        return norm_out
+
+    def _run_qwen3_mlp_graph(
+        self,
+        layer_idx: int,
+        layer: nn.Module,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        key = (int(layer_idx), int(hidden_states.shape[0]))
+        self._mlp_graph_total += 1
+        if key in self._mlp_graph_disabled:
+            return None
+        if hidden_states.ndim != 2 or residual.ndim != 2 or hidden_states.shape != residual.shape:
+            self._mlp_graph_disabled.add(key)
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            return None
+
+        entry = self._mlp_graphs.get(key)
+        if entry is not None:
+            entry["static_hidden"].copy_(hidden_states)
+            entry["static_residual"].copy_(residual)
+            entry["graph"].replay()
+            self._mlp_graph_hits += 1
+            if (
+                _LAYER_CUDAGRAPH_STATS_ENABLED
+                and _LAYER_CUDAGRAPH_STATS_EVERY > 0
+                and self._mlp_graph_total % _LAYER_CUDAGRAPH_STATS_EVERY == 0
+            ):
+                self._log_mlp_graph_stats()
+            return entry["static_output"], entry["static_residual_out"]
+
+        try:
+            static_hidden = torch.empty_like(hidden_states)
+            static_residual = torch.empty_like(residual)
+            static_hidden.copy_(hidden_states)
+            static_residual.copy_(residual)
+            graph = torch.cuda.CUDAGraph()
+            with torch.inference_mode(), torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+                normed, static_residual_out = layer.post_attention_layernorm(static_hidden, static_residual)
+                static_output = layer.mlp(normed)
+            self._mlp_graphs[key] = {
+                "graph": graph,
+                "static_hidden": static_hidden,
+                "static_residual": static_residual,
+                "static_output": static_output,
+                "static_residual_out": static_residual_out,
+            }
+            self._mlp_graph_captures += 1
+            logger.info(
+                "HiggsAudioV3Talker: captured MLP CUDA graph for layer=%d decode batch=%d",
+                layer_idx,
+                int(hidden_states.shape[0]),
+            )
+            return static_output, static_residual_out
+        except Exception as exc:
+            self._mlp_graph_disabled.add(key)
+            self._mlp_graph_failures += 1
+            logger.warning(
+                "HiggsAudioV3Talker: MLP CUDA graph disabled for layer=%d batch=%d: %s",
+                layer_idx,
+                int(hidden_states.shape[0]),
+                exc,
+            )
+            return None
 
     def _run_qwen3_layers_graph(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor | None:
         self._record_layer_graph_attempt(
@@ -740,6 +853,22 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             self._layer_graph_batch_hits.most_common(8),
             self._layer_graph_batch_fallbacks.most_common(8),
             self._layer_graph_signature_miss_keys.most_common(16),
+        )
+
+    def _log_mlp_graph_stats(self) -> None:
+        if not _LAYER_CUDAGRAPH_STATS_ENABLED or self._mlp_graph_total <= 0:
+            return
+        hit_rate = 100.0 * self._mlp_graph_hits / max(1, self._mlp_graph_total)
+        logger.info(
+            "HiggsAudioV3Talker MLP CUDA Graph stats: total=%d hits=%d captures=%d "
+            "failures=%d disabled=%d hit_rate=%.2f%% cache_entries=%d",
+            self._mlp_graph_total,
+            self._mlp_graph_hits,
+            self._mlp_graph_captures,
+            self._mlp_graph_failures,
+            len(self._mlp_graph_disabled),
+            hit_rate,
+            len(self._mlp_graphs),
         )
 
     def _attention_metadata_signature(self) -> tuple:
