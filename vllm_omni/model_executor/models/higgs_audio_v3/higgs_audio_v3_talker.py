@@ -48,6 +48,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 __all__ = ["HiggsAudioV3TalkerForConditionalGeneration"]
 
 logger = init_logger(__name__)
+_FLASHINFER_API_UNWRAPPED = False
 
 _PROFILE_ENABLED = bool(os.getenv("HIGGS_AUDIO_V3_PROFILE"))
 _PROFILE_SYNC = os.getenv("HIGGS_AUDIO_V3_PROFILE_SYNC", "1").lower() not in {"0", "false", "no"}
@@ -109,6 +110,11 @@ _FAST_AUDIO_ASSUME_FULL_DECODE = os.getenv("HIGGS_AUDIO_V3_FAST_AUDIO_ASSUME_FUL
     "yes",
 }
 _SKIP_TEXT_LOGITS_ENABLED = os.getenv("HIGGS_AUDIO_V3_SKIP_TEXT_LOGITS", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+_UNWRAP_FLASHINFER_API_ENABLED = os.getenv("HIGGS_AUDIO_V3_UNWRAP_FLASHINFER_API", "").lower() in {
     "1",
     "true",
     "yes",
@@ -235,6 +241,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        if _UNWRAP_FLASHINFER_API_ENABLED:
+            self._maybe_unwrap_flashinfer_api_wrappers()
 
         hf_config = vllm_config.model_config.hf_config
         if isinstance(hf_config, HiggsAudioV3Config):
@@ -373,6 +381,34 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         #    observed in qwen3_tts (#3665).
         self.requires_full_prefix_cached_hidden_states = False
         self.deferred_prefix_cache_mm_keys = {"codes.audio"}
+
+    @staticmethod
+    def _maybe_unwrap_flashinfer_api_wrappers() -> None:
+        """Remove FlashInfer trace auto-dump wrappers for perf experiments."""
+        global _FLASHINFER_API_UNWRAPPED
+        if _FLASHINFER_API_UNWRAPPED:
+            return
+        _FLASHINFER_API_UNWRAPPED = True
+        try:
+            from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
+            from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
+        except Exception as exc:
+            logger.warning("HiggsAudioV3Talker: failed to import FlashInfer for API unwrap: %s", exc)
+            return
+
+        patched: list[str] = []
+        for cls, method_names in (
+            (BatchDecodeWithPagedKVCacheWrapper, ("run", "plan")),
+            (BatchPrefillWithPagedKVCacheWrapper, ("run", "paged_run", "plan")),
+        ):
+            for method_name in method_names:
+                method = getattr(cls, method_name, None)
+                original = getattr(method, "__wrapped__", None)
+                if original is None:
+                    continue
+                setattr(cls, method_name, original)
+                patched.append(f"{cls.__name__}.{method_name}")
+        logger.info("HiggsAudioV3Talker: unwrapped FlashInfer API wrappers: %s", patched)
 
     def _resolve_token_ids(self) -> None:
         """Resolve <|audio|> and eos token IDs.
