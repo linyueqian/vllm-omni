@@ -1317,21 +1317,29 @@ class OmniGPUModelRunner(GPUModelRunner):
             # execute the custom postprocess function
             # TODO(Peiqi): do we have a more elegant way to do this?
             if hasattr(self.model, "has_postprocess") and self.model.has_postprocess:
+                postprocess_uses_hidden_states = getattr(self.model, "postprocess_uses_hidden_states", True)
+                postprocess_uses_multimodal_outputs = getattr(self.model, "postprocess_uses_multimodal_outputs", True)
+                postprocess_uses_req_infos = getattr(self.model, "postprocess_uses_req_infos", True)
                 for req_index, req_id in enumerate(self.input_batch.req_ids):
                     if req_ids_filter is not None and req_id not in req_ids_filter:
                         continue
-                    req_infos = self.model_intermediate_buffer.get(req_id, {})
-                    if combined_hidden_states:
-                        # Combined hidden states contains all hidden states for every request
-                        hidden_states_slice = combined_hidden_states[req_id]
+                    req_infos = self.model_intermediate_buffer.get(req_id, {}) if postprocess_uses_req_infos else {}
+                    if postprocess_uses_hidden_states:
+                        if combined_hidden_states:
+                            # Combined hidden states contains all hidden states for every request
+                            hidden_states_slice = combined_hidden_states[req_id]
+                        else:
+                            start_offset = int(self.query_start_loc.cpu[req_index])
+                            sched_tokens = int(num_scheduled_tokens_np[req_index])
+                            s, e = start_offset, start_offset + sched_tokens
+                            # only consider to store data into update dict.
+                            hidden_states_slice = hidden_states[s:e]
                     else:
-                        start_offset = int(self.query_start_loc.cpu[req_index])
-                        sched_tokens = int(num_scheduled_tokens_np[req_index])
-                        s, e = start_offset, start_offset + sched_tokens
-                        # only consider to store data into update dict.
-                        hidden_states_slice = hidden_states[s:e]
+                        hidden_states_slice = hidden_states
 
-                    if combined_multimodal_outputs:
+                    if not postprocess_uses_multimodal_outputs:
+                        mm_out = None
+                    elif combined_multimodal_outputs:
                         # NOTE this is a bit ugly, but the mm data is structured as a list of
                         # keys mapping to request IDs, and if enabled, we will always have all
                         # request IDs in every subdict, including for cache misses.
@@ -1806,6 +1814,14 @@ class OmniGPUModelRunner(GPUModelRunner):
     ):
         """Inject omni-specific kwargs into forward and cache model output"""
         model_kwargs_extra = self._build_model_kwargs_extra()
+        update_decode_metadata = getattr(self.model, "update_decode_step_metadata", None)
+        if getattr(self.model, "supports_omni_decode_step_metadata", False) and callable(update_decode_metadata):
+            update_decode_metadata(
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                omni_query_start_loc=model_kwargs_extra.get("omni_query_start_loc"),
+            )
 
         model_output = super()._model_forward(
             input_ids=input_ids,

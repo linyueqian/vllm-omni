@@ -107,6 +107,10 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
     # Tell the runner to call postprocess() to emit per-step audio codes.
     have_multimodal_outputs: bool = True
     has_postprocess: bool = True
+    skips_model_sampler_output_token_history: bool = True
+    postprocess_uses_hidden_states: bool = False
+    postprocess_uses_multimodal_outputs: bool = False
+    postprocess_uses_req_infos: bool = False
     supports_sampled_token_ids_cpu_override: bool = True
     supports_omni_query_start_loc: bool = True
 
@@ -117,6 +121,15 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             self.config = hf_config
         else:
             self.config = HiggsAudioV3Config(**hf_config.to_dict())
+        model_config = getattr(vllm_config, "model_config", None)
+        compilation_config = getattr(vllm_config, "compilation_config", None)
+        cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+        mode_name = getattr(cudagraph_mode, "name", str(cudagraph_mode)).upper()
+        self._use_external_decode_cudagraph = (
+            not bool(getattr(model_config, "enforce_eager", True)) and cudagraph_mode is not None and "NONE" not in mode_name
+        )
+        if self._use_external_decode_cudagraph:
+            self.config.enable_mlp_cudagraph = False
 
         self.vllm_config = vllm_config
         self.num_codebooks = int(self.config.num_codebooks)
@@ -167,6 +180,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._last_step_input_ids: torch.Tensor | None = None
         self._last_step_query_start_loc: torch.Tensor | None = None
         self._last_step_query_start_loc_buffer: torch.Tensor | None = None
+        self.supports_omni_decode_step_metadata = True
+        self._decode_step_metadata_from_runner = False
         self._last_audio_codes: torch.Tensor | None = None
         self._last_audio_code_valid: list[bool] = []
         self._postprocess_cursor: int = 0
@@ -183,23 +198,27 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._codebook_index_cache: dict[tuple[str, int], torch.Tensor] = {}
         self._boc_frame_cache: dict[tuple[str, int], torch.Tensor] = {}
         self._fast_audio_direct_rows: int = 0
-        self._postprocess_audio_rows: int = 0
-        self._postprocess_audio_active_rows: int = 0
         scheduler_config = getattr(vllm_config, "scheduler_config", None)
         self._mlp_cudagraph_max_batch = max(1, int(getattr(scheduler_config, "max_num_seqs", 16)))
+        self._postprocess_audio_rows: int = 0
+        self._postprocess_audio_active_rows: int = 0
         self._mlp_graphs: dict[tuple[int, int], dict[str, Any]] = {}
         self._mlp_graph_disabled: set[tuple[int, int]] = set()
 
         # Pre-allocated decode-step audio feedback buffers (CUDA-graph safe).
         # Populated by sample(), read by forward() via torch.where (no dict).
-        max_bs = 64  # safe upper bound; will grow if needed
-        self._decode_last_codes = torch.zeros(max_bs, self.num_codebooks, dtype=torch.long)
-        self._decode_has_codes = torch.zeros(max_bs, dtype=torch.bool)
+        max_bs = max(64, self._mlp_cudagraph_max_batch)
+        self.register_buffer(
+            "_decode_last_codes",
+            torch.zeros(max_bs, self.num_codebooks, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer("_decode_has_codes", torch.zeros(max_bs, dtype=torch.bool), persistent=False)
         # Keep delay/ramp counters as int64 to match arange/codebook-index
         # arithmetic in the decode hot path without per-step dtype casts.
-        self._decode_delay_count = torch.zeros(max_bs, dtype=torch.long)
-        self._decode_eoc_countdown = torch.full((max_bs,), -1, dtype=torch.long)
-        self._decode_generation_done = torch.zeros(max_bs, dtype=torch.bool)
+        self.register_buffer("_decode_delay_count", torch.zeros(max_bs, dtype=torch.long), persistent=False)
+        self.register_buffer("_decode_eoc_countdown", torch.full((max_bs,), -1, dtype=torch.long), persistent=False)
+        self.register_buffer("_decode_generation_done", torch.zeros(max_bs, dtype=torch.bool), persistent=False)
         self._decode_active_audio_count: int = 0
 
         # PrefixCache opt-outs (mirror qwen3_tts pattern):
@@ -320,6 +339,24 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         except Exception as exc:
             logger.warning("Failed to resolve token IDs from tokenizer: %s", exc)
 
+    def update_decode_step_metadata(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        omni_query_start_loc: torch.Tensor | None = None,
+        **_: Any,
+    ) -> None:
+        """Update per-step metadata before runner forward or CUDA graph replay."""
+        _ = positions, inputs_embeds
+        if input_ids is not None:
+            self._last_step_input_ids = input_ids
+            if self._use_external_decode_cudagraph and input_ids.is_cuda and input_ids.ndim >= 1:
+                self._ensure_decode_state_capacity(int(input_ids.shape[0]), input_ids.device)
+        self._set_last_step_query_start_loc(omni_query_start_loc)
+        self._decode_step_metadata_from_runner = True
+
     # ------------------------------------------------------------------ forward
     def forward(
         self,
@@ -329,6 +366,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        metadata_from_runner = self._decode_step_metadata_from_runner
+        self._decode_step_metadata_from_runner = False
+
         info_dicts = kwargs.get("model_intermediate_buffer")
         if info_dicts is None:
             info_dicts = kwargs.get("runtime_additional_information")
@@ -341,25 +381,26 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         else:
             hidden_states = inputs_embeds
 
-        if input_ids is not None:
+        if input_ids is not None and not metadata_from_runner:
             self._last_step_input_ids = input_ids
 
         # Stash query_start_loc for audio-state row mapping. Some attention
         # backends do not expose it in their metadata, so prefer backend
         # metadata when available and otherwise use the runner-supplied buffer.
-        try:
-            fallback_qsl = kwargs.get("omni_query_start_loc")
-            from vllm.forward_context import get_forward_context
+        if not metadata_from_runner:
+            try:
+                fallback_qsl = kwargs.get("omni_query_start_loc")
+                from vllm.forward_context import get_forward_context
 
-            attn_metadata = get_forward_context().attn_metadata
-            if isinstance(attn_metadata, dict) and attn_metadata:
-                attn = next(iter(attn_metadata.values()))
-            else:
-                attn = attn_metadata
-            qsl = getattr(attn, "query_start_loc", None)
-            self._set_last_step_query_start_loc(qsl if isinstance(qsl, torch.Tensor) else fallback_qsl)
-        except Exception:
-            self._last_step_query_start_loc = None
+                attn_metadata = get_forward_context().attn_metadata
+                if isinstance(attn_metadata, dict) and attn_metadata:
+                    attn = next(iter(attn_metadata.values()))
+                else:
+                    attn = attn_metadata
+                qsl = getattr(attn, "query_start_loc", None)
+                self._set_last_step_query_start_loc(qsl if isinstance(qsl, torch.Tensor) else fallback_qsl)
+            except Exception:
+                self._last_step_query_start_loc = None
 
         # Prefill-only operations: ref audio substitution and audio feedback
         # require Python dict/list ops that break CUDA graph capture.
@@ -605,7 +646,14 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         For prefill: audio feedback is not needed (ref audio substitution
         handles the prefill path separately).
         """
-        if self._decode_active_audio_count == 0 or not self._is_single_token_decode_step(int(hidden_states.shape[0])):
+        num_rows = int(hidden_states.shape[0])
+        is_decode_step = getattr(self, "_is_single_token_decode_step", None)
+        if callable(is_decode_step):
+            decode_step = is_decode_step(num_rows)
+        else:
+            decode_step = int(input_ids.numel()) == num_rows
+        external_decode_graph = bool(getattr(self, "_use_external_decode_cudagraph", False))
+        if not decode_step or (self._decode_active_audio_count == 0 and not external_decode_graph):
             return hidden_states
 
         bs = hidden_states.shape[0]

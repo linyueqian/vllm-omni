@@ -103,8 +103,9 @@ python examples/online_serving/text_to_speech/higgs_audio_v3/batch_speech_client
 - Voice cloning: `ref_audio` accepts WAV/FLAC/MP3; `ref_text` is optional but improves fidelity.
 - Deploy config: `vllm_omni/deploy/higgs_multimodal_qwen3.yaml` (auto-discovered from `model_type`).
   - `max_num_seqs=16` for both stages.
-  - `enforce_eager=true` for both stages (CUDA graph available for stage 0 but no throughput gain at batch>1).
+  - Stage 0 and Stage 1 default to separate devices (`0` and `1`) for concurrent talker/code2wav execution.
+  - Stage 0 uses FlashInfer attention with `FULL_DECODE_ONLY` CUDA graph capture sizes `[1, 2, 4, 8, 16]`.
+  - Stage 1 remains `enforce_eager=true` for the codec decoder.
 - Known limitations:
-  - CUDA graph for stage 0 helps batch=1 (-13% RTF) but not batch>1 due to model-owned sampler running outside graph.
   - Stage 1 (code2wav) must use `enforce_eager=true` (`@torch.inference_mode` incompatible with graph capture).
-  - Async streaming (chunk-based) not yet implemented; sync-only pipeline.
+  - Stage 0 decode graph leaves sampler, delay-state updates, staging, and request postprocess outside graph.
