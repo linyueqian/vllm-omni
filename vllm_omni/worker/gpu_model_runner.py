@@ -1,5 +1,4 @@
 import contextlib
-import os
 from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
@@ -48,15 +47,6 @@ else:
 
 logger = init_logger(__name__)
 
-_HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS = os.getenv(
-    "HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS",
-    "",
-).lower() in {"1", "true", "yes"}
-_HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS_EVERY = max(
-    1,
-    int(os.getenv("HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS_EVERY", "100") or 100),
-)
-
 
 class OmniGPUModelRunner(GPUModelRunner):
     def __init__(self, *args, **kwargs):
@@ -67,40 +57,16 @@ class OmniGPUModelRunner(GPUModelRunner):
         # The Omni tensor prefix cache will be allocated
         # when we initialize the metadata builders if enabled
         self.omni_prefix_cache = None
-        self._higgs_cpu_token_override_total = 0
-        self._higgs_cpu_token_override_hits = 0
-        self._higgs_cpu_token_override_fallbacks = 0
+        self._sampled_token_ids_cpu_override = None
+        self._omni_query_start_loc_model_kwarg = False
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
-        override_fn = getattr(self.model, "consume_sampled_token_ids_cpu_override", None)
+        override_fn = self._sampled_token_ids_cpu_override
         if callable(override_fn):
-            if _HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS:
-                self._higgs_cpu_token_override_total += 1
             sampled = override_fn(sampled_token_ids)
             if sampled is not None:
-                if _HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS:
-                    self._higgs_cpu_token_override_hits += 1
-                    self._log_higgs_cpu_token_override_stats()
                 return sampled
-            if _HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS:
-                self._higgs_cpu_token_override_fallbacks += 1
-                self._log_higgs_cpu_token_override_stats()
         return super()._to_list(sampled_token_ids)
-
-    def _log_higgs_cpu_token_override_stats(self) -> None:
-        if (
-            not _HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS
-            or self._higgs_cpu_token_override_total % _HIGGS_AUDIO_V3_CPU_TOKEN_OVERRIDE_STATS_EVERY != 0
-        ):
-            return
-        hit_rate = 100.0 * self._higgs_cpu_token_override_hits / max(1, self._higgs_cpu_token_override_total)
-        logger.info(
-            "HiggsAudioV3 CPU token override stats: total=%d hits=%d fallbacks=%d hit_rate=%.2f%%",
-            self._higgs_cpu_token_override_total,
-            self._higgs_cpu_token_override_hits,
-            self._higgs_cpu_token_override_fallbacks,
-            hit_rate,
-        )
 
     def _omni_routed_experts_d2h(self, scheduler_output) -> None:
         """Issue routed-experts D2H copy matching upstream GPUModelRunner pattern.
@@ -149,30 +115,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         )
 
     def initialize_metadata_builders(self, kv_cache_config, kernel_block_sizes):
-        """Override to fix scheduler_metadata buffer size for FA3 + CUDA graph.
-
-        The upstream FlashAttentionMetadataBuilder pre-allocates
-        scheduler_metadata with (max_num_seqs + 1) entries, but FA3's
-        get_scheduler_metadata() can return up to
-        (max_num_seqs * max_num_splits + 1) entries, causing a RuntimeError
-        during CUDA graph capture.  After calling the parent implementation
-        we resize any too-small buffers.
-        """
         super().initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
-
-        for kv_cache_group in self.attn_groups:
-            for attn_group in kv_cache_group:
-                for builder in attn_group.metadata_builders:
-                    sm = getattr(builder, "scheduler_metadata", None)
-                    max_num_splits = getattr(builder, "max_num_splits", 0)
-                    if sm is not None and max_num_splits > 1:
-                        required = self.scheduler_config.max_num_seqs * max_num_splits + 1
-                        if sm.shape[0] < required:
-                            builder.scheduler_metadata = torch.zeros(
-                                required,
-                                dtype=sm.dtype,
-                                device=sm.device,
-                            )
 
         # Initialize the wrapper for both multimodal output tensors
         # and for hidden states to be passed between stages
@@ -187,6 +130,14 @@ class OmniGPUModelRunner(GPUModelRunner):
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
+        model = getattr(self, "model", None)
+        override_fn = None
+        if bool(getattr(model, "supports_sampled_token_ids_cpu_override", False)):
+            candidate = getattr(model, "consume_sampled_token_ids_cpu_override", None)
+            if callable(candidate):
+                override_fn = candidate
+        self._sampled_token_ids_cpu_override = override_fn
+        self._omni_query_start_loc_model_kwarg = bool(getattr(model, "supports_omni_query_start_loc", False))
         self._init_talker_mtp()
         self._prewarm_attention_capture_workspaces()
 
@@ -1334,11 +1285,12 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             traceback.print_exc()
 
-        try:
-            num_reqs = len(self.input_batch.req_ids)
-            model_kwargs_extra["omni_query_start_loc"] = self.query_start_loc.gpu[: num_reqs + 1]
-        except Exception as e:
-            logger.debug("[OMNI DEBUG] Failed to attach query_start_loc: %s", e)
+        if self._omni_query_start_loc_model_kwarg:
+            try:
+                num_reqs = len(self.input_batch.req_ids)
+                model_kwargs_extra["omni_query_start_loc"] = self.query_start_loc.gpu[: num_reqs + 1]
+            except Exception as e:
+                logger.debug("[OMNI] Failed to attach query_start_loc: %s", e)
 
         if getattr(self.model_config, "has_sampling_extra_args", False):
             extra_args_list: list[dict] = []

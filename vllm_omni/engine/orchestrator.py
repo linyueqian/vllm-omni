@@ -16,7 +16,6 @@ attaches / detaches head-side stage clients for headless replicas.
 from __future__ import annotations
 
 import asyncio
-import os
 import time as _time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -71,49 +70,6 @@ from vllm_omni.outputs import OmniRequestOutput
 RemoteReplicaFactory = Callable[[int, int], Awaitable[Any]]
 
 logger = init_logger(__name__)
-
-_HIGGS_AUDIO_V3_PROFILE_ENABLED = bool(os.getenv("HIGGS_AUDIO_V3_PROFILE"))
-_HIGGS_AUDIO_V3_PROFILE_SUMMARY_EVERY = max(
-    1,
-    int(os.getenv("HIGGS_AUDIO_V3_PROFILE_SUMMARY_EVERY", "50")),
-)
-_HIGGS_AUDIO_V3_PROFILE_STATS: dict[str, list[float]] = {}
-_HIGGS_AUDIO_V3_PROFILE_EVENTS = 0
-
-
-class _HiggsAudioV3ProfileScope:
-    def __init__(self, name: str) -> None:
-        self.name = name
-        self.start = 0.0
-
-    def __enter__(self) -> _HiggsAudioV3ProfileScope:
-        self.start = _time.perf_counter()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        _record_higgs_audio_v3_profile(self.name, (_time.perf_counter() - self.start) * 1000.0)
-
-
-def _record_higgs_audio_v3_profile(name: str, elapsed_ms: float) -> None:
-    global _HIGGS_AUDIO_V3_PROFILE_EVENTS
-    if not _HIGGS_AUDIO_V3_PROFILE_ENABLED:
-        return
-    stats = _HIGGS_AUDIO_V3_PROFILE_STATS.setdefault(name, [0.0, 0.0, 0.0])
-    stats[0] += 1
-    stats[1] += elapsed_ms
-    stats[2] = max(stats[2], elapsed_ms)
-    _HIGGS_AUDIO_V3_PROFILE_EVENTS += 1
-    if _HIGGS_AUDIO_V3_PROFILE_EVENTS % _HIGGS_AUDIO_V3_PROFILE_SUMMARY_EVERY != 0:
-        return
-    for stat_name, (count, total_ms, max_ms) in sorted(_HIGGS_AUDIO_V3_PROFILE_STATS.items()):
-        logger.info(
-            "[HiggsAudioV3Profile] name=%s count=%d total_ms=%.3f mean_ms=%.3f max_ms=%.3f",
-            stat_name,
-            int(count),
-            total_ms,
-            total_ms / max(count, 1),
-            max_ms,
-        )
 
 
 def build_engine_core_request_from_tokens(
@@ -1325,21 +1281,11 @@ class Orchestrator:
             )[req_id] = req_state.pd_prefill_multimodal_output
 
         try:
-            if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
-                with _HiggsAudioV3ProfileScope(
-                    f"connector.orchestrator.stage{src_stage_id}_to_{next_logical}.process_engine_inputs"
-                ):
-                    next_inputs = next_client.process_engine_inputs(
-                        source_outputs,
-                        req_state.prompt,
-                        streaming_context=req_state.streaming,
-                    )
-            else:
-                next_inputs = next_client.process_engine_inputs(
-                    source_outputs,
-                    req_state.prompt,
-                    streaming_context=req_state.streaming,
-                )
+            next_inputs = next_client.process_engine_inputs(
+                source_outputs,
+                req_state.prompt,
+                streaming_context=req_state.streaming,
+            )
         except Exception:
             logger.exception(
                 "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
@@ -1354,52 +1300,23 @@ class Orchestrator:
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
             model_stage = getattr(next_client, "model_stage", None)
             mm_features = req_state.mm_features if model_stage == "thinker" else None
-            if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
-                with _HiggsAudioV3ProfileScope(
-                    f"connector.orchestrator.stage{src_stage_id}_to_{next_logical}.build_request"
-                ):
-                    request = build_engine_core_request_from_tokens(
-                        request_id=req_id,
-                        prompt=next_input,
-                        params=params,
-                        model_config=next_pool.stage_vllm_config.model_config,
-                        mm_features=mm_features,
-                        resumable=next_stage_resumable,
-                    )
-            else:
-                request = build_engine_core_request_from_tokens(
-                    request_id=req_id,
-                    prompt=next_input,
-                    params=params,
-                    model_config=next_pool.stage_vllm_config.model_config,
-                    mm_features=mm_features,
-                    resumable=next_stage_resumable,
-                )
+            request = build_engine_core_request_from_tokens(
+                request_id=req_id,
+                prompt=next_input,
+                params=params,
+                model_config=next_pool.stage_vllm_config.model_config,
+                mm_features=mm_features,
+                resumable=next_stage_resumable,
+            )
 
             request.external_req_id = request.request_id
             if already_submitted:
-                if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
-                    with _HiggsAudioV3ProfileScope(
-                        f"connector.orchestrator.stage{src_stage_id}_to_{next_logical}.submit_update"
-                    ):
-                        await next_pool.submit_update(req_id, req_state, request)
-                else:
-                    await next_pool.submit_update(req_id, req_state, request)
+                await next_pool.submit_update(req_id, req_state, request)
             else:
-                if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
-                    with _HiggsAudioV3ProfileScope(
-                        f"connector.orchestrator.stage{src_stage_id}_to_{next_logical}.submit_initial"
-                    ):
-                        await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
-                else:
-                    await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
         req_state.stage_submit_ts[next_logical] = _time.time()
         _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
-        _record_higgs_audio_v3_profile(
-            f"connector.orchestrator.stage{src_stage_id}_to_{next_logical}.total_submit",
-            _tx_ms,
-        )
         self._emit_tx_edge(
             from_stage=src_stage_id,
             from_replica=src_replica_id if src_replica_id is not None else 0,

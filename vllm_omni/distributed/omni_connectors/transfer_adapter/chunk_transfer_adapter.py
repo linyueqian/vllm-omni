@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
-import os
-import time
 from collections import defaultdict, deque
 from collections.abc import Callable
 from typing import Any
@@ -20,46 +18,6 @@ from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
 logger = get_connector_logger(__name__)
-
-_PROFILE_ENABLED = bool(os.getenv("HIGGS_AUDIO_V3_PROFILE"))
-_PROFILE_SUMMARY_EVERY = max(1, int(os.getenv("HIGGS_AUDIO_V3_PROFILE_SUMMARY_EVERY", "50")))
-_PROFILE_STATS: dict[str, list[float]] = {}
-_PROFILE_EVENTS = 0
-
-
-class _ProfileScope:
-    def __init__(self, name: str):
-        self.name = name
-        self.start = 0.0
-
-    def __enter__(self) -> None:
-        self.start = time.perf_counter()
-        return None
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        _record_profile(self.name, (time.perf_counter() - self.start) * 1000.0)
-
-
-def _record_profile(name: str, elapsed_ms: float) -> None:
-    global _PROFILE_EVENTS
-    if not _PROFILE_ENABLED:
-        return
-    stats = _PROFILE_STATS.setdefault(name, [0.0, 0.0, 0.0])
-    stats[0] += 1.0
-    stats[1] += elapsed_ms
-    stats[2] = max(stats[2], elapsed_ms)
-    _PROFILE_EVENTS += 1
-    if _PROFILE_EVENTS % _PROFILE_SUMMARY_EVERY != 0:
-        return
-    for stat_name, (count, total_ms, max_ms) in sorted(_PROFILE_STATS.items()):
-        logger.info(
-            "[HiggsAudioV3Profile] name=%s count=%d total_ms=%.3f mean_ms=%.3f max_ms=%.3f",
-            stat_name,
-            int(count),
-            total_ms,
-            total_ms / max(count, 1.0),
-            max_ms,
-        )
 
 
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
@@ -244,103 +202,87 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         # Use timeout=0 for non-blocking poll
         try:
-            if _PROFILE_ENABLED:
-                with _ProfileScope(f"connector.stage{stage_id}.get"):
-                    result = self.connector.get(
-                        str(target_stage_id),
-                        str(stage_id),
-                        connector_get_key,
-                    )
-            else:
-                result = self.connector.get(
-                    str(target_stage_id),
-                    str(stage_id),
-                    connector_get_key,
-                )
+            result = self.connector.get(
+                str(target_stage_id),
+                str(stage_id),
+                connector_get_key,
+            )
         except Exception as e:
             logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
             return False
 
         if result is None:
-            _record_profile(f"connector.stage{stage_id}.get_empty", 0.0)
             return False
         payload_data, size = result
 
         if payload_data:
-            process_scope = _ProfileScope(f"connector.stage{stage_id}.merge_payload") if _PROFILE_ENABLED else None
-            if process_scope is not None:
-                process_scope.__enter__()
             # Update connector state
-            try:
-                self.get_req_chunk[req_id] += 1
+            self.get_req_chunk[req_id] += 1
 
-                meta = payload_data.get("meta", {})
-                payload_finished = self._is_truthy_scalar(meta.get("finished"))
-                payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
-                if self.model_mode == "ar":
-                    request.additional_information = payload_data
-                    if chunk_id > 0 and request.resumable:
-                        # For new streaming input segment, we should update prompt from payload
-                        construct_next_stage_streaming_input_prompt(payload_data, request)
+            meta = payload_data.get("meta", {})
+            payload_finished = self._is_truthy_scalar(meta.get("finished"))
+            payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
+            if self.model_mode == "ar":
+                request.additional_information = payload_data
+                if chunk_id > 0 and request.resumable:
+                    # For new streaming input segment, we should update prompt from payload
+                    construct_next_stage_streaming_input_prompt(payload_data, request)
 
-                    if payload_finished:
-                        self.finished_requests.add(req_id)
-                        request.resumable = False
-                    if payload_segment_finished:
-                        self.segment_finished_requests.add(req_id)
-                else:
-                    if payload_finished:
-                        self.finished_requests.add(req_id)
-                        request.resumable = False
-                    if payload_segment_finished:
-                        self.segment_finished_requests.add(req_id)
+                if payload_finished:
+                    self.finished_requests.add(req_id)
+                    request.resumable = False
+                if payload_segment_finished:
+                    self.segment_finished_requests.add(req_id)
+            else:
+                if payload_finished:
+                    self.finished_requests.add(req_id)
+                    request.resumable = False
+                if payload_segment_finished:
+                    self.segment_finished_requests.add(req_id)
 
-                    new_ids = payload_data.get("codes", {}).get("audio")
-                    has_tensor_codes = isinstance(new_ids, torch.Tensor)
-                    use_tensor_codes = has_tensor_codes and new_ids.ndim >= 2
-                    if use_tensor_codes:
-                        request.prompt_token_ids = [0] if new_ids.numel() > 0 else []
-                    elif has_tensor_codes:
-                        new_ids = new_ids.tolist()
-                    elif new_ids is None:
-                        new_ids = []
-                        request.prompt_token_ids = new_ids
-                    if not use_tensor_codes:
-                        request.prompt_token_ids = new_ids
-                    prev_info = getattr(request, "additional_information", None)
-                    info = dict(prev_info) if isinstance(prev_info, dict) else {}
-                    for key, value in payload_data.items():
-                        if key == "codes":
-                            if use_tensor_codes and isinstance(value, dict):
-                                existing_sub = info.get(key)
-                                merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
-                                merged_sub.update(value)
-                                info[key] = merged_sub
-                            continue
-                        if isinstance(value, dict):
+                new_ids = payload_data.get("codes", {}).get("audio")
+                has_tensor_codes = isinstance(new_ids, torch.Tensor)
+                use_tensor_codes = has_tensor_codes and new_ids.ndim >= 2
+                if use_tensor_codes:
+                    request.prompt_token_ids = [0] if new_ids.numel() > 0 else []
+                elif has_tensor_codes:
+                    new_ids = new_ids.tolist()
+                elif new_ids is None:
+                    new_ids = []
+                    request.prompt_token_ids = new_ids
+                if not use_tensor_codes:
+                    request.prompt_token_ids = new_ids
+                prev_info = getattr(request, "additional_information", None)
+                info = dict(prev_info) if isinstance(prev_info, dict) else {}
+                for key, value in payload_data.items():
+                    if key == "codes":
+                        if use_tensor_codes and isinstance(value, dict):
                             existing_sub = info.get(key)
                             merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
-                            for sk, sv in value.items():
-                                if key == "meta" and sk == "finished":
-                                    continue
-                                merged_sub[sk] = sv
+                            merged_sub.update(value)
                             info[key] = merged_sub
-                            continue
-                        info[key] = value
-                    request.additional_information = info
-                    request.num_computed_tokens = 0
+                        continue
+                    if isinstance(value, dict):
+                        existing_sub = info.get(key)
+                        merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
+                        for sk, sv in value.items():
+                            if key == "meta" and sk == "finished":
+                                continue
+                            merged_sub[sk] = sv
+                        info[key] = merged_sub
+                        continue
+                    info[key] = value
+                request.additional_information = info
+                request.num_computed_tokens = 0
 
-                    # Empty chunk with more data expected: keep polling.
-                    has_new_ids = bool(new_ids.numel()) if use_tensor_codes else bool(new_ids)
-                    if not has_new_ids and not payload_finished:
-                        # The base recv loop treats False as "not ready yet" and
-                        # requeues the request. Do not mark an empty non-terminal
-                        # chunk as ready, otherwise Stage1 can consume before the
-                        # first DAC frame arrives.
-                        return False
-            finally:
-                if process_scope is not None:
-                    process_scope.__exit__(None, None, None)
+                # Empty chunk with more data expected: keep polling.
+                has_new_ids = bool(new_ids.numel()) if use_tensor_codes else bool(new_ids)
+                if not has_new_ids and not payload_finished:
+                    # The base recv loop treats False as "not ready yet" and
+                    # requeues the request. Do not mark an empty non-terminal
+                    # chunk as ready, otherwise Stage1 can consume before the
+                    # first DAC frame arrives.
+                    return False
 
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)
@@ -364,23 +306,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         payload_data: OmniPayloadStruct | None = None
         if self.custom_process_next_stage_input_func:
             try:
-                if _PROFILE_ENABLED:
-                    with _ProfileScope(f"connector.stage{stage_id}.build_payload"):
-                        payload_data = self.custom_process_next_stage_input_func(
-                            transfer_manager=self,
-                            pooling_output=pooling_output,
-                            request=request,
-                            # Existing processors use is_finished as a flush signal.
-                            is_finished=is_segment_finished,
-                        )
-                else:
-                    payload_data = self.custom_process_next_stage_input_func(
-                        transfer_manager=self,
-                        pooling_output=pooling_output,
-                        request=request,
-                        # Existing processors use is_finished as a flush signal.
-                        is_finished=is_segment_finished,
-                    )
+                payload_data = self.custom_process_next_stage_input_func(
+                    transfer_manager=self,
+                    pooling_output=pooling_output,
+                    request=request,
+                    # Existing processors use is_finished as a flush signal.
+                    is_finished=is_segment_finished,
+                )
 
             except Exception as e:
                 logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
@@ -396,21 +328,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
         payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
 
-        if _PROFILE_ENABLED:
-            with _ProfileScope(f"connector.stage{stage_id}.put"):
-                success, size, metadata = self.connector.put(
-                    from_stage=str(stage_id),
-                    to_stage=str(next_stage_id),
-                    put_key=connector_put_key,
-                    data=payload_data,
-                )
-        else:
-            success, size, metadata = self.connector.put(
-                from_stage=str(stage_id),
-                to_stage=str(next_stage_id),
-                put_key=connector_put_key,
-                data=payload_data,
-            )
+        success, size, metadata = self.connector.put(
+            from_stage=str(stage_id),
+            to_stage=str(next_stage_id),
+            put_key=connector_put_key,
+            data=payload_data,
+        )
 
         if success:
             self.put_req_chunk[external_req_id] += 1

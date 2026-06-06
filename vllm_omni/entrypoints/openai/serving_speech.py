@@ -63,7 +63,6 @@ from vllm_omni.utils.speaker_cache import (
 )
 
 logger = init_logger(__name__)
-_HIGGS_AUDIO_V3_PROFILE_ENABLED = bool(os.getenv("HIGGS_AUDIO_V3_PROFILE"))
 
 # TTS Configuration
 _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
@@ -77,7 +76,7 @@ _MING_TTS_MODEL_STAGES = {"ming_tts"}
 _MOSS_TTS_MODEL_STAGES = {"moss_tts_nano"}
 _MOSS_TTS_FULL_MODEL_STAGES = {"moss_tts", "moss_tts_codec"}
 _HIGGS_AUDIO_V2_TTS_MODEL_STAGES = {"higgs_audio_v2"}
-_HIGGS_AUDIO_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
+_HIGGS_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
@@ -86,7 +85,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _COSYVOICE3_TTS_MODEL_STAGES
     | _OMNIVOICE_TTS_MODEL_STAGES
     | _HIGGS_AUDIO_V2_TTS_MODEL_STAGES
-    | _HIGGS_AUDIO_V3_TTS_MODEL_STAGES
+    | _HIGGS_V3_TTS_MODEL_STAGES
     | _COVO_AUDIO_MODEL_STAGES
     | _VOXCPM2_TTS_MODEL_STAGES
     | _MING_TTS_MODEL_STAGES
@@ -120,10 +119,8 @@ _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 256
 _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES = 256 * 1024 * 1024
-_HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_ENTRIES = int(os.getenv("HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_ENTRIES", "256") or 256)
-_HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_BYTES = int(
-    os.getenv("HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_BYTES", str(64 * 1024 * 1024)) or str(64 * 1024 * 1024)
-)
+_HIGGS_V3_REF_CODE_CACHE_MAX_ENTRIES = 256
+_HIGGS_V3_REF_CODE_CACHE_MAX_BYTES = 64 * 1024 * 1024
 _QWEN3_TTS_REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MIN = 1
@@ -605,7 +602,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "moss_tts"
         if model_stage in _HIGGS_AUDIO_V2_TTS_MODEL_STAGES:
             return "higgs_audio_v2"
-        if model_stage in _HIGGS_AUDIO_V3_TTS_MODEL_STAGES:
+        if model_stage in _HIGGS_V3_TTS_MODEL_STAGES:
             return "higgs_audio_v3"
         if model_stage in _GLM_TTS_MODEL_STAGES:
             return "glm_tts"
@@ -1935,17 +1932,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         adapter = await self._resolve_higgs_audio_v3_adapter()
 
         if request.ref_audio is None:
-            start_s = time.perf_counter()
             prompt_ids = adapter.build_prompt(request.input)
-            if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
-                elapsed_ms = (time.perf_counter() - start_s) * 1000.0
-                logger.info(
-                    "[HiggsAudioV3Profile] name=serving.higgs_v3.build_plain_prompt count=1 "
-                    "total_ms=%.3f mean_ms=%.3f max_ms=%.3f",
-                    elapsed_ms,
-                    elapsed_ms,
-                    elapsed_ms,
-                )
             return tokens_input(prompt_token_ids=prompt_ids)
 
         # Voice clone
@@ -1954,20 +1941,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             encode_reference_audio,
         )
 
-        start_s = time.perf_counter()
         wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
         artifact_key = self._get_resolved_ref_audio_artifact_key(request.ref_audio)
         wav = np.asarray(wav_list, dtype=np.float32)
-        if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
-            elapsed_ms = (time.perf_counter() - start_s) * 1000.0
-            logger.info(
-                "[HiggsAudioV3Profile] name=serving.higgs_v3.resolve_ref_audio count=1 "
-                "total_ms=%.3f mean_ms=%.3f max_ms=%.3f",
-                elapsed_ms,
-                elapsed_ms,
-                elapsed_ms,
-            )
-        start_s = time.perf_counter()
         ref_codes_delayed, cache_hit, inflight_wait = await self._resolve_higgs_audio_v3_ref_codes(
             artifact_key,
             wav,
@@ -1975,33 +1951,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             encode_reference_audio,
             apply_delay_pattern,
         )
-        if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
-            elapsed_ms = (time.perf_counter() - start_s) * 1000.0
-            logger.info(
-                "[HiggsAudioV3Profile] name=serving.higgs_v3.encode_ref_audio count=1 "
-                "total_ms=%.3f mean_ms=%.3f max_ms=%.3f cache_hit=%d inflight_wait=%d",
-                elapsed_ms,
-                elapsed_ms,
-                elapsed_ms,
-                int(cache_hit),
-                int(inflight_wait),
-            )
+        del cache_hit, inflight_wait
 
-        start_s = time.perf_counter()
         prompt_ids = adapter.build_prompt(
             request.input,
             num_ref_tokens=int(ref_codes_delayed.shape[0]),
             reference_text=request.ref_text or None,
         )
-        if _HIGGS_AUDIO_V3_PROFILE_ENABLED:
-            elapsed_ms = (time.perf_counter() - start_s) * 1000.0
-            logger.info(
-                "[HiggsAudioV3Profile] name=serving.higgs_v3.build_clone_prompt count=1 "
-                "total_ms=%.3f mean_ms=%.3f max_ms=%.3f",
-                elapsed_ms,
-                elapsed_ms,
-                elapsed_ms,
-            )
         prompt = tokens_input(prompt_token_ids=prompt_ids)
         import torch
 
@@ -2055,25 +2011,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return cached[0].clone()
 
     def _put_higgs_audio_v3_ref_codes(self, artifact_key: str, codes: torch.Tensor) -> None:
-        if (
-            _HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_ENTRIES <= 0
-            or _HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_BYTES <= 0
-            or not artifact_key
-        ):
+        if _HIGGS_V3_REF_CODE_CACHE_MAX_ENTRIES <= 0 or _HIGGS_V3_REF_CODE_CACHE_MAX_BYTES <= 0 or not artifact_key:
             return
         cached_codes = codes.detach().to("cpu", dtype=torch.long).contiguous()
         size = int(cached_codes.numel() * cached_codes.element_size())
-        if size > _HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_BYTES:
+        if size > _HIGGS_V3_REF_CODE_CACHE_MAX_BYTES:
             return
         previous = self._higgs_audio_v3_ref_code_cache.pop(artifact_key, None)
         if previous is not None:
             self._higgs_audio_v3_ref_code_cache_bytes -= previous[1]
         self._higgs_audio_v3_ref_code_cache[artifact_key] = (cached_codes, size)
         self._higgs_audio_v3_ref_code_cache_bytes += size
-        while len(self._higgs_audio_v3_ref_code_cache) > _HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_ENTRIES:
+        while len(self._higgs_audio_v3_ref_code_cache) > _HIGGS_V3_REF_CODE_CACHE_MAX_ENTRIES:
             _, (_, old_size) = self._higgs_audio_v3_ref_code_cache.popitem(last=False)
             self._higgs_audio_v3_ref_code_cache_bytes -= old_size
-        while self._higgs_audio_v3_ref_code_cache_bytes > _HIGGS_AUDIO_V3_REF_CODE_CACHE_MAX_BYTES:
+        while self._higgs_audio_v3_ref_code_cache_bytes > _HIGGS_V3_REF_CODE_CACHE_MAX_BYTES:
             _, (_, old_size) = self._higgs_audio_v3_ref_code_cache.popitem(last=False)
             self._higgs_audio_v3_ref_code_cache_bytes -= old_size
 

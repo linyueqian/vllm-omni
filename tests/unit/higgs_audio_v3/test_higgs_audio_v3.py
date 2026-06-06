@@ -236,7 +236,7 @@ class TestDelayPatternBehavior:
 
 
 class TestSamplerMethods:
-    """Test the actual _sample_audio_codes and _apply_delay_pattern_masking methods."""
+    """Test the actual sampler and batched delay masking methods."""
 
     def _make_minimal_talker(self):
         """Create a minimal talker-like object with sampler/masking methods."""
@@ -245,13 +245,9 @@ class TestSamplerMethods:
         class FakeTalker:
             num_codebooks = 8
             codebook_size = 1026
-            _audio_state = {}
 
         t = FakeTalker()
         t._sample_audio_codes = mod.HiggsAudioV3TalkerForConditionalGeneration._sample_audio_codes.__get__(t)
-        t._apply_delay_pattern_masking = (
-            mod.HiggsAudioV3TalkerForConditionalGeneration._apply_delay_pattern_masking.__get__(t)
-        )
         return t
 
     def _make_batched_sampler_talker(self, num_rows=4):
@@ -277,7 +273,8 @@ class TestSamplerMethods:
         t._last_audio_host_staging = None
         t._last_audio_gpu_staging = None
         t._last_audio_staging_event = None
-        t._audio_staging_event = None
+        t._audio_staging_events = []
+        t._audio_staging_event_cursor = 0
         t._last_audio_codes = None
         t._last_audio_code_valid = []
         t._postprocess_cursor = 0
@@ -286,6 +283,7 @@ class TestSamplerMethods:
 
         cls = mod.HiggsAudioV3TalkerForConditionalGeneration
         for name in (
+            "_sample_audio_codes",
             "_ensure_decode_state_capacity",
             "_get_codebook_indices",
             "_get_audio_codes_buffer",
@@ -300,7 +298,7 @@ class TestSamplerMethods:
 
     def test_sample_respects_mask(self):
         """Tokens masked to -inf must never be sampled."""
-        t = self._make_minimal_talker()
+        t = self._make_batched_sampler_talker(num_rows=1)
         logits = torch.full((10, 1026), float("-inf"))
         # Only token 500 is allowed for each row
         logits[:, 500] = 0.0
@@ -310,7 +308,7 @@ class TestSamplerMethods:
 
     def test_sample_all_masked_falls_back_to_argmax(self):
         """All-masked row should fall back to argmax (least-negative logit)."""
-        t = self._make_minimal_talker()
+        t = self._make_batched_sampler_talker(num_rows=1)
         logits = torch.full((2, 1026), float("-inf"))
         # Row 0: all masked
         # Row 1: only token 42 allowed
@@ -323,11 +321,13 @@ class TestSamplerMethods:
         """During delay phase, codebooks beyond delay_count must have only BOC allowed."""
         from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import BOC_ID
 
-        t = self._make_minimal_talker()
+        t = self._make_batched_sampler_talker(num_rows=1)
         # Simulate delay_count=2 for batch row 0
-        t._audio_state[0] = {"num_delay": 2, "num_remaining_delays": None}
+        t._ensure_decode_state_capacity(1, torch.device("cpu"))
+        t._decode_delay_count[0] = 2
+        t._decode_eoc_countdown[0] = -1
         cb_logits = torch.zeros(1, 8, 1026)  # [1 audio row, 8 codebooks, 1026 vocab]
-        t._apply_delay_pattern_masking(cb_logits, [0])
+        t._apply_delay_pattern_masking_batched(cb_logits, torch.tensor([0], dtype=torch.long))
         # CBs 3-7 should have only BOC allowed (everything else -inf)
         for q in range(3, 8):
             row = cb_logits[0, q]
@@ -340,10 +340,12 @@ class TestSamplerMethods:
         """Active codebooks during delay should have BOC disallowed."""
         from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import BOC_ID
 
-        t = self._make_minimal_talker()
-        t._audio_state[0] = {"num_delay": 3, "num_remaining_delays": None}
+        t = self._make_batched_sampler_talker(num_rows=1)
+        t._ensure_decode_state_capacity(1, torch.device("cpu"))
+        t._decode_delay_count[0] = 3
+        t._decode_eoc_countdown[0] = -1
         cb_logits = torch.zeros(1, 8, 1026)
-        t._apply_delay_pattern_masking(cb_logits, [0])
+        t._apply_delay_pattern_masking_batched(cb_logits, torch.tensor([0], dtype=torch.long))
         # CBs 0-3 are active: BOC should be -inf
         for q in range(4):
             assert cb_logits[0, q, BOC_ID].item() == float("-inf")
@@ -352,10 +354,12 @@ class TestSamplerMethods:
         """Only codebook 0 should allow EOC during normal generation."""
         from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
 
-        t = self._make_minimal_talker()
-        t._audio_state[0] = {"num_delay": 8, "num_remaining_delays": None}
+        t = self._make_batched_sampler_talker(num_rows=1)
+        t._ensure_decode_state_capacity(1, torch.device("cpu"))
+        t._decode_delay_count[0] = 8
+        t._decode_eoc_countdown[0] = -1
         cb_logits = torch.zeros(1, 8, 1026)
-        t._apply_delay_pattern_masking(cb_logits, [0])
+        t._apply_delay_pattern_masking_batched(cb_logits, torch.tensor([0], dtype=torch.long))
         # CB0 should keep EOC
         assert cb_logits[0, 0, EOC_ID].item() != float("-inf")
         # CB1-7 should have EOC masked
@@ -369,11 +373,13 @@ class TestSamplerMethods:
             EOC_ID,
         )
 
-        t = self._make_minimal_talker()
+        t = self._make_batched_sampler_talker(num_rows=1)
         # Ramp-down with 4 remaining delays: lock CBs 0-3 to EOC
-        t._audio_state[0] = {"num_delay": 8, "num_remaining_delays": 4}
+        t._ensure_decode_state_capacity(1, torch.device("cpu"))
+        t._decode_delay_count[0] = 8
+        t._decode_eoc_countdown[0] = 4
         cb_logits = torch.zeros(1, 8, 1026)
-        t._apply_delay_pattern_masking(cb_logits, [0])
+        t._apply_delay_pattern_masking_batched(cb_logits, torch.tensor([0], dtype=torch.long))
         # CBs 0-3 locked: only EOC allowed
         for q in range(4):
             row = cb_logits[0, q]
@@ -515,7 +521,6 @@ class TestAudioFeedback:
             codebook_size = 1026
             _audio_continuation_id = 99999  # fake audio token
             _last_step_query_start_loc = None
-            _audio_state = {}
             _decode_active_audio_count = 0
             _decode_last_codes = torch.zeros(4, 8, dtype=torch.long)
             _decode_has_codes = torch.zeros(4, dtype=torch.bool)

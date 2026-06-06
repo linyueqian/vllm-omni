@@ -10,7 +10,6 @@ prefix) rather than from a standalone tokenizer repo.
 from __future__ import annotations
 
 import os
-import time
 from typing import Any
 
 import torch
@@ -35,62 +34,6 @@ __all__ = [
 ]
 
 logger = init_logger(__name__)
-
-_PROFILE_ENABLED = bool(os.getenv("HIGGS_AUDIO_V3_PROFILE"))
-_PROFILE_SYNC = os.getenv("HIGGS_AUDIO_V3_PROFILE_SYNC", "1").lower() not in {"0", "false", "no"}
-_PROFILE_SUMMARY_EVERY = max(1, int(os.getenv("HIGGS_AUDIO_V3_PROFILE_SUMMARY_EVERY", "50")))
-_PROFILE_STATS: dict[str, list[float]] = {}
-_PROFILE_EVENTS = 0
-_COMPILE_ACOUSTIC_DECODER = os.getenv("HIGGS_AUDIO_V3_STAGE1_COMPILE_ACOUSTIC_DECODER", "").lower() in {
-    "1",
-    "true",
-    "yes",
-}
-_COMPILE_ACOUSTIC_DECODER_DYNAMIC = os.getenv("HIGGS_AUDIO_V3_STAGE1_COMPILE_DYNAMIC", "1").lower() not in {
-    "0",
-    "false",
-    "no",
-}
-
-
-class _ProfileScope:
-    def __init__(self, name: str):
-        self.name = name
-        self.start = 0.0
-
-    def __enter__(self) -> None:
-        if _PROFILE_SYNC and torch.cuda.is_available():
-            torch.accelerator.synchronize()
-        self.start = time.perf_counter()
-        return None
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        if _PROFILE_SYNC and torch.cuda.is_available():
-            torch.accelerator.synchronize()
-        elapsed_ms = (time.perf_counter() - self.start) * 1000.0
-        _record_profile(self.name, elapsed_ms)
-
-
-def _record_profile(name: str, elapsed_ms: float) -> None:
-    global _PROFILE_EVENTS
-    if not _PROFILE_ENABLED:
-        return
-    stats = _PROFILE_STATS.setdefault(name, [0.0, 0.0, 0.0])
-    stats[0] += 1.0
-    stats[1] += elapsed_ms
-    stats[2] = max(stats[2], elapsed_ms)
-    _PROFILE_EVENTS += 1
-    if _PROFILE_EVENTS % _PROFILE_SUMMARY_EVERY != 0:
-        return
-    for stat_name, (count, total_ms, max_ms) in sorted(_PROFILE_STATS.items()):
-        logger.info(
-            "[HiggsAudioV3Profile] name=%s count=%d total_ms=%.3f mean_ms=%.3f max_ms=%.3f",
-            stat_name,
-            int(count),
-            total_ms,
-            total_ms / max(count, 1.0),
-            max_ms,
-        )
 
 
 # Prefix under which codec weights are stored in the v3 checkpoint.
@@ -154,7 +97,6 @@ class HiggsAudioV3Code2Wav(nn.Module):
         self.fc2: nn.Linear | None = None
         self.acoustic_decoder: nn.Module | None = None
         self._loaded: bool = False
-        self._acoustic_decoder_compiled: bool = False
         # Do NOT eagerly load from standalone tokenizer here.
         # load_weights() will try bundled V3 codec first, then fall back.
 
@@ -189,7 +131,6 @@ class HiggsAudioV3Code2Wav(nn.Module):
         self.quantizer = quantizer
         self.fc2 = fc2
         self.acoustic_decoder = acoustic_decoder
-        self._maybe_compile_acoustic_decoder()
         self._loaded = True
         logger.info("Loaded HiggsAudioV3Code2Wav from standalone tokenizer repo.")
 
@@ -423,26 +364,7 @@ class HiggsAudioV3Code2Wav(nn.Module):
         self.quantizer = quantizer
         self.fc2 = fc2
         self.acoustic_decoder = acoustic_decoder
-        self._maybe_compile_acoustic_decoder()
         self._loaded = True
-
-    def _maybe_compile_acoustic_decoder(self) -> None:
-        if not _COMPILE_ACOUSTIC_DECODER or self.acoustic_decoder is None or self._acoustic_decoder_compiled:
-            return
-        try:
-            self.acoustic_decoder = torch.compile(
-                self.acoustic_decoder,
-                mode="reduce-overhead",
-                fullgraph=False,
-                dynamic=_COMPILE_ACOUSTIC_DECODER_DYNAMIC,
-            )
-            self._acoustic_decoder_compiled = True
-            logger.info(
-                "HiggsAudioV3Code2Wav: enabled torch.compile for acoustic_decoder (mode=reduce-overhead, dynamic=%s).",
-                _COMPILE_ACOUSTIC_DECODER_DYNAMIC,
-            )
-        except Exception as exc:
-            logger.warning("HiggsAudioV3Code2Wav: torch.compile acoustic_decoder failed: %s", exc)
 
     # ------------------------------------------------------------------ decode
     @torch.inference_mode()
@@ -451,30 +373,15 @@ class HiggsAudioV3Code2Wav(nn.Module):
         if not self._loaded:
             raise RuntimeError("HiggsAudioV3Code2Wav not loaded.")
 
-        if _PROFILE_ENABLED:
-            with _ProfileScope("stage1.decode.validate_codes"):
-                codes = self._validate_codes(audio_codes)
-            with _ProfileScope("stage1.decode.rvq_decode"):
-                rvq_codes = codes.transpose(0, 1).long()
-                quantized = self.quantizer.decode(rvq_codes)
-            with _ProfileScope("stage1.decode.fc2"):
-                quantized = quantized.to(dtype=self.fc2.weight.dtype)
-                quantized = self.fc2(quantized.transpose(1, 2)).transpose(1, 2)
-            with _ProfileScope("stage1.decode.acoustic_decoder"):
-                first_param = next(self.acoustic_decoder.parameters(), None)
-                if first_param is not None and quantized.dtype != first_param.dtype:
-                    quantized = quantized.to(dtype=first_param.dtype)
-                audio = self.acoustic_decoder(quantized)
-        else:
-            codes = self._validate_codes(audio_codes)
-            rvq_codes = codes.transpose(0, 1).long()
-            quantized = self.quantizer.decode(rvq_codes)
-            quantized = quantized.to(dtype=self.fc2.weight.dtype)
-            quantized = self.fc2(quantized.transpose(1, 2)).transpose(1, 2)
-            first_param = next(self.acoustic_decoder.parameters(), None)
-            if first_param is not None and quantized.dtype != first_param.dtype:
-                quantized = quantized.to(dtype=first_param.dtype)
-            audio = self.acoustic_decoder(quantized)
+        codes = self._validate_codes(audio_codes)
+        rvq_codes = codes.transpose(0, 1).long()
+        quantized = self.quantizer.decode(rvq_codes)
+        quantized = quantized.to(dtype=self.fc2.weight.dtype)
+        quantized = self.fc2(quantized.transpose(1, 2)).transpose(1, 2)
+        first_param = next(self.acoustic_decoder.parameters(), None)
+        if first_param is not None and quantized.dtype != first_param.dtype:
+            quantized = quantized.to(dtype=first_param.dtype)
+        audio = self.acoustic_decoder(quantized)
         if audio.dim() == 2:
             audio = audio.unsqueeze(1)
         return audio.to(codes.device)
@@ -530,13 +437,8 @@ class HiggsAudioV3Code2Wav(nn.Module):
                 multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
             )
 
-        if _PROFILE_ENABLED:
-            with _ProfileScope("stage1.forward.flatten_split_ids"):
-                ids = input_ids.reshape(-1).to(dtype=torch.long)
-                request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
-        else:
-            ids = input_ids.reshape(-1).to(dtype=torch.long)
-            request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
+        ids = input_ids.reshape(-1).to(dtype=torch.long)
+        request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
 
         left_context_size = [0] * len(request_ids_list)
         right_holdback_size = [0] * len(request_ids_list)
@@ -565,13 +467,8 @@ class HiggsAudioV3Code2Wav(nn.Module):
                 wavs.append(empty)
                 continue
             frames = n // self.num_codebooks
-            if _PROFILE_ENABLED:
-                with _ProfileScope("stage1.forward.reshape_codes"):
-                    codes_qf = req_ids.reshape(self.num_codebooks, frames)
-                    codes_bqf = codes_qf.unsqueeze(0)
-            else:
-                codes_qf = req_ids.reshape(self.num_codebooks, frames)
-                codes_bqf = codes_qf.unsqueeze(0)
+            codes_qf = req_ids.reshape(self.num_codebooks, frames)
+            codes_bqf = codes_qf.unsqueeze(0)
             try:
                 pcm = self.forward_chunk(
                     codes_bqf,
@@ -583,11 +480,7 @@ class HiggsAudioV3Code2Wav(nn.Module):
                 logger.warning("HiggsAudioV3Code2Wav: decode skipped (%s)", exc)
                 wavs.append(empty)
                 continue
-            if _PROFILE_ENABLED:
-                with _ProfileScope("stage1.forward.to_cpu_float32"):
-                    wavs.append(pcm.squeeze(0).squeeze(0).to(torch.float32).cpu())
-            else:
-                wavs.append(pcm.squeeze(0).squeeze(0).to(torch.float32).cpu())
+            wavs.append(pcm.squeeze(0).squeeze(0).to(torch.float32).cpu())
 
         return OmniOutput(
             text_hidden_states=None,
