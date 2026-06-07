@@ -104,8 +104,10 @@ python examples/online_serving/text_to_speech/higgs_audio_v3/batch_speech_client
 - Deploy config: `vllm_omni/deploy/higgs_multimodal_qwen3.yaml` (auto-discovered from `model_type`).
   - `max_num_seqs=16` for both stages.
   - Stage 0 and Stage 1 default to the same device (`0`) for single-GPU serving.
-  - Stage 0 uses FlashInfer attention with `FULL_DECODE_ONLY` CUDA graph capture sizes `[1, 2, 4, 8, 16]`.
+  - Stage 0 intentionally keeps `enforce_eager=true`. This preserves the Higgs-specific local MLP CUDA graph path, which is the current high-throughput default.
   - Stage 1 remains `enforce_eager=true` for the codec decoder.
+- Performance note:
+  - Do not switch Stage 0 to vLLM `FULL_DECODE_ONLY` CUDA graph by default without an end-to-end throughput and audio-quality revalidation. On the H20 SeedTTS c16/full-dataset benchmark, the eager Stage 0 path with Higgs local MLP CUDA graph reproduced ~35 audio_s/s (`1088/1088` OK per run, three runs around 134-136s). The vLLM `FULL_DECODE_ONLY` experiment was functionally correct but only reached ~25 audio_s/s on the c16/p500 benchmark because it replaces, rather than stacks on top of, the local MLP graph path.
 - Known limitations:
   - Stage 1 (code2wav) must use `enforce_eager=true` (`@torch.inference_mode` incompatible with graph capture).
-  - Stage 0 decode graph leaves sampler, delay-state updates, staging, and request postprocess outside graph.
+  - Stage 0 full-decode CUDA graph is experimental; sampler, delay-state updates, staging, and request postprocess remain outside the graph.
