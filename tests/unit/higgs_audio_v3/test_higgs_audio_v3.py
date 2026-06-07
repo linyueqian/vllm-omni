@@ -291,6 +291,8 @@ class TestSamplerMethods:
             "_get_audio_host_staging_buffer",
             "_apply_delay_pattern_masking_batched",
             "_update_delay_state_batched",
+            "_prefill_row_mask",
+            "_audio_seed_mask_from_step_input",
         ):
             setattr(t, name, getattr(cls, name).__get__(t))
         t._device_cache_key = cls._device_cache_key
@@ -490,6 +492,37 @@ class TestSamplerMethods:
         assert not t._decode_generation_done[2:5].any()
         assert t._decode_eoc_countdown[2:5].eq(-1).all()
 
+    def test_mixed_batch_prefill_mask_targets_request_rows(self):
+        """Mixed prefill/decode must reset only prefill request rows."""
+        t = self._make_batched_sampler_talker(num_rows=3)
+        t._last_step_query_start_loc = torch.tensor([0, 1, 4, 5])
+
+        mask = t._prefill_row_mask(3, torch.device("cpu"))
+
+        assert torch.equal(mask, torch.tensor([False, True, False]))
+
+    def test_mixed_batch_seed_mask_maps_token_tails_to_request_rows(self):
+        """Seed detection should return one flag per request, not per token."""
+        t = self._make_batched_sampler_talker(num_rows=3)
+        t._audio_continuation_id = 99999
+        t._last_step_query_start_loc = torch.tensor([0, 1, 4, 5])
+        t._last_step_input_ids = torch.tensor([99999, 11, 12, 13, 99999])
+
+        mask = t._audio_seed_mask_from_step_input(3, torch.device("cpu"))
+
+        assert torch.equal(mask, torch.tensor([True, False, True]))
+
+    def test_mixed_batch_seed_mask_ignores_prefill_tail_audio_token(self):
+        """A prefill span ending in <|audio|> is not a decode seed row."""
+        t = self._make_batched_sampler_talker(num_rows=3)
+        t._audio_continuation_id = 99999
+        t._last_step_query_start_loc = torch.tensor([0, 1, 4, 5])
+        t._last_step_input_ids = torch.tensor([99999, 11, 12, 99999, 99999])
+
+        mask = t._audio_seed_mask_from_step_input(3, torch.device("cpu"))
+
+        assert torch.equal(mask, torch.tensor([True, False, True]))
+
 
 # ---- AC-6: Feedback Method Tests ----
 
@@ -582,6 +615,10 @@ class TestAudioFeedback:
         t._is_single_token_decode_step = (
             mod.HiggsAudioV3TalkerForConditionalGeneration._is_single_token_decode_step.__get__(t)
         )
+        t._step_request_count = mod.HiggsAudioV3TalkerForConditionalGeneration._step_request_count.__get__(t)
+        t._decode_request_token_positions = (
+            mod.HiggsAudioV3TalkerForConditionalGeneration._decode_request_token_positions.__get__(t)
+        )
         t._ensure_decode_state_capacity = lambda min_bs, device: None
         return t
 
@@ -601,8 +638,8 @@ class TestAudioFeedback:
         t._decode_last_codes[1] = torch.zeros(8, dtype=torch.long)
         t._decode_has_codes[1] = True
         t._decode_active_audio_count = 1
-        t._is_single_token_decode_step = lambda num_rows: True
         t._ensure_decode_state_capacity = lambda min_bs, device: None
+        t._last_step_query_start_loc = torch.tensor([0, 1, 2, 3])
         input_ids = torch.tensor([1, audio_id, 3])
         hidden = torch.zeros(3, 16)
         result = t._apply_audio_feedback(hidden, input_ids)
@@ -651,6 +688,26 @@ class TestAudioFeedback:
         assert result[2].abs().sum() > 0
         assert result[0].abs().sum() == 0
         assert result[1].abs().sum() == 0
+        assert result[3].abs().sum() == 0
+
+    def test_mixed_prefill_decode_receives_feedback_only_on_decode_rows(self):
+        """Mixed batches should skip prefill spans but keep audio feedback for decode spans."""
+        t = self._make_feedback_talker()
+        t._last_step_input_ids = torch.tensor([99999, 21, 22, 23, 99999])
+        t._last_step_query_start_loc = torch.tensor([0, 1, 4, 5])
+        t._decode_last_codes[0] = torch.zeros(8, dtype=torch.long)
+        t._decode_last_codes[2] = torch.zeros(8, dtype=torch.long)
+        t._decode_has_codes[0] = True
+        t._decode_has_codes[2] = True
+        t._decode_active_audio_count = 2
+        hidden = torch.zeros(5, 16)
+
+        result = t._apply_audio_feedback(hidden, t._last_step_input_ids)
+
+        assert result[0].abs().sum() > 0
+        assert result[4].abs().sum() > 0
+        assert result[1].abs().sum() == 0
+        assert result[2].abs().sum() == 0
         assert result[3].abs().sum() == 0
 
 

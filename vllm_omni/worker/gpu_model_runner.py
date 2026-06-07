@@ -115,7 +115,29 @@ class OmniGPUModelRunner(GPUModelRunner):
         )
 
     def initialize_metadata_builders(self, kv_cache_config, kernel_block_sizes):
+        """Initialize metadata builders and keep FA3 graph metadata buffers sized.
+
+        FlashAttentionMetadataBuilder can pre-allocate scheduler_metadata for
+        only max_num_seqs + 1 entries while FA3 with split scheduling may need
+        max_num_seqs * max_num_splits + 1 entries during CUDA graph capture.
+        This runner is shared across Omni models, so preserve the existing
+        workaround for non-Higgs models that still use FA3.
+        """
         super().initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
+
+        for kv_cache_group in self.attn_groups:
+            for attn_group in kv_cache_group:
+                for builder in attn_group.metadata_builders:
+                    sm = getattr(builder, "scheduler_metadata", None)
+                    max_num_splits = getattr(builder, "max_num_splits", 0)
+                    if sm is not None and max_num_splits > 1:
+                        required = self.scheduler_config.max_num_seqs * max_num_splits + 1
+                        if sm.shape[0] < required:
+                            builder.scheduler_metadata = torch.zeros(
+                                required,
+                                dtype=sm.dtype,
+                                device=sm.device,
+                            )
 
         # Initialize the wrapper for both multimodal output tensors
         # and for hidden states to be passed between stages
