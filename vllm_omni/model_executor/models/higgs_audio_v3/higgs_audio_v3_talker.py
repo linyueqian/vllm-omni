@@ -111,7 +111,6 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
     postprocess_uses_hidden_states: bool = False
     postprocess_uses_multimodal_outputs: bool = False
     postprocess_uses_req_infos: bool = False
-    supports_sampled_token_ids_cpu_override: bool = True
     supports_omni_query_start_loc: bool = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -196,7 +195,6 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._last_audio_staging_event: torch.cuda.Event | None = None
         self._last_audio_valid_flags: list[int] | None = None
         self._last_audio_done_flags: list[int] | None = None
-        self._last_sampled_token_ids_cpu_override: list[list[int]] | None = None
         self._audio_staging_events: list[torch.cuda.Event] = []
         self._audio_staging_event_cursor: int = 0
         self._row_index_cache: dict[tuple[str, int], torch.Tensor] = {}
@@ -289,20 +287,6 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 "HiggsAudioV3Talker: FlashInfer backend was detected but no API wrappers were unwrapped; "
                 "FlashInfer internals may have changed and wrapper-unwrapping performance benefits may be unavailable."
             )
-
-    def consume_sampled_token_ids_cpu_override(
-        self,
-        sampled_token_ids: torch.Tensor,
-    ) -> list[list[int]] | None:
-        if not self.config.enable_cpu_token_override:
-            return None
-        override = self._last_sampled_token_ids_cpu_override
-        self._last_sampled_token_ids_cpu_override = None
-        if override is None or sampled_token_ids.ndim != 2:
-            return None
-        if int(sampled_token_ids.shape[-1]) != 1 or len(override) != int(sampled_token_ids.shape[0]):
-            return None
-        return override
 
     def _resolve_token_ids(self) -> None:
         """Resolve <|audio|> and eos token IDs.
@@ -864,7 +848,6 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         and accumulate per-request state.
         """
         self._resolve_token_ids()
-        self._last_sampled_token_ids_cpu_override = None
 
         audio_id = self._audio_continuation_id
 
@@ -919,13 +902,6 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                     audio_tokens = torch.where(done_mask, eos_tokens, audio_tokens)
                 sampled = audio_tokens.unsqueeze(-1)
                 sampler_output = SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
-                done_flags = self._last_audio_done_flags
-                eos_id = self._eos_token_id if self._eos_token_id is not None else int(audio_id)
-                self._last_sampled_token_ids_cpu_override = [[int(audio_id)] for _ in range(num_rows)]
-                if done_flags is not None and len(done_flags) >= num_rows:
-                    self._last_sampled_token_ids_cpu_override = [
-                        [int(eos_id) if int(done_flags[row]) else int(audio_id)] for row in range(num_rows)
-                    ]
             else:
                 self._apply_audio_mode_bias_batched(logits, audio_mask, done_mask)
                 sampler_output = run_stock_sampler()

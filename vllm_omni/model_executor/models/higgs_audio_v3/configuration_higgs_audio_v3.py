@@ -95,9 +95,11 @@ class HiggsAudioV3Config(PretrainedConfig):
         audio_continuation_id: int | None = None,
         enable_flashinfer_api_unwrap: bool = True,
         enable_mlp_cudagraph: bool = True,
-        enable_cpu_token_override: bool = True,
         **kwargs: Any,
     ) -> None:
+        # Legacy perf knob removed: Higgs v3 scheduler tokens now come from
+        # SamplerOutput.sampled_token_ids only.
+        kwargs.pop("enable_cpu_token_override", None)
         self.audio_token_id = audio_token_id
         self.mel_per_sample = mel_per_sample
 
@@ -129,7 +131,6 @@ class HiggsAudioV3Config(PretrainedConfig):
         self.audio_continuation_id = audio_continuation_id
         self.enable_flashinfer_api_unwrap = bool(enable_flashinfer_api_unwrap)
         self.enable_mlp_cudagraph = bool(enable_mlp_cudagraph)
-        self.enable_cpu_token_override = bool(enable_cpu_token_override)
 
         super().__init__(**kwargs)
 

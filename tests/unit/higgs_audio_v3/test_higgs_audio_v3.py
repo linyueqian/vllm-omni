@@ -269,6 +269,7 @@ class TestSamplerMethods:
         t._decode_active_audio_count = 0
         t._codebook_index_cache = {}
         t._row_index_cache = {}
+        t._boc_frame_cache = {}
         t._last_audio_codes_buffer = None
         t._last_audio_host_staging = None
         t._last_audio_gpu_staging = None
@@ -285,7 +286,9 @@ class TestSamplerMethods:
         for name in (
             "_sample_audio_codes",
             "_ensure_decode_state_capacity",
+            "_get_row_indices",
             "_get_codebook_indices",
+            "_get_boc_frames",
             "_get_audio_codes_buffer",
             "_get_audio_gpu_staging_buffer",
             "_get_audio_host_staging_buffer",
@@ -442,6 +445,63 @@ class TestSamplerMethods:
         assert all_rows._last_audio_codes is None
         assert sparse._last_audio_codes is None
         assert torch.equal(all_rows._last_audio_host_staging, sparse._last_audio_host_staging)
+
+    def test_direct_audio_sampler_does_not_override_done_tokens(self):
+        """Done rows are represented directly in GPU sampled tokens."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        t = self._make_batched_sampler_talker(num_rows=2)
+        t._resolve_token_ids = lambda: None
+        t._audio_continuation_id = 99999
+        t._eos_token_id = 151671
+        t._last_logits_hidden = torch.zeros(2, 16)
+        t._last_step_input_ids = torch.tensor([99999, 99999])
+        t._last_step_query_start_loc = None
+        t._decode_has_codes = torch.tensor([True, True])
+        t._decode_generation_done = torch.tensor([False, True])
+        t._decode_delay_count = torch.zeros(2, dtype=torch.long)
+        t._decode_eoc_countdown = torch.full((2,), -1, dtype=torch.long)
+        t._fast_audio_direct_rows = 2
+        t._last_audio_done_flags = None
+        t._fast_audio_sampler_gpu_fallback_reason = lambda **kwargs: None
+        t._audio_codebook_logits_from_rows = lambda hidden, rows, all_rows=False: torch.zeros(2, 8, 1026)
+        t._apply_delay_pattern_masking_batched = lambda cb_logits, audio_rows, all_rows=False: None
+        t._sample_audio_codes = lambda logits_2d: torch.zeros(int(logits_2d.shape[0]), dtype=torch.long)
+        t._update_delay_state_batched = lambda *args, **kwargs: None
+        t.sample = mod.HiggsAudioV3TalkerForConditionalGeneration.sample.__get__(t)
+
+        sampler_output = t.sample(torch.zeros(2, 200000), sampling_metadata=object())
+
+        assert not getattr(mod.HiggsAudioV3TalkerForConditionalGeneration, "supports_sampled_token_ids_cpu_override", False)
+        assert sampler_output.sampled_token_ids.tolist() == [[99999], [151671]]
+
+    def test_direct_audio_sampler_uses_gpu_tokens_for_active_rows(self):
+        """Direct audio sampling leaves scheduler-visible tokens to the GPU tensor."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        t = self._make_batched_sampler_talker(num_rows=2)
+        t._resolve_token_ids = lambda: None
+        t._audio_continuation_id = 99999
+        t._eos_token_id = 151671
+        t._last_logits_hidden = torch.zeros(2, 16)
+        t._last_step_input_ids = torch.tensor([99999, 99999])
+        t._last_step_query_start_loc = None
+        t._decode_has_codes = torch.tensor([True, True])
+        t._decode_generation_done = torch.tensor([False, False])
+        t._decode_delay_count = torch.zeros(2, dtype=torch.long)
+        t._decode_eoc_countdown = torch.full((2,), -1, dtype=torch.long)
+        t._fast_audio_direct_rows = 2
+        t._last_audio_done_flags = [0, 0]
+        t._fast_audio_sampler_gpu_fallback_reason = lambda **kwargs: None
+        t._audio_codebook_logits_from_rows = lambda hidden, rows, all_rows=False: torch.zeros(2, 8, 1026)
+        t._apply_delay_pattern_masking_batched = lambda cb_logits, audio_rows, all_rows=False: None
+        t._sample_audio_codes = lambda logits_2d: torch.zeros(int(logits_2d.shape[0]), dtype=torch.long)
+        t._update_delay_state_batched = lambda *args, **kwargs: None
+        t.sample = mod.HiggsAudioV3TalkerForConditionalGeneration.sample.__get__(t)
+
+        sampler_output = t.sample(torch.zeros(2, 200000), sampling_metadata=object())
+
+        assert sampler_output.sampled_token_ids.tolist() == [[99999], [99999]]
 
     def test_terminal_rampdown_frame_is_emitted_before_done(self):
         """The final ramp-down frame must be emitted, not replaced by a done marker."""
