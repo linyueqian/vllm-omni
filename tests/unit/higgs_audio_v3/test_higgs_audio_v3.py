@@ -441,6 +441,55 @@ class TestSamplerMethods:
         assert sparse._last_audio_codes is None
         assert torch.equal(all_rows._last_audio_host_staging, sparse._last_audio_host_staging)
 
+    def test_terminal_rampdown_frame_is_emitted_before_done(self):
+        """The final ramp-down frame must be emitted, not replaced by a done marker."""
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
+
+        t = self._make_batched_sampler_talker(num_rows=1)
+        t._decode_delay_count[0] = 8
+        t._decode_eoc_countdown[0] = 1
+        t._decode_generation_done[0] = False
+        t._decode_has_codes[0] = True
+        codes = torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]], dtype=torch.long)
+
+        t._update_delay_state_batched(
+            codes,
+            torch.tensor([0], dtype=torch.long),
+            1,
+            torch.device("cpu"),
+            code_row_mask=torch.tensor([True]),
+            all_rows=True,
+        )
+
+        staged = t._last_audio_host_staging[0]
+        assert staged[t.num_codebooks].item() == 1  # valid
+        assert staged[t.num_codebooks + 1].item() == 1  # done
+        assert not (staged[: t.num_codebooks] == -1).any()
+        assert staged[: t.num_codebooks - 1].eq(EOC_ID).all()
+        assert t._decode_generation_done[0].item() is True
+        assert t._decode_has_codes[0].item() is False
+
+    def test_decode_state_growth_preserves_inflight_rows(self):
+        """Growing decode buffers must copy old rows and initialize new rows inactive."""
+        t = self._make_batched_sampler_talker(num_rows=2)
+        old_codes = t._decode_last_codes.clone()
+        old_has = t._decode_has_codes.clone()
+        old_delay = t._decode_delay_count.clone()
+        old_rem = t._decode_eoc_countdown.clone()
+        old_done = t._decode_generation_done.clone()
+
+        t._ensure_decode_state_capacity(5, torch.device("cpu"))
+
+        assert t._decode_last_codes.shape[0] >= 5
+        assert torch.equal(t._decode_last_codes[:2], old_codes)
+        assert torch.equal(t._decode_has_codes[:2], old_has)
+        assert torch.equal(t._decode_delay_count[:2], old_delay)
+        assert torch.equal(t._decode_eoc_countdown[:2], old_rem)
+        assert torch.equal(t._decode_generation_done[:2], old_done)
+        assert not t._decode_has_codes[2:5].any()
+        assert not t._decode_generation_done[2:5].any()
+        assert t._decode_eoc_countdown[2:5].eq(-1).all()
+
 
 # ---- AC-6: Feedback Method Tests ----
 
@@ -524,11 +573,16 @@ class TestAudioFeedback:
             _decode_active_audio_count = 0
             _decode_last_codes = torch.zeros(4, 8, dtype=torch.long)
             _decode_has_codes = torch.zeros(4, dtype=torch.bool)
+            _use_external_decode_cudagraph = False
             multimodal_embedding = embed
             model = type("M", (), {"embed_tokens": lambda self, ids: torch.zeros(ids.shape[0], 16)})()
 
         t = FakeTalker()
         t._apply_audio_feedback = mod.HiggsAudioV3TalkerForConditionalGeneration._apply_audio_feedback.__get__(t)
+        t._is_single_token_decode_step = mod.HiggsAudioV3TalkerForConditionalGeneration._is_single_token_decode_step.__get__(
+            t
+        )
+        t._ensure_decode_state_capacity = lambda min_bs, device: None
         return t
 
     def test_text_positions_unchanged(self):
@@ -567,6 +621,37 @@ class TestAudioFeedback:
         hidden = torch.zeros(1, 16)
         result = t._apply_audio_feedback(hidden, input_ids)
         assert torch.equal(result, hidden)
+
+    def test_prefill_span_does_not_receive_audio_feedback(self):
+        """A prefill span can have numel == hidden rows but must not be treated as decode."""
+        t = self._make_feedback_talker()
+        t._last_step_input_ids = torch.tensor([1, 2, 3, 4])
+        t._last_step_query_start_loc = torch.tensor([0, 4])
+        t._decode_last_codes[0] = torch.zeros(8, dtype=torch.long)
+        t._decode_has_codes[0] = True
+        t._decode_active_audio_count = 1
+        hidden = torch.zeros(4, 16)
+
+        result = t._apply_audio_feedback(hidden, t._last_step_input_ids)
+
+        assert torch.equal(result, hidden)
+
+    def test_multi_request_decode_receives_audio_feedback(self):
+        """Concurrent decode has numel > 1 but each request span is exactly one token."""
+        t = self._make_feedback_talker()
+        t._last_step_input_ids = torch.tensor([10, 11, 12, 13])
+        t._last_step_query_start_loc = torch.tensor([0, 1, 2, 3, 4])
+        t._decode_last_codes[2] = torch.zeros(8, dtype=torch.long)
+        t._decode_has_codes[2] = True
+        t._decode_active_audio_count = 1
+        hidden = torch.zeros(4, 16)
+
+        result = t._apply_audio_feedback(hidden, t._last_step_input_ids)
+
+        assert result[2].abs().sum() > 0
+        assert result[0].abs().sum() == 0
+        assert result[1].abs().sum() == 0
+        assert result[3].abs().sum() == 0
 
 
 # ---- AC-8: Codec Strictness ----
@@ -892,6 +977,23 @@ class TestStageInputProcessor:
         codes = torch.zeros(8, 5)
         with pytest.raises(ValueError, match="Not enough frames"):
             _revert_delay_pattern(codes)
+
+    def test_talker2code2wav_skips_too_few_frames_without_crashing(self):
+        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
+            talker2code2wav,
+        )
+
+        class Output:
+            multimodal_output = {"codes": {"audio": torch.zeros(5, 8, dtype=torch.long)}}
+
+        class TalkerOutput:
+            finished = True
+            outputs = [Output()]
+
+        result = talker2code2wav([TalkerOutput()])
+
+        assert len(result) == 1
+        assert result[0]["prompt_token_ids"] == []
 
     def test_filter_real_code_frames(self):
         from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (

@@ -673,8 +673,11 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         return torch.where(has_codes, audio_embeds, hidden_states)
 
     def _is_single_token_decode_step(self, num_rows: int) -> bool:
-        ids = self._last_step_input_ids
-        return isinstance(ids, torch.Tensor) and int(ids.numel()) == int(num_rows)
+        q_start = self._last_step_query_start_loc
+        if isinstance(q_start, torch.Tensor):
+            return int(q_start.numel()) == int(num_rows) + 1
+        ids = getattr(self, "_last_step_input_ids", None)
+        return isinstance(ids, torch.Tensor) and int(ids.numel()) == int(num_rows) and int(num_rows) == 1
 
     def _prefill_row_mask(self, num_rows: int, device: torch.device) -> torch.Tensor:
         q_start = self._last_step_query_start_loc
@@ -1221,19 +1224,18 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         normal_next_rem = torch.where(has_eos, num_codebooks - last_eos_idx - 1, torch.full_like(last_eos_idx, -1))
 
         next_rem = torch.where(ramp, ramp_next_rem, normal_next_rem)
-        done = (next_rem >= 0) & (next_rem <= 0)
-        valid = (~done) & update_mask
-        done = done & update_mask
+        done = ((next_rem >= 0) & (next_rem <= 0)) & update_mask
+        valid = update_mask
 
         next_delay = torch.where(done, torch.zeros_like(next_delay), next_delay)
         next_rem = torch.where(done, torch.full_like(next_rem, -1), next_rem)
-        output_codes = torch.where(done.unsqueeze(1), torch.full_like(codes, -1), codes)
+        output_codes = codes
 
         write_delay = torch.where(update_mask, next_delay, prev_delay)
         write_rem = torch.where(update_mask, next_rem, prev_rem)
         write_done = torch.where(update_mask, done, prev_done)
         write_codes = torch.where(update_mask.unsqueeze(1), codes, prev_codes)
-        write_has_codes = torch.where(update_mask, valid, prev_has_codes)
+        write_has_codes = torch.where(update_mask, ~done, prev_has_codes)
 
         if all_rows:
             self._decode_delay_count[:num_audio_rows].copy_(write_delay.to(dtype=self._decode_delay_count.dtype))

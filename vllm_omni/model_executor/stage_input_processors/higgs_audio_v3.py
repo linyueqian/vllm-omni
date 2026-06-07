@@ -32,6 +32,7 @@ from vllm_omni.data_entry_keys import (
     OmniPayload,
     OmniPayloadStruct,
 )
+from vllm_omni.inputs.data import OmniTokensPrompt
 
 __all__ = ["talker2code2wav", "talker2code2wav_async_chunk"]
 
@@ -46,6 +47,15 @@ _NUM_REAL_CODES = 1024  # codes in [0, 1023] are real
 _DEFAULT_CODEC_CHUNK_FRAMES = 25
 _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES = 25
 _DEFAULT_CODEC_RIGHT_HOLDBACK_FRAMES = 4
+
+
+def _empty_code2wav_prompt() -> Any:
+    return OmniTokensPrompt(
+        prompt_token_ids=[],
+        multi_modal_data=None,
+        mm_processor_kwargs=None,
+        additional_information=None,
+    )
 
 
 def _revert_delay_pattern(audio_codes_qt: torch.Tensor) -> torch.Tensor:
@@ -91,9 +101,8 @@ def talker2code2wav(
     _requires_multimodal_data: bool = False,
 ) -> list[Any]:
     """Sync: collect all talker codes, revert delay pattern, filter, pass to code2wav."""
-    from vllm_omni.inputs.data import OmniTokensPrompt
 
-    code2wav_inputs: list[OmniTokensPrompt] = []
+    code2wav_inputs: list[Any] = []
     for talker_output in source_outputs:
         if not talker_output.finished:
             continue
@@ -103,14 +112,7 @@ def talker2code2wav(
 
         audio_codes = mm_codes.get("audio")
         if audio_codes is None or not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
-            code2wav_inputs.append(
-                OmniTokensPrompt(
-                    prompt_token_ids=[],
-                    multi_modal_data=None,
-                    mm_processor_kwargs=None,
-                    additional_information=None,
-                )
-            )
+            code2wav_inputs.append(_empty_code2wav_prompt())
             continue
 
         audio_codes = audio_codes.to(torch.long)
@@ -135,7 +137,12 @@ def talker2code2wav(
         codes_qt = audio_codes.transpose(0, 1).contiguous().cpu()
 
         # Step 1: Revert delay pattern
-        codes_qt = _revert_delay_pattern(codes_qt)
+        try:
+            codes_qt = _revert_delay_pattern(codes_qt)
+        except ValueError as exc:
+            logger.warning("Skipping invalid Higgs Audio v3 code sequence for Stage 1: %s", exc)
+            code2wav_inputs.append(_empty_code2wav_prompt())
+            continue
 
         # Step 2: Replace out-of-range codes (BOC=1024, EOC=1025, -1) with 0.
         # Must use torch.where, NOT clamp: clamp(max=1023) turns 1025→1023
@@ -154,14 +161,7 @@ def talker2code2wav(
             codes_qt = codes_qt[:, :-1]
 
         if codes_qt.numel() == 0:
-            code2wav_inputs.append(
-                OmniTokensPrompt(
-                    prompt_token_ids=[],
-                    multi_modal_data=None,
-                    mm_processor_kwargs=None,
-                    additional_information=None,
-                )
-            )
+            code2wav_inputs.append(_empty_code2wav_prompt())
             continue
 
         # Code2Wav expects codebook-major flat: [Q * num_frames]
