@@ -31,7 +31,7 @@ stages:
   - stage_id: 0
     max_num_seqs: 16
     gpu_memory_utilization: 0.6
-    enforce_eager: true
+    enforce_eager: false
     attention_backend: FLASHINFER
     trust_remote_code: true
     # Stage-0 prefix caching is on by default. The talker's HS opt-out and
@@ -43,6 +43,9 @@ stages:
     async_scheduling: false
     max_num_batched_tokens: 4096
     max_model_len: 8192
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16]
+      cudagraph_mode: "FULL_DECODE_ONLY"
     devices: "0"
     output_connectors:
       to_stage_1: connector_of_shared_memory
