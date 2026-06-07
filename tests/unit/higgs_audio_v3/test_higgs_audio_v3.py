@@ -579,8 +579,8 @@ class TestAudioFeedback:
 
         t = FakeTalker()
         t._apply_audio_feedback = mod.HiggsAudioV3TalkerForConditionalGeneration._apply_audio_feedback.__get__(t)
-        t._is_single_token_decode_step = mod.HiggsAudioV3TalkerForConditionalGeneration._is_single_token_decode_step.__get__(
-            t
+        t._is_single_token_decode_step = (
+            mod.HiggsAudioV3TalkerForConditionalGeneration._is_single_token_decode_step.__get__(t)
         )
         t._ensure_decode_state_capacity = lambda min_bs, device: None
         return t
