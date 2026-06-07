@@ -392,7 +392,7 @@ steps:
   - group: ":card_index_dividers: TTS Model Test"
     key: nightly-tts-test-group
     depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
+    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "tts-test"
     steps:
       - label: ":full_moon: TTS · Function Test with L4"
         timeout_in_minutes: 90
