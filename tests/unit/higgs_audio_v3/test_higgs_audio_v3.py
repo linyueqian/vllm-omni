@@ -472,7 +472,9 @@ class TestSamplerMethods:
 
         sampler_output = t.sample(torch.zeros(2, 200000), sampling_metadata=object())
 
-        assert not getattr(mod.HiggsAudioV3TalkerForConditionalGeneration, "supports_sampled_token_ids_cpu_override", False)
+        assert not getattr(
+            mod.HiggsAudioV3TalkerForConditionalGeneration, "supports_sampled_token_ids_cpu_override", False
+        )
         assert sampler_output.sampled_token_ids.tolist() == [[99999], [151671]]
 
     def test_direct_audio_sampler_uses_gpu_tokens_for_active_rows(self):
