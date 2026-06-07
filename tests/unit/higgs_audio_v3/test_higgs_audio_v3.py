@@ -512,8 +512,8 @@ class TestSamplerMethods:
 
         assert torch.equal(mask, torch.tensor([True, False, True]))
 
-    def test_mixed_batch_seed_mask_ignores_prefill_tail_audio_token(self):
-        """A prefill span ending in <|audio|> is not a decode seed row."""
+    def test_mixed_batch_seed_mask_allows_prefill_tail_audio_token(self):
+        """A prefill span ending in <|audio|> starts audio-code generation."""
         t = self._make_batched_sampler_talker(num_rows=3)
         t._audio_continuation_id = 99999
         t._last_step_query_start_loc = torch.tensor([0, 1, 4, 5])
@@ -521,7 +521,7 @@ class TestSamplerMethods:
 
         mask = t._audio_seed_mask_from_step_input(3, torch.device("cpu"))
 
-        assert torch.equal(mask, torch.tensor([True, False, True]))
+        assert torch.equal(mask, torch.tensor([True, True, True]))
 
 
 # ---- AC-6: Feedback Method Tests ----

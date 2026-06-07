@@ -789,11 +789,10 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         q_start = self._last_step_query_start_loc
         if isinstance(q_start, torch.Tensor) and int(q_start.numel()) == num_rows + 1:
             q = q_start.to(device=device, dtype=torch.long)
-            spans = q[1:] - q[:-1]
             tail_idx = q[1:] - 1
             valid_tail = tail_idx >= 0
             tail_ids = flat_ids.index_select(0, tail_idx.clamp_min(0))
-            return (tail_ids == int(audio_id)) & valid_tail & (spans == 1)
+            return (tail_ids == int(audio_id)) & valid_tail
         if int(flat_ids.numel()) == num_rows:
             tail_ids = flat_ids
         else:
@@ -885,17 +884,14 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             self._clear_last_audio_outputs()
             return sampler_output
 
-        num_tokens = int(hidden.shape[0])
-        num_rows = self._step_request_count(num_tokens)
+        num_rows = int(hidden.shape[0])
         self._ensure_decode_state_capacity(num_rows, hidden.device)
-        decode_only = self._is_single_token_decode_step(num_tokens)
-        decode_req_rows, decode_token_positions = self._decode_request_token_positions(num_tokens, hidden.device)
+        ids = getattr(self, "_last_step_input_ids", None)
+        decode_only = isinstance(ids, torch.Tensor) and int(ids.numel()) == num_rows
         if not decode_only:
             self._fast_audio_direct_rows = 0
             pfmask = self._prefill_row_mask(num_rows, hidden.device)
             self._reset_decode_state_rows(pfmask, num_rows, hidden.device)
-            if int(decode_req_rows.numel()) == 0:
-                self._decode_active_audio_count = 0
         prev_audio_mask = self._audio_seed_mask_from_step_input(num_rows, hidden.device)
         if prev_audio_mask is None:
             prev_audio_mask = torch.zeros(num_rows, dtype=torch.bool, device=hidden.device)
@@ -904,21 +900,11 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         fast_fallback_reason = self._fast_audio_sampler_gpu_fallback_reason(
             logits=logits,
             sampling_metadata=sampling_metadata,
-            num_rows=num_tokens,
+            num_rows=num_rows,
         )
         seed_mask = prev_audio_mask & ~active_mask & ~done_mask
         audio_mask = prev_audio_mask | active_mask | done_mask
         code_row_mask = (seed_mask | active_mask) & ~done_mask
-        if not decode_only:
-            decode_audio_mask = audio_mask.index_select(0, decode_req_rows)
-            decode_done_mask = done_mask.index_select(0, decode_req_rows)
-            token_audio_mask = torch.zeros(num_tokens, dtype=torch.bool, device=hidden.device)
-            token_done_mask = torch.zeros(num_tokens, dtype=torch.bool, device=hidden.device)
-            token_audio_mask.index_copy_(0, decode_token_positions, decode_audio_mask)
-            token_done_mask.index_copy_(0, decode_token_positions, decode_done_mask)
-        else:
-            token_audio_mask = audio_mask
-            token_done_mask = done_mask
         gpu_stock_sampler_reasons = {"logprobs", "allowed_token_ids", "bad_words"}
         use_gpu_audio_mode = fast_fallback_reason is None or fast_fallback_reason in gpu_stock_sampler_reasons
 
@@ -941,7 +927,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                         [int(eos_id) if int(done_flags[row]) else int(audio_id)] for row in range(num_rows)
                     ]
             else:
-                self._apply_audio_mode_bias_batched(logits, token_audio_mask, token_done_mask)
+                self._apply_audio_mode_bias_batched(logits, audio_mask, done_mask)
                 sampler_output = run_stock_sampler()
                 sampled = getattr(sampler_output, "sampled_token_ids", None)
                 if sampled is None:
@@ -949,7 +935,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                     return sampler_output
         elif use_gpu_audio_mode:
             self._fast_audio_direct_rows = 0
-            self._apply_audio_mode_bias_batched(logits, token_audio_mask, token_done_mask)
+            self._apply_audio_mode_bias_batched(logits, audio_mask, done_mask)
             sampler_output = run_stock_sampler()
             sampled = getattr(sampler_output, "sampled_token_ids", None)
             if sampled is None:
@@ -962,16 +948,12 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             return sampler_output
 
         sampled_flat = sampled.reshape(-1)
-        if int(sampled_flat.numel()) != num_tokens:
+        if int(sampled_flat.numel()) != num_rows:
             self._clear_last_audio_outputs()
             return sampler_output
 
         if use_gpu_audio_mode:
-            audio_row_tensor = self._get_row_indices(num_rows, hidden.device) if decode_only else decode_req_rows
-            audio_token_positions = audio_row_tensor if decode_only else decode_token_positions
-            if int(audio_row_tensor.numel()) == 0:
-                self._clear_last_audio_outputs()
-                return sampler_output
+            audio_row_tensor = self._get_row_indices(num_rows, hidden.device)
             seed_mask_1d = seed_mask.to(device=hidden.device, dtype=torch.bool)
             done_mask_1d = done_mask.to(device=hidden.device, dtype=torch.bool)
             self._decode_generation_done[:num_rows].masked_fill_(done_mask_1d, False)
@@ -992,17 +974,14 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             self._decode_generation_done[:num_rows].masked_fill_(seed_mask_1d, False)
             self._decode_active_audio_count = num_rows
         else:
-            audio_row_tensor = decode_req_rows
-            audio_token_positions = decode_token_positions
+            audio_row_tensor = self._get_row_indices(num_rows, hidden.device)
 
         # Per-codebook logits at audio positions
-        all_audio_rows = use_gpu_audio_mode and decode_only
-        if all_audio_rows:
+        all_audio_rows = use_gpu_audio_mode
+        if use_gpu_audio_mode:
             cb_logits = self._audio_codebook_logits_from_rows(hidden, audio_row_tensor, all_rows=True)
         else:
-            cb_logits = self.modality_head.generate(
-                hidden.reshape(-1, hidden.shape[-1]).index_select(0, audio_token_positions)
-            )
+            cb_logits = self._audio_codebook_logits_from_rows(hidden, audio_row_tensor, all_rows=False)
 
         # Apply delay pattern masking BEFORE sampling
         self._apply_delay_pattern_masking_batched(cb_logits, audio_row_tensor, all_rows=all_audio_rows)
