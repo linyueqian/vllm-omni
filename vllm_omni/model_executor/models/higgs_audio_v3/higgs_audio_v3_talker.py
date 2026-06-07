@@ -126,7 +126,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
         mode_name = getattr(cudagraph_mode, "name", str(cudagraph_mode)).upper()
         self._use_external_decode_cudagraph = (
-            not bool(getattr(model_config, "enforce_eager", True)) and cudagraph_mode is not None and "NONE" not in mode_name
+            not bool(getattr(model_config, "enforce_eager", True))
+            and cudagraph_mode is not None
+            and "NONE" not in mode_name
         )
         if self._use_external_decode_cudagraph:
             self.config.enable_mlp_cudagraph = False
