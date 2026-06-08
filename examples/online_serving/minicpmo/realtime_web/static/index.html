@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MiniCPM-o 4.5 — Realtime Duplex Voice Chat</title>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: #ffffff; color: #1f2328; display: flex; justify-content: center;
+      padding: 24px;
+    }
+    .wrap { width: 100%; max-width: 760px; }
+    h1 { font-size: 1.3rem; margin: 0 0 4px; }
+    .sub { color: #57606a; font-size: 0.85rem; margin-bottom: 18px; }
+
+    .controls { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; margin-bottom: 16px; }
+    #callBtn {
+      font-size: 1rem; font-weight: 600; padding: 14px 28px; border-radius: 999px;
+      border: none; cursor: pointer; background: #1f883d; color: #fff; transition: .15s;
+    }
+    #callBtn.active { background: #cf222e; }
+    #callBtn:disabled { opacity: .6; cursor: default; }
+    #pttBtn {
+      font-size: .95rem; font-weight: 600; padding: 12px 22px; border-radius: 999px;
+      border: 1px solid #d0d7de; cursor: pointer; background: #f6f8fa; color: #1f2328;
+      transition: .1s; display: none;
+    }
+    #pttBtn.held { background: #0969da; border-color: #0969da; color: #fff; }
+    #pttBtn:disabled { opacity: .5; cursor: default; }
+
+    .badge {
+      font-size: 0.8rem; padding: 4px 12px; border-radius: 999px; background: #eaeef2;
+      color: #57606a; border: 1px solid #d0d7de; white-space: nowrap;
+    }
+    .badge.listening { background: #ddf4ff; color: #0969da; border-color: #54aeff; }
+    .badge.speaking { background: #fff1e5; color: #bc4c00; border-color: #fdaa7a; }
+    .badge.idle { background: #eaeef2; color: #57606a; }
+    #timer { font-variant-numeric: tabular-nums; font-size: .85rem; color: #57606a; }
+    #status { color: #57606a; font-size: 0.8rem; }
+
+    .vu-wrap { display: flex; align-items: center; gap: 8px; }
+    .vu-label { font-size: .72rem; color: #57606a; }
+    #vu {
+      width: 120px; height: 8px; border-radius: 4px; background: #eaeef2;
+      border: 1px solid #d0d7de; overflow: hidden;
+    }
+    #vuFill { height: 100%; width: 0%; background: linear-gradient(90deg, #2da44e, #d4a72c, #cf222e);
+      transition: width .06s linear; }
+    .mic-dot { width: 9px; height: 9px; border-radius: 50%; background: #d0d7de; display: inline-block; }
+    .mic-dot.live { background: #2da44e; box-shadow: 0 0 6px #2da44e; }
+
+    .config { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-end; margin-bottom: 16px;
+      padding: 12px 16px; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 10px; }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .field label { font-size: .7rem; text-transform: uppercase; letter-spacing: .04em; color: #57606a; }
+    select, input[type=file] { font-size: .85rem; background: #ffffff; color: #1f2328;
+      border: 1px solid #d0d7de; border-radius: 6px; padding: 7px 9px; }
+    select:disabled { opacity: .55; }
+    .hint { font-size: .7rem; color: #6e7681; max-width: 260px; }
+    .locked { color: #bf8700; }
+
+    .panel {
+      background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 10px;
+      padding: 12px 16px; margin-bottom: 14px;
+    }
+    .panel h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: .05em;
+      color: #57606a; margin: 0 0 8px; display: flex; justify-content: space-between; }
+    #conversation { display: flex; flex-direction: column; gap: 10px; max-height: 320px; overflow-y: auto; }
+    .turn { display: flex; gap: 10px; align-items: flex-start; font-size: .92rem; line-height: 1.5; }
+    .turn .who { flex: 0 0 64px; font-size: .72rem; text-transform: uppercase; letter-spacing: .04em;
+      padding-top: 2px; }
+    .turn.user .who { color: #0969da; }
+    .turn.assistant .who { color: #bc4c00; }
+    .turn .text { white-space: pre-wrap; flex: 1; }
+    .turn.live .text { opacity: .7; }
+    .empty { color: #6e7681; font-size: .85rem; }
+    #log { white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; font-size: 0.72rem;
+      color: #57606a; max-height: 160px; overflow-y: auto; }
+    .err { color: #cf222e; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>MiniCPM-o 4.5 — Realtime Duplex Voice Chat</h1>
+    <div class="sub">Always-on, model-driven turn-taking. Pick a voice + interaction mode, click Start, and talk.</div>
+
+    <!-- config (set BEFORE starting; locked once audio is flowing) -->
+    <div class="config" id="configRow">
+      <div class="field">
+        <label for="voiceSel">Voice</label>
+        <select id="voiceSel">
+          <option value="default" selected>Default (HT_ref_audio)</option>
+          <option value="__ref__">Clone from reference audio…</option>
+        </select>
+      </div>
+      <div class="field" id="refField" style="display:none;">
+        <label for="refFile">Reference audio (wav/mp3)</label>
+        <input type="file" id="refFile" accept="audio/*" />
+        <div class="hint">A few seconds of clean speech. Used to clone the reply voice.</div>
+      </div>
+      <div class="field">
+        <label for="modeSel">Interaction mode</label>
+        <select id="modeSel">
+          <option value="full" selected>Full-duplex (continuous)</option>
+          <option value="half">Half-duplex (push-to-talk)</option>
+          <option value="turn">Turn-based (record &amp; send)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="turnDetSel">Turn detection</label>
+        <select id="turnDetSel">
+          <option value="model" selected>Model-driven (MiniCPM-o)</option>
+          <option value="server_vad">Server VAD</option>
+        </select>
+      </div>
+      <div class="hint locked" id="lockNote" style="display:none;">
+        Voice &amp; mode are locked during a call (server rejects voice change after audio starts). Hang up to change.
+      </div>
+    </div>
+
+    <!-- live controls -->
+    <div class="controls">
+      <button id="callBtn">Start call</button>
+      <button id="pttBtn">Hold to talk</button>
+      <span class="badge idle" id="modelState">idle</span>
+      <span id="timer">00:00</span>
+      <div class="vu-wrap">
+        <span class="mic-dot" id="micDot"></span>
+        <span class="vu-label">mic</span>
+        <div id="vu"><div id="vuFill"></div></div>
+      </div>
+      <span id="status">idle</span>
+    </div>
+
+    <div class="panel">
+      <h2><span>Conversation</span><span class="empty" id="convHint"></span></h2>
+      <div id="conversation"><div class="empty">No turns yet. Start a call and say hello.</div></div>
+    </div>
+    <div class="panel">
+      <h2>Log</h2>
+      <div id="log"></div>
+    </div>
+  </div>
+
+  <script>
+    // Optional server-injected WS base. Empty -> app.js derives location.hostname:8099.
+    window.DUPLEX_WS_BASE = "__DUPLEX_WS_BASE__";
+    if (window.DUPLEX_WS_BASE.indexOf("__") === 0) window.DUPLEX_WS_BASE = "";
+  </script>
+  <script src="static/app.js"></script>
+</body>
+</html>
