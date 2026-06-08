@@ -109,6 +109,18 @@ class TestStageConfig:
         assert "max_num_seqs" not in omega_config.engine_args
         # Legacy field name for backward compatibility
         assert omega_config.engine_input_source == []
+        assert omega_config.session_mode == "turn"
+
+    def test_to_omegaconf_duplex_session_mode(self):
+        """Test that session mode is preserved as stage metadata."""
+        config = StageConfig(
+            stage_id=0,
+            model_stage="thinker",
+            session_mode="duplex",
+        )
+        omega_config = config.to_omegaconf()
+
+        assert omega_config.session_mode == "duplex"
 
     def test_to_omegaconf_with_runtime_overrides(self):
         """Test that runtime overrides are applied to OmegaConf output."""

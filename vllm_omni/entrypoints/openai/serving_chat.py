@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
@@ -77,7 +78,7 @@ from vllm.outputs import RequestOutput
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs import TokPrompt
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers import TokenizerLike as AnyTokenizer
 from vllm.tokenizers.mistral import (
@@ -137,6 +138,177 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     _supported_speakers: set[str] | None = None
     _diffusion_extra_body_params: frozenset[str] | None = None
     _diffusion_extra_output_params: frozenset[str] | None = None
+
+    @staticmethod
+    def _stage_get(obj: Any, key: str, default: Any = None) -> Any:
+        if obj is None:
+            return default
+        if hasattr(obj, "get"):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    def _has_minicpmo45_stage(self) -> bool:
+        for stage in getattr(self.engine_client, "stage_configs", []) or []:
+            engine_args = self._stage_get(stage, "engine_args")
+            model_arch = self._stage_get(engine_args, "model_arch")
+            if model_arch == "MiniCPMO45OmniForConditionalGeneration":
+                return True
+        return False
+
+    def _minicpmo45_tts_replica_count(self) -> int:
+        count = 1
+        for stage in getattr(self.engine_client, "stage_configs", []) or []:
+            engine_args = self._stage_get(stage, "engine_args")
+            if self._stage_get(engine_args, "model_arch") != "MiniCPMO45OmniForConditionalGeneration":
+                continue
+            if self._stage_get(engine_args, "model_stage") != "tts":
+                continue
+            runtime_cfg = self._stage_get(stage, "runtime", {})
+            try:
+                count = max(count, int(self._stage_get(runtime_cfg, "num_replicas", 1) or 1))
+            except (TypeError, ValueError):
+                logger.warning("Invalid MiniCPM-o 4.5 TTS num_replicas=%r; using 1", runtime_cfg)
+        return count
+
+    def _fix_minicpmo45_audio_stream_output_kinds(
+        self,
+        sampling_params_list: list[Any],
+        output_modalities: list[str] | tuple[str, ...] | None,
+    ) -> list[Any]:
+        """Keep MiniCPM-o 4.5's thinker final-only during audio streaming.
+
+        Chat ``stream=true`` normally coerces every AR stage to DELTA output.
+        That is correct for token-level text streaming, but MiniCPM-o 4.5's
+        Talker consumes the completed TTS span plus aligned thinker hidden
+        states. If Stage0 is DELTA, llm2tts receives one generated token at a
+        time and repeatedly starts tiny, independent TTS streams. The API then
+        never represents one coherent audio response.
+
+        For this model, stream the audio stage, not the thinker-to-talker
+        boundary.
+        """
+        if not output_modalities or "audio" not in output_modalities:
+            return sampling_params_list
+        if not self._has_minicpmo45_stage():
+            return sampling_params_list
+
+        stage_configs = getattr(self.engine_client, "stage_configs", []) or []
+        for idx, stage in enumerate(stage_configs):
+            if idx >= len(sampling_params_list):
+                break
+            sp = sampling_params_list[idx]
+            if not hasattr(sp, "output_kind"):
+                continue
+
+            engine_args = self._stage_get(stage, "engine_args")
+            if self._stage_get(engine_args, "model_arch") != "MiniCPMO45OmniForConditionalGeneration":
+                continue
+
+            model_stage = self._stage_get(engine_args, "model_stage")
+            if model_stage == "llm":
+                sp.output_kind = RequestOutputKind.FINAL_ONLY
+            elif model_stage == "tts":
+                sp.output_kind = RequestOutputKind.DELTA
+        return sampling_params_list
+
+    def _should_run_minicpmo45_chat_warmup(self) -> bool:
+        # Real request warmup changes startup latency and capacity accounting.
+        # Keep it disabled until it has a first-class serving/stage config
+        # rather than another MiniCPM-specific environment variable.
+        return False
+
+    def _build_minicpmo45_ref_audio_url(self) -> str | None:
+        model_path = self.model_config.model
+        ref_path = os.path.join(model_path, "assets", "HT_ref_audio.wav")
+        if not os.path.exists(ref_path):
+            logger.info("MiniCPM-o 4.5 chat warmup reference audio not found: %s", ref_path)
+            return None
+        with open(ref_path, "rb") as f:
+            audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:audio/wav;base64,{audio_b64}"
+
+    def _build_minicpmo45_chat_warmup_request(self, index: int) -> ChatCompletionRequest:
+        ref_audio_url = self._build_minicpmo45_ref_audio_url()
+        if ref_audio_url is None:
+            system_content: str | list[dict[str, Any]] = "You are MiniCPM-o, a helpful multimodal assistant."
+        else:
+            system_content = [
+                {"type": "text", "text": "Use the voice in the audio prompt to synthesize new content."},
+                {"type": "audio_url", "audio_url": {"url": ref_audio_url}},
+                {"type": "text", "text": "You are a helpful assistant with the above voice style."},
+            ]
+        request_kwargs: dict[str, Any] = {
+            "model": self.model_config.model,
+            "messages": [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": "Warm up speech generation."},
+            ],
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "modalities": ["text", "audio"],
+            "chat_template_kwargs": {"use_tts_template": True},
+            "request_id": f"minicpmo45-chat-warmup-{index}",
+        }
+        try:
+            request = ChatCompletionRequest(**request_kwargs)
+        except Exception:
+            fallback_kwargs = dict(request_kwargs)
+            fallback_kwargs.pop("modalities", None)
+            fallback_kwargs.pop("chat_template_kwargs", None)
+            fallback_kwargs.pop("request_id", None)
+            request = ChatCompletionRequest(**fallback_kwargs)
+        # Older vLLM protocol versions keep extra OpenAI fields in Pydantic's
+        # model_extra. Attach explicit attrs as well so Omni serving code sees
+        # the same shape as a real HTTP request after extra_body flattening.
+        object.__setattr__(request, "modalities", ["text", "audio"])
+        object.__setattr__(request, "chat_template_kwargs", {"use_tts_template": True})
+        return request
+
+    async def warmup_minicpmo45_chat_audio(self) -> None:
+        """Run real chat+audio requests after the engine is ready.
+
+        MiniCPM-o 4.5 does not use /v1/audio/speech for the main online demo.
+        The expensive first-request path is a chat-completions request with
+        ``modalities=["text", "audio"]`` and ``use_tts_template=True``.  A
+        load_weights-time dummy TTS warmup does not hit the same vLLM request
+        guards, so this startup hook warms the actual serving path.
+        """
+        if self._diffusion_mode or not self._has_minicpmo45_stage():
+            return
+        if not self._should_run_minicpmo45_chat_warmup():
+            logger.info("Skipping MiniCPM-o 4.5 chat/audio warmup")
+            return
+
+        warmup_count = self._minicpmo45_tts_replica_count()
+        warmup_count = max(1, warmup_count)
+        timeout_s = 180.0
+
+        async def _run_one(index: int) -> bool:
+            request = self._build_minicpmo45_chat_warmup_request(index)
+            result = await asyncio.wait_for(self.create_chat_completion(request, raw_request=None), timeout=timeout_s)
+            if isinstance(result, ErrorResponse):
+                logger.warning("MiniCPM-o 4.5 chat/audio warmup %d failed: %s", index, result)
+                return False
+            if hasattr(result, "__aiter__"):
+                async for _ in result:
+                    pass
+            return True
+
+        t0 = time.perf_counter()
+        logger.info("Running %d MiniCPM-o 4.5 chat/audio warmup request(s)", warmup_count)
+        try:
+            results = await asyncio.gather(*(_run_one(i) for i in range(warmup_count)))
+        except Exception as exc:
+            logger.warning("MiniCPM-o 4.5 chat/audio warmup failed (non-fatal): %s", exc, exc_info=True)
+            return
+
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "MiniCPM-o 4.5 chat/audio warmup complete: success=%d/%d elapsed=%.1fs",
+            sum(1 for ok in results if ok),
+            warmup_count,
+            elapsed,
+        )
 
     @classmethod
     def for_diffusion(
@@ -549,6 +721,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # to delta to ensure emitted outputs are correctly drained. Otherwise
                 # convert cumulative to Final Only to ensure the output is correct.
                 sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
+                if request.stream:
+                    sampling_params_list = self._fix_minicpmo45_audio_stream_output_kinds(
+                        sampling_params_list,
+                        output_modalities,
+                    )
 
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):

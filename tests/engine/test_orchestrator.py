@@ -13,6 +13,7 @@ from typing import Any
 import janus
 import psutil
 import pytest
+import torch
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.core_client import AsyncMPClient
@@ -20,19 +21,50 @@ from vllm.v1.engine.core_client import AsyncMPClient
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
+    AppendDuplexInputMessage,
+    CloseDuplexSessionMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
+    DuplexControlResultMessage,
+    OpenDuplexSessionMessage,
     OutputMessage,
     ShutdownRequestMessage,
+    SignalDuplexTurnMessage,
     StageSubmissionMessage,
 )
-from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
+from vllm_omni.engine.orchestrator import (
+    Orchestrator,
+    OrchestratorRequestState,
+    build_engine_core_request_from_tokens,
+)
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _minicpmo_stage_handoff_payload(
+    *,
+    token_ids: list[int],
+    hidden: torch.Tensor,
+    text: str,
+    end_of_turn: bool = False,
+) -> dict[str, Any]:
+    from vllm_omni.data_entry_keys import serialize_payload
+
+    return {
+        "type": "minicpmo45_tts_handoff",
+        "omni_payload": serialize_payload(
+            {
+                "ids": {"output": token_ids},
+                "hidden_states": {"output": hidden},
+            }
+        ),
+        "llm_output_text": [text],
+        "end_of_turn": end_of_turn,
+    }
 
 
 @dataclass
@@ -43,6 +75,72 @@ class OrchestratorFixture:
     queues: tuple[janus.Queue, ...]
     thread: threading.Thread
     result_future: concurrent.futures.Future[None]
+
+
+def test_orchestrator_duplex_capability_core_kv_lease_must_be_explicit() -> None:
+    capabilities = Orchestrator._coerce_duplex_capabilities(
+        {
+            "supports_kv_lease": True,
+            "supports_model_internal_state": True,
+        }
+    )
+
+    assert capabilities.supports_kv_lease is True
+    assert capabilities.supports_model_internal_state is True
+    assert capabilities.supports_core_kv_lease is False
+
+
+def test_build_engine_core_request_preserves_model_intermediate_buffer() -> None:
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    request = build_engine_core_request_from_tokens(
+        request_id="req-stage-handoff",
+        prompt={
+            "prompt_token_ids": [1],
+            "model_intermediate_buffer": {
+                "ids": {"tts": [11, 12]},
+                "hidden_states": {"tts": hidden},
+                "meta": {"ref_audio_sr": 16000},
+            },
+        },
+        params=SamplingParams(max_tokens=1),
+    )
+
+    assert request.additional_information is None
+    assert isinstance(request.model_intermediate_buffer, dict)
+    info = request.model_intermediate_buffer
+    assert info["ids"]["tts"] == [11, 12]
+    assert torch.equal(info["hidden_states"]["tts"], hidden)
+    assert info["meta"]["ref_audio_sr"] == 16000
+
+
+def test_duplex_sampling_params_apply_stage_overrides() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    stage = SimpleNamespace(stage_client=SimpleNamespace(default_sampling_params=SamplingParams(max_tokens=8)))
+    orchestrator.stage_pools = [stage]
+    session = SimpleNamespace(
+        session_config={
+            "extra_body": {
+                "duplex_stage_max_tokens": {"0": 24},
+                "duplex_stage_sampling_params": {
+                    "0": {
+                        "temperature": 0.7,
+                        "top_p": 0.8,
+                        "top_k": 100,
+                        "repetition_penalty": 1.05,
+                    }
+                },
+            }
+        }
+    )
+
+    params = orchestrator._duplex_sampling_params_list(session)[0]
+
+    assert params.max_tokens == 24
+    assert params.temperature == 0.7
+    assert params.top_p == 0.8
+    assert params.top_k == 100
+    assert params.repetition_penalty == 1.05
 
 
 class FakeStageClient:
@@ -154,6 +252,26 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
         normalized_kwargs = dict(kwargs or {})
         self.collective_rpc_calls.append((method, timeout, args, normalized_kwargs))
         return self.rpc_result
+
+
+class FakeSequentialCollectiveRpcStageClient(FakeStageClient):
+    def __init__(self, *args, rpc_results: list[Any], **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.rpc_results = list(rpc_results)
+
+    async def collective_rpc_async(
+        self,
+        *,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        normalized_kwargs = dict(kwargs or {})
+        self.collective_rpc_calls.append((method, timeout, args, normalized_kwargs))
+        if not self.rpc_results:
+            raise AssertionError(f"no rpc result queued for {method}")
+        return self.rpc_results.pop(0)
 
 
 class FakeOutputProcessor:
@@ -913,6 +1031,102 @@ async def test_stage_pool_submit_update_reuses_existing_binding() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stage_pool_replica_eviction_skips_failed_replica_for_new_admission() -> None:
+    stage0_r0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_r1 = FakeStageClient(stage_type="llm", final_output=False)
+    pool = StagePool(
+        0,
+        [stage0_r0, stage0_r1],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+
+    released = pool.mark_replica_unavailable(0)
+    req_state = OrchestratorRequestState(
+        request_id="req-after-failure",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+
+    replica_id = await pool.submit_initial(
+        "req-after-failure",
+        req_state,
+        SimpleNamespace(request_id="req-after-failure", prompt_token_ids=[1, 2]),
+    )
+
+    assert released == []
+    assert replica_id == 1
+    assert pool.available_replica_ids() == [1]
+    assert stage0_r0.add_request_calls == []
+    assert stage0_r1.add_request_calls[0][0].request_id == "req-after-failure"
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_duplex_open_retries_busy_replica() -> None:
+    stage0_r0 = FakeCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_result={"supported": False, "reason": "native_duplex_session_busy"},
+    )
+    stage0_r1 = FakeCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_result={"supported": True, "opened": True},
+    )
+    pool = StagePool(
+        0,
+        [stage0_r0, stage0_r1],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+
+    results = await pool.open_duplex_session(
+        "sid-retry",
+        epoch=0,
+        capabilities={"implementation_level": "model_native_duplex"},
+        session_config={},
+    )
+
+    assert results == [(1, {"supported": True, "opened": True})]
+    assert pool._get_duplex_replica_id("sid-retry") == 1
+    assert len(stage0_r0.collective_rpc_calls) == 1
+    assert len(stage0_r1.collective_rpc_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_replica_eviction_releases_duplex_session_binding() -> None:
+    stage0_r0 = FakeCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_result={"supported": True},
+    )
+    stage0_r1 = FakeCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_result={"supported": True},
+    )
+    pool = StagePool(
+        0,
+        [stage0_r0, stage0_r1],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+
+    results = await pool.open_duplex_session(
+        "sid-dead-replica",
+        epoch=0,
+        capabilities={"implementation_level": "model_native_duplex"},
+        session_config={},
+    )
+
+    assert results[0][0] == 0
+    assert pool.duplex_session_ids_for_replica(0) == ["sid-dead-replica"]
+    pool.mark_replica_unavailable(0)
+    assert pool._get_duplex_replica_id("sid-dead-replica") is None
+    assert pool.available_replica_ids() == [1]
+
+
+@pytest.mark.asyncio
 async def test_stage_pool_submit_update_refreshes_output_processor_state() -> None:
     output_processor = FakeOutputProcessor()
 
@@ -1101,6 +1315,872 @@ async def test_collective_rpc_ignores_invalid_stage_ids(orchestrator_factory, ca
         assert not stage0.collective_rpc_calls
         assert len(stage1.collective_rpc_calls) == 1
         assert "collective_rpc: ignoring invalid stage_id 99" in caplog.text
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_duplex_open_reports_stage_unsupported_results(orchestrator_factory) -> None:
+    stage0 = FakeCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_result=[{"supported": False, "reason": "worker_duplex_session_not_implemented"}],
+    )
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            OpenDuplexSessionMessage(
+                control_id="duplex-control-1",
+                session_id="sid-unsupported",
+                session_mode="duplex",
+                capabilities={},
+            )
+        )
+
+        msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(msg, DuplexControlResultMessage)
+        assert msg.type == "duplex_control_result"
+        assert msg.control_id == "duplex-control-1"
+        assert msg.operation == "open"
+        assert msg.ok is True
+        assert msg.unsupported_count == 0
+        assert msg.error_count == 0
+        assert msg.stage_results[0]["stage_id"] == -1
+        assert msg.stage_results[0]["result"]["data_plane_session"] is True
+        assert stage0.collective_rpc_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_duplex_open_forwards_timeout_to_stage_rpc(orchestrator_factory) -> None:
+    stage0 = FakeCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_result={"supported": False, "reason": "worker_duplex_session_not_implemented"},
+    )
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            OpenDuplexSessionMessage(
+                control_id="duplex-control-timeout",
+                session_id="sid-timeout",
+                session_mode="duplex",
+                capabilities={},
+                timeout=2.5,
+            )
+        )
+
+        msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(msg, DuplexControlResultMessage)
+        assert msg.ok is True
+        assert stage0.collective_rpc_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_duplex_open_preserves_native_implementation_level(orchestrator_factory) -> None:
+    stage0 = FakeCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_result={"supported": True},
+    )
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            OpenDuplexSessionMessage(
+                control_id="duplex-control-native",
+                session_id="sid-native",
+                session_mode="duplex",
+                capabilities={
+                    "implementation_level": "model_native_duplex",
+                    "input_modes": ["append_audio_chunk"],
+                    "adapter_patterns": ["scheduler_data_plane"],
+                    "supports_scheduler_native_append": False,
+                    "supports_core_resumable_request": False,
+                    "supports_stage_connector_handoff": False,
+                    "stage_handoff_transport": "scheduler_data_plane",
+                },
+            )
+        )
+
+        msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(msg, DuplexControlResultMessage)
+        assert msg.ok is True
+        assert msg.stage_results[0]["result"]["implementation_level"] == "model_native_duplex"
+        assert msg.stage_results[0]["result"]["data_plane_session"] is True
+        assert stage0.collective_rpc_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_duplex_session_controls_bind_to_one_replica_per_stage(orchestrator_factory) -> None:
+    stage0_replica0 = FakeSequentialCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_results=[
+            {"supported": True},
+            {"supported": True, "native_result": {"is_listen": True}},
+            {"supported": True},
+            {"supported": True},
+        ],
+    )
+    stage0_replica1 = FakeSequentialCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_results=[
+            {"supported": False, "error": "unbound replica must not be called"},
+        ],
+    )
+    stage_pools = _build_stage_pools(
+        [[stage0_replica0, stage0_replica1]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            OpenDuplexSessionMessage(
+                control_id="duplex-control-bind-open",
+                session_id="sid-bound-replica",
+                session_mode="duplex",
+                capabilities={
+                    "implementation_level": "model_native_duplex",
+                    "input_modes": ["append_audio_chunk"],
+                },
+                session_config={"extra_body": {"duplex_stage_max_tokens": {"0": 17}}},
+            )
+        )
+        open_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(open_msg, DuplexControlResultMessage)
+        assert open_msg.ok is True
+        assert open_msg.stage_results[0]["replica_id"] == -1
+
+        orchestrator_fixture.request_sync_q.put_nowait(
+            AppendDuplexInputMessage(
+                control_id="duplex-control-bind-append",
+                session_id="sid-bound-replica",
+                mode="append_audio_chunk",
+                payload={"audio": "AAAA", "format": "pcm_f32le"},
+                final=False,
+            )
+        )
+        append_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(append_msg, DuplexControlResultMessage)
+        assert append_msg.ok is True
+        assert append_msg.stage_results[0]["replica_id"] == 0
+        request = stage0_replica0.add_request_calls[0][0]
+        assert request.request_id == "duplex-sid-bound-replica-e0-stage0"
+        assert request.resumable is True
+        assert isinstance(request.model_intermediate_buffer, dict)
+        info = request.model_intermediate_buffer
+        assert info["duplex"]["session_id"] == "sid-bound-replica"
+
+        orchestrator_fixture.request_sync_q.put_nowait(
+            SignalDuplexTurnMessage(
+                control_id="duplex-control-bind-signal",
+                session_id="sid-bound-replica",
+                event="user_started",
+                payload={},
+            )
+        )
+        signal_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(signal_msg, DuplexControlResultMessage)
+        assert signal_msg.ok is True
+        assert signal_msg.stage_results[0]["replica_id"] == -1
+
+        orchestrator_fixture.request_sync_q.put_nowait(
+            CloseDuplexSessionMessage(
+                control_id="duplex-control-bind-close",
+                session_id="sid-bound-replica",
+                reason="session_close",
+            )
+        )
+        close_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(close_msg, DuplexControlResultMessage)
+        assert close_msg.ok is True
+        assert close_msg.stage_results[0]["replica_id"] == -1
+
+        assert stage0_replica0.collective_rpc_calls == []
+        assert stage0_replica1.collective_rpc_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_duplex_open_counts_nested_passive_stage_results(orchestrator_factory) -> None:
+    stage0 = FakeCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_result={"supported": True},
+    )
+    stage1 = FakeCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_result={
+            "supported": True,
+            "native_result": {
+                "supported": True,
+                "implementation_level": "model_native_duplex_passive",
+                "native_result": {"passive_stage": True},
+            },
+        },
+    )
+    stage_pools = _build_stage_pools(
+        [[stage0], [stage1]],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            OpenDuplexSessionMessage(
+                control_id="duplex-control-passive",
+                session_id="sid-passive",
+                session_mode="duplex",
+                capabilities={"implementation_level": "model_native_duplex"},
+            )
+        )
+
+        msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(msg, DuplexControlResultMessage)
+        assert msg.ok is True
+        assert msg.unsupported_count == 0
+        assert msg.error_count == 0
+        assert msg.passive_count == 0
+        assert stage0.collective_rpc_calls == []
+        assert stage1.collective_rpc_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_duplex_append_requires_existing_stage_session_binding() -> None:
+    stage0_replica0 = FakeCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_result={"supported": True},
+    )
+    stage0_replica1 = FakeCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_result={"supported": True},
+    )
+    pool = StagePool(0, [stage0_replica0, stage0_replica1])
+
+    result = await pool.append_duplex_input(
+        "sid-never-opened",
+        epoch=0,
+        seq=1,
+        mode="append_audio_chunk",
+        payload={"audio": "AAAA"},
+        final=False,
+    )
+
+    assert result == [
+        (
+            -1,
+            {
+                "supported": False,
+                "error": "duplex_stage_session_not_open",
+                "session_id": "sid-never-opened",
+            },
+        )
+    ]
+    assert stage0_replica0.collective_rpc_calls == []
+    assert stage0_replica1.collective_rpc_calls == []
+
+
+@pytest.mark.asyncio
+async def test_duplex_open_stage_error_rolls_back_runtime_session(orchestrator_factory) -> None:
+    stage0 = FakeCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_result={"supported": False, "error": "stage open failed"},
+    )
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            OpenDuplexSessionMessage(
+                control_id="duplex-control-error",
+                session_id="sid-open-error",
+                session_mode="duplex",
+                capabilities={},
+            )
+        )
+
+        msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(msg, DuplexControlResultMessage)
+        assert msg.ok is True
+        assert msg.error_count == 0
+        assert orchestrator_fixture.orchestrator.duplex_sessions.get("sid-open-error") is not None
+        assert stage0.collective_rpc_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_duplex_open_stage_error_closes_already_opened_stage_sessions(orchestrator_factory) -> None:
+    stage0 = FakeSequentialCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=False,
+        rpc_results=[
+            {"supported": True},
+            {"supported": True},
+        ],
+    )
+    stage1 = FakeSequentialCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_results=[
+            {"supported": False, "error": "stage1 open failed"},
+        ],
+    )
+    stage_pools = _build_stage_pools(
+        [[stage0], [stage1]],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            OpenDuplexSessionMessage(
+                control_id="duplex-control-open-rollback",
+                session_id="sid-open-rollback",
+                session_mode="duplex",
+                capabilities={},
+            )
+        )
+
+        msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(msg, DuplexControlResultMessage)
+        assert msg.ok is True
+        assert orchestrator_fixture.orchestrator.duplex_sessions.get("sid-open-rollback") is not None
+        assert stage0.collective_rpc_calls == []
+        assert stage1.collective_rpc_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_duplex_open_unsupported_marks_control_not_ok(orchestrator_factory) -> None:
+    stage0 = FakeCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_result={"supported": False, "reason": "native_duplex_session_busy"},
+    )
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            OpenDuplexSessionMessage(
+                control_id="duplex-control-unsupported",
+                session_id="sid-open-unsupported",
+                session_mode="duplex",
+                capabilities={},
+            )
+        )
+
+        msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(msg, DuplexControlResultMessage)
+        assert msg.ok is True
+        assert msg.unsupported_count == 0
+        assert msg.error_count == 0
+        assert orchestrator_fixture.orchestrator.duplex_sessions.get("sid-open-unsupported") is not None
+        assert stage0.collective_rpc_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_duplex_signal_stage_error_does_not_advance_epoch(orchestrator_factory) -> None:
+    stage0 = FakeCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_result={"supported": True},
+    )
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            OpenDuplexSessionMessage(
+                control_id="duplex-control-open-ok",
+                session_id="sid-signal-error",
+                session_mode="duplex",
+                capabilities={},
+            )
+        )
+        open_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(open_msg, DuplexControlResultMessage)
+        assert open_msg.ok is True
+        session = orchestrator_fixture.orchestrator.duplex_sessions.require("sid-signal-error")
+        assert session.epoch == 0
+
+        stage0.rpc_result = {"supported": False, "error": "stage signal failed"}
+        orchestrator_fixture.request_sync_q.put_nowait(
+            SignalDuplexTurnMessage(
+                control_id="duplex-control-signal-error",
+                session_id="sid-signal-error",
+                event="barge_in",
+                payload={},
+            )
+        )
+        signal_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(signal_msg, DuplexControlResultMessage)
+        assert signal_msg.ok is True
+        assert session.epoch == 1
+        assert stage0.collective_rpc_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_duplex_signal_stage_unsupported_does_not_advance_epoch(orchestrator_factory) -> None:
+    stage0 = FakeCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_result={"supported": True},
+    )
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            OpenDuplexSessionMessage(
+                control_id="duplex-control-open-ok",
+                session_id="sid-signal-unsupported",
+                session_mode="duplex",
+                capabilities={},
+            )
+        )
+        open_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(open_msg, DuplexControlResultMessage)
+        assert open_msg.ok is True
+        session = orchestrator_fixture.orchestrator.duplex_sessions.require("sid-signal-unsupported")
+        assert session.epoch == 0
+
+        stage0.rpc_result = {"supported": False, "reason": "barge_in unsupported"}
+        orchestrator_fixture.request_sync_q.put_nowait(
+            SignalDuplexTurnMessage(
+                control_id="duplex-control-signal-unsupported",
+                session_id="sid-signal-unsupported",
+                event="barge_in",
+                payload={},
+            )
+        )
+        signal_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(signal_msg, DuplexControlResultMessage)
+        assert signal_msg.ok is True
+        assert signal_msg.unsupported_count == 0
+        assert signal_msg.error_count == 0
+        assert session.epoch == 1
+        assert stage0.collective_rpc_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_duplex_close_stage_error_keeps_session_for_retry(orchestrator_factory) -> None:
+    stage0 = FakeCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        rpc_result={"supported": True},
+    )
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            OpenDuplexSessionMessage(
+                control_id="duplex-control-open-ok",
+                session_id="sid-close-error",
+                session_mode="duplex",
+                capabilities={},
+            )
+        )
+        open_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(open_msg, DuplexControlResultMessage)
+        assert open_msg.ok is True
+        session = orchestrator_fixture.orchestrator.duplex_sessions.require("sid-close-error")
+        session.bind_stage_request(stage_id=0, request_id="duplex-stage-request", replica_id=0)
+        stage_pools[0].select_replica_id("duplex-stage-request")
+
+        stage0.rpc_result = {"supported": False, "error": "stage close failed"}
+        orchestrator_fixture.request_sync_q.put_nowait(
+            CloseDuplexSessionMessage(
+                control_id="duplex-control-close-error",
+                session_id="sid-close-error",
+                reason="session_close",
+            )
+        )
+        close_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(close_msg, DuplexControlResultMessage)
+        assert close_msg.ok is True
+        assert orchestrator_fixture.orchestrator.duplex_sessions.get("sid-close-error") is None
+        assert session.stage_request_ids() == []
+        assert stage0.abort_calls == [["duplex-stage-request"]]
+        assert stage0.collective_rpc_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_native_append_routes_stage0_handoff_to_stage1(orchestrator_factory) -> None:
+    stage0 = FakeSequentialCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=False,
+        model_stage="llm",
+        rpc_results=[],
+    )
+    stage1 = FakeSequentialCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        model_stage="tts",
+        rpc_results=[],
+    )
+    stage_pools = _build_stage_pools(
+        [[stage0], [stage1]],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            OpenDuplexSessionMessage(
+                control_id="duplex-open-minicpmo",
+                session_id="sid-minicpmo-native",
+                session_mode="duplex",
+                capabilities={
+                    "implementation_level": "model_native_duplex",
+                    "input_modes": ["append_audio_chunk"],
+                },
+                session_config={
+                    "duplex_stage_max_tokens": {"0": 17},
+                },
+            )
+        )
+        open_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(open_msg, DuplexControlResultMessage)
+        assert open_msg.ok is True
+
+        audio_payload = {
+            "type": "audio",
+            "audio": "AAAAAA==",
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+        }
+        orchestrator_fixture.request_sync_q.put_nowait(
+            AppendDuplexInputMessage(
+                control_id="duplex-append-minicpmo",
+                session_id="sid-minicpmo-native",
+                mode="append_audio_chunk",
+                payload=audio_payload,
+                final=False,
+            )
+        )
+
+        append_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(append_msg, DuplexControlResultMessage)
+        assert append_msg.ok is True
+        assert stage0.collective_rpc_calls == []
+        assert stage1.collective_rpc_calls == []
+        assert len(stage0.add_request_calls) == 1
+        request = stage0.add_request_calls[0][0]
+        assert request.request_id == "duplex-sid-minicpmo-native-e0-stage0"
+        assert len(request.prompt_token_ids) == 64
+        assert request.sampling_params.max_tokens == 17
+        assert request.resumable is True
+        assert request.additional_information is None
+        assert isinstance(request.model_intermediate_buffer, dict)
+        info = request.model_intermediate_buffer
+        assert info["duplex"]["session_id"] == "sid-minicpmo-native"
+        assert info["duplex"]["mode"] == "append_audio_chunk"
+        assert info["duplex"]["payload"] == audio_payload
+        assert info["duplex"]["data_plane"] is True
+        assert info["duplex"]["scheduler_token_budget"] == 64
+        assert append_msg.stage_results[0]["result"]["data_plane_append"] is True
+        assert append_msg.stage_results[0]["result"]["resumable"] is True
+
+        second_payload = {
+            "type": "audio",
+            "audio": "AAAAAA==",
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+            "force_listen": True,
+        }
+        orchestrator_fixture.request_sync_q.put_nowait(
+            AppendDuplexInputMessage(
+                control_id="duplex-append-minicpmo-2",
+                session_id="sid-minicpmo-native",
+                mode="append_audio_chunk",
+                payload=second_payload,
+                final=False,
+            )
+        )
+        second_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(second_msg, DuplexControlResultMessage)
+        assert second_msg.ok is True
+        assert len(stage0.add_request_calls) == 2
+        second_request = stage0.add_request_calls[1][0]
+        assert second_request.request_id == request.request_id
+        assert second_request.resumable is True
+        assert isinstance(second_request.model_intermediate_buffer, dict)
+        second_info = second_request.model_intermediate_buffer
+        assert second_info["duplex"]["seq"] == 2
+        assert second_info["duplex"]["payload"] == second_payload
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_duplex_append_with_stale_expected_epoch_is_ignored(orchestrator_factory) -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            OpenDuplexSessionMessage(
+                control_id="duplex-stale-open",
+                session_id="sid-stale-append",
+                session_mode="duplex",
+                capabilities={
+                    "implementation_level": "model_native_duplex",
+                    "input_modes": ["append_audio_chunk"],
+                },
+            )
+        )
+        open_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(open_msg, DuplexControlResultMessage)
+        assert open_msg.ok is True
+
+        orchestrator_fixture.request_sync_q.put_nowait(
+            SignalDuplexTurnMessage(
+                control_id="duplex-stale-barge",
+                session_id="sid-stale-append",
+                event="barge_in",
+                payload={},
+            )
+        )
+        signal_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(signal_msg, DuplexControlResultMessage)
+        assert signal_msg.ok is True
+
+        orchestrator_fixture.request_sync_q.put_nowait(
+            AppendDuplexInputMessage(
+                control_id="duplex-stale-append",
+                session_id="sid-stale-append",
+                expected_epoch=0,
+                mode="append_audio_chunk",
+                payload={"type": "audio", "audio": "AAAA", "format": "pcm_f32le"},
+                final=False,
+            )
+        )
+        append_msg = await _get_rpc_message(orchestrator_fixture)
+
+        assert isinstance(append_msg, DuplexControlResultMessage)
+        assert append_msg.ok is True
+        assert append_msg.stage_results[0]["result"]["stale_append_ignored"] is True
+        assert append_msg.stage_results[0]["result"]["current_epoch"] == 1
+        assert stage0.add_request_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_native_append_does_not_route_handoff_after_stage_unsupported(orchestrator_factory) -> None:
+    stage0 = FakeSequentialCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=False,
+        model_stage="llm",
+        rpc_results=[
+            {"supported": True, "native_result": {"stage_role": "llm"}},
+            {"supported": False, "reason": "native duplex append unsupported"},
+        ],
+    )
+    stage1 = FakeSequentialCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        model_stage="tts",
+        rpc_results=[
+            {"supported": True, "native_result": {"stage_role": "tts"}},
+        ],
+    )
+    stage_pools = _build_stage_pools(
+        [[stage0], [stage1]],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            OpenDuplexSessionMessage(
+                control_id="duplex-control-open",
+                session_id="sid-handoff-unsupported",
+                session_mode="duplex",
+                capabilities={
+                    "implementation_level": "model_native_duplex",
+                    "input_modes": ["append_audio_chunk", "append_stage_handoff"],
+                },
+            )
+        )
+        open_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(open_msg, DuplexControlResultMessage)
+        assert open_msg.ok is True
+
+        orchestrator_fixture.request_sync_q.put_nowait(
+            AppendDuplexInputMessage(
+                control_id="duplex-control-append",
+                session_id="sid-handoff-unsupported",
+                mode="append_audio_chunk",
+                payload={"audio": "AAAA", "format": "pcm_f32le"},
+                final=False,
+            )
+        )
+        append_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(append_msg, DuplexControlResultMessage)
+        assert append_msg.ok is True
+        assert append_msg.unsupported_count == 0
+        assert stage0.collective_rpc_calls == []
+        assert stage1.collective_rpc_calls == []
+        assert len(stage0.add_request_calls) == 1
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_native_append_errors_when_tts_handoff_has_no_target_stage(orchestrator_factory) -> None:
+    tts_handoff = _minicpmo_stage_handoff_payload(
+        token_ids=[151],
+        hidden=torch.tensor([[0.1, 0.2]], dtype=torch.float32),
+        text="hi",
+    )
+    stage0 = FakeSequentialCollectiveRpcStageClient(
+        stage_type="llm",
+        final_output=True,
+        model_stage="llm",
+        rpc_results=[
+            {"supported": True, "native_result": {"stage_role": "llm"}},
+            {
+                "supported": True,
+                "native_result": {
+                    "is_listen": False,
+                    "text": "hi",
+                    "requires_stage_handoff": True,
+                    "stage_handoff": {
+                        "target_stage_role": "tts",
+                        "mode": "append_stage_handoff",
+                        "payload": tts_handoff,
+                    },
+                },
+            },
+        ],
+    )
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            OpenDuplexSessionMessage(
+                control_id="duplex-open-minicpmo-no-tts",
+                session_id="sid-minicpmo-no-tts",
+                session_mode="duplex",
+                capabilities={
+                    "implementation_level": "model_native_duplex",
+                    "input_modes": ["append_audio_chunk"],
+                },
+            )
+        )
+        open_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(open_msg, DuplexControlResultMessage)
+        assert open_msg.ok is True
+
+        orchestrator_fixture.request_sync_q.put_nowait(
+            AppendDuplexInputMessage(
+                control_id="duplex-append-minicpmo-no-tts",
+                session_id="sid-minicpmo-no-tts",
+                mode="append_audio_chunk",
+                payload={"type": "audio", "audio": "AAAA", "format": "pcm_f32le"},
+                final=False,
+            )
+        )
+
+        append_msg = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(append_msg, DuplexControlResultMessage)
+        assert append_msg.ok is True
+        assert append_msg.error_count == 0
+        assert append_msg.stage_results[-1]["stage_id"] == 0
+        assert append_msg.stage_results[-1]["result"]["data_plane_append"] is True
+        assert stage0.collective_rpc_calls == []
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from time import time
@@ -33,6 +34,10 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
+
+
+def _minicpmo45_profile_logs_enabled() -> bool:
+    return os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
 
 
 @dataclass
@@ -132,6 +137,98 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         self._omits_kv_transfer_cache[rid] = result
         return result
+
+    @staticmethod
+    def _duplex_data_plane_info(request: Request) -> dict[str, Any] | None:
+        info = getattr(request, "model_intermediate_buffer", None)
+        if not isinstance(info, dict):
+            return None
+        duplex = info.get("duplex")
+        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+            return None
+        return duplex
+
+    @staticmethod
+    def _duplex_stage_stop_token_ids(request: Request) -> set[int]:
+        stop_token_ids: set[int] = set()
+        sampling_params = getattr(request, "sampling_params", None)
+        for source in (
+            getattr(sampling_params, "stop_token_ids", None),
+            getattr(sampling_params, "_all_stop_token_ids", None),
+        ):
+            if isinstance(source, (list, tuple, set)):
+                for token_id in source:
+                    try:
+                        token_id = int(token_id)
+                    except (TypeError, ValueError):
+                        continue
+                    if token_id >= 0:
+                        stop_token_ids.add(token_id)
+
+        duplex = OmniARScheduler._duplex_data_plane_info(request)
+        if duplex is None:
+            return stop_token_ids
+        session_config = duplex.get("session_config")
+        if not isinstance(session_config, dict):
+            return stop_token_ids
+        extra_body = session_config.get("extra_body")
+        raw = session_config.get("duplex_stage_sampling_params")
+        if raw is None and isinstance(extra_body, dict):
+            raw = extra_body.get("duplex_stage_sampling_params")
+        stage0_params = None
+        if isinstance(raw, dict):
+            candidate = raw.get(0)
+            if candidate is None:
+                candidate = raw.get("0")
+            if isinstance(candidate, dict):
+                stage0_params = candidate
+        raw_stop = stage0_params.get("stop_token_ids") if isinstance(stage0_params, dict) else None
+        if isinstance(raw_stop, (list, tuple, set)):
+            for token_id in raw_stop:
+                try:
+                    token_id = int(token_id)
+                except (TypeError, ValueError):
+                    continue
+                if token_id >= 0:
+                    stop_token_ids.add(token_id)
+        return stop_token_ids
+
+    def _is_duplex_segment_boundary(
+        self,
+        request: Request,
+        new_token_ids: list[int],
+    ) -> bool:
+        if not getattr(request, "resumable", False):
+            return False
+        if self._duplex_data_plane_info(request) is None:
+            return False
+
+        stop_token_ids = self._duplex_stage_stop_token_ids(request)
+        if stop_token_ids and any(int(token_id) in stop_token_ids for token_id in new_token_ids):
+            logger.info(
+                "[OmniARScheduler] duplex segment boundary by stop token: req=%s tokens=%s stop_token_ids=%s",
+                request.request_id,
+                new_token_ids,
+                sorted(stop_token_ids),
+            )
+            return True
+
+        max_tokens = getattr(request, "max_tokens", None)
+        try:
+            max_tokens = int(max_tokens)
+        except (TypeError, ValueError):
+            max_tokens = 0
+        output_token_ids = getattr(request, "output_token_ids", None)
+        if max_tokens > 0 and isinstance(output_token_ids, list) and len(output_token_ids) >= max_tokens:
+            logger.info(
+                "[OmniARScheduler] duplex segment boundary by max_tokens: req=%s output_len=%d max_tokens=%d",
+                request.request_id,
+                len(output_token_ids),
+                max_tokens,
+            )
+            return True
+
+        return False
 
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
@@ -257,6 +354,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
                     prompt_is_token_ids=nr.prompt_is_token_ids,
                     additional_information=(getattr(request, "additional_information", None) if request else None),
+                    model_intermediate_buffer=(
+                        getattr(request, "model_intermediate_buffer", None) if request else None
+                    ),
                 )
                 new_list.append(omni_nr)
 
@@ -400,10 +500,32 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
+            if (
+                new_token_ids
+                and self._duplex_data_plane_info(request) is not None
+                and _minicpmo45_profile_logs_enabled()
+            ):
+                logger.info(
+                    "[OmniARScheduler] duplex post-update: req=%s tokens=%s "
+                    "stopped=%s status=%s resumable=%s output_len=%s "
+                    "stop_token_ids=%s",
+                    request.request_id,
+                    new_token_ids,
+                    stopped,
+                    request.status,
+                    getattr(request, "resumable", None),
+                    len(getattr(request, "output_token_ids", []) or []),
+                    sorted(self._duplex_stage_stop_token_ids(request)),
+                )
+
             # If criteria returns True, it means we must STOP the request.
             # If criteria returns False, it might have triggered a background
             # transfer (e.g. prefill finished / special token) but continues decoding.
             if not stopped and self._process_kv_transfer_trigger(request, new_token_ids):
+                stopped = True
+
+            if not stopped and new_token_ids and self._is_duplex_segment_boundary(request, new_token_ids):
+                request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
@@ -672,6 +794,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     session.record_event(EngineCoreEventType.QUEUED)
                 return
         super()._update_request_as_session(session, update)
+        if hasattr(update, "model_intermediate_buffer"):
+            session.model_intermediate_buffer = update.model_intermediate_buffer
 
     def _free_request(self, request: Request, delay_free_blocks: bool = False) -> dict[str, Any] | None:
         # TODO(wzliu)! for offline mode, we should not end process until all data is transferred

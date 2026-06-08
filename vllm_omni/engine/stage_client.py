@@ -63,6 +63,52 @@ class StagePoolClient(StageClient, Protocol):
     ) -> Any: ...
 
 
+class StageDuplexClient(StagePoolClient, Protocol):
+    """Optional stage-local duplex control plane.
+
+    Stages may implement these methods directly. StagePool also exposes a
+    collective-RPC fallback so existing stages do not have to grow this surface
+    before `session_mode: duplex` is enabled for a model.
+    """
+
+    async def open_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        epoch: int,
+        capabilities: dict[str, Any],
+        session_config: dict[str, Any] | None = None,
+    ) -> Any: ...
+
+    async def append_duplex_input_async(
+        self,
+        session_id: str,
+        *,
+        epoch: int,
+        seq: int,
+        mode: str,
+        payload: Any,
+        final: bool,
+    ) -> Any: ...
+
+    async def signal_duplex_turn_async(
+        self,
+        session_id: str,
+        *,
+        epoch: int,
+        event: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Any: ...
+
+    async def close_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        epoch: int,
+        reason: str,
+    ) -> Any: ...
+
+
 class StagePoolLLMClient(StagePoolClient, Protocol):
     """Pool-facing API for LLM-style stages."""
 

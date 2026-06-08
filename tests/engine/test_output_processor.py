@@ -171,6 +171,57 @@ def test_finish_consolidation_drains_mm_delta():
     assert AUDIO not in s.mm_accumulated  # drained
 
 
+def test_delta_audio_non_final_tts_chunk_overrides_spurious_finish():
+    s = _make_state(RequestOutputKind.DELTA)
+    s.add_multimodal_tensor(
+        {
+            "model_outputs": torch.ones(5),
+            "meta.tts_is_last_chunk": torch.tensor([0]),
+        },
+        mm_type=AUDIO,
+    )
+
+    result = s.make_request_output([1], None, FinishReason.STOP, None)
+
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    assert result.finished is False
+    assert result.outputs[0].finish_reason is None
+    assert torch.equal(result.outputs[0].multimodal_output[AUDIO], torch.ones(5))
+
+
+def test_delta_audio_final_tts_chunk_keeps_finish():
+    s = _make_state(RequestOutputKind.DELTA)
+    s.add_multimodal_tensor(
+        {
+            "model_outputs": torch.ones(5),
+            "meta.tts_is_last_chunk": torch.tensor([1]),
+        },
+        mm_type=AUDIO,
+    )
+
+    result = s.make_request_output([151645], None, FinishReason.STOP, None)
+
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    assert result.finished is True
+    assert result.outputs[0].finish_reason == "stop"
+
+
+def test_delta_audio_non_final_tts_chunk_accepts_nested_meta():
+    s = _make_state(RequestOutputKind.DELTA)
+    s.add_multimodal_tensor(
+        {
+            AUDIO: torch.ones(5),
+            "meta": {"tts_is_last_chunk": torch.tensor([0])},
+        },
+        mm_type=AUDIO,
+    )
+
+    result = s.make_request_output([1], None, FinishReason.STOP, None)
+
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    assert result.finished is False
+
+
 @pytest.mark.parametrize("mm_type", [AUDIO, "hidden"])
 def test_final_only_consolidates_drainable_keys(mm_type):
     """FINAL_ONLY never drains per-step, so modality keys and hidden state

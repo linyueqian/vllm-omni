@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Any
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
@@ -20,10 +21,13 @@ class OmniNewRequestData(NewRequestData):
         external_req_id: Optional external request ID for tracking
         additional_information: Optional serialized additional information
             dictionary containing tensors or lists
+        model_intermediate_buffer: Optional runner-owned payload for
+            GPUModelRunner.model_intermediate_buffer
     """
 
     external_req_id: str | None = None
     additional_information: AdditionalInformationPayload | None = None
+    model_intermediate_buffer: dict[str, Any] | None = None
 
     @classmethod
     def from_request(
@@ -56,6 +60,7 @@ class OmniNewRequestData(NewRequestData):
             prompt_is_token_ids=getattr(request, "prompt_is_token_ids", None),
             prefill_token_ids=prefill_token_ids,
             additional_information=getattr(request, "additional_information", None),
+            model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
         )
 
 

@@ -5,12 +5,14 @@ subsequent attempts to collect output raise RuntimeError.
 """
 
 import queue
+import threading
+from types import SimpleNamespace
 
 import pytest
 from pytest_mock import MockerFixture
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-from vllm_omni.engine.messages import ErrorMessage, OutputMessage
+from vllm_omni.engine.messages import DuplexControlResultMessage, ErrorMessage, OutputMessage
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -111,3 +113,59 @@ async def test_fatal_error_message_surfaces_through_try_get_output_async(mocker:
     assert msg is not None
     assert msg.type == "error"
     assert msg.fatal is True
+
+
+def test_open_duplex_session_waits_for_control_ack(mocker: MockerFixture):
+    request_q = queue.Queue()
+    rpc_q = queue.Queue()
+    rpc_q.put_nowait(
+        DuplexControlResultMessage(
+            control_id="ctrl-1",
+            operation="open",
+            session_id="sid",
+            ok=False,
+            stage_results=[{"stage_id": 0, "replica_id": 0, "result": {"supported": False}}],
+            unsupported_count=1,
+            error_count=0,
+        )
+    )
+
+    engine = object.__new__(AsyncOmniEngine)
+    engine.request_queue = SimpleNamespace(sync_q=request_q)
+    engine.rpc_output_queue = SimpleNamespace(sync_q=rpc_q)
+    engine._rpc_lock = threading.Lock()
+    mocker.patch("vllm_omni.engine.async_omni_engine.uuid.uuid4", return_value=SimpleNamespace(hex="ctrl-1"))
+
+    result = engine.open_duplex_session("sid", timeout=1)
+
+    msg = request_q.get_nowait()
+    assert msg.type == "open_duplex_session"
+    assert msg.control_id == "ctrl-1"
+    assert msg.timeout == 1
+    assert result["unsupported_count"] == 1
+    assert result["stage_results"][0]["result"]["supported"] is False
+
+
+def test_open_duplex_session_raises_on_stage_control_error(mocker: MockerFixture):
+    request_q = queue.Queue()
+    rpc_q = queue.Queue()
+    rpc_q.put_nowait(
+        DuplexControlResultMessage(
+            control_id="ctrl-error",
+            operation="open",
+            session_id="sid",
+            ok=False,
+            stage_results=[{"stage_id": 0, "replica_id": 0, "result": {"supported": False, "error": "boom"}}],
+            unsupported_count=1,
+            error_count=1,
+        )
+    )
+
+    engine = object.__new__(AsyncOmniEngine)
+    engine.request_queue = SimpleNamespace(sync_q=request_q)
+    engine.rpc_output_queue = SimpleNamespace(sync_q=rpc_q)
+    engine._rpc_lock = threading.Lock()
+    mocker.patch("vllm_omni.engine.async_omni_engine.uuid.uuid4", return_value=SimpleNamespace(hex="ctrl-error"))
+
+    with pytest.raises(RuntimeError, match="duplex open failed"):
+        engine.open_duplex_session("sid", timeout=1)

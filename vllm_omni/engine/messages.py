@@ -29,6 +29,44 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     final_output_stage_ids: list[int] | None = None
 
 
+class OpenDuplexSessionMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["open_duplex_session"] = "open_duplex_session"
+    control_id: str
+    session_id: str
+    session_mode: str = "duplex"
+    capabilities: dict[str, object]
+    session_config: dict[str, object] | None = None
+    timeout: float | None = None
+
+
+class AppendDuplexInputMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["append_duplex_input"] = "append_duplex_input"
+    control_id: str
+    session_id: str
+    expected_epoch: int | None = None
+    mode: str
+    payload: object
+    final: bool = False
+    timeout: float | None = None
+
+
+class SignalDuplexTurnMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["signal_duplex_turn"] = "signal_duplex_turn"
+    control_id: str
+    session_id: str
+    event: str
+    payload: dict[str, object]
+    timeout: float | None = None
+
+
+class CloseDuplexSessionMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["close_duplex_session"] = "close_duplex_session"
+    control_id: str
+    session_id: str
+    reason: str = "client_close"
+    timeout: float | None = None
+
+
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
     type: Literal["add_companion_request"] = "add_companion_request"
     companion_id: str
@@ -104,3 +142,15 @@ class CollectiveRPCResultMessage(EngineQueueMessage, kw_only=True):
     method: str
     stage_ids: list[int]
     results: list[object]
+
+
+class DuplexControlResultMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["duplex_control_result"] = "duplex_control_result"
+    control_id: str
+    operation: str
+    session_id: str
+    ok: bool
+    stage_results: list[dict[str, object]]
+    unsupported_count: int = 0
+    error_count: int = 0
+    passive_count: int = 0

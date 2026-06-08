@@ -8,6 +8,7 @@ out of StageEngineCoreClient into reusable functions.
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import importlib
 import multiprocessing as mp
@@ -466,6 +467,76 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         runtime_cfg=runtime_cfg,
         prompt_expand_func=prompt_expand_func,
     )
+
+
+def _normalize_token_name_list(raw_names: Any) -> list[str]:
+    if raw_names is None:
+        return []
+    if isinstance(raw_names, str):
+        return [raw_names]
+    if isinstance(raw_names, Sequence) and not isinstance(raw_names, bytes | bytearray):
+        return [str(name) for name in raw_names]
+    raise TypeError(f"token names must be a string or sequence of strings, got {type(raw_names).__name__}")
+
+
+def _resolve_token_id_by_name(tokenizer: Any, token_name: str) -> int:
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    token_id: Any = convert(token_name) if callable(convert) else None
+    unk_token = getattr(tokenizer, "unk_token", None)
+    unk_token_id = getattr(tokenizer, "unk_token_id", None)
+    if token_id is None or (unk_token_id is not None and token_id == unk_token_id and token_name != unk_token):
+        encode = getattr(tokenizer, "encode", None)
+        if callable(encode):
+            encoded = encode(token_name, add_special_tokens=False)
+            if isinstance(encoded, Sequence) and len(encoded) == 1:
+                token_id = encoded[0]
+    if not isinstance(token_id, int) or token_id < 0:
+        raise ValueError(f"Could not resolve tokenizer token name {token_name!r} to a token id")
+    return token_id
+
+
+def resolve_sampling_param_token_names(
+    default_sampling_params: OmniSamplingParams,
+    stage_vllm_config: Any,
+) -> OmniSamplingParams:
+    """Resolve symbolic sampling token names after tokenizer config exists."""
+
+    extra_args = getattr(default_sampling_params, "extra_args", None)
+    if not isinstance(extra_args, dict):
+        return default_sampling_params
+    stop_token_names = _normalize_token_name_list(extra_args.get("stop_token_names"))
+    if not stop_token_names:
+        return default_sampling_params
+
+    model_config = getattr(stage_vllm_config, "model_config", None)
+    if model_config is None:
+        raise ValueError("Cannot resolve stop_token_names without a stage model_config")
+    tokenizer = cached_tokenizer_from_config(model_config=model_config)
+    stop_token_ids = [_resolve_token_id_by_name(tokenizer, name) for name in stop_token_names]
+
+    resolved = (
+        default_sampling_params.clone()
+        if hasattr(default_sampling_params, "clone")
+        else copy.deepcopy(default_sampling_params)
+    )
+    existing_ids = list(getattr(resolved, "stop_token_ids", None) or [])
+    for token_id in stop_token_ids:
+        if token_id not in existing_ids:
+            existing_ids.append(token_id)
+    resolved.stop_token_ids = existing_ids
+    all_stop_token_ids = getattr(resolved, "_all_stop_token_ids", None)
+    if isinstance(all_stop_token_ids, set):
+        all_stop_token_ids.update(existing_ids)
+
+    resolved_extra_args = dict(extra_args)
+    resolved_extra_args.pop("stop_token_names", None)
+    resolved.extra_args = resolved_extra_args or None
+    logger.info(
+        "Resolved default_sampling_params.extra_args.stop_token_names=%s to stop_token_ids=%s",
+        stop_token_names,
+        stop_token_ids,
+    )
+    return resolved
 
 
 def prepare_engine_environment() -> None:

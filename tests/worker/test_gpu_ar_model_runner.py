@@ -1,9 +1,8 @@
 from types import SimpleNamespace
 
 import pytest
-import torch
 
-from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState, GPUARModelRunner
+from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -44,89 +43,127 @@ def test_resolve_pooler_payload_req_ids_downstream_stage_uses_filtered_requests(
     assert payload_req_ids == ["r2"]
 
 
-def test_sparse_mm_req_ids_requires_sparse_audio_marker():
-    assert GPUARModelRunner._sparse_mm_req_ids({"meta": {"req_id": ["r1"]}}) is None
-    assert GPUARModelRunner._sparse_mm_req_ids({"meta.req_id": ["r1"]}) is None
-
-    assert GPUARModelRunner._sparse_mm_req_ids({"meta": {"req_id": ["r1"], "sparse_audio": ["1"]}}) == ["r1"]
-    assert GPUARModelRunner._sparse_mm_req_ids({"meta.req_id": ["r1"], "meta.sparse_audio": ["1"]}) == ["r1"]
-
-
-@pytest.mark.parametrize("query_start_loc_attr", ["method", "tensor_attr"])
-def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monkeypatch, query_start_loc_attr):
+def test_duplex_forward_with_runner_context_exposes_scheduler_kv_contract():
     runner = object.__new__(GPUARModelRunner)
-    runner.execute_model_state = ExecuteModelState(
-        SimpleNamespace(
-            total_num_scheduled_tokens=3,
-            num_scheduled_tokens={"r1": 1, "r2": 2},
-        ),
-        None,
-        None,
-        None,
-        torch.zeros((3, 2), dtype=torch.float32),
-        torch.tensor([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]]),
-        None,
-        None,
-        None,
-        None,
-        {},
-        None,
+
+    hook = runner.duplex_forward_with_runner_context
+
+    assert getattr(hook, "uses_scheduler_metadata") is True
+    assert getattr(hook, "uses_runner_kv_cache") is True
+    assert getattr(hook, "vllm_omni_runner_context_contract") is True
+    assert getattr(runner, "supports_native_duplex_runner_context") is True
+
+
+def test_duplex_forward_with_runner_context_delegates_to_runner_impl():
+    runner = object.__new__(GPUARModelRunner)
+    calls = []
+
+    def impl(**kwargs):
+        calls.append(kwargs)
+        return {
+            "logits": "logits",
+            "hidden_states": "hidden",
+            "sampled_token_id": 7,
+            "kv_cache_length": kwargs["context_len"],
+        }
+
+    runner._duplex_forward_with_runner_context_impl = impl
+
+    result = runner.duplex_forward_with_runner_context(
+        session_id="sid",
+        inputs_embeds="embeds",
+        context_len=3,
+        previous_context_len=2,
+        reset_kv=False,
     )
-    runner.kv_connector_output = None
+
+    assert calls == [
+        {
+            "session_id": "sid",
+            "inputs_embeds": "embeds",
+            "context_len": 3,
+            "previous_context_len": 2,
+            "reset_kv": False,
+        }
+    ]
+    assert result == {
+        "logits": "logits",
+        "hidden_states": "hidden",
+        "sampled_token_id": 7,
+        "kv_cache_length": 3,
+        "uses_model_runner_scheduler": True,
+        "runner_kv_backed": True,
+    }
+
+
+def test_model_sampler_identifies_duplex_rows_without_mutating_metadata():
+    runner = object.__new__(GPUARModelRunner)
     runner.input_batch = SimpleNamespace(
-        req_ids=["r1", "r2"],
-        req_id_to_index={"r1": 0, "r2": 1},
-        sampling_metadata=SimpleNamespace(no_penalties=True),
-        vocab_size=10,
-        num_tokens_no_spec=None,
+        req_ids=["duplex-sid-e0-stage0-s1", "plain-request"],
+        req_output_token_ids=[[], []],
+        sampled_token_ids_cpu=None,
+        prev_req_id_to_index=None,
     )
-    query_start_loc = torch.tensor([0, 1], dtype=torch.long)
-    if query_start_loc_attr == "method":
-        runner.query_start_loc = query_start_loc
-    else:
-        runner.query_start_loc = SimpleNamespace(cpu=query_start_loc)
-    runner.omni_prefix_cache = object()
-    runner.speculative_config = None
-    runner.routed_experts_initialized = False
+    runner.model_intermediate_buffer = {
+        "duplex-sid-e0-stage0-s1": {"duplex": {"data_plane": True}},
+        "plain-request": {},
+    }
     runner.requests = {}
-    runner.supports_mm_inputs = False
-    runner.use_async_scheduling = False
-    runner._omni_num_scheduled_tokens_np = None
+    metadata = SimpleNamespace(output_token_ids=[[], []])
 
-    monkeypatch.setattr(
-        GPUARModelRunner, "_sample", lambda self, logits, spec_decode_metadata: SimpleNamespace(sampled_token_ids=[])
-    )
-    monkeypatch.setattr(GPUARModelRunner, "_update_states_after_model_execute", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        GPUARModelRunner,
-        "_bookkeeping_sync",
-        lambda *args, **kwargs: (
-            0,
-            None,
-            [],
-            None,
-            ["r1", "r2"],
-            {"r1": 0, "r2": 1},
-            [],
-        ),
-    )
-    monkeypatch.setattr(GPUARModelRunner, "eplb_step", lambda self: None)
-    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("audio", req_ids))
-    monkeypatch.setattr(GPUARModelRunner, "_deferred_prefix_cache_mm_keys", lambda self: set())
-    monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
-    monkeypatch.setattr(
-        GPUARModelRunner,
-        "_maybe_get_combined_prefix_cache_tensors",
-        lambda *args, **kwargs: (None, None),
-    )
-    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
-    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
-    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+    result = runner._sampling_metadata_for_model_sampler(metadata)
 
-    output = GPUARModelRunner.sample_tokens(runner, grammar_output=None)
+    assert result is metadata
+    assert not hasattr(result, "_vllm_omni_duplex_rows")
+    assert runner._model_sampler_duplex_rows() == [0]
 
-    assert torch.equal(output.pooler_output[0]["hidden"], torch.tensor([[1.0, 10.0]]))
-    assert torch.equal(
-        output.pooler_output[1]["hidden"],
-        torch.tensor([[2.0, 20.0], [3.0, 30.0]]),
+
+def test_model_sampler_does_not_treat_request_id_prefix_as_duplex_row():
+    runner = object.__new__(GPUARModelRunner)
+    runner.input_batch = SimpleNamespace(
+        req_ids=["duplex-looking-plain-request"],
     )
+    runner.model_intermediate_buffer = {
+        "duplex-looking-plain-request": {},
+    }
+    runner.requests = {}
+
+    assert runner._model_sampler_duplex_rows() == []
+
+
+def test_call_model_sampler_passes_duplex_rows_when_supported():
+    calls = []
+
+    def model_sample(logits, sampling_metadata, *, duplex_rows=None):
+        calls.append((logits, sampling_metadata, duplex_rows))
+        return "sampled"
+
+    assert (
+        GPUARModelRunner._call_model_sampler(
+            model_sample,
+            "logits",
+            "metadata",
+            duplex_rows=[0],
+        )
+        == "sampled"
+    )
+    assert calls == [("logits", "metadata", [0])]
+
+
+def test_call_model_sampler_falls_back_for_legacy_signature():
+    calls = []
+
+    def model_sample(logits, sampling_metadata):
+        calls.append((logits, sampling_metadata))
+        return "sampled"
+
+    assert (
+        GPUARModelRunner._call_model_sampler(
+            model_sample,
+            "logits",
+            "metadata",
+            duplex_rows=[0],
+        )
+        == "sampled"
+    )
+    assert calls == [("logits", "metadata")]

@@ -66,11 +66,11 @@ class TestOmniPayloadStruct:
 
     def test_struct_with_all_categories(self):
         d = {
-            "hidden_states": {"output": torch.zeros(1)},
+            "hidden_states": {"output": torch.zeros(1), "tts": torch.ones(2, 4)},
             "embed": {"prefill": torch.zeros(1), "tts_bos": torch.zeros(1)},
-            "ids": {"all": [1, 2], "prompt": [1]},
-            "codes": {"audio": torch.zeros(1)},
-            "meta": {"left_context_size": 3, "num_processed_tokens": 7},
+            "ids": {"all": [1, 2], "prompt": [1], "tts": [3, 4]},
+            "codes": {"audio": torch.zeros(1), "ref": torch.ones(4)},
+            "meta": {"left_context_size": 3, "num_processed_tokens": 7, "ref_audio_sr": 24000},
         }
         s = to_struct(d)
         assert isinstance(s.hidden_states, HiddenStatesStruct)
@@ -79,7 +79,11 @@ class TestOmniPayloadStruct:
         assert isinstance(s.codes, CodesStruct)
         assert isinstance(s.meta, MetaStruct)
         assert s.ids.all == [1, 2]
+        assert s.ids.tts == [3, 4]
+        assert torch.equal(s.hidden_states.tts, torch.ones(2, 4))
         assert s.meta.num_processed_tokens == 7
+        assert torch.equal(s.codes.ref, torch.ones(4))
+        assert s.meta.ref_audio_sr == 24000
 
 
 class TestValidatePayload:
@@ -331,8 +335,8 @@ class TestSerializeDeserializePayload:
         original: OmniPayload = {
             "hidden_states": {"output": torch.tensor([1.0, 2.0])},
             "ids": {"all": [1, 2, 3]},
-            "meta": {"finished": torch.tensor(False, dtype=torch.bool), "ar_width": 4},
-            "codes": {"audio": torch.tensor([3.0])},
+            "meta": {"finished": torch.tensor(False, dtype=torch.bool), "ar_width": 4, "ref_audio_sr": 16000},
+            "codes": {"audio": torch.tensor([3.0]), "ref": torch.tensor([0.1, 0.2])},
         }
         wire = serialize_payload(original)
         restored = deserialize_payload(wire)
@@ -340,7 +344,9 @@ class TestSerializeDeserializePayload:
         assert restored["ids"]["all"] == [1, 2, 3]
         assert restored["meta"]["finished"].item() is False
         assert restored["meta"]["ar_width"] == 4
+        assert restored["meta"]["ref_audio_sr"] == 16000
         assert torch.equal(restored["codes"]["audio"], original["codes"]["audio"])
+        assert torch.equal(restored["codes"]["ref"], original["codes"]["ref"])
 
     def test_hidden_states_layers_round_trip(self):
         original = {
@@ -362,6 +368,21 @@ class TestSerializeDeserializePayload:
             wire = serialize_payload(original)
             restored = deserialize_payload(wire)
             assert restored["codes"]["audio"].dtype == dtype, f"dtype mismatch for {dtype}"
+
+    def test_tensor_entry_helpers_round_trip_tensor_wire_format(self):
+        from vllm_omni.data_entry_keys import (
+            deserialize_tensor_entry,
+            serialize_tensor_entry,
+        )
+
+        tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+        entry = serialize_tensor_entry(tensor)
+        restored = deserialize_tensor_entry(entry)
+
+        assert entry.tensor_dtype == "float32"
+        assert entry.tensor_shape == [2, 3]
+        assert torch.equal(restored, tensor)
 
     def test_tensor_shape_preserved(self):
         t = torch.randn(3, 4, 5)

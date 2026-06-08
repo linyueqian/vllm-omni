@@ -124,6 +124,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.entrypoints.openai.serving_duplex import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage, ReferenceVideo
@@ -213,6 +214,32 @@ def _should_enable_profiler_endpoints(stage_configs: list | None) -> bool:
             )
             if profiler is not None:
                 return True
+    return False
+
+
+def _should_enable_duplex_endpoint(
+    stage_configs: list | None,
+    *,
+    config_path: str | None = None,
+) -> bool:
+    """Enable /v1/duplex only for deployments that opt into duplex sessions."""
+    if stage_configs:
+        for stage in stage_configs:
+            session_mode = (
+                stage.get("session_mode") if isinstance(stage, dict) else getattr(stage, "session_mode", None)
+            )
+            if session_mode == "duplex":
+                return True
+    if config_path:
+        try:
+            from omegaconf import OmegaConf
+
+            raw_config = OmegaConf.load(config_path)
+            session_mode = raw_config.get("session_mode") if hasattr(raw_config, "get") else None
+            if session_mode == "duplex":
+                return True
+        except Exception as exc:
+            logger.warning("Failed to inspect duplex session_mode from %s: %s", config_path, exc)
     return False
 
 
@@ -728,6 +755,7 @@ async def omni_init_app_state(
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
         )
+        state.openai_serving_duplex = None
         state.openai_streaming_speech = None
         state.openai_streaming_video = None
         state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
@@ -911,6 +939,7 @@ async def omni_init_app_state(
     # Warm up chat template processing to avoid first-request latency
     if state.openai_serving_chat is not None:
         state.openai_serving_chat.warmup()
+        await state.openai_serving_chat.warmup_minicpmo45_chat_audio()
 
     state.openai_serving_completion = (
         OpenAIServingCompletion(
@@ -1059,6 +1088,15 @@ async def omni_init_app_state(
             engine_client=engine_client,
         )
         if state.openai_serving_chat is not None
+        else None
+    )
+    state.openai_serving_duplex = (
+        OmniDuplexSessionHandler(chat_service=state.openai_serving_chat)
+        if state.openai_serving_chat is not None
+        and _should_enable_duplex_endpoint(
+            state.stage_configs,
+            config_path=getattr(args, "stage_configs_path", None) or getattr(args, "deploy_config", None),
+        )
         else None
     )
     state.openai_serving_realtime = OpenAIServingRealtime(
@@ -1506,6 +1544,39 @@ async def streaming_video_chat(websocket: WebSocket):
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
+    duplex_handler = getattr(websocket.app.state, "openai_serving_duplex", None)
+    realtime_model = websocket.query_params.get("model")
+    duplex_query = websocket.query_params.get("duplex")
+    minicpmo45_realtime_model = isinstance(realtime_model, str) and (
+        "minicpm-o-4-5" in realtime_model.lower().replace("_", "-")
+        or "minicpmo-4-5" in realtime_model.lower().replace("_", "-")
+        or "minicpmo45" in realtime_model.lower().replace("_", "-")
+    )
+    use_duplex_realtime = (
+        duplex_handler is not None
+        and duplex_query not in {"0", "false", "False", "off"}
+        and (duplex_query in {"1", "true", "True", "on"} or minicpmo45_realtime_model)
+    )
+    if use_duplex_realtime and duplex_handler is not None:
+        await duplex_handler.handle_realtime_session(websocket)
+        return
+
+    engine_client = getattr(websocket.app.state, "engine_client", None)
+    if engine_client is not None and getattr(engine_client, "async_chunk", False):
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "type": "error",
+                "error": (
+                    "The /v1/realtime API is not supported when async_chunk is enabled on the server. "
+                    "Use a stage configuration with async_chunk disabled and restart the server before using "
+                    "this endpoint."
+                ),
+                "code": "unsupported",
+            }
+        )
+        await websocket.close()
+        return
     serving = getattr(websocket.app.state, "openai_serving_realtime", None)
     if serving is None:
         await websocket.accept()
@@ -1531,6 +1602,18 @@ async def realtime_robot_openpi(websocket: WebSocket):
         return
     connection = RobotRealtimeConnection(websocket, serving)
     await connection.handle_connection()
+
+
+@router.websocket("/v1/duplex")
+async def duplex_websocket(websocket: WebSocket):
+    """WebSocket endpoint for vLLM-Omni duplex session control."""
+    handler = getattr(websocket.app.state, "openai_serving_duplex", None)
+    if handler is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "error": "Duplex API is not available", "code": "unsupported"})
+        await websocket.close()
+        return
+    await handler.handle_session(websocket)
 
 
 # Health and Model endpoints for diffusion mode

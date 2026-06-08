@@ -6,6 +6,7 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -72,6 +73,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     outputs per request while keeping Async output semantics.
     """
 
+    supports_native_duplex_runner_context = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
@@ -103,6 +106,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 kv_transfer_manager=self.kv_transfer_manager,
             )
         self._downstream_payload_cache: dict[str, bool] = {}
+        self._duplex_force_listen_applied_segments: set[tuple[str, int]] = set()
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -164,9 +168,112 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def _sampling_metadata_for_model_sampler(self, sampling_metadata):
         output_token_ids = self._build_model_sampler_output_token_ids()
-        if output_token_ids == sampling_metadata.output_token_ids:
-            return sampling_metadata
-        return replace(sampling_metadata, output_token_ids=output_token_ids)
+        if output_token_ids != sampling_metadata.output_token_ids:
+            return replace(sampling_metadata, output_token_ids=output_token_ids)
+        return sampling_metadata
+
+    def _model_sampler_duplex_rows(self) -> list[int]:
+        req_ids = list(getattr(self.input_batch, "req_ids", []))
+        return [idx for idx, req_id in enumerate(req_ids) if self._request_has_duplex_data_plane_metadata(str(req_id))]
+
+    def _request_has_duplex_data_plane_metadata(self, req_id: str) -> bool:
+        info = self._request_duplex_intermediate_info(req_id)
+        if not isinstance(info, dict):
+            return False
+        duplex = info.get("duplex")
+        return isinstance(duplex, dict) and duplex.get("data_plane") is True
+
+    def _request_duplex_intermediate_info(self, req_id: str) -> dict[str, Any] | None:
+        model_intermediate_buffer = getattr(self, "model_intermediate_buffer", {})
+        info = model_intermediate_buffer.get(req_id) if isinstance(model_intermediate_buffer, dict) else None
+        if isinstance(info, dict):
+            return info
+        requests = getattr(self, "requests", {})
+        req_state = requests.get(req_id) if isinstance(requests, dict) else None
+        info = getattr(req_state, "additional_information_cpu", None)
+        return info if isinstance(info, dict) else None
+
+    def _request_duplex_payload(self, req_id: str) -> dict[str, Any] | None:
+        info = self._request_duplex_intermediate_info(req_id)
+        if not isinstance(info, dict):
+            return None
+        duplex = info.get("duplex")
+        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+            return None
+        payload = duplex.get("payload")
+        return payload if isinstance(payload, dict) else None
+
+    def _request_duplex_seq(self, req_id: str) -> int | None:
+        info = self._request_duplex_intermediate_info(req_id)
+        if not isinstance(info, dict):
+            return None
+        duplex = info.get("duplex")
+        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+            return None
+        try:
+            return int(duplex.get("seq"))
+        except (TypeError, ValueError):
+            return None
+
+    def _apply_duplex_force_listen_logits(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: Any,
+        duplex_rows: list[int],
+    ) -> None:
+        if not duplex_rows:
+            return
+        token_id_fn = getattr(self.model, "_minicpmo45_native_duplex_token_ids", None)
+        if not callable(token_id_fn):
+            return
+        try:
+            listen_id = int(token_id_fn().get("listen_token_id", -1))
+        except Exception:
+            return
+        if listen_id < 0 or listen_id >= logits.shape[-1]:
+            return
+        req_ids = [str(req_id) for req_id in getattr(self.input_batch, "req_ids", [])]
+        output_token_ids = getattr(sampling_metadata, "output_token_ids", None) or []
+        for row_idx in duplex_rows:
+            if row_idx >= len(req_ids):
+                continue
+            req_id = req_ids[row_idx]
+            payload = self._request_duplex_payload(req_id)
+            if not isinstance(payload, dict) or payload.get("force_listen") is not True:
+                continue
+            seq = self._request_duplex_seq(req_id)
+            segment_key = (req_id, seq if seq is not None else -1)
+            if segment_key in self._duplex_force_listen_applied_segments:
+                continue
+            row_outputs = output_token_ids[row_idx] if row_idx < len(output_token_ids) else []
+            logits[row_idx, :] = float("-inf")
+            logits[row_idx, listen_id] = 0.0
+            self._duplex_force_listen_applied_segments.add(segment_key)
+            if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
+                logger.info(
+                    "MiniCPM-o duplex force listen logits: req_id=%s seq=%s row=%s prior_output_len=%s listen_id=%s",
+                    req_id,
+                    seq,
+                    row_idx,
+                    len(row_outputs) if hasattr(row_outputs, "__len__") else None,
+                    listen_id,
+                )
+
+    @staticmethod
+    def _call_model_sampler(
+        model_sample: Any,
+        logits: torch.Tensor,
+        sampling_metadata: Any,
+        *,
+        duplex_rows: list[int],
+    ):
+        if duplex_rows:
+            try:
+                return model_sample(logits, sampling_metadata, duplex_rows=duplex_rows)
+            except TypeError as exc:
+                if "duplex_rows" not in str(exc):
+                    raise
+        return model_sample(logits, sampling_metadata)
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)
@@ -226,6 +333,49 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if isinstance(value, str):
             return value.lower() in ("1", "true", "yes", "on")
         return bool(value)
+
+    def duplex_forward_with_runner_context(
+        self,
+        *,
+        session_id: str,
+        inputs_embeds: torch.Tensor,
+        context_len: int,
+        previous_context_len: int = 0,
+        reset_kv: bool = False,
+    ) -> dict[str, Any]:
+        """Run one native-duplex Stage0 step through a runner-owned boundary.
+
+        This method is intentionally a runner contract, not a model method:
+        token selection and KV/attention ownership must stay in the model
+        runner instead of being reimplemented by MiniCPM-o's duplex runtime.
+
+        The actual scheduled implementation is installed by the runner/backend
+        that owns the active session context. Without that context we fail
+        closed rather than falling back to an eager model.forward path.
+        """
+        impl = getattr(self, "_duplex_forward_with_runner_context_impl", None)
+        if not callable(impl):
+            raise RuntimeError(
+                "GPUARModelRunner native duplex requires a scheduler-owned "
+                "duplex runner context; core KV lease/resumable request is not "
+                "enabled for this runner."
+            )
+        output = impl(
+            session_id=session_id,
+            inputs_embeds=inputs_embeds,
+            context_len=context_len,
+            previous_context_len=previous_context_len,
+            reset_kv=reset_kv,
+        )
+        if not isinstance(output, dict):
+            raise TypeError("duplex runner context forward must return a dict")
+        missing = {"logits", "hidden_states", "sampled_token_id", "kv_cache_length"} - set(output)
+        if missing:
+            raise ValueError(f"duplex runner context forward missing fields: {sorted(missing)}")
+        output = dict(output)
+        output["uses_model_runner_scheduler"] = True
+        output["runner_kv_backed"] = True
+        return output
 
     def capture_model(self) -> int:
         result = super().capture_model()
@@ -808,6 +958,24 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if spec_decode_metadata is None:
             model_sample = getattr(self.model, "sample", None)
             self.input_batch.update_async_output_token_ids()
+            duplex_rows = self._model_sampler_duplex_rows()
+            if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
+                req_ids = [str(req_id) for req_id in getattr(self.input_batch, "req_ids", [])]
+                if duplex_rows:
+                    prompt_token_ids = getattr(sampling_metadata, "prompt_token_ids", None)
+                    output_token_ids = getattr(sampling_metadata, "output_token_ids", None)
+                    logger.info(
+                        "MiniCPM-o duplex sampler gate: req_ids=%s prefer_model_sampler=%s "
+                        "model=%s prompt_shape=%s output_lens=%s temperature=%s top_k=%s top_p=%s",
+                        req_ids,
+                        getattr(self.model, "prefer_model_sampler", False),
+                        type(self.model).__name__,
+                        None if prompt_token_ids is None else tuple(prompt_token_ids.shape),
+                        None if output_token_ids is None else [len(ids) for ids in output_token_ids],
+                        getattr(sampling_metadata, "temperature", None),
+                        getattr(sampling_metadata, "top_k", None),
+                        getattr(sampling_metadata, "top_p", None),
+                    )
             if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
                 # Apply logit bias (min_tokens, allowed_token_ids) before
                 # the custom model sampler — the standard GPU sampler does
@@ -819,9 +987,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         self.input_batch.idx_mapping_np,
                         self.input_batch.positions[self.input_batch.logits_indices],
                     )
-                sampler_output = model_sample(
+                self._apply_duplex_force_listen_logits(logits, sampling_metadata, duplex_rows)
+                sampler_output = self._call_model_sampler(
+                    model_sample,
                     logits,
                     self._sampling_metadata_for_model_sampler(sampling_metadata),
+                    duplex_rows=duplex_rows,
                 )
                 if sampler_output is not None:
                     return sampler_output
@@ -1221,3 +1392,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 return global_id.decode("utf-8")
             return str(global_id)
         return req_id
+
+
+GPUARModelRunner.duplex_forward_with_runner_context.uses_scheduler_metadata = True  # type: ignore[attr-defined]
+GPUARModelRunner.duplex_forward_with_runner_context.uses_runner_kv_cache = True  # type: ignore[attr-defined]
+GPUARModelRunner.duplex_forward_with_runner_context.vllm_omni_runner_context_contract = True  # type: ignore[attr-defined]

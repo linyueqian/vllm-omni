@@ -16,6 +16,7 @@ attaches / detaches head-side stage clients for headless replicas.
 from __future__ import annotations
 
 import asyncio
+import os
 import time as _time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -26,7 +27,7 @@ import torch
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
@@ -39,16 +40,31 @@ from vllm_omni.distributed.omni_coordinator import (
 )
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.duplex import (
+    DuplexAdapterPattern,
+    DuplexInputMode,
+    DuplexRuntimeCapabilities,
+    DuplexSessionRuntimeManager,
+    DuplexSessionRuntimeState,
+    DuplexSignalSource,
+    SessionMode,
+    duplex_scheduler_token_budget,
+)
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
+    AppendDuplexInputMessage,
+    CloseDuplexSessionMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
+    DuplexControlResultMessage,
     EngineQueueMessage,
     ErrorMessage,
+    OpenDuplexSessionMessage,
     OutputMessage,
     RegisterRemoteReplicaMessage,
     ShutdownRequestMessage,
+    SignalDuplexTurnMessage,
     StageMetricsMessage,
     StageSubmissionMessage,
     UnregisterRemoteReplicaMessage,
@@ -70,6 +86,10 @@ from vllm_omni.outputs import OmniRequestOutput
 RemoteReplicaFactory = Callable[[int, int], Awaitable[Any]]
 
 logger = init_logger(__name__)
+
+
+def _minicpmo45_profile_logs_enabled() -> bool:
+    return os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
 
 
 def build_engine_core_request_from_tokens(
@@ -97,8 +117,13 @@ def build_engine_core_request_from_tokens(
         pooling_params = params.clone()
 
     prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
+    raw_additional_information = prompt.get("additional_information")
+    model_intermediate_buffer = prompt.get("model_intermediate_buffer")
+    wire_payload: dict[str, Any] | None = None
+    if isinstance(raw_additional_information, dict):
+        wire_payload = dict(raw_additional_information)
     additional_info_payload = serialize_additional_information(
-        prompt.get("additional_information"),
+        wire_payload,
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
     )
 
@@ -115,6 +140,7 @@ def build_engine_core_request_from_tokens(
         prompt_embeds=prompt_embeds,
         resumable=resumable,
         additional_information=additional_info_payload,
+        model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
     )
 
 
@@ -205,6 +231,7 @@ class Orchestrator:
         self.request_states: dict[str, OrchestratorRequestState] = {}
         self._init_metrics_state(stage_pools, running_counter, transfer_emitter, log_stats=log_stats)
 
+        self.duplex_sessions = DuplexSessionRuntimeManager()
         self._cfg_tracker = CfgCompanionTracker()
 
         self._shutdown_event = asyncio.Event()
@@ -414,6 +441,14 @@ class Orchestrator:
                 await self._handle_streaming_update(msg)
             elif msg_type == "add_companion_request":
                 await self._handle_add_companion(msg)
+            elif msg_type == "open_duplex_session":
+                await self._handle_open_duplex_session(msg)
+            elif msg_type == "append_duplex_input":
+                await self._handle_append_duplex_input(msg)
+            elif msg_type == "signal_duplex_turn":
+                await self._handle_signal_duplex_turn(msg)
+            elif msg_type == "close_duplex_session":
+                await self._handle_close_duplex_session(msg)
             elif msg_type == "abort":
                 await self._handle_abort(msg)
             elif msg_type == "collective_rpc":
@@ -445,6 +480,552 @@ class Orchestrator:
                 break
             else:
                 logger.warning("[Orchestrator] Unknown message type: %s", msg_type)
+
+    @staticmethod
+    def _coerce_duplex_capabilities(raw: dict[str, object]) -> DuplexRuntimeCapabilities:
+        def enum_set(enum_cls: Any, values: object) -> set[Any]:
+            if not isinstance(values, list):
+                return set()
+            result = set()
+            for value in values:
+                try:
+                    result.add(enum_cls(value))
+                except ValueError:
+                    logger.warning("[Orchestrator] Ignoring unknown duplex capability value: %s", value)
+            return result
+
+        adapter_patterns = enum_set(DuplexAdapterPattern, raw.get("adapter_patterns"))
+        input_modes = enum_set(DuplexInputMode, raw.get("input_modes")) or {DuplexInputMode.TURN_COMMIT_ONLY}
+        signal_sources = enum_set(DuplexSignalSource, raw.get("signal_sources")) or {
+            DuplexSignalSource.CLIENT_EVENT,
+            DuplexSignalSource.SERVER_POLICY,
+        }
+        chunk_period = raw.get("chunk_period_ms")
+        target_latency = raw.get("target_barge_in_latency_ms")
+        return DuplexRuntimeCapabilities(
+            adapter_patterns=adapter_patterns,
+            input_modes=input_modes,
+            signal_sources=signal_sources,
+            supports_kv_lease=bool(raw.get("supports_kv_lease", False)),
+            supports_core_kv_lease=bool(raw.get("supports_core_kv_lease", False)),
+            supports_model_internal_state=bool(raw.get("supports_model_internal_state", False)),
+            supports_stage_resumption=bool(raw.get("supports_stage_resumption", False)),
+            supports_scheduler_native_append=bool(raw.get("supports_scheduler_native_append", False)),
+            supports_core_resumable_request=bool(raw.get("supports_core_resumable_request", False)),
+            supports_stage_connector_handoff=bool(raw.get("supports_stage_connector_handoff", False)),
+            supports_independent_io_streams=bool(raw.get("supports_independent_io_streams", False)),
+            supports_realtime_endpoint=bool(raw.get("supports_realtime_endpoint", False)),
+            supports_multi_session=bool(raw.get("supports_multi_session", False)),
+            supports_multi_session_same_replica=bool(raw.get("supports_multi_session_same_replica", False)),
+            supports_barge_in=bool(raw.get("supports_barge_in", True)),
+            supports_playback_ack=bool(raw.get("supports_playback_ack", True)),
+            supports_audio_truncate=bool(raw.get("supports_audio_truncate", False)),
+            implementation_level=str(raw.get("implementation_level") or "serving_session_adapter"),
+            stage_handoff_transport=(
+                str(raw.get("stage_handoff_transport")) if raw.get("stage_handoff_transport") is not None else None
+            ),
+            chunk_period_ms=int(chunk_period) if isinstance(chunk_period, int | float) else None,
+            target_barge_in_latency_ms=int(target_latency) if isinstance(target_latency, int | float) else None,
+        )
+
+    async def _handle_open_duplex_session(self, msg: OpenDuplexSessionMessage) -> None:
+        try:
+            session_mode = SessionMode(msg.session_mode)
+            capabilities = self._coerce_duplex_capabilities(msg.capabilities)
+            self.duplex_sessions.open_session(
+                msg.session_id,
+                session_mode=session_mode,
+                capabilities=capabilities,
+                session_config=msg.session_config,
+            )
+            session = self.duplex_sessions.require(msg.session_id)
+            request_state = self._ensure_duplex_stage_request_state(session, stage_id=0)
+            await self._put_duplex_control_result(
+                msg.control_id,
+                operation="open",
+                session_id=msg.session_id,
+                stage_results=[
+                    {
+                        "stage_id": -1,
+                        "replica_id": -1,
+                        "result": {
+                            "supported": True,
+                            "implementation_level": capabilities.implementation_level,
+                            "data_plane_session": True,
+                            "session_mode": session_mode.value,
+                            "scheduler_request_context": request_state is not None,
+                            "request_id": request_state.request_id if request_state is not None else None,
+                            "stage_request_topology": self._duplex_stage_request_topology(session),
+                        },
+                    }
+                ],
+            )
+        except Exception as exc:
+            logger.exception("[Orchestrator] open_duplex_session failed: %s", exc)
+            await self._put_duplex_control_result(
+                msg.control_id,
+                operation="open",
+                session_id=msg.session_id,
+                stage_results=[],
+                error=str(exc),
+            )
+
+    async def _handle_append_duplex_input(self, msg: AppendDuplexInputMessage) -> None:
+        stage_results: list[dict[str, object]] = []
+        try:
+            session = self.duplex_sessions.require(msg.session_id)
+            if msg.expected_epoch is not None and session.epoch != msg.expected_epoch:
+                await self._put_duplex_control_result(
+                    msg.control_id,
+                    operation="append",
+                    session_id=msg.session_id,
+                    stage_results=[
+                        {
+                            "stage_id": -1,
+                            "replica_id": -1,
+                            "result": {
+                                "supported": True,
+                                "stale_append_ignored": True,
+                                "expected_epoch": msg.expected_epoch,
+                                "current_epoch": session.epoch,
+                            },
+                        }
+                    ],
+                )
+                return
+            mode = DuplexInputMode(msg.mode)
+            update = session.append_input(
+                msg.payload,
+                mode=mode,
+                final=msg.final,
+            )
+            stage_results = await self._append_duplex_input_via_data_plane(
+                msg,
+                session=session,
+                seq=update.seq,
+                mode=mode,
+            )
+            await self._put_duplex_control_result(
+                msg.control_id,
+                operation="append",
+                session_id=msg.session_id,
+                stage_results=stage_results,
+            )
+        except Exception as exc:
+            logger.exception("[Orchestrator] append_duplex_input failed: %s", exc)
+            await self._put_duplex_control_result(
+                msg.control_id,
+                operation="append",
+                session_id=msg.session_id,
+                stage_results=[],
+                error=str(exc),
+            )
+
+    async def _append_duplex_input_via_data_plane(
+        self,
+        msg: AppendDuplexInputMessage,
+        *,
+        session: DuplexSessionRuntimeState,
+        seq: int,
+        mode: DuplexInputMode,
+    ) -> list[dict[str, object]]:
+        if not self.stage_pools:
+            return [
+                {
+                    "stage_id": -1,
+                    "replica_id": -1,
+                    "result": {
+                        "supported": False,
+                        "error": "duplex_data_plane_has_no_stage",
+                    },
+                }
+            ]
+
+        stage_id = 0
+        pool = self.stage_pools[stage_id]
+        request_id = self._duplex_stage_request_id(
+            session.session_id,
+            epoch=session.epoch,
+            stage_id=stage_id,
+        )
+        existing_binding = session.stage_bindings.get(stage_id)
+        already_submitted = existing_binding is not None and existing_binding.request_id == request_id
+        req_state = self._ensure_duplex_stage_request_state(session, stage_id=stage_id)
+        if req_state is None:
+            raise RuntimeError("duplex_data_plane_has_no_stage")
+
+        prompt = self._build_duplex_data_plane_prompt(
+            request_id=request_id,
+            session=session,
+            seq=seq,
+            mode=mode,
+            payload=msg.payload,
+            final=msg.final,
+        )
+        request = build_engine_core_request_from_tokens(
+            request_id=request_id,
+            prompt=prompt,
+            params=req_state.sampling_params_list[stage_id],
+            model_config=pool.stage_vllm_config.model_config,
+            resumable=True,
+        )
+        request.external_req_id = request.request_id
+        if already_submitted:
+            replica_id = await pool.submit_update(request_id, req_state, request)
+        else:
+            replica_id = await pool.submit_initial(request_id, req_state, request, prompt_text=None)
+        self._record_duplex_stage_submission(
+            stage_id,
+            request_id,
+            replica_id,
+            req_state,
+            already_submitted=already_submitted,
+        )
+        req_state.stage_submit_ts[stage_id] = _time.time()
+        return [
+            {
+                "stage_id": stage_id,
+                "replica_id": replica_id,
+                "result": {
+                    "supported": True,
+                    "implementation_level": session.capabilities.implementation_level,
+                    "data_plane_append": True,
+                    "request_id": request_id,
+                    "response_stage_id": req_state.final_stage_id,
+                    "stage_request_topology": self._duplex_stage_request_topology(session),
+                    "seq": seq,
+                    "mode": mode.value,
+                    "resumable": True,
+                },
+            }
+        ]
+
+    @staticmethod
+    def _duplex_stage_max_tokens(session_config: dict[str, Any], stage_id: int) -> int | None:
+        raw = session_config.get("duplex_stage_max_tokens")
+        if raw is None:
+            extra_body = session_config.get("extra_body")
+            if isinstance(extra_body, dict):
+                raw = extra_body.get("duplex_stage_max_tokens")
+        value: object | None = None
+        if isinstance(raw, dict):
+            value = raw.get(stage_id)
+            if value is None:
+                value = raw.get(str(stage_id))
+        elif isinstance(raw, list | tuple) and stage_id < len(raw):
+            value = raw[stage_id]
+        if isinstance(value, int | float) and int(value) > 0:
+            return int(value)
+        return None
+
+    @staticmethod
+    def _duplex_stage_sampling_overrides(session_config: dict[str, Any], stage_id: int) -> dict[str, Any]:
+        raw = session_config.get("duplex_stage_sampling_params")
+        if raw is None:
+            extra_body = session_config.get("extra_body")
+            if isinstance(extra_body, dict):
+                raw = extra_body.get("duplex_stage_sampling_params")
+        value: object | None = None
+        if isinstance(raw, dict):
+            value = raw.get(stage_id)
+            if value is None:
+                value = raw.get(str(stage_id))
+        elif isinstance(raw, list | tuple) and stage_id < len(raw):
+            value = raw[stage_id]
+        return dict(value) if isinstance(value, dict) else {}
+
+    def _duplex_sampling_params_list(self, session: DuplexSessionRuntimeState) -> list[Any]:
+        params: list[Any] = []
+        for stage_id, pool in enumerate(self.stage_pools):
+            stage_params = pool.stage_client.default_sampling_params
+            max_tokens = self._duplex_stage_max_tokens(session.session_config, stage_id)
+            overrides = self._duplex_stage_sampling_overrides(session.session_config, stage_id)
+            if isinstance(stage_params, SamplingParams) and (max_tokens is not None or overrides):
+                stage_params = stage_params.clone()
+                if max_tokens is not None:
+                    stage_params.max_tokens = max_tokens
+                for name, value in overrides.items():
+                    if hasattr(stage_params, name):
+                        setattr(stage_params, name, value)
+                        if name == "stop_token_ids":
+                            all_stop_token_ids = getattr(stage_params, "_all_stop_token_ids", None)
+                            if isinstance(all_stop_token_ids, set):
+                                all_stop_token_ids.update(int(token_id) for token_id in value)
+            params.append(stage_params)
+        return params
+
+    @staticmethod
+    def _duplex_stage_request_id(session_id: str, *, epoch: int, stage_id: int, seq: int | None = None) -> str:
+        suffix = f"-s{seq}" if seq is not None else ""
+        return f"duplex-{session_id}-e{epoch}-stage{stage_id}{suffix}"
+
+    def _ensure_duplex_stage_request_state(
+        self,
+        session: DuplexSessionRuntimeState,
+        *,
+        stage_id: int,
+    ) -> OrchestratorRequestState | None:
+        if not self.stage_pools or stage_id >= len(self.stage_pools):
+            return None
+        request_id = self._duplex_stage_request_id(
+            session.session_id,
+            epoch=session.epoch,
+            stage_id=stage_id,
+        )
+        req_state = self.request_states.get(request_id)
+        if req_state is not None:
+            return req_state
+        req_state = OrchestratorRequestState(
+            request_id=request_id,
+            prompt=None,
+            sampling_params_list=self._duplex_sampling_params_list(session),
+            final_stage_id=len(self.stage_pools) - 1,
+        )
+        req_state.streaming.enabled = True
+        req_state.streaming.bridge_states.setdefault("duplex", {}).update(
+            {
+                "session_id": session.session_id,
+                "epoch": session.epoch,
+            }
+        )
+        self.request_states[request_id] = req_state
+        return req_state
+
+    def _duplex_stage_request_topology(self, session: DuplexSessionRuntimeState) -> dict[str, Any]:
+        """Return the session's scheduler data-plane request topology.
+
+        One duplex session owns one logical resumable scheduler request for the
+        current epoch. Each physical stage keeps its own runner/scheduler state
+        for that logical request id after it is admitted. Downstream stages are
+        admitted on the first handoff and then updated until the final segment.
+        This is deliberately not a persistent core KV lease.
+        """
+        logical_request_id = self._duplex_stage_request_id(
+            session.session_id,
+            epoch=session.epoch,
+            stage_id=0,
+        )
+        created = logical_request_id in self.request_states
+        stage_requests: list[dict[str, Any]] = []
+        all_stage_actors_submitted = bool(self.stage_pools)
+        for stage_id in range(len(self.stage_pools)):
+            binding = session.stage_bindings.get(stage_id)
+            is_stage0 = stage_id == 0
+            if binding is None:
+                all_stage_actors_submitted = False
+            stage_requests.append(
+                {
+                    "stage_id": stage_id,
+                    "logical_request_id": logical_request_id,
+                    "planned_request_id": logical_request_id,
+                    "bound_request_id": binding.request_id if binding is not None else None,
+                    "created": created,
+                    "submitted": binding is not None,
+                    "replica_id": binding.replica_id if binding is not None else None,
+                    "resumable": True,
+                    "admission": "open" if is_stage0 else "first_handoff",
+                    "update_policy": "append_streaming_input" if is_stage0 else "segment_payload_update",
+                    "stage_actor_state": "submitted" if binding is not None else "planned",
+                    "long_lived_stage_actor": is_stage0 or binding is not None,
+                }
+            )
+        return {
+            "kind": "scheduler_data_plane_resumable_stage_pipeline",
+            "persistent_core_kv_lease": False,
+            "one_long_lived_request_per_stage": all_stage_actors_submitted,
+            "stage0_long_lived_request": True,
+            "stage_actors_become_long_lived_after_first_handoff": True,
+            "downstream_stage_update_policy": "segment_payload_update",
+            "logical_request_id": logical_request_id,
+            "stage_request_id_scope": "shared_logical_request_id_per_stage_runner_state",
+            "stage_requests": stage_requests,
+        }
+
+    @staticmethod
+    def _build_duplex_data_plane_prompt(
+        *,
+        request_id: str,
+        session: DuplexSessionRuntimeState,
+        seq: int,
+        mode: DuplexInputMode,
+        payload: object,
+        final: bool,
+    ) -> dict[str, Any]:
+        token_budget = duplex_scheduler_token_budget(payload)
+        token_id = 0
+        extra_body = session.session_config.get("extra_body")
+        raw_token_id = session.session_config.get("duplex_scheduler_token_id")
+        if raw_token_id is None and isinstance(extra_body, dict):
+            raw_token_id = extra_body.get("duplex_scheduler_token_id")
+        try:
+            token_id = max(0, int(raw_token_id))
+        except (TypeError, ValueError):
+            token_id = 0
+        return {
+            "prompt_token_ids": [token_id] * token_budget,
+            "model_intermediate_buffer": {
+                "request_id": request_id,
+                "global_request_id": [session.session_id],
+                "duplex": {
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "seq": seq,
+                    "mode": mode.value,
+                    "payload": payload,
+                    "final": final,
+                    "data_plane": True,
+                    "session_config": dict(session.session_config),
+                    "scheduler_token_budget": token_budget,
+                    "scheduler_token_id": token_id,
+                },
+            },
+        }
+
+    async def _handle_signal_duplex_turn(self, msg: SignalDuplexTurnMessage) -> None:
+        stage_results: list[dict[str, object]] = []
+        try:
+            session = self.duplex_sessions.require(msg.session_id)
+            if msg.event in {"barge_in", "input.cancel", "response.cancel"}:
+                epoch, stale_request_ids = session.barge_in()
+                if stale_request_ids:
+                    await self._cleanup_request_ids(stale_request_ids, abort=True)
+            else:
+                epoch = session.epoch
+            stage_results.append(
+                {
+                    "stage_id": -1,
+                    "replica_id": -1,
+                    "result": {
+                        "supported": True,
+                        "data_plane_signal": True,
+                        "event": msg.event,
+                        "epoch": epoch,
+                    },
+                }
+            )
+            await self._put_duplex_control_result(
+                msg.control_id,
+                operation="signal",
+                session_id=msg.session_id,
+                stage_results=stage_results,
+            )
+        except Exception as exc:
+            logger.exception("[Orchestrator] signal_duplex_turn failed: %s", exc)
+            await self._put_duplex_control_result(
+                msg.control_id,
+                operation="signal",
+                session_id=msg.session_id,
+                stage_results=[],
+                error=str(exc),
+            )
+
+    async def _handle_close_duplex_session(self, msg: CloseDuplexSessionMessage) -> None:
+        stage_results: list[dict[str, object]] = []
+        try:
+            session = self.duplex_sessions.get(msg.session_id)
+            if session is None:
+                await self._put_duplex_control_result(
+                    msg.control_id,
+                    operation="close",
+                    session_id=msg.session_id,
+                    stage_results=[],
+                )
+                return
+            stale_request_ids = session.stage_request_ids()
+            self.duplex_sessions.close_session(msg.session_id)
+            if stale_request_ids:
+                await self._cleanup_request_ids(stale_request_ids, abort=True)
+            stage_results.append(
+                {
+                    "stage_id": -1,
+                    "replica_id": -1,
+                    "result": {
+                        "supported": True,
+                        "data_plane_close": True,
+                        "reason": msg.reason,
+                    },
+                }
+            )
+            await self._put_duplex_control_result(
+                msg.control_id,
+                operation="close",
+                session_id=msg.session_id,
+                stage_results=stage_results,
+            )
+        except Exception as exc:
+            logger.exception("[Orchestrator] close_duplex_session failed: %s", exc)
+            await self._put_duplex_control_result(
+                msg.control_id,
+                operation="close",
+                session_id=msg.session_id,
+                stage_results=[],
+                error=str(exc),
+            )
+
+    @classmethod
+    def _iter_duplex_result_dicts(cls, result: object):
+        if isinstance(result, dict):
+            yield result
+            return
+        if isinstance(result, list | tuple):
+            for item in result:
+                yield from cls._iter_duplex_result_dicts(item)
+
+    @classmethod
+    def _duplex_result_has_passive_stage(cls, result: object) -> bool:
+        if isinstance(result, dict):
+            if result.get("passive_stage") is True:
+                return True
+            return any(cls._duplex_result_has_passive_stage(value) for value in result.values())
+        if isinstance(result, list | tuple):
+            return any(cls._duplex_result_has_passive_stage(item) for item in result)
+        return False
+
+    @classmethod
+    def _duplex_result_counts(cls, stage_results: list[dict[str, object]]) -> tuple[int, int, int]:
+        unsupported_count = 0
+        error_count = 0
+        passive_count = 0
+        for item in stage_results:
+            for result in cls._iter_duplex_result_dicts(item.get("result")):
+                if result.get("supported") is False:
+                    unsupported_count += 1
+                if result.get("error"):
+                    error_count += 1
+                if cls._duplex_result_has_passive_stage(result.get("native_result")):
+                    passive_count += 1
+        return unsupported_count, error_count, passive_count
+
+    async def _put_duplex_control_result(
+        self,
+        control_id: str,
+        *,
+        operation: str,
+        session_id: str,
+        stage_results: list[dict[str, object]],
+        error: str | None = None,
+    ) -> None:
+        if error is not None:
+            stage_results = [
+                {
+                    "stage_id": -1,
+                    "replica_id": -1,
+                    "result": {"supported": False, "error": error},
+                }
+            ]
+        unsupported_count, error_count, passive_count = self._duplex_result_counts(stage_results)
+        await self.rpc_async_queue.put(
+            DuplexControlResultMessage(
+                control_id=control_id,
+                operation=operation,
+                session_id=session_id,
+                ok=error_count == 0 and unsupported_count == 0,
+                stage_results=stage_results,
+                unsupported_count=unsupported_count,
+                error_count=error_count,
+                passive_count=passive_count,
+            )
+        )
 
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
@@ -692,6 +1273,17 @@ class Orchestrator:
                                 if req_state is None:
                                     continue
                                 req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
+                                if self._is_duplex_session_request(req_state) and _minicpmo45_profile_logs_enabled():
+                                    logger.info(
+                                        "[Orchestrator] duplex raw output: stage=%s "
+                                        "req=%s finished=%s segment_finished=%s "
+                                        "new_tokens=%s",
+                                        stage_id,
+                                        getattr(eco, "request_id", None),
+                                        getattr(eco, "finished", None),
+                                        getattr(eco, "is_segment_finished", None),
+                                        getattr(eco, "new_token_ids", None),
+                                    )
                                 req_state.streaming.new_prompt_len_snapshot = getattr(
                                     eco,
                                     "new_prompt_len_snapshot",
@@ -721,32 +1313,61 @@ class Orchestrator:
                             raise
                         except EngineDeadError as e:
                             logger.error(
-                                "[Orchestrator] Stage-%s is dead: %s",
+                                "[Orchestrator] Stage-%s replica-%s is dead: %s",
                                 stage_id,
+                                replica_id,
                                 e,
                             )
-                            # TODO: Fault handling is intentionally fail-stop at
-                            # the orchestrator level today. If one replica in a
-                            # logical stage dies, we promote it to `_fatal_error`,
-                            # notify requests already admitted to that stage, and
-                            # re-raise so `run()` shuts down all stages. This is
-                            # conservative but means a single unhealthy replica in
-                            # a multi-replica deployment can take down otherwise
-                            # healthy replicas in other stages. Revisit this when
-                            # adding per-replica fault isolation / eviction.
-                            self._fatal_error = str(e)
-                            self._fatal_error_stage_id = stage_id
-                            for req_id, req_state in list(self.request_states.items()):
-                                if stage_id in req_state.stage_submit_ts:
+                            affected_session_ids = pool.duplex_session_ids_for_replica(replica_id)
+                            affected_request_ids = pool.mark_replica_unavailable(replica_id)
+                            if affected_session_ids:
+                                for session_id in affected_session_ids:
+                                    session = self.duplex_sessions.get(session_id)
+                                    if session is None:
+                                        continue
+                                    stale_request_ids = session.stage_request_ids()
+                                    self.duplex_sessions.close_session(session_id)
+                                    affected_request_ids.extend(stale_request_ids)
+                                    logger.warning(
+                                        "[Orchestrator] closed duplex session %s after stage-%s replica-%s died; "
+                                        "stale_request_ids=%s",
+                                        session_id,
+                                        stage_id,
+                                        replica_id,
+                                        stale_request_ids,
+                                    )
+                            affected_request_ids = list(dict.fromkeys(affected_request_ids))
+                            if pool.available_replica_ids():
+                                for req_id in affected_request_ids:
                                     await self.output_async_queue.put(
                                         ErrorMessage(
                                             error=str(e),
-                                            fatal=True,
+                                            fatal=False,
                                             request_id=req_id,
                                             stage_id=stage_id,
                                         )
                                     )
-                                    self.request_states.pop(req_id, None)
+                                await self._cleanup_request_ids(
+                                    affected_request_ids,
+                                    close_duplex_sessions=True,
+                                )
+                                continue
+
+                            self._fatal_error = str(e)
+                            self._fatal_error_stage_id = stage_id
+                            for req_id in affected_request_ids:
+                                await self.output_async_queue.put(
+                                    ErrorMessage(
+                                        error=str(e),
+                                        fatal=True,
+                                        request_id=req_id,
+                                        stage_id=stage_id,
+                                    )
+                                )
+                            await self._cleanup_request_ids(
+                                affected_request_ids,
+                                close_duplex_sessions=True,
+                            )
                             self._shutdown_event.set()
                             raise
                         except Exception:
@@ -814,19 +1435,38 @@ class Orchestrator:
         await self._cleanup_request_ids(
             [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)],
             abort=True,
+            close_duplex_sessions=True,
         )
 
     # ---- Shared helpers ----
 
-    async def _cleanup_request_ids(self, request_ids: list[str], *, abort: bool = False) -> None:
+    async def _cleanup_request_ids(
+        self,
+        request_ids: list[str],
+        *,
+        abort: bool = False,
+        close_duplex_sessions: bool = False,
+    ) -> None:
         """Release pool bindings and logical request state for the given ids."""
         if not request_ids:
             return
 
+        cleanup_ids = list(dict.fromkeys(request_ids))
+        if close_duplex_sessions:
+            closed_sessions = self.duplex_sessions.close_sessions_for_request_ids(cleanup_ids)
+            for session_id, stale_request_ids in closed_sessions.items():
+                logger.info(
+                    "[Orchestrator] closed duplex session %s while cleaning failed request ids %s",
+                    session_id,
+                    stale_request_ids,
+                )
+                cleanup_ids.extend(stale_request_ids)
+            cleanup_ids = list(dict.fromkeys(cleanup_ids))
+
         if abort:
-            await self._abort_request_ids(request_ids)
-        self._release_request_bindings(request_ids)
-        for request_id in request_ids:
+            await self._abort_request_ids(cleanup_ids)
+        self._release_request_bindings(cleanup_ids)
+        for request_id in cleanup_ids:
             self._pd_kv_params.pop(request_id, None)
             if self.request_states.pop(request_id, None) is not None and self._running_counter is not None:
                 self._running_counter.decrement()
@@ -876,6 +1516,39 @@ class Orchestrator:
         params.cfg_kv_request_ids = companion_request_ids
         return params
 
+    def _duplex_session_for_req_state(self, req_state: OrchestratorRequestState) -> DuplexSessionRuntimeState | None:
+        duplex_state = req_state.streaming.bridge_states.get("duplex")
+        if not isinstance(duplex_state, dict):
+            return None
+        session_id = duplex_state.get("session_id")
+        if not isinstance(session_id, str):
+            return None
+        return self.duplex_sessions.get(session_id)
+
+    def _record_duplex_stage_submission(
+        self,
+        stage_id: int,
+        request_id: str,
+        replica_id: int,
+        req_state: OrchestratorRequestState,
+        *,
+        already_submitted: bool,
+    ) -> None:
+        session = self._duplex_session_for_req_state(req_state)
+        if session is None:
+            return
+        session.bind_stage_request(stage_id, request_id, replica_id=replica_id)
+        if _minicpmo45_profile_logs_enabled():
+            logger.info(
+                "[Orchestrator] duplex stage submit: session=%s epoch=%s stage=%s replica=%s req=%s update=%s",
+                session.session_id,
+                session.epoch,
+                stage_id,
+                replica_id,
+                request_id,
+                already_submitted,
+            )
+
     async def _route_output(
         self,
         stage_id: int,
@@ -910,7 +1583,10 @@ class Orchestrator:
                     replica_id=replica_id,
                     engine_outputs=output,
                     metrics=stage_metrics,
-                    finished=request_finished,
+                    finished=(
+                        request_finished
+                        or (self._is_duplex_session_request(req_state) and req_state.streaming.segment_finished)
+                    ),
                     stage_submit_ts=submit_ts,
                 )
             )
@@ -931,6 +1607,33 @@ class Orchestrator:
                 self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
             req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
 
+        if self._is_duplex_session_request(req_state) and _minicpmo45_profile_logs_enabled():
+            logger.info(
+                "[Orchestrator] duplex route check: stage=%s replica=%s "
+                "req=%s finished=%s streaming=%s segment_finished=%s "
+                "final_stage=%s async_chunk=%s next_submitted=%s",
+                stage_id,
+                replica_id,
+                req_id,
+                finished,
+                req_state.streaming.enabled,
+                req_state.streaming.segment_finished,
+                req_state.final_stage_id,
+                self.async_chunk,
+                self._next_stage_already_submitted(stage_id, req_state),
+            )
+
+        if self._is_duplex_model_listen_segment(stage_id, output, req_state):
+            await self._emit_duplex_model_listen_output(
+                stage_id,
+                req_id,
+                output,
+                req_state,
+                stage_metrics,
+                submit_ts,
+            )
+            return
+
         if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
             and stage_id < req_state.final_stage_id
@@ -944,6 +1647,12 @@ class Orchestrator:
             ):
                 self._cfg_tracker.defer_parent(req_id, output, stage_id)
             else:
+                stage_params = req_state.sampling_params_list[stage_id]
+                final_only_finished = (
+                    req_state.streaming.enabled
+                    and finished
+                    and getattr(stage_params, "output_kind", None) == RequestOutputKind.FINAL_ONLY
+                )
                 await self._forward_to_next_stage(
                     req_id,
                     stage_id,
@@ -951,9 +1660,14 @@ class Orchestrator:
                     req_state,
                     src_replica_id=replica_id,
                     is_streaming_session=req_state.streaming.enabled,
-                    is_final_update=False,
+                    is_final_update=final_only_finished,
                 )
-                if req_state.streaming.enabled and finished:
+                if (
+                    req_state.streaming.enabled
+                    and finished
+                    and not final_only_finished
+                    and not self._is_duplex_session_request(req_state)
+                ):
                     # For streaming sessions, send the terminal (resumable=False) update only on a finish
                     await self._forward_to_next_stage(
                         req_id,
@@ -965,11 +1679,183 @@ class Orchestrator:
                         is_final_update=True,
                     )
 
-        if request_finished:
+        if request_finished and not self._is_duplex_session_request(req_state):
             await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
+
+    @staticmethod
+    def _is_duplex_session_request(req_state: OrchestratorRequestState) -> bool:
+        duplex_state = req_state.streaming.bridge_states.get("duplex")
+        return isinstance(duplex_state, dict) and isinstance(duplex_state.get("session_id"), str)
+
+    @classmethod
+    def _is_duplex_model_listen_segment(
+        cls,
+        stage_id: int,
+        output: Any,
+        req_state: OrchestratorRequestState,
+    ) -> bool:
+        if stage_id >= req_state.final_stage_id:
+            return False
+        if not cls._is_duplex_session_request(req_state):
+            return False
+        if not (req_state.streaming.enabled and req_state.streaming.segment_finished):
+            return False
+
+        completion = cls._first_completion(output)
+        mm_output = cls._completion_multimodal_output(output, completion)
+        listen_id = cls._duplex_special_token_ids(mm_output).get("listen_token_id")
+        if listen_id is None:
+            return False
+
+        stop_reason = getattr(completion, "stop_reason", None) if completion is not None else None
+        if cls._coerce_int(stop_reason) == listen_id:
+            return True
+
+        token_ids = cls._completion_token_ids(completion)
+        return bool(token_ids and token_ids[-1] == listen_id)
+
+    async def _emit_duplex_model_listen_output(
+        self,
+        stage_id: int,
+        req_id: str,
+        output: Any,
+        req_state: OrchestratorRequestState,
+        stage_metrics: Any,
+        submit_ts: float | None,
+    ) -> None:
+        self._annotate_duplex_model_listen_output(output)
+        completion = self._first_completion(output)
+        mm_output = self._completion_multimodal_output(output, completion)
+        direct_mm_output = dict(mm_output) if isinstance(mm_output, dict) else {}
+        direct_mm_output.setdefault("duplex_direct_response", True)
+        direct_mm_output.setdefault("duplex_native_decision", "listen")
+        direct_mm_output.setdefault("model_listen", True)
+        direct_mm_output.setdefault("listen_source", "model_listen")
+        if _minicpmo45_profile_logs_enabled():
+            logger.info(
+                "[Orchestrator] duplex model listen: stage=%s req=%s segment_finished=%s; bypassing downstream stages",
+                stage_id,
+                req_id,
+                req_state.streaming.segment_finished,
+            )
+        await self.output_async_queue.put(
+            OutputMessage(
+                request_id=req_id,
+                stage_id=stage_id,
+                engine_outputs=OmniRequestOutput(
+                    request_id=req_id,
+                    finished=True,
+                    stage_id=stage_id,
+                    final_output_type="text",
+                    request_output=output,
+                    _multimodal_output=direct_mm_output,
+                ),
+                metrics=stage_metrics,
+                finished=True,
+                stage_submit_ts=submit_ts,
+            )
+        )
+
+    @classmethod
+    def _annotate_duplex_model_listen_output(cls, output: Any) -> None:
+        completion = cls._first_completion(output)
+        mm_output = cls._completion_multimodal_output(output, completion)
+        if not isinstance(mm_output, dict):
+            return
+        mm_output["duplex_direct_response"] = True
+        mm_output["duplex_native_decision"] = "listen"
+        mm_output["model_listen"] = True
+        mm_output["listen_source"] = "model_listen"
+
+    @staticmethod
+    def _first_completion(output: Any) -> Any:
+        outputs = getattr(output, "outputs", None)
+        return outputs[0] if isinstance(outputs, list) and outputs else None
+
+    @staticmethod
+    def _completion_multimodal_output(output: Any, completion: Any) -> dict[str, Any]:
+        mm_output = getattr(output, "multimodal_output", None)
+        if isinstance(mm_output, dict):
+            return mm_output
+        mm_output = getattr(completion, "multimodal_output", None) if completion is not None else None
+        return mm_output if isinstance(mm_output, dict) else {}
+
+    @classmethod
+    def _duplex_special_token_ids(cls, mm_output: dict[str, Any]) -> dict[str, int]:
+        out: dict[str, int] = {}
+        sources: list[Any] = []
+        raw_special = mm_output.get("special_token_ids")
+        if isinstance(raw_special, dict):
+            sources.append(raw_special)
+        raw_meta = mm_output.get("meta")
+        if isinstance(raw_meta, dict):
+            sources.append(raw_meta)
+        sources.append(
+            {
+                key.removeprefix("meta."): value
+                for key, value in mm_output.items()
+                if isinstance(key, str) and key.startswith("meta.")
+            }
+        )
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for key, value in source.items():
+                if not isinstance(key, str):
+                    continue
+                token_id = cls._coerce_int(value)
+                if token_id is not None and token_id >= 0:
+                    out[key] = token_id
+        return out
+
+    @classmethod
+    def _completion_token_ids(cls, completion: Any) -> list[int]:
+        if completion is None:
+            return []
+        for candidate in (
+            getattr(completion, "token_ids", None),
+            getattr(completion, "cumulative_token_ids", None),
+        ):
+            token_ids = cls._coerce_int_list(candidate)
+            if token_ids:
+                return token_ids
+        return []
+
+    @classmethod
+    def _coerce_int_list(cls, value: Any) -> list[int]:
+        if value is None:
+            return []
+        if hasattr(value, "detach"):
+            try:
+                value = value.detach().cpu().reshape(-1).tolist()
+            except Exception:
+                return []
+        if not isinstance(value, (list, tuple)):
+            return []
+        out: list[int] = []
+        for item in value:
+            token_id = cls._coerce_int(item)
+            if token_id is not None:
+                out.append(token_id)
+        return out
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        if hasattr(value, "detach"):
+            try:
+                value = value.detach().cpu().reshape(-1)
+                if value.numel() == 0:
+                    return None
+                value = value[0].item()
+            except Exception:
+                return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     async def _handle_cfg_companion_ready(self, req_id: str) -> None:
         """Mark a CFG companion as done; if all companions are done, flush deferred parent."""
@@ -1200,9 +2086,9 @@ class Orchestrator:
                 diffusion_prompt = req_state.prompt
 
             if already_submitted:
-                await next_pool.submit_update(req_id, req_state, diffusion_prompt)
+                replica_id = await next_pool.submit_update(req_id, req_state, diffusion_prompt)
             else:
-                await next_pool.submit_initial(
+                replica_id = await next_pool.submit_initial(
                     req_id,
                     req_state,
                     diffusion_prompt,
@@ -1214,6 +2100,13 @@ class Orchestrator:
                     },
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                 )
+            self._record_duplex_stage_submission(
+                next_logical,
+                req_id,
+                replica_id,
+                req_state,
+                already_submitted=already_submitted,
+            )
             req_state.stage_submit_ts[next_logical] = _time.time()
             _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
             self._emit_tx_edge(
@@ -1258,9 +2151,16 @@ class Orchestrator:
                 )
                 request.external_req_id = request.request_id
                 if already_submitted:
-                    await next_pool.submit_update(req_id, req_state, request)
+                    replica_id = await next_pool.submit_update(req_id, req_state, request)
                 else:
-                    await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                    replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                self._record_duplex_stage_submission(
+                    next_logical,
+                    req_id,
+                    replica_id,
+                    req_state,
+                    already_submitted=already_submitted,
+                )
 
             req_state.stage_submit_ts[next_logical] = _time.time()
             _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
@@ -1311,9 +2211,16 @@ class Orchestrator:
 
             request.external_req_id = request.request_id
             if already_submitted:
-                await next_pool.submit_update(req_id, req_state, request)
+                replica_id = await next_pool.submit_update(req_id, req_state, request)
             else:
-                await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+            self._record_duplex_stage_submission(
+                next_logical,
+                req_id,
+                replica_id,
+                req_state,
+                already_submitted=already_submitted,
+            )
 
         req_state.stage_submit_ts[next_logical] = _time.time()
         _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0

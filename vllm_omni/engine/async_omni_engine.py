@@ -53,12 +53,17 @@ from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
+    AppendDuplexInputMessage,
+    CloseDuplexSessionMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
+    DuplexControlResultMessage,
     EngineQueueMessage,
     ErrorMessage,
+    OpenDuplexSessionMessage,
     RegisterRemoteReplicaMessage,
     ShutdownRequestMessage,
+    SignalDuplexTurnMessage,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
@@ -100,6 +105,8 @@ from vllm_omni.engine.stage_init_utils import (
     load_omni_transfer_config_for_model,
     prepare_engine_environment,
     release_device_locks,
+    resolve_sampling_param_token_names,
+    setup_stage_devices,
     stage_runtime_setup,
     terminate_alive_proc,
 )
@@ -179,24 +186,30 @@ def _upgrade_to_omni_request(
     """Restore omni-only fields omitted by upstream InputProcessor."""
     prompt_embeds = request.prompt_embeds
     additional_information = None
+    wire_payload = None
+    model_intermediate_buffer = None
 
     if isinstance(raw_prompt, dict):
         if prompt_embeds is None:
             raw_prompt_embeds = raw_prompt.get("prompt_embeds")
             if isinstance(raw_prompt_embeds, torch.Tensor):
                 prompt_embeds = raw_prompt_embeds
-        additional_information = serialize_additional_information(
-            raw_prompt.get("additional_information"),
-            log_prefix="AsyncOmniEngine",
-        )
+        raw_info = raw_prompt.get("additional_information")
+        raw_buffer = raw_prompt.get("model_intermediate_buffer")
+        if isinstance(raw_info, dict):
+            wire_payload = dict(raw_info)
+        if isinstance(raw_buffer, dict):
+            model_intermediate_buffer = raw_buffer
+        additional_information = serialize_additional_information(wire_payload, log_prefix="AsyncOmniEngine")
 
-    if prompt_embeds is None and additional_information is None:
+    if prompt_embeds is None and additional_information is None and model_intermediate_buffer is None:
         return request
 
     return OmniEngineCoreRequest.from_request(
         request,
         prompt_embeds=prompt_embeds,
         additional_information=additional_information,
+        model_intermediate_buffer=model_intermediate_buffer,
     )
 
 
@@ -579,6 +592,11 @@ class AsyncOmniEngine:
                     replica_cfg.runtime.devices = replica_devices_map[stage_idx][replica_id]
 
                 replica_metadata = extract_stage_metadata(replica_cfg)
+                if stage_vllm_config is not None:
+                    replica_metadata.default_sampling_params = resolve_sampling_param_token_names(
+                        replica_metadata.default_sampling_params,
+                        stage_vllm_config,
+                    )
                 replica_metadata.replica_id = replica_id
                 # In single_stage_mode the head only owns its self stage's
                 # replicas; the remote-stage metadata exists only so the
@@ -2322,6 +2340,217 @@ class AsyncOmniEngine:
             arrival_time=arrival_time,
             resumable=resumable,
         )
+
+    def open_duplex_session(
+        self,
+        session_id: str,
+        *,
+        session_mode: str = "duplex",
+        capabilities: dict[str, object] | None = None,
+        session_config: dict[str, object] | None = None,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Open a session-level duplex runtime context in the orchestrator."""
+        return self._duplex_control(
+            OpenDuplexSessionMessage(
+                control_id=uuid.uuid4().hex,
+                session_id=session_id,
+                session_mode=session_mode,
+                capabilities=dict(capabilities or {}),
+                session_config=dict(session_config or {}),
+                timeout=timeout,
+            ),
+            timeout=timeout,
+        )
+
+    async def open_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        session_mode: str = "duplex",
+        capabilities: dict[str, object] | None = None,
+        session_config: dict[str, object] | None = None,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.open_duplex_session(
+                session_id,
+                session_mode=session_mode,
+                capabilities=capabilities,
+                session_config=session_config,
+                timeout=timeout,
+            ),
+        )
+
+    def append_duplex_input(
+        self,
+        session_id: str,
+        *,
+        mode: str,
+        payload: object,
+        final: bool = False,
+        expected_epoch: int | None = None,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Append or update duplex input for an open session."""
+        return self._duplex_control(
+            AppendDuplexInputMessage(
+                control_id=uuid.uuid4().hex,
+                session_id=session_id,
+                expected_epoch=expected_epoch,
+                mode=mode,
+                payload=payload,
+                final=final,
+                timeout=timeout,
+            ),
+            timeout=timeout,
+        )
+
+    async def append_duplex_input_async(
+        self,
+        session_id: str,
+        *,
+        mode: str,
+        payload: object,
+        final: bool = False,
+        expected_epoch: int | None = None,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.append_duplex_input(
+                session_id,
+                mode=mode,
+                payload=payload,
+                final=final,
+                expected_epoch=expected_epoch,
+                timeout=timeout,
+            ),
+        )
+
+    def signal_duplex_turn(
+        self,
+        session_id: str,
+        *,
+        event: str,
+        payload: dict[str, object] | None = None,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Send a normalized turn/control signal to a duplex session."""
+        return self._duplex_control(
+            SignalDuplexTurnMessage(
+                control_id=uuid.uuid4().hex,
+                session_id=session_id,
+                event=event,
+                payload=dict(payload or {}),
+                timeout=timeout,
+            ),
+            timeout=timeout,
+        )
+
+    async def signal_duplex_turn_async(
+        self,
+        session_id: str,
+        *,
+        event: str,
+        payload: dict[str, object] | None = None,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.signal_duplex_turn(
+                session_id,
+                event=event,
+                payload=payload,
+                timeout=timeout,
+            ),
+        )
+
+    def close_duplex_session(
+        self,
+        session_id: str,
+        *,
+        reason: str = "client_close",
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Close a duplex runtime session and release its stage bindings."""
+        return self._duplex_control(
+            CloseDuplexSessionMessage(
+                control_id=uuid.uuid4().hex,
+                session_id=session_id,
+                reason=reason,
+                timeout=timeout,
+            ),
+            timeout=timeout,
+        )
+
+    async def close_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        reason: str = "client_close",
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.close_duplex_session(session_id, reason=reason, timeout=timeout),
+        )
+
+    def _duplex_control(
+        self,
+        msg: OpenDuplexSessionMessage | AppendDuplexInputMessage | SignalDuplexTurnMessage | CloseDuplexSessionMessage,
+        *,
+        timeout: float | None,
+    ) -> dict[str, object]:
+        if self.request_queue is None:
+            raise RuntimeError("request_queue is not initialized")
+        if self.rpc_output_queue is None:
+            raise RuntimeError("rpc_output_queue is not initialized")
+
+        control_id = msg.control_id
+        with self._rpc_lock:
+            self.request_queue.sync_q.put_nowait(msg)
+            deadline = None if timeout is None else time.monotonic() + timeout
+            while True:
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                try:
+                    result_msg = self.rpc_output_queue.sync_q.get(timeout=remaining)
+                except queue.Empty as exc:
+                    raise TimeoutError(f"duplex control timed out after {timeout} seconds") from exc
+
+                if isinstance(result_msg, ErrorMessage):
+                    raise RuntimeError(result_msg.error)
+                if not isinstance(result_msg, DuplexControlResultMessage):
+                    logger.warning(
+                        "[AsyncOmniEngine] Dropping unexpected duplex control queue message type=%s",
+                        getattr(result_msg, "type", type(result_msg).__name__),
+                    )
+                    continue
+                if result_msg.control_id != control_id:
+                    logger.warning(
+                        "[AsyncOmniEngine] Dropping mismatched duplex control result control_id=%s expected=%s",
+                        result_msg.control_id,
+                        control_id,
+                    )
+                    continue
+
+                result = {
+                    "operation": result_msg.operation,
+                    "session_id": result_msg.session_id,
+                    "ok": result_msg.ok,
+                    "stage_results": list(result_msg.stage_results),
+                    "unsupported_count": result_msg.unsupported_count,
+                    "error_count": result_msg.error_count,
+                    "passive_count": result_msg.passive_count,
+                }
+                if result_msg.error_count:
+                    raise RuntimeError(f"duplex {result_msg.operation} failed: {result}")
+                return result
 
     def try_get_output(self, timeout: float = 0.001) -> EngineQueueMessage | None:
         """Read one output message from the Orchestrator output queue."""

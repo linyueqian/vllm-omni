@@ -96,6 +96,8 @@ class StagePool:
         self._stage_vllm_config = stage_vllm_config
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
+        self._duplex_session_bindings: dict[str, int] = {}
+        self._unavailable_replicas: set[int] = set()
         self._replica_metrics: list[_ReplicaMetrics] = [_ReplicaMetrics() for _ in self.clients]
         self._output_timestamps_by_request: dict[str, list[float]] = {}
         self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
@@ -443,6 +445,41 @@ class StagePool:
         for request_id in request_ids:
             self.release_binding(request_id)
 
+    def release_replica_bindings(self, replica_id: int) -> list[str]:
+        """Drop all route/session bindings owned by one physical replica."""
+        released_request_ids = [
+            request_id
+            for request_id, bound_replica_id in list(self._request_bindings.items())
+            if bound_replica_id == replica_id
+        ]
+        for request_id in released_request_ids:
+            self.release_binding(request_id)
+        for session_id, bound_replica_id in list(self._duplex_session_bindings.items()):
+            if bound_replica_id == replica_id:
+                self._duplex_session_bindings.pop(session_id, None)
+                self.release_binding(f"duplex-session:{session_id}")
+        return released_request_ids
+
+    def duplex_session_ids_for_replica(self, replica_id: int) -> list[str]:
+        """Return duplex session ids currently pinned to one physical replica."""
+        return [
+            session_id
+            for session_id, bound_replica_id in self._duplex_session_bindings.items()
+            if bound_replica_id == replica_id
+        ]
+
+    def mark_replica_unavailable(self, replica_id: int) -> list[str]:
+        """Evict a failed replica from admission and release its bindings."""
+        if 0 <= replica_id < self.num_replicas:
+            self._unavailable_replicas.add(replica_id)
+        return self.release_replica_bindings(replica_id)
+
+    def is_replica_available(self, replica_id: int) -> bool:
+        return 0 <= replica_id < self.num_replicas and replica_id not in self._unavailable_replicas
+
+    def available_replica_ids(self) -> list[int]:
+        return [replica_id for replica_id in range(self.num_replicas) if self.is_replica_available(replica_id)]
+
     def select_replica_id(
         self,
         request_id: str,
@@ -451,23 +488,27 @@ class StagePool:
     ) -> int:
         """Pick a replica id for *request_id* and cache the choice (legacy path)."""
         cached = self.get_bound_replica_id(request_id)
-        if cached is not None and self.clients[cached] is not None:
+        if cached is not None and self.clients[cached] is not None and self.is_replica_available(cached):
             return cached
+        if cached is not None:
+            # Cached replica is dead/unavailable: drop the stale binding.
+            self.release_binding(request_id)
 
         chosen: int | None = None
         if affinity_request_id is not None:
             parent = self.get_bound_replica_id(affinity_request_id)
-            if parent is not None and self.clients[parent] is not None:
+            if parent is not None and self.clients[parent] is not None and self.is_replica_available(parent):
                 chosen = parent
 
         if chosen is None:
-            live = self.live_replica_ids()
+            # Prefer replicas that are both live (client up) and available.
+            live = [r for r in self.live_replica_ids() if self.is_replica_available(r)]
             if not live:
                 raise RuntimeError(f"stage {self.stage_id} has no live replicas")
             if len(live) == 1:
                 chosen = live[0]
             else:
-                # Round-robin over live replicas only.
+                # Round-robin over live, available replicas only.
                 start = self._next_replica_id % len(live)
                 chosen = live[start]
                 self._next_replica_id = (self._next_replica_id + 1) % len(live)
@@ -992,14 +1033,28 @@ class StagePool:
             # Refresh the shared output-processor state before yielding to the
             # stage client so streaming segments are merged against the latest
             # prompt/token metadata.
-            self.output_processor.add_request(
-                request=request,
-                prompt=prompt_text,
-                parent_req=None,
-                request_index=0,
-                queue=None,
-            )
-            await self._llm_client(replica_id).add_request_async(request)
+            try:
+                self.output_processor.add_request(
+                    request=request,
+                    prompt=prompt_text,
+                    parent_req=None,
+                    request_index=0,
+                    queue=None,
+                )
+                await self._llm_client(replica_id).add_request_async(request)
+            except Exception:
+                rollback = getattr(self.output_processor, "remove_request", None)
+                if callable(rollback):
+                    try:
+                        rollback(request_id)
+                    except Exception as rollback_error:
+                        logger.warning(
+                            "[StagePool] Failed to rollback output processor update for req=%s stage-%s: %s",
+                            request_id,
+                            self.stage_id,
+                            rollback_error,
+                        )
+                raise
         return replica_id
 
     async def _pick_or_select(
@@ -1154,6 +1209,215 @@ class StagePool:
                 "supported": False,
                 "error": str(exc),
             }
+
+    def _select_duplex_replica_id(self, session_id: str) -> int:
+        cached = self._duplex_session_bindings.get(session_id)
+        if cached is not None:
+            if self.is_replica_available(cached):
+                return cached
+            self._release_duplex_binding(session_id)
+        replica_id = self.select_replica_id(f"duplex-session:{session_id}")
+        self._duplex_session_bindings[session_id] = replica_id
+        return replica_id
+
+    def _get_duplex_replica_id(self, session_id: str) -> int | None:
+        replica_id = self._duplex_session_bindings.get(session_id)
+        if replica_id is not None and not self.is_replica_available(replica_id):
+            self._release_duplex_binding(session_id)
+            return None
+        return replica_id
+
+    def _release_duplex_binding(self, session_id: str) -> None:
+        replica_id = self._duplex_session_bindings.pop(session_id, None)
+        self.release_binding(f"duplex-session:{session_id}")
+        if replica_id is not None:
+            logger.debug(
+                "[StagePool] released duplex session binding stage=%s session=%s replica=%s",
+                self.stage_id,
+                session_id,
+                replica_id,
+            )
+
+    @staticmethod
+    def _duplex_rpc_failed(result: Any) -> bool:
+        if not isinstance(result, dict):
+            return False
+        return result.get("supported") is False or bool(result.get("error"))
+
+    @staticmethod
+    def _duplex_rpc_busy(result: Any) -> bool:
+        if not isinstance(result, dict):
+            return False
+        reason = result.get("reason") or result.get("error")
+        return reason in {"native_duplex_session_busy", "duplex_stage_session_busy"}
+
+    @staticmethod
+    def _duplex_result(replica_id: int, result: Any) -> tuple[int, Any]:
+        return replica_id, result
+
+    @staticmethod
+    def _duplex_session_not_open_result(session_id: str) -> list[tuple[int, Any]]:
+        return [
+            (
+                -1,
+                {
+                    "supported": False,
+                    "error": "duplex_stage_session_not_open",
+                    "session_id": session_id,
+                },
+            )
+        ]
+
+    async def open_duplex_session(
+        self,
+        session_id: str,
+        *,
+        epoch: int,
+        capabilities: dict[str, Any],
+        session_config: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> list[tuple[int, Any]]:
+        """Open one stage-local duplex session on a single bound replica."""
+        attempts = max(1, len(self.available_replica_ids()))
+        last_result: tuple[int, Any] | None = None
+        for _ in range(attempts):
+            replica_id = self._select_duplex_replica_id(session_id)
+            result = await self.collective_rpc(
+                replica_id,
+                "open_duplex_session_async",
+                timeout=timeout,
+                kwargs={
+                    "session_id": session_id,
+                    "epoch": epoch,
+                    "capabilities": capabilities,
+                    "session_config": dict(session_config or {}),
+                },
+            )
+            last_result = self._duplex_result(replica_id, result)
+            if not self._duplex_rpc_failed(result):
+                return [last_result]
+            self._release_duplex_binding(session_id)
+            if not self._duplex_rpc_busy(result):
+                return [last_result]
+        if last_result is not None:
+            return [last_result]
+        return self._duplex_session_not_open_result(session_id)
+
+    async def append_duplex_input(
+        self,
+        session_id: str,
+        *,
+        epoch: int,
+        seq: int,
+        mode: str,
+        payload: Any,
+        final: bool,
+        timeout: float | None = None,
+    ) -> list[tuple[int, Any]]:
+        """Append duplex input to the replica that owns this stage session."""
+        replica_id = self._get_duplex_replica_id(session_id)
+        if replica_id is None:
+            return self._duplex_session_not_open_result(session_id)
+        result = await self.collective_rpc(
+            replica_id,
+            "append_duplex_input_async",
+            timeout=timeout,
+            kwargs={
+                "session_id": session_id,
+                "epoch": epoch,
+                "seq": seq,
+                "mode": mode,
+                "payload": payload,
+                "final": final,
+            },
+        )
+        return [self._duplex_result(replica_id, result)]
+
+    async def put_duplex_stage_payload(
+        self,
+        session_id: str,
+        *,
+        epoch: int,
+        seq: int,
+        payload_ref: str,
+        payload: Any,
+        timeout: float | None = None,
+    ) -> list[tuple[int, Any]]:
+        """Register a full duplex handoff payload on the bound stage replica.
+
+        The subsequent append control message carries only ``payload_ref``.
+        This keeps large tensor payloads out of the append/event state machine
+        and lets the target stage consume them through its runner-local payload
+        cache.
+        """
+        replica_id = self._get_duplex_replica_id(session_id)
+        if replica_id is None:
+            return self._duplex_session_not_open_result(session_id)
+        result = await self.collective_rpc(
+            replica_id,
+            "put_duplex_stage_payload_async",
+            timeout=timeout,
+            kwargs={
+                "session_id": session_id,
+                "epoch": epoch,
+                "seq": seq,
+                "payload_ref": payload_ref,
+                "payload": payload,
+            },
+        )
+        return [self._duplex_result(replica_id, result)]
+
+    async def signal_duplex_turn(
+        self,
+        session_id: str,
+        *,
+        epoch: int,
+        event: str,
+        payload: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> list[tuple[int, Any]]:
+        """Send a duplex turn/control signal to the bound stage replica."""
+        replica_id = self._get_duplex_replica_id(session_id)
+        if replica_id is None:
+            return self._duplex_session_not_open_result(session_id)
+        result = await self.collective_rpc(
+            replica_id,
+            "signal_duplex_turn_async",
+            timeout=timeout,
+            kwargs={
+                "session_id": session_id,
+                "epoch": epoch,
+                "event": event,
+                "payload": dict(payload or {}),
+            },
+        )
+        return [self._duplex_result(replica_id, result)]
+
+    async def close_duplex_session(
+        self,
+        session_id: str,
+        *,
+        epoch: int,
+        reason: str,
+        timeout: float | None = None,
+    ) -> list[tuple[int, Any]]:
+        """Close the duplex session on its bound stage replica."""
+        replica_id = self._get_duplex_replica_id(session_id)
+        if replica_id is None:
+            return self._duplex_session_not_open_result(session_id)
+        result = await self.collective_rpc(
+            replica_id,
+            "close_duplex_session_async",
+            timeout=timeout,
+            kwargs={
+                "session_id": session_id,
+                "epoch": epoch,
+                "reason": reason,
+            },
+        )
+        if not self._duplex_rpc_failed(result):
+            self._release_duplex_binding(session_id)
+        return [self._duplex_result(replica_id, result)]
 
     def shutdown_replica(self, replica_id: int) -> None:
         """Shutdown one backend handle in this stage pool."""

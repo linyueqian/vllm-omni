@@ -16,7 +16,7 @@ from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats, RequestStateStats
 
 from vllm_omni.data_entry_keys import unflatten_payload
-from vllm_omni.engine.output_modality import DRAINABLE_MODALITIES
+from vllm_omni.engine.output_modality import DRAINABLE_MODALITIES, OutputModalityNames
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -144,6 +144,16 @@ class OmniRequestState(RequestState):
                         elif k == "sr":
                             # Sample rate is a constant scalar, keep last value.
                             self.mm_accumulated[k] = v[-1]
+                        elif k.startswith("meta."):
+                            # Request metadata is repeated with each scheduled
+                            # token; keep the latest scalar/tiny tensor instead
+                            # of concatenating it into a fake sequence.
+                            self.mm_accumulated[k] = v[-1]
+                        elif k == "duplex_prompt_token_ids":
+                            # Prompt-token metadata describes the full request
+                            # prompt, not one generated token. It is repeated
+                            # on every output step, so keep the latest copy.
+                            self.mm_accumulated[k] = v[-1]
                         else:
                             self.mm_accumulated[k] = torch.cat(v, dim=0)
                     except Exception:
@@ -166,6 +176,38 @@ class OmniRequestState(RequestState):
             self.mm_accumulated = unflatten_payload(self.mm_accumulated)
         except Exception:
             logger.exception("Error unflattening consolidated multimodal tensors")
+
+    @staticmethod
+    def _payload_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, list):
+            if not value:
+                return default
+            return OmniRequestState._payload_bool(value[-1], default)
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return default
+            return bool(value.reshape(-1)[-1].item())
+        try:
+            return bool(value)
+        except Exception:
+            return default
+
+    def _should_keep_streaming_audio_open(self, finish_reason: FinishReason | None) -> bool:
+        """Ignore a spurious core finish for non-final streaming TTS chunks."""
+        if finish_reason is None or self.output_kind != RequestOutputKind.DELTA:
+            return False
+        if OutputModalityNames.AUDIO not in self.mm_accumulated:
+            return False
+        marker = self.mm_accumulated.get("meta.tts_is_last_chunk")
+        if marker is None:
+            meta = self.mm_accumulated.get("meta")
+            if isinstance(meta, dict):
+                marker = meta.get("tts_is_last_chunk")
+        if marker is None:
+            return False
+        return not self._payload_bool(marker, default=True)
 
     # Override: do not route to pooling-only path; always create completion
     # outputs, and attach pooling_result into the CompletionOutput.
@@ -203,6 +245,10 @@ class OmniRequestState(RequestState):
                 stop_reason,
                 kv_transfer_params,
             )
+
+        if self._should_keep_streaming_audio_open(finish_reason):
+            finish_reason = None
+            stop_reason = None
 
         finished = finish_reason is not None
         is_final_only = self.output_kind == RequestOutputKind.FINAL_ONLY

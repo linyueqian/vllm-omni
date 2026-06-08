@@ -925,3 +925,38 @@ def test_build_engine_args_dict_uses_diffusion_attention_config_key():
 
     assert "attention_config" not in engine_args_dict
     assert engine_args_dict["diffusion_attention_config"].default.backend == "FLASH_ATTN"
+
+
+def test_resolve_sampling_param_token_names_materializes_stop_ids(monkeypatch):
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_omni.engine.stage_init_utils import resolve_sampling_param_token_names
+
+    class FakeTokenizer:
+        unk_token = "<unk>"
+        unk_token_id = 0
+
+        def convert_tokens_to_ids(self, token):
+            return {"<|im_end|>": 151645}[token]
+
+    monkeypatch.setattr(
+        "vllm_omni.engine.stage_init_utils.cached_tokenizer_from_config",
+        lambda *, model_config: FakeTokenizer(),
+    )
+    params = SamplingParams(
+        max_tokens=1,
+        stop_token_ids=[7],
+        extra_args={"stop_token_names": ["<|im_end|>"], "keep": True},
+    )
+
+    resolved = resolve_sampling_param_token_names(
+        params,
+        types.SimpleNamespace(model_config=types.SimpleNamespace()),
+    )
+
+    assert resolved is not params
+    assert resolved.stop_token_ids == [7, 151645]
+    assert 151645 in resolved._all_stop_token_ids
+    assert resolved.extra_args == {"keep": True}
+    assert params.stop_token_ids == [7]
+    assert params.extra_args == {"stop_token_names": ["<|im_end|>"], "keep": True}

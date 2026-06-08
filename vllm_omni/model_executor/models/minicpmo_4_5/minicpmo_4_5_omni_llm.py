@@ -1,8 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Adapted from:
-# https://huggingface.co/openbmb/MiniCPM-o-4_5/blob/main/modeling_minicpmo.py
-#
 # Copyright 2025 The OpenBMB Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -118,16 +113,10 @@ from vllm.multimodal.inputs import (
     NestedTensors,
 )
 
-# vllm >=0.21 moved ModalityData / MultiModalDataDict from
-# vllm.multimodal.inputs to vllm.inputs (still re-exported from
-# vllm.multimodal.parse). Fall back to the old location for older vllm.
 try:
-    from vllm.inputs import ModalityData, MultiModalDataDict
+    from vllm.multimodal.inputs import ModalityData, MultiModalDataDict
 except ImportError:
-    from vllm.multimodal.inputs import (  # type: ignore[no-redef]
-        ModalityData,
-        MultiModalDataDict,
-    )
+    from vllm.multimodal.parse import ModalityData, MultiModalDataDict
 from vllm.multimodal.parse import (
     AudioItem,
     AudioProcessorItems,
@@ -154,24 +143,12 @@ except ImportError:
     from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 
+try:
+    from vllm.transformers_utils.tokenizer import encode_tokens
+except ImportError:
 
-def encode_tokens(tokenizer, prompt: str) -> list[int]:
-    """Tokenize ``prompt`` without adding special tokens.
-
-    Prefer vllm's ``vllm.transformers_utils.tokenizer.encode_tokens`` when
-    available; falls back to the equivalent ``tokenizer.encode`` call so we
-    keep working across vllm versions that do not ship that helper.
-
-    The import is performed lazily inside the function so the docs builder
-    (griffe / mkdocs strict mode) does not try to statically resolve the
-    upstream alias, which can fail across vllm releases that rename or move
-    the helper.
-    """
-    try:
-        from vllm.transformers_utils.tokenizer import encode_tokens as _impl
-    except ImportError:
+    def encode_tokens(tokenizer, prompt: str) -> list[int]:
         return tokenizer.encode(prompt, add_special_tokens=False)
-    return _impl(tokenizer, prompt)
 
 
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
@@ -2558,7 +2535,11 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
         return_dict=None,
         past_key_values: EncoderDecoderCache | None = None,
         use_cache: bool | None = None,
-    ) -> BaseModelOutputWithPast | tuple:
+        use_extra_context: bool | None = False,
+        prefix_extra_frames: int | None = 1,
+        suffix_extra_frames: int | None = 1,
+        cnn_min_length: int | None = None,
+    ):
         r"""
         Forward pass of the Whisper encoder.
 
@@ -2669,8 +2650,36 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
         # Ignore copy
         input_features = input_features.to(dtype=self.conv1.weight.dtype, device=self.conv1.weight.device)
 
+        original_length = input_features.shape[2]
+        padded_for_cnn = False
+        if cnn_min_length is not None and original_length < cnn_min_length:
+            padded_features = torch.zeros(
+                input_features.shape[0],
+                input_features.shape[1],
+                cnn_min_length,
+                dtype=input_features.dtype,
+                device=input_features.device,
+            )
+            padded_features[:, :, :original_length] = input_features
+            input_features = padded_features
+            padded_for_cnn = True
+
         inputs_embeds = nn.functional.gelu(self.conv1(input_features))
         inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
+
+        if padded_for_cnn:
+            actual_cnn_output_length = (original_length + 1) // 2
+            inputs_embeds = inputs_embeds[:, :, :actual_cnn_output_length]
+
+        if use_extra_context:
+            prefix_extra_frames = int(prefix_extra_frames or 0)
+            suffix_extra_frames = int(suffix_extra_frames or 0)
+            prefix_to_remove = (prefix_extra_frames + 1) // 2 if prefix_extra_frames > 0 else 0
+            suffix_to_remove = (suffix_extra_frames + 1) // 2 if suffix_extra_frames > 0 else 0
+            if prefix_to_remove > 0:
+                inputs_embeds = inputs_embeds[:, :, prefix_to_remove:]
+            if 0 < suffix_to_remove < inputs_embeds.shape[2]:
+                inputs_embeds = inputs_embeds[:, :, :-suffix_to_remove]
 
         inputs_embeds = inputs_embeds.permute(0, 2, 1)
 
@@ -3810,11 +3819,13 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             self.audio_avg_pooler = nn.AvgPool1d(config.audio_pool_step, stride=config.audio_pool_step)
             self.audio_projection_layer = MultiModalProjector(in_dim=audio_output_dim, out_dim=embed_dim)
             self.audio_encoder_layer = -1
+            self.audio_past_key_values = None
         else:
             self.apm = None
             self.audio_avg_pooler = None
             self.audio_projection_layer = None
             self.audio_encoder_layer = None
+            self.audio_past_key_values = None
 
         self.mm_token_ids = set[int]()
         self.make_empty_intermediate_tensors = self.llm.make_empty_intermediate_tensors
@@ -4241,6 +4252,100 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
             final_audio_embeds.append(torch.cat(target_audio_embeds_lst))
 
+        return final_audio_embeds
+
+    def get_audio_embedding_streaming(
+        self,
+        data: MiniCPMOAudioFeatureInputs,
+        use_extra_context: bool = False,
+        prefix_extra_frames: int = 1,
+        suffix_extra_frames: int = 1,
+        cnn_min_length: int | None = None,
+    ) -> list[list[torch.Tensor]]:
+        if self.apm is None or self.audio_projection_layer is None or self.audio_avg_pooler is None:
+            return []
+
+        wavforms = data["audio_features"]
+        audio_feature_lens_raw = data["audio_feature_lens"]
+        if isinstance(wavforms, list):
+            if not wavforms:
+                return []
+            batch_size = len(wavforms)
+            channels = wavforms[0].shape[-2]
+            max_len = max(item.shape[-1] for item in wavforms)
+            wavforms_tensor = torch.zeros(
+                (batch_size, channels, max_len),
+                dtype=wavforms[0].dtype,
+                device=wavforms[0].device,
+            )
+            for idx, item in enumerate(wavforms):
+                wavforms_tensor[idx, ..., : item.shape[-1]] = item
+            wavforms = wavforms_tensor
+        if isinstance(audio_feature_lens_raw, torch.Tensor):
+            audio_feature_lens_raw = audio_feature_lens_raw.unbind(0)
+        if wavforms.shape[0] == 0:
+            return []
+        audio_feature_lens = torch.hstack(audio_feature_lens_raw)
+        batch_size, _, max_mel_seq_len = wavforms.shape
+        assert batch_size == 1
+
+        current_seq_len = (max_mel_seq_len - 1) // 2 + 1
+        if use_extra_context:
+            prefix_to_remove = (int(prefix_extra_frames) + 1) // 2 if prefix_extra_frames > 0 else 0
+            suffix_to_remove = (int(suffix_extra_frames) + 1) // 2 if suffix_extra_frames > 0 else 0
+            current_seq_len = current_seq_len - prefix_to_remove - suffix_to_remove
+        if current_seq_len <= 0:
+            return []
+
+        if self.audio_past_key_values is not None:
+            cache_length = self.audio_past_key_values[0][0].shape[2]
+            apm_max_len = self.apm.embed_positions.weight.shape[0]
+            if cache_length + current_seq_len >= apm_max_len:
+                logger.warning(
+                    "audio_past_key_values length %s exceeds %s, reset.",
+                    cache_length + current_seq_len,
+                    apm_max_len,
+                )
+                self.audio_past_key_values = None
+
+        past_len = 0
+        if self.audio_past_key_values is not None:
+            past_len = self.audio_past_key_values[0][0].shape[2]
+        total_seq_len = past_len + current_seq_len
+        audio_attention_mask = torch.zeros(
+            (batch_size, 1, current_seq_len, total_seq_len),
+            dtype=self.apm.conv1.weight.dtype,
+            device=wavforms.device,
+        )
+
+        audio_outputs = self.apm(
+            wavforms,
+            past_key_values=self.audio_past_key_values,
+            use_cache=True,
+            output_hidden_states=True,
+            attention_mask=audio_attention_mask,
+            use_extra_context=use_extra_context,
+            prefix_extra_frames=prefix_extra_frames,
+            suffix_extra_frames=suffix_extra_frames,
+            cnn_min_length=cnn_min_length,
+        )
+        audio_states = audio_outputs.hidden_states[self.audio_encoder_layer]
+        self.audio_past_key_values = audio_outputs.past_key_values
+
+        audio_embeds = self.audio_projection_layer(audio_states)
+        audio_embeds = audio_embeds.transpose(1, 2)
+        audio_embeds = self.audio_avg_pooler(audio_embeds)
+        audio_embeds = audio_embeds.transpose(1, 2)
+
+        _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(audio_feature_lens)
+        final_audio_embeds: list[list[torch.Tensor]] = []
+        idx = 0
+        for i in range(len(audio_feature_lens_raw)):
+            target_audio_embeds = []
+            for _ in range(len(audio_feature_lens_raw[i])):
+                target_audio_embeds.append(audio_embeds[idx, : feature_lens_after_pooling[idx], :])
+                idx += 1
+            final_audio_embeds.append(target_audio_embeds)
         return final_audio_embeds
 
     def _process_audio_input(

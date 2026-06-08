@@ -27,6 +27,7 @@ from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import OmniACK, OmniSleepTask, OmniWakeTask
+from vllm_omni.engine.duplex import duplex_data_plane_request_info
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import (
@@ -242,6 +243,198 @@ class AsyncOmni(EngineClient, OmniBase):
         uuid = random_uuid()
         prefix = "" if not external_request_id else f"{external_request_id}-"
         return f"{prefix}{uuid:.8}"
+    async def open_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        session_mode: str = "duplex",
+        capabilities: dict[str, object] | None = None,
+        session_config: dict[str, object] | None = None,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Open an engine-level duplex session when the backend supports it."""
+        return await self.engine.open_duplex_session_async(
+            session_id,
+            session_mode=session_mode,
+            capabilities=capabilities,
+            session_config=session_config,
+            timeout=timeout,
+        )
+
+    async def append_duplex_input_async(
+        self,
+        session_id: str,
+        *,
+        mode: str,
+        payload: object,
+        final: bool = False,
+        expected_epoch: int | None = None,
+        timeout: float | None = 10.0,
+        collect_outputs: bool = True,
+    ) -> dict[str, object]:
+        """Append input to an engine-level duplex session."""
+        result = await self.engine.append_duplex_input_async(
+            session_id,
+            mode=mode,
+            payload=payload,
+            final=final,
+            expected_epoch=expected_epoch,
+            timeout=timeout,
+        )
+        request_id, response_stage_id = self._duplex_data_plane_request_info(result)
+        if request_id is None:
+            return result
+        self._final_output_handler()
+        req_state = self.request_states.setdefault(request_id, ClientRequestState(request_id))
+        if not collect_outputs:
+            return result
+        outputs = await self._collect_duplex_data_plane_outputs(
+            request_id,
+            req_state,
+            response_stage_id=response_stage_id,
+            timeout=timeout,
+        )
+        if outputs:
+            result = dict(result)
+            result["data_plane_outputs"] = outputs
+        return result
+
+    async def collect_duplex_data_plane_outputs_async(
+        self,
+        request_id: str,
+        *,
+        response_stage_id: int | None = None,
+        timeout: float | None = 10.0,
+    ) -> list[OmniRequestOutput]:
+        """Collect the next duplex data-plane output batch for a live request."""
+        self._final_output_handler()
+        req_state = self.request_states.get(request_id)
+        if req_state is None:
+            return []
+        return await self._collect_duplex_data_plane_outputs(
+            request_id,
+            req_state,
+            response_stage_id=response_stage_id,
+            timeout=timeout,
+        )
+
+    async def signal_duplex_turn_async(
+        self,
+        session_id: str,
+        *,
+        event: str,
+        payload: dict[str, object] | None = None,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Send a turn/control signal to an engine-level duplex session."""
+        return await self.engine.signal_duplex_turn_async(
+            session_id,
+            event=event,
+            payload=payload,
+            timeout=timeout,
+        )
+
+    async def close_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        reason: str = "client_close",
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Close an engine-level duplex session."""
+        return await self.engine.close_duplex_session_async(session_id, reason=reason, timeout=timeout)
+
+    @staticmethod
+    def _duplex_data_plane_request_info(result: dict[str, object]) -> tuple[str | None, int | None]:
+        return duplex_data_plane_request_info(result)
+
+    async def _collect_duplex_data_plane_outputs(
+        self,
+        request_id: str,
+        req_state: ClientRequestState,
+        *,
+        response_stage_id: int | None,
+        timeout: float | None,
+    ) -> list[OmniRequestOutput]:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        wall_start_ts = time.time()
+        final_stage_id = (
+            response_stage_id if response_stage_id is not None else max(0, getattr(self, "num_stages", 1) - 1)
+        )
+        num_stages = max(getattr(self, "num_stages", final_stage_id + 1), final_stage_id + 1)
+        metrics = getattr(req_state, "metrics", None) or OrchestratorMetrics(
+            num_stages,
+            getattr(self, "log_stats", False),
+            wall_start_ts,
+            final_stage_id,
+        )
+        req_start_ts = {request_id: wall_start_ts}
+        outputs: list[OmniRequestOutput] = []
+        while True:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if remaining == 0.0:
+                break
+            try:
+                msg = await asyncio.wait_for(req_state.queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+            if isinstance(msg, ErrorMessage):
+                raise RuntimeError(msg.error)
+            if not isinstance(msg, OutputMessage):
+                continue
+            engine_outputs = msg.engine_outputs
+            is_response_stage = response_stage_id is None or msg.stage_id >= response_stage_id
+            is_direct_duplex_response = self._is_direct_duplex_data_plane_response(engine_outputs)
+            output_to_collect = None
+            if isinstance(engine_outputs, OmniRequestOutput):
+                output_to_collect = engine_outputs
+            elif is_response_stage:
+                output_to_collect = self._process_single_result(
+                    msg,
+                    msg.stage_id,
+                    metrics,
+                    req_start_ts,
+                    wall_start_ts,
+                    final_stage_id,
+                )
+            if output_to_collect is not None and (is_response_stage or is_direct_duplex_response):
+                if msg.finished:
+                    output_to_collect.finished = True
+                outputs.append(output_to_collect)
+            if msg.finished or outputs:
+                break
+        request_states = getattr(self, "request_states", None)
+        if outputs and outputs[-1].finished and isinstance(request_states, dict):
+            request_states.pop(request_id, None)
+        return outputs
+
+    @classmethod
+    def _is_direct_duplex_data_plane_response(cls, output: object) -> bool:
+        mm_output = cls._duplex_multimodal_output(output)
+        if not mm_output:
+            return False
+        return mm_output.get("duplex_direct_response") is True or mm_output.get("duplex_native_decision") in {
+            "listen",
+            "speak",
+        }
+
+    @classmethod
+    def _duplex_multimodal_output(cls, output: object) -> dict[str, object]:
+        if isinstance(output, OmniRequestOutput):
+            mm_output = output.multimodal_output
+            if isinstance(mm_output, dict) and mm_output:
+                return mm_output
+            inner_output = getattr(output, "request_output", None)
+            if inner_output is not None and inner_output is not output:
+                return cls._duplex_multimodal_output(inner_output)
+            return mm_output if isinstance(mm_output, dict) else {}
+        mm_output = getattr(output, "multimodal_output", None)
+        if isinstance(mm_output, dict):
+            return mm_output
+        outputs = getattr(output, "outputs", None)
+        completion = outputs[0] if isinstance(outputs, list) and outputs else None
+        mm_output = getattr(completion, "multimodal_output", None) if completion is not None else None
+        return mm_output if isinstance(mm_output, dict) else {}
 
     # ==================== Generate Method ====================
 
