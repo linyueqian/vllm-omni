@@ -86,7 +86,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 prefix=maybe_prefix(prefix, "thinker"),
                 hf_config=config,
                 # Use registry architecture key
-                architectures=["MiniCPMO45OmniLLMModel"],
+                architectures=["MiniCPMO45OmniLLMForConditionalGeneration"],
             )
             self.model = self.thinker
             self.talker = None
@@ -100,7 +100,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 prefix=maybe_prefix(prefix, "talker"),
                 hf_config=config,
                 # Use registry architecture key
-                architectures=["MiniCPMO45OmniTTSModel"],
+                architectures=["MiniCPMO45OmniTTSForConditionalGeneration"],
             )
             # Initialize multimodal components if needed
             if hasattr(self.talker, "init_multi_modal"):

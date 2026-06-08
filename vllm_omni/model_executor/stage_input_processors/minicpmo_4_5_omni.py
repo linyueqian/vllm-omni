@@ -232,6 +232,14 @@ def llm2tts(
             _require_native_tts_boundary_metadata(special_token_ids)
         tts_end_ids = _native_tts_boundary_token_ids(special_token_ids)
 
+        # Plain-chat (use_tts_template) fallback: for non-duplex requests the thinker
+        # does not surface special_token_ids, so resolve the MiniCPM-o 4.5 <|tts_bos|>
+        # (151703) boundary directly and bound the spoken region at <|im_end|> (151645),
+        # mirroring the pre-duplex code path so chat-completions audio still works.
+        if tts_bos_id is None and not is_native_duplex_handoff:
+            tts_bos_id = 151703
+            tts_end_ids = set(tts_end_ids) | {151645}
+
         tts_bos_idx = None
         for idx_t, tid in enumerate(full_token_ids):
             if tid == tts_bos_id:
