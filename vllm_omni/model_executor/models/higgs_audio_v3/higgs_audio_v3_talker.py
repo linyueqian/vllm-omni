@@ -380,9 +380,11 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         if input_ids is not None and not metadata_from_runner:
             self._last_step_input_ids = input_ids
 
-        # Stash query_start_loc for audio-state row mapping. Some attention
-        # backends do not expose it in their metadata, so prefer backend
-        # metadata when available and otherwise use the runner-supplied buffer.
+        # Stash query_start_loc for audio-state row mapping and max_query_len
+        # for prefill detection. Some attention backends do not expose
+        # query_start_loc, so prefer backend metadata when available and
+        # otherwise use the runner-supplied buffer.
+        max_query_len = None
         if not metadata_from_runner:
             try:
                 fallback_qsl = kwargs.get("omni_query_start_loc")
@@ -395,13 +397,22 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                     attn = attn_metadata
                 qsl = getattr(attn, "query_start_loc", None)
                 self._set_last_step_query_start_loc(qsl if isinstance(qsl, torch.Tensor) else fallback_qsl)
+                max_query_len = getattr(attn, "max_query_len", None)
             except Exception:
                 self._last_step_query_start_loc = None
 
         # Prefill-only operations: ref audio substitution and audio feedback
         # require Python dict/list ops that break CUDA graph capture.
-        # Detect prefill (sequence length > batch size heuristic) vs decode.
-        is_prefill = input_ids is not None and inputs_embeds is None and int(input_ids.numel()) > 1
+        # Prefer max_query_len where available: concurrent decode has
+        # input_ids.numel() > 1 but max_query_len == 1.
+        if max_query_len is not None:
+            is_prefill = int(max_query_len) > 1
+        else:
+            is_prefill = (
+                input_ids is not None
+                and inputs_embeds is None
+                and not self._is_single_token_decode_step(int(hidden_states.shape[0]))
+            )
         if is_prefill and info_dicts:
             # Voice clone: replace -100 placeholder positions with ref audio embeddings
             hidden_states = self._apply_ref_audio_substitution(hidden_states, input_ids, info_dicts)

@@ -336,7 +336,21 @@ def talker2code2wav_async_chunk(
         return None
 
     codes_qt = torch.tensor(window_rows, dtype=torch.long).t().contiguous()
-    de_delayed = _revert_delay_pattern(codes_qt)
+    try:
+        de_delayed = _revert_delay_pattern(codes_qt)
+    except ValueError:
+        logger.warning(
+            "async_chunk: insufficient frames for delay pattern reversal "
+            "(T=%d < Q=%d, request=%s). Returning empty chunk.",
+            codes_qt.shape[1],
+            codes_qt.shape[0],
+            request_id,
+        )
+        emitted_frames.pop(request_id, None)
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+            meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+        )
     # Replace BOC=1024/EOC=1025 (and any negative pads) with 0; matches the
     # sync-path substitution. Clamp would turn 1025 into 1023 which is a
     # VALID codec code and decodes to audible artifacts.

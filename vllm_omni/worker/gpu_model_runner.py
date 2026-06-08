@@ -160,8 +160,13 @@ class OmniGPUModelRunner(GPUModelRunner):
                 override_fn = candidate
         self._sampled_token_ids_cpu_override = override_fn
         self._omni_query_start_loc_model_kwarg = bool(getattr(model, "supports_omni_query_start_loc", False))
+        self._maybe_enable_output_token_ids_for_model_sampler()
         self._init_talker_mtp()
         self._prewarm_attention_capture_workspaces()
+
+    def _maybe_enable_output_token_ids_for_model_sampler(self) -> None:
+        if getattr(self.model, "logitsprocs_need_output_token_ids", False):
+            self.input_batch.logitsprocs_need_output_token_ids = True
 
     def _init_talker_mtp(self) -> None:
         # TODO move this model specific logic to a separate class
