@@ -1126,8 +1126,12 @@ class OmniDuplexSessionHandler:
                     defer_native_append = False
                     buffer_overlap_audio = True
                     if self._uses_native_input_append(session):
-                        overlap_active = native_response_in_progress() or (
-                            event.get("_duplex_overlap_candidate") is True and actor.output_generation_in_flight()
+                        # Full-duplex: continuous mic chunks must FEED the ongoing
+                        # stage0 stream (the model owns speak/listen), not be routed
+                        # through the discrete-response overlap/barge-in policy.
+                        overlap_active = (not self._session_auto_responds(session)) and (
+                            native_response_in_progress()
+                            or (event.get("_duplex_overlap_candidate") is True and actor.output_generation_in_flight())
                         )
                         if overlap_active:
                             decision = self._overlap_decision(session, actor, event, payload)
@@ -1227,7 +1231,14 @@ class OmniDuplexSessionHandler:
                                 chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
                                 allow_emit=(
                                     not defer_native_append
-                                    and (realtime_protocol is None or event_type != "input_audio_buffer.append")
+                                    and (
+                                        realtime_protocol is None
+                                        or event_type != "input_audio_buffer.append"
+                                        # Full-duplex: emit each ~chunk_period of audio so the model
+                                        # runs per-chunk generation (speak/listen) without an explicit
+                                        # response.create, matching the official duplex_generate loop.
+                                        or self._session_auto_responds(session)
+                                    )
                                 ),
                             )
                         except ValueError as exc:
@@ -1704,6 +1715,20 @@ class OmniDuplexSessionHandler:
                 "reason": "client_force_barge_in",
                 "duration_ms": duration_ms,
                 "buffer_audio": True,
+            }
+        if self._session_auto_responds(session):
+            # Full-duplex: continuous input while the model is speaking is the
+            # normal case (the client streams the mic non-stop). Buffer it as the
+            # next turn's input and let the model finish its current response,
+            # instead of auto-cancelling on every overlapping chunk. Explicit
+            # barge-in (force_barge_in / overlap_action above) still interrupts.
+            actor.overlap_speech_ms = 0
+            return {
+                "action": "listen",
+                "reason": "auto_response_continuous",
+                "duration_ms": duration_ms,
+                "buffer_audio": is_speech,
+                "defer_runtime_append": True,
             }
         if bool(event.get("force_listen", False)):
             actor.overlap_speech_ms = 0
@@ -3457,6 +3482,22 @@ class OmniDuplexSessionHandler:
     @staticmethod
     def _native_stage0_request_id(session: DuplexSession, epoch: int) -> str:
         return f"duplex-{session.session_id}-e{epoch}-stage0"
+
+    @staticmethod
+    def _session_auto_responds(session: DuplexSession) -> bool:
+        """Full-duplex / model-driven mode.
+
+        When set, the server runs per-chunk speak-generation continuously (like
+        the official MiniCPM-o ``duplex_generate`` loop) instead of waiting for an
+        explicit ``response.create``: each ~chunk_period of appended audio is
+        emitted and fed to the stage0 stream so the model itself decides to speak
+        or listen. Signaled by the client via ``extra_body.auto_response`` (or
+        ``extra_body.full_duplex``).
+        """
+        extra = getattr(session.config, "extra_body", None)
+        if not isinstance(extra, dict):
+            return False
+        return extra.get("auto_response") is True or extra.get("full_duplex") is True
 
     async def _receive_text(
         self,
