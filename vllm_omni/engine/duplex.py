@@ -238,10 +238,17 @@ class DuplexSessionRuntimeState:
         self.touch()
 
     def barge_in(self) -> tuple[int, list[str]]:
-        stale_request_ids = self.stage_request_ids()
+        # Stage0 is the single long-lived resumable request that owns the
+        # conversation KV/context (see Orchestrator._duplex_stage_request_topology:
+        # "stage0_long_lived_request": True). A barge-in must stop downstream
+        # output but PRESERVE stage0 so conversation memory survives the
+        # interruption, matching the official MiniCPM-o continuous design where
+        # an interruption stops current speech but keeps context. Only
+        # downstream (stage_id > 0) requests are torn down here.
+        stale_request_ids = [binding.request_id for stage_id, binding in self.stage_bindings.items() if stage_id != 0]
         self.epoch += 1
         self.pending_inputs.clear()
-        self.stage_bindings.clear()
+        self.stage_bindings = {stage_id: binding for stage_id, binding in self.stage_bindings.items() if stage_id == 0}
         self.touch()
         return self.epoch, stale_request_ids
 

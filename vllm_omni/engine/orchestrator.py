@@ -757,7 +757,14 @@ class Orchestrator:
     @staticmethod
     def _duplex_stage_request_id(session_id: str, *, epoch: int, stage_id: int, seq: int | None = None) -> str:
         suffix = f"-s{seq}" if seq is not None else ""
-        return f"duplex-{session_id}-e{epoch}-stage{stage_id}{suffix}"
+        # Stage0 owns the single long-lived resumable request per session: its
+        # KV/context must persist across epochs (barge-in) so the conversation
+        # is not dropped on every turn. Keep its id epoch-independent so that
+        # post-barge-in appends resolve to ``submit_update`` (KV continues)
+        # instead of ``submit_initial`` (fresh, context-less KV). Downstream
+        # stages stay epoch-scoped.
+        epoch_tag = "" if stage_id == 0 else f"-e{epoch}"
+        return f"duplex-{session_id}{epoch_tag}-stage{stage_id}{suffix}"
 
     def _ensure_duplex_stage_request_state(
         self,
