@@ -735,6 +735,20 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 else:
                     logits[0, token_id] *= repetition_penalty
 
+        # Official MiniCPM-o StreamDecoder.decode listen handling (utils.py): bias
+        # the listen token and optionally force-keep it only when it ranks in the
+        # top-k. Defaults (scale=1.0, top_k=None) are a no-op; a scale < 1 makes
+        # the model speak more readily (the official knob for listen/speak balance).
+        listen_id = token_ids.get("listen_token_id", -1)
+        listen_prob_scale, listen_top_k = self._minicpmo45_listen_decode_params()
+        if 0 <= listen_id < logits.shape[-1]:
+            if listen_prob_scale != 1.0:
+                logits[0, listen_id] = logits[0, listen_id] * listen_prob_scale
+            if listen_top_k is not None:
+                listen_rank = int((logits[0] > logits[0, listen_id]).sum().item())
+                if listen_rank < int(listen_top_k):
+                    return int(listen_id)
+
         temperature = float(self._sampling_metadata_value(sampling_metadata, "temperature", row_idx, 0.7))
         top_k = int(self._sampling_metadata_value(sampling_metadata, "top_k", row_idx, 100))
         top_p = float(self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8))
@@ -745,6 +759,34 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         logits = self._top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
         probs = F.softmax(logits, dim=-1)
         return int(torch.multinomial(probs, num_samples=1, generator=generator).item())
+
+    def _minicpmo45_listen_decode_params(self) -> tuple[float, int | None]:
+        """Listen-token decode controls, matching official StreamDecoder.decode.
+
+        Read from config/env so the listen/speak balance is tunable without code
+        changes. ``listen_prob_scale`` multiplies the listen-token logit (<1 ->
+        speak more); ``listen_top_k`` forces listen only when it ranks in top-k.
+        Defaults (1.0, None) preserve current behavior.
+        """
+        cached = getattr(self, "_minicpmo45_listen_decode_params_cache", None)
+        if cached is not None:
+            return cached
+        import os
+
+        try:
+            scale = float(os.environ.get("MINICPMO45_LISTEN_PROB_SCALE", "1.0"))
+        except (TypeError, ValueError):
+            scale = 1.0
+        top_k: int | None = None
+        raw_k = os.environ.get("MINICPMO45_LISTEN_TOP_K")
+        if raw_k not in (None, ""):
+            try:
+                top_k = int(raw_k)
+            except (TypeError, ValueError):
+                top_k = None
+        params = (scale, top_k)
+        self._minicpmo45_listen_decode_params_cache = params
+        return params
 
     def _minicpmo45_native_duplex_token_ids(self) -> dict[str, int]:
         cached = getattr(self, "_minicpmo45_native_duplex_token_ids_cache", None)
