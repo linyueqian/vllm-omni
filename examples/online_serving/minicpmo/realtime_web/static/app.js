@@ -216,6 +216,10 @@
       case 'response.listen':
         setModelState('listening');
         if (mode === 'full') flushPlayback('listen');
+        // Turn-based: a listen decision is a complete (empty) reply. Without
+        // this the status would hang on "waiting for reply" since the model
+        // emits no audio and may not send a prompt response.done.
+        else if (mode === 'turn') setStatus('model listened — no reply (hold to record; try a fuller sentence)');
         break;
       case 'response.speak':
       case 'response.created':
@@ -246,6 +250,7 @@
         if (st === 'cancelled') flushPlayback('cancelled');
         asstDone();
         setModelState('listening');
+        if (mode === 'turn') setStatus('idle (hold to record)');
         break;
       }
       case 'error':
@@ -270,6 +275,9 @@
       session.voice = voiceSel.value;              // named voice, e.g. "default"
       log('voice: ' + voiceSel.value);
     }
+    // Full-duplex: ask the server to run continuous per-chunk generation (model
+    // decides speak/listen) instead of waiting for an explicit response.create.
+    if (mode === 'full') session.extra_body = Object.assign({}, session.extra_body, { auto_response: true });
     return session;
   }
 
