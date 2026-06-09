@@ -688,7 +688,11 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         if isinstance(q_start, torch.Tensor):
             return int(q_start.numel()) == int(num_rows) + 1
         ids = getattr(self, "_last_step_input_ids", None)
-        return isinstance(ids, torch.Tensor) and int(ids.numel()) == int(num_rows) and int(num_rows) == 1
+        if not isinstance(ids, torch.Tensor) or int(ids.numel()) != int(num_rows):
+            return False
+        if bool(getattr(self, "_use_external_decode_cudagraph", False)):
+            return True
+        return int(num_rows) == 1
 
     def _step_request_count(self, num_tokens: int) -> int:
         q_start = self._last_step_query_start_loc
@@ -711,9 +715,13 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             return req_rows[decode_mask], starts[decode_mask]
 
         ids = getattr(self, "_last_step_input_ids", None)
-        if isinstance(ids, torch.Tensor) and int(ids.numel()) == int(num_tokens) and int(num_tokens) == 1:
-            row = torch.zeros(1, dtype=torch.long, device=device)
-            return row, row
+        if isinstance(ids, torch.Tensor) and int(ids.numel()) == int(num_tokens):
+            if bool(getattr(self, "_use_external_decode_cudagraph", False)):
+                rows = torch.arange(int(num_tokens), dtype=torch.long, device=device)
+                return rows, rows
+            if int(num_tokens) == 1:
+                row = torch.zeros(1, dtype=torch.long, device=device)
+                return row, row
         empty = torch.empty(0, dtype=torch.long, device=device)
         return empty, empty
 

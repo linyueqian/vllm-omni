@@ -752,6 +752,23 @@ class TestAudioFeedback:
         assert result[1].abs().sum() == 0
         assert result[3].abs().sum() == 0
 
+    def test_external_decode_graph_capture_keeps_feedback_ops_without_query_start_loc(self):
+        """FULL_DECODE capture has no request qsl but still needs dense decode feedback ops."""
+        t = self._make_feedback_talker()
+        t._use_external_decode_cudagraph = True
+        t._last_step_input_ids = torch.tensor([10, 11, 12, 13])
+        t._last_step_query_start_loc = None
+        t._decode_last_codes[2] = torch.zeros(8, dtype=torch.long)
+        t._decode_has_codes[2] = True
+        hidden = torch.zeros(4, 16)
+
+        result = t._apply_audio_feedback(hidden, t._last_step_input_ids)
+
+        assert result[2].abs().sum() > 0
+        assert result[0].abs().sum() == 0
+        assert result[1].abs().sum() == 0
+        assert result[3].abs().sum() == 0
+
     def test_mixed_prefill_decode_receives_feedback_only_on_decode_rows(self):
         """Mixed batches should skip prefill spans but keep audio feedback for decode spans."""
         t = self._make_feedback_talker()
@@ -1165,8 +1182,14 @@ class TestRegistry:
 
         # __file__ = tests/unit/higgs_audio_v3/test_*.py → 4 dirnames to repo root
         repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-        yaml_path = os.path.join(repo_root, "vllm_omni", "deploy", "higgs_multimodal_qwen3.yaml")
-        assert os.path.isfile(yaml_path), f"Deploy YAML not found at {yaml_path}"
+        deploy_dir = os.path.join(repo_root, "vllm_omni", "deploy")
+        for name in (
+            "higgs_multimodal_qwen3.yaml",
+            "higgs_multimodal_qwen3_high_throughput.yaml",
+            "higgs_multimodal_qwen3_low_latency.yaml",
+        ):
+            yaml_path = os.path.join(deploy_dir, name)
+            assert os.path.isfile(yaml_path), f"Deploy YAML not found at {yaml_path}"
 
 
 # ---- AC-3: Prompt Builder ----
