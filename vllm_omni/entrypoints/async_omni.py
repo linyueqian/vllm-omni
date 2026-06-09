@@ -243,6 +243,7 @@ class AsyncOmni(EngineClient, OmniBase):
         uuid = random_uuid()
         prefix = "" if not external_request_id else f"{external_request_id}-"
         return f"{prefix}{uuid:.8}"
+
     async def open_duplex_session_async(
         self,
         session_id: str,

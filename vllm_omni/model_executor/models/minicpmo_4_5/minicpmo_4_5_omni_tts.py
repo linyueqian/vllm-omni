@@ -123,7 +123,7 @@ class _PreallocatedKVCache:
     attention length while avoiding per-step cache reallocation/copy.
     """
 
-    is_compileable = False
+    is_compilable = False
 
     def __init__(self, *, num_layers: int, max_cache_len: int):
         self.max_cache_len = max_cache_len

@@ -106,7 +106,6 @@ from vllm_omni.engine.stage_init_utils import (
     prepare_engine_environment,
     release_device_locks,
     resolve_sampling_param_token_names,
-    setup_stage_devices,
     stage_runtime_setup,
     terminate_alive_proc,
 )

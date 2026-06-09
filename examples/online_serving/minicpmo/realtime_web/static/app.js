@@ -344,7 +344,7 @@
                  autoGainControl: true, sampleRate: { ideal: TARGET_SR } },
       });
       // Capture at 16k directly so the browser does anti-aliased resampling
-      // (naive JS downsample 48k->16k aliases -> garbled audio the model mis-hears).
+      // (naive JS downsample 48k->16k aliases -> garbled audio the model mishears).
       try { micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: TARGET_SR }); }
       catch (_) { micCtx = new (window.AudioContext || window.webkitAudioContext)(); }
       captureSR = micCtx.sampleRate;
