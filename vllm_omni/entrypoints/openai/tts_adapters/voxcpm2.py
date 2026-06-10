@@ -21,9 +21,10 @@ class VoxCPM2Adapter(ARTTSAdapter):
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         return self.ctx.server._validate_voxcpm2_request(request)
 
-    async def build(self, request: "OpenAICreateSpeechRequest", sampling_params_list: list) -> PreparedRequest:
+    async def build(
+        self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
+    ) -> PreparedRequest:
         server = self.ctx.server
-        has_inline_ref_audio = request.ref_audio is not None
         # VoxCPM2 needs the raw waveform tuple for prefill-length accounting, so
         # it loads uploaded audio directly rather than via _apply_uploaded_speaker.
         uploaded_ref = None

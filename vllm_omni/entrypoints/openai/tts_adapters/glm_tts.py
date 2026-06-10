@@ -21,8 +21,9 @@ class GlmTTSAdapter(ARTTSAdapter):
             return err
         return self.ctx.server._validate_glm_tts_request(request)
 
-    async def build(self, request: "OpenAICreateSpeechRequest", sampling_params_list: list) -> PreparedRequest:
-        has_inline_ref_audio = request.ref_audio is not None
+    async def build(
+        self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
+    ) -> PreparedRequest:
         prompt = await self.ctx.server._build_glm_tts_prompt(request, has_inline_ref_audio=has_inline_ref_audio)
         # GLM-TTS dynamic-token sampling stays in the orchestrator tail
         # (keyed on _tts_model_type) during this incremental migration.

@@ -27,9 +27,10 @@ class OmniVoiceAdapter(ARTTSAdapter):
             return "Input text cannot be empty"
         return self.ctx.server._apply_uploaded_speaker(request)
 
-    async def build(self, request: "OpenAICreateSpeechRequest", sampling_params_list: list) -> PreparedRequest:
+    async def build(
+        self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
+    ) -> PreparedRequest:
         server = self.ctx.server
-        has_inline_ref_audio = request.ref_audio is not None
         prompt: dict = {"input": request.input}
         if request.ref_audio:
             wav, sr = await server._resolve_ref_audio(request.ref_audio)

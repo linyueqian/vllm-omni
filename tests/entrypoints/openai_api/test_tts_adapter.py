@@ -19,7 +19,6 @@ from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
 # uniform ``self._adapter.build(...)`` dispatch covers it.
 EXPECTED_MODEL_TYPES = {
     "qwen3_tts",
-    "voxcpm",
     "voxcpm2",
     "voxtral_tts",
     "fish_tts",
@@ -61,10 +60,14 @@ def test_resolve_unknown_returns_none():
     assert resolve_adapter(None) is None
 
 
-def test_voxcpm_and_voxcpm2_are_distinct():
-    """The shared ``latent_generator`` stage no longer causes ambiguity: the
-    two models resolve by their distinct detected model-type names."""
-    assert resolve_adapter("voxcpm") is not resolve_adapter("voxcpm2")
+def test_voxcpm2_resolves():
+    """VoxCPM2 (the served ``latent_generator`` model) resolves cleanly.
+
+    Detection never returns the legacy ``voxcpm`` type, so there is no shared
+    stage-key ambiguity to resolve.
+    """
+    assert resolve_adapter("voxcpm2") is not None
+    assert resolve_adapter("voxcpm") is None
 
 
 def test_all_adapters_are_ar_or_diffusion():

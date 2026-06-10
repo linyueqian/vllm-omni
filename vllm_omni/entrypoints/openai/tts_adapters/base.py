@@ -105,11 +105,18 @@ class TTSModelAdapter(ABC):
         self,
         request: "OpenAICreateSpeechRequest",
         sampling_params_list: list,
+        has_inline_ref_audio: bool,
     ) -> PreparedRequest:
         """Build the engine prompt + tts_params for this request.
 
         ``sampling_params_list`` is passed read-only for models (e.g. MOSS) that
         fold the resolved seed into ``additional_information`` at build time.
+
+        ``has_inline_ref_audio`` is captured by the orchestrator *before*
+        ``validate()`` runs, because ``_apply_uploaded_speaker`` (invoked inside
+        several adapters' ``validate``) sets ``request.ref_audio`` in place.
+        Recomputing it here would misclassify uploaded voices as inline and drop
+        the ``voice_name`` / ``voice_created_at`` metadata.
         """
 
     def apply_sampling_overrides(

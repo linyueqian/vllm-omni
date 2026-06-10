@@ -21,9 +21,10 @@ class HiggsAudioV2Adapter(ARTTSAdapter):
             return err
         return self.ctx.server._validate_higgs_audio_v2_request(request)
 
-    async def build(self, request: "OpenAICreateSpeechRequest", sampling_params_list: list) -> PreparedRequest:
+    async def build(
+        self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
+    ) -> PreparedRequest:
         server = self.ctx.server
-        has_inline_ref_audio = request.ref_audio is not None
         prompt = await server._build_higgs_audio_v2_params(request)
         if request.voice:
             voice_lower = request.voice.lower()

@@ -3187,11 +3187,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # overrides and the model-type label remain in the orchestrator tail
         # below (keyed on ``_tts_model_type``) during this incremental migration.
         # Non-TTS deployments (no adapter) fall through to the rejection below.
+        # Capture inline-ref-audio status BEFORE validate(): several adapters
+        # apply uploaded speakers inside validate(), which sets request.ref_audio
+        # in place. The builders need to know whether the caller supplied audio
+        # inline vs. via an uploaded voice.
+        has_inline_ref_audio = request.ref_audio is not None
         if self._adapter is not None:
             validation_error = self._adapter.validate(request)
             if validation_error:
                 raise ValueError(validation_error)
-            prepared = await self._adapter.build(request, sampling_params_list)
+            prepared = await self._adapter.build(request, sampling_params_list, has_inline_ref_audio)
             prompt = prepared.prompt
             tts_params = prepared.tts_params
             qwen3_ref_audio_warmup_artifact_key = prepared.warmup_artifact_key
@@ -3807,6 +3812,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         merged_requests = [self._merge_batch_item(batch_request, item) for item in batch_request.items]
 
         async def _run_item(idx: int, req: OpenAICreateSpeechRequest) -> SpeechBatchItemResult:
+            # Batch validation still goes through _validate_tts_request directly
+            # (not the adapter). The single-request path validates via the
+            # adapter; both ultimately call the same per-model validators, so the
+            # surfaces stay in sync. Routing batch through the adapter (and its
+            # uploaded-speaker handling) is a follow-up (RFC #4327).
             validation_error = self._validate_tts_request(req)
             if validation_error is not None:
                 return SpeechBatchItemResult(index=idx, status="error", error=validation_error)

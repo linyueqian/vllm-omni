@@ -18,7 +18,9 @@ class MingTTSAdapter(ARTTSAdapter):
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         return self.ctx.server._validate_ming_tts_request(request)
 
-    async def build(self, request: "OpenAICreateSpeechRequest", sampling_params_list: list) -> PreparedRequest:
+    async def build(
+        self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
+    ) -> PreparedRequest:
         server = self.ctx.server
         ref_audio_source = request.ref_audio
         voice_lower = request.voice.lower() if isinstance(request.voice, str) else None

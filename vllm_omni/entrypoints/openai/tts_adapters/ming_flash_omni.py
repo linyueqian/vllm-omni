@@ -18,6 +18,8 @@ class MingFlashOmniAdapter(ARTTSAdapter):
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         return self.ctx.server._validate_ming_flash_omni_tts_request(request)
 
-    async def build(self, request: "OpenAICreateSpeechRequest", sampling_params_list: list) -> PreparedRequest:
+    async def build(
+        self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
+    ) -> PreparedRequest:
         prompt = self.ctx.server._build_ming_flash_omni_prompt(request)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="ming_flash_omni_tts")

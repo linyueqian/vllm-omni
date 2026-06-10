@@ -21,11 +21,12 @@ class FishSpeechAdapter(ARTTSAdapter):
             return err
         return self.ctx.server._validate_fish_tts_request(request)
 
-    async def build(self, request: "OpenAICreateSpeechRequest", sampling_params_list: list) -> PreparedRequest:
+    async def build(
+        self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
+    ) -> PreparedRequest:
         from vllm_omni.entrypoints.openai import serving_speech as _ss
 
         server = self.ctx.server
-        has_inline_ref_audio = request.ref_audio is not None
         ref_audio_data = None
         if request.ref_audio is not None:
             wav_list, sr = await server._resolve_ref_audio(request.ref_audio)

@@ -15,6 +15,8 @@ class CovoAudioAdapter(ARTTSAdapter):
     stage_keys = frozenset({"fused_thinker_talker"})
     name = "covo_audio"
 
-    async def build(self, request: "OpenAICreateSpeechRequest", sampling_params_list: list) -> PreparedRequest:
+    async def build(
+        self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
+    ) -> PreparedRequest:
         prompt = self.ctx.server._build_covo_audio_prompt(request)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="covo_audio")
