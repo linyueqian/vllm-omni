@@ -44,6 +44,10 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     SpeechBatchItem,
     SpeechBatchItemResult,
 )
+from vllm_omni.entrypoints.openai.tts_adapters import (
+    SpeechServingContext,
+    resolve_adapter,
+)
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     build_fish_text_only_prompt_ids,
@@ -466,6 +470,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._build_voxtral_prompt_async = make_async(self._build_voxtral_prompt, executor=self._tts_executor)
         self._build_fish_speech_prompt_async = make_async(self._build_fish_speech_prompt, executor=self._tts_executor)
         self._estimate_prompt_len_async = make_async(self._estimate_prompt_len, executor=self._tts_executor)
+
+        # Resolve the per-model serving adapter (RFC #4327). Only Qwen3-TTS is
+        # migrated onto the adapter framework so far; all other models stay on
+        # the legacy dispatch. Resolution is additive and never raises here
+        # during the incremental migration -- an unresolved stage simply keeps
+        # the legacy path.
+        self._adapter = None
+        if self._tts_stage is not None:
+            ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
+            present_stage_keys = {
+                getattr(getattr(stage, "engine_args", None), "model_stage", None)
+                for stage in self.engine_client.stage_configs
+            }
+            present_stage_keys.discard(None)
+            model_arch = getattr(self._tts_stage.engine_args, "model_arch", None)
+            adapter_cls = resolve_adapter(present_stage_keys, model_arch)
+            if adapter_cls is not None:
+                self._adapter = adapter_cls(ctx)
+                logger.info("Resolved TTS serving adapter: %s", adapter_cls.__name__)
 
     async def warmup(self) -> None:
         """Run a synthetic speech request to trigger all first-request warmup.
@@ -3105,6 +3128,47 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     # ---- Common speech generation helpers ----
 
+    async def _build_default_tts_request(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> tuple[dict[str, Any], dict[str, Any], str | None]:
+        """Build prompt + tts_params for the default placeholder path.
+
+        Shared by Qwen3-TTS (via ``Qwen3TTSAdapter.build``) and the legacy
+        VoxCPM branch. Extracted verbatim from ``_prepare_speech_generation`` so
+        both callers and the batch path use one implementation. Returns
+        ``(prompt, tts_params, warmup_artifact_key)`` where the warmup key is the
+        Qwen3-TTS ref-audio artifact tracked after ``generate()``.
+        """
+        qwen3_ref_audio_warmup_artifact_key: str | None = None
+        tts_params = self._build_tts_params(request)
+        # Resolve ref_audio (explicit or auto-set for uploaded voices)
+        # to [[wav_list, sr]] so the model doesn't re-decode base64.
+        ref_audio_source = request.ref_audio
+        if ref_audio_source is None and isinstance(tts_params.get("ref_audio"), list):
+            # Uploaded voice: ref_audio was auto-set as [base64_data_url]
+            ref_audio_source = tts_params["ref_audio"][0]
+        if ref_audio_source is not None and isinstance(ref_audio_source, str):
+            wav_list, sr = await self._resolve_ref_audio(ref_audio_source)
+            artifact_key = self._get_resolved_ref_audio_artifact_key(ref_audio_source)
+            if self._tts_model_type == "qwen3_tts" and artifact_key:
+                tts_params[_QWEN3_TTS_REF_AUDIO_CACHE_KEY] = [artifact_key]
+            ref_code_length = self._estimate_ref_code_len([wav_list, sr])
+            if self._tts_model_type == "qwen3_tts" and ref_code_length is not None:
+                tts_params["ref_code_length"] = [int(ref_code_length)]
+            if self._qwen3_tts_can_use_ref_audio_artifact_only(tts_params, artifact_key):
+                logger.debug("Using Qwen3-TTS ref_audio artifact-only path: %s", artifact_key)
+            else:
+                tts_params["ref_audio"] = [[wav_list, sr]]
+                if self._tts_model_type == "qwen3_tts":
+                    qwen3_ref_audio_warmup_artifact_key = artifact_key
+
+        ph_len = await self._estimate_prompt_len_async(tts_params)
+        prompt = tokens_input(prompt_token_ids=[1] * ph_len)
+        prompt["additional_information"] = tts_params
+        prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
+        return prompt, tts_params, qwen3_ref_audio_warmup_artifact_key
+
     async def _prepare_speech_generation(
         self,
         request: OpenAICreateSpeechRequest,
@@ -3293,33 +3357,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     prompt = tokens_input(prompt_token_ids=[1])
                 prompt["additional_information"] = tts_params
                 prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
+            elif self._adapter is not None and self._adapter.name == "qwen3_tts":
+                # Qwen3-TTS is migrated onto the adapter framework (RFC #4327);
+                # route prompt/param building through the adapter. VoxCPM still
+                # uses the shared default builder via the legacy branch below.
+                prepared = await self._adapter.build(request)
+                prompt = prepared.prompt
+                tts_params = prepared.tts_params
+                qwen3_ref_audio_warmup_artifact_key = prepared.warmup_artifact_key
             else:
-                tts_params = self._build_tts_params(request)
-                # Resolve ref_audio (explicit or auto-set for uploaded voices)
-                # to [[wav_list, sr]] so the model doesn't re-decode base64.
-                ref_audio_source = request.ref_audio
-                if ref_audio_source is None and isinstance(tts_params.get("ref_audio"), list):
-                    # Uploaded voice: ref_audio was auto-set as [base64_data_url]
-                    ref_audio_source = tts_params["ref_audio"][0]
-                if ref_audio_source is not None and isinstance(ref_audio_source, str):
-                    wav_list, sr = await self._resolve_ref_audio(ref_audio_source)
-                    artifact_key = self._get_resolved_ref_audio_artifact_key(ref_audio_source)
-                    if self._tts_model_type == "qwen3_tts" and artifact_key:
-                        tts_params[_QWEN3_TTS_REF_AUDIO_CACHE_KEY] = [artifact_key]
-                    ref_code_length = self._estimate_ref_code_len([wav_list, sr])
-                    if self._tts_model_type == "qwen3_tts" and ref_code_length is not None:
-                        tts_params["ref_code_length"] = [int(ref_code_length)]
-                    if self._qwen3_tts_can_use_ref_audio_artifact_only(tts_params, artifact_key):
-                        logger.debug("Using Qwen3-TTS ref_audio artifact-only path: %s", artifact_key)
-                    else:
-                        tts_params["ref_audio"] = [[wav_list, sr]]
-                        if self._tts_model_type == "qwen3_tts":
-                            qwen3_ref_audio_warmup_artifact_key = artifact_key
-
-                ph_len = await self._estimate_prompt_len_async(tts_params)
-                prompt = tokens_input(prompt_token_ids=[1] * ph_len)
-                prompt["additional_information"] = tts_params
-                prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
+                (
+                    prompt,
+                    tts_params,
+                    qwen3_ref_audio_warmup_artifact_key,
+                ) = await self._build_default_tts_request(request)
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The
