@@ -34,7 +34,7 @@ connectors:
 
 stages:
   - stage_id: 0
-    max_num_seqs: 16
+    max_num_seqs: 64
     gpu_memory_utilization: 0.6
     enforce_eager: true
     attention_backend: FLASHINFER
