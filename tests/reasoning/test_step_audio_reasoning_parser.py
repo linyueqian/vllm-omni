@@ -26,8 +26,20 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
-def _setup_vllm_stubs():
-    """Create minimal stub modules for vllm imports used by the parser."""
+def _install_vllm_stubs() -> dict[str, ModuleType | None]:
+    """Temporarily install minimal stub modules for the vllm imports the
+    parser needs, so it can be imported without the full vLLM/torch stack.
+
+    Returns a snapshot of the original ``sys.modules`` entries that were
+    replaced. The caller MUST pass it to ``_restore_vllm_stubs`` once the
+    parser is imported. These stubs are process-global: if they leak, they
+    shadow the real vllm modules for every other test in the same worker
+    (and any forked server subprocess), e.g. replacing
+    ``vllm.entrypoints.openai.engine.protocol`` with a stub that lacks
+    ``ErrorResponse`` and breaking unrelated server-startup tests.
+    """
+    stubs: dict[str, ModuleType] = {}
+
     # DeltaMessage stub
     delta_mod = ModuleType("vllm.entrypoints.openai.engine.protocol")
 
@@ -39,7 +51,7 @@ def _setup_vllm_stubs():
             self.content = content
 
     delta_mod.DeltaMessage = DeltaMessage
-    sys.modules["vllm.entrypoints.openai.engine.protocol"] = delta_mod
+    stubs["vllm.entrypoints.openai.engine.protocol"] = delta_mod
 
     # ReasoningParser stub
     reasoning_mod = ModuleType("vllm.reasoning")
@@ -64,23 +76,24 @@ def _setup_vllm_stubs():
 
     reasoning_mod.ReasoningParser = ReasoningParser
     reasoning_mod.ReasoningParserManager = _ReasoningParserManager
-    sys.modules["vllm.reasoning"] = reasoning_mod
-    sys.modules["vllm.reasoning.abs_reasoning_parsers"] = reasoning_mod
+    stubs["vllm.reasoning"] = reasoning_mod
+    stubs["vllm.reasoning.abs_reasoning_parsers"] = reasoning_mod
 
     # TokenizerLike stub
     tokenizers_mod = ModuleType("vllm.tokenizers")
     tokenizers_mod.TokenizerLike = object
-    sys.modules["vllm.tokenizers"] = tokenizers_mod
+    stubs["vllm.tokenizers"] = tokenizers_mod
 
     # ChatCompletionRequest / ResponsesRequest stubs
     chat_mod = ModuleType("vllm.entrypoints.openai.chat_completion.protocol")
     chat_mod.ChatCompletionRequest = MagicMock
-    sys.modules["vllm.entrypoints.openai.chat_completion.protocol"] = chat_mod
+    stubs["vllm.entrypoints.openai.chat_completion.protocol"] = chat_mod
     responses_mod = ModuleType("vllm.entrypoints.openai.responses.protocol")
     responses_mod.ResponsesRequest = MagicMock
-    sys.modules["vllm.entrypoints.openai.responses.protocol"] = responses_mod
+    stubs["vllm.entrypoints.openai.responses.protocol"] = responses_mod
 
-    # vllm and vllm.entrypoints openai stubs
+    # Parent packages: only stub the ones not already importable, so we never
+    # clobber a real (installed) vllm package tree.
     for mod_path in [
         "vllm",
         "vllm.entrypoints",
@@ -89,14 +102,33 @@ def _setup_vllm_stubs():
         "vllm.entrypoints.openai.chat_completion",
         "vllm.entrypoints.openai.responses",
     ]:
-        if mod_path not in sys.modules:
-            sys.modules[mod_path] = ModuleType(mod_path)
+        if mod_path not in sys.modules and mod_path not in stubs:
+            stubs[mod_path] = ModuleType(mod_path)
+
+    saved = {name: sys.modules.get(name) for name in stubs}
+    sys.modules.update(stubs)
+    return saved
 
 
-_setup_vllm_stubs()
+def _restore_vllm_stubs(saved: dict[str, ModuleType | None]) -> None:
+    """Undo ``_install_vllm_stubs`` so ``sys.modules`` is left untouched."""
+    for name, original in saved.items():
+        if original is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
 
-# Now import the parser under test
-from vllm_omni.reasoning.step_audio_reasoning_parser import StepAudioReasoningParser  # noqa: E402
+
+# Install stubs only for the duration of the import. The parser binds these
+# stub classes into its own module namespace at import time, so it keeps using
+# them at runtime even after sys.modules is restored below.
+_saved_modules = _install_vllm_stubs()
+try:
+    from vllm_omni.reasoning.step_audio_reasoning_parser import (  # noqa: E402
+        StepAudioReasoningParser,
+    )
+finally:
+    _restore_vllm_stubs(_saved_modules)
 
 # Short aliases for marker constants
 TS = StepAudioReasoningParser.THINK_START_TEXT  # <think>
