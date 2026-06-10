@@ -471,22 +471,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._build_fish_speech_prompt_async = make_async(self._build_fish_speech_prompt, executor=self._tts_executor)
         self._estimate_prompt_len_async = make_async(self._estimate_prompt_len, executor=self._tts_executor)
 
-        # Resolve the per-model serving adapter (RFC #4327). Only Qwen3-TTS is
-        # migrated onto the adapter framework so far; all other models stay on
-        # the legacy dispatch. Resolution is additive and never raises here
-        # during the incremental migration -- an unresolved stage simply keeps
-        # the legacy path.
+        # Resolve the per-model serving adapter (RFC #4327), keyed on the
+        # detected model-type. Every dedicated TTS model has an adapter; the
+        # adapter owns request validation + prompt/param building. Sampling
+        # overrides and the model-type label remain in the orchestrator tail
+        # (keyed on ``_tts_model_type``) during this incremental migration.
         self._adapter = None
         if self._tts_stage is not None:
-            ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
-            present_stage_keys = {
-                getattr(getattr(stage, "engine_args", None), "model_stage", None)
-                for stage in self.engine_client.stage_configs
-            }
-            present_stage_keys.discard(None)
-            model_arch = getattr(self._tts_stage.engine_args, "model_arch", None)
-            adapter_cls = resolve_adapter(present_stage_keys, model_arch)
+            adapter_cls = resolve_adapter(self._tts_model_type)
             if adapter_cls is not None:
+                ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
                 self._adapter = adapter_cls(ctx)
                 logger.info("Resolved TTS serving adapter: %s", adapter_cls.__name__)
 
@@ -3187,190 +3181,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         sampling_params_list = list(self.engine_client.default_sampling_params_list)
         sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
 
-        # Resolve uploaded voice for non-Qwen3 models.
-        # Qwen3 TTS has its own uploaded voice handling in _build_tts_params().
-        has_inline_ref_audio = request.ref_audio is not None
-        if self._tts_model_type in ("fish_tts", "cosyvoice3", "moss_tts_nano", "glm_tts"):
-            err = self._apply_uploaded_speaker(request)
-            if err:
-                raise ValueError(err)
-
-        if self._is_fish_speech:
-            validation_error = self._validate_fish_tts_request(request)
+        # Build prompt + tts_params via the per-model adapter (RFC #4327). Every
+        # dedicated TTS model resolves to an adapter that owns its validation,
+        # uploaded-speaker handling, and prompt/param building. Sampling
+        # overrides and the model-type label remain in the orchestrator tail
+        # below (keyed on ``_tts_model_type``) during this incremental migration.
+        # Non-TTS deployments (no adapter) fall through to the rejection below.
+        if self._adapter is not None:
+            validation_error = self._adapter.validate(request)
             if validation_error:
                 raise ValueError(validation_error)
-            ref_audio_data = None
-            if request.ref_audio is not None:
-                wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
-                ref_audio_data = (wav_list, sr)
-            prompt = await self._build_fish_speech_prompt_async(
-                request, ref_audio_data=ref_audio_data, has_inline_ref_audio=has_inline_ref_audio
-            )
-            tts_params = {}
-            # Fish Speech resolves conditioning entirely from raw request fields
-            # (text / ref_audio / ref_text rebuilt into inputs_embeds); unlike
-            # uploaded-voice models it has no resolved tts_params to fold in, so
-            # the salt is derived from the request alone.
-            prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
-        elif self._tts_model_type == "omnivoice":
-            if not request.input or not request.input.strip():
-                raise ValueError("Input text cannot be empty")
-            err = self._apply_uploaded_speaker(request)
-            if err:
-                raise ValueError(err)
-            tts_params = {}
-            prompt: dict[str, Any] = {"input": request.input}
-            if request.ref_audio:
-                wav, sr = await self._resolve_ref_audio(request.ref_audio)
-                prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
-            if request.ref_text:
-                prompt["ref_text"] = request.ref_text
-            if request.voice:
-                voice_lower = request.voice.lower()
-                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
-                    prompt["voice_name"] = voice_lower
-                    prompt["voice_created_at"] = self._voice_created_at(voice_lower)
-            if request.language:
-                prompt["lang"] = request.language
-            if request.instructions:
-                prompt["instruct"] = request.instructions
-        elif self._tts_model_type == "covo_audio":
-            prompt = self._build_covo_audio_prompt(request)
-            tts_params = {}
-        elif self._tts_model_type == "higgs_audio_v2":
-            # Explicit higgs_audio_v2 branch: do NOT fall through to the
-            # Qwen-style generic placeholder path; build prompt_token_ids
-            # directly via the upstream processor + the project's plain-text
-            # helper.
-            #
-            # Resolve uploaded voices first so a voice=<name> request (after
-            # POST /v1/audio/voices) populates ref_audio + ref_text from the
-            # cached speaker entry, mirroring the cosyvoice3 / voxcpm2 flow.
-            err = self._apply_uploaded_speaker(request)
-            if err:
-                raise ValueError(err)
-            validation_error = self._validate_higgs_audio_v2_request(request)
-            if validation_error:
-                raise ValueError(validation_error)
-            prompt = await self._build_higgs_audio_v2_params(request)
-            if request.voice:
-                voice_lower = request.voice.lower()
-                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
-                    additional = prompt.setdefault("additional_information", {})
-                    additional["voice_name"] = voice_lower
-                    additional["voice_created_at"] = self._voice_created_at(voice_lower)
-            tts_params = {}
-        elif self._tts_model_type == "higgs_audio_v3":
-            err = self._apply_uploaded_speaker(request)
-            if err:
-                raise ValueError(err)
-            validation_error = self._validate_higgs_audio_v3_request(request)
-            if validation_error:
-                raise ValueError(validation_error)
-            prompt = await self._build_higgs_audio_v3_params(request)
-            tts_params = {}
-        elif self._tts_model_type == "voxcpm2":
-            # voxcpm2 doesn't use `_apply_uploaded_speaker` because the prompt builder needs the
-            # raw waveform tuple for prefill-length accounting, not a base64 data URL.
-            validation_error = self._validate_voxcpm2_request(request)
-            if validation_error:
-                raise ValueError(validation_error)
-
-            uploaded_ref: tuple[np.ndarray, int] | None = None
-            if request.voice:
-                voice_lower = request.voice.lower()
-                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
-                    if self.uploaded_speakers[voice_lower].get("embedding_source") == "direct":
-                        raise ValueError(
-                            f"Uploaded voice '{request.voice}' uses a speaker embedding (Qwen3-only). "
-                            f"Re-upload with an audio file for VoxCPM2."
-                        )
-                    if request.ref_audio is None:
-                        uploaded_ref = self._load_uploaded_audio(voice_lower)
-            prompt = await self._build_voxcpm2_prompt(request, uploaded_ref=uploaded_ref)
-            tts_params = {}
-            if request.voice:
-                voice_lower = request.voice.lower()
-                if voice_lower in self.uploaded_speakers or voice_lower in self.precomputed_speakers:
-                    additional = prompt.setdefault("additional_information", {})
-                    additional["voice_name"] = voice_lower
-                    additional["voice_created_at"] = self._voice_created_at(voice_lower)
-        elif self._is_tts:
-            validation_error = self._validate_tts_request(request)
-            if validation_error:
-                raise ValueError(validation_error)
-
-            if self._tts_model_type == "voxtral_tts":
-                prompt = await self._build_voxtral_prompt_async(request)
-                tts_params = {}
-            elif self._tts_model_type == "cosyvoice3":
-                prompt = await self._build_cosyvoice3_prompt(request, has_inline_ref_audio=has_inline_ref_audio)
-                tts_params = {}
-            elif self._tts_model_type == "glm_tts":
-                prompt = await self._build_glm_tts_prompt(request, has_inline_ref_audio=has_inline_ref_audio)
-                tts_params = {}
-            elif self._tts_model_type == "ming_flash_omni_tts":
-                prompt = self._build_ming_flash_omni_prompt(request)
-                tts_params = {}
-            elif self._tts_model_type == "ming_tts":
-                ref_audio_source = request.ref_audio
-                voice_lower = request.voice.lower() if isinstance(request.voice, str) else None
-                if ref_audio_source is None and voice_lower in self.uploaded_speakers:
-                    ref_audio_source = self._get_uploaded_audio_data(request.voice)
-                    if request.ref_text is None:
-                        request.ref_text = self.uploaded_speakers[voice_lower].get("ref_text")
-                ref_audio_data = None
-                if isinstance(ref_audio_source, list):
-                    ref_audio_data = await self._resolve_ref_audio_many(ref_audio_source)
-                    if request.speaker_embedding is None:
-                        request.speaker_embedding = self._extract_ming_speaker_embeddings_from_ref_audio(ref_audio_data)
-                elif ref_audio_source is not None and isinstance(ref_audio_source, str):
-                    wav_list, sr = await self._resolve_ref_audio(ref_audio_source)
-                    ref_audio_data = (wav_list, sr)
-                    if request.speaker_embedding is None:
-                        request.speaker_embedding = self._extract_ming_speaker_embeddings_from_ref_audio(
-                            [ref_audio_data]
-                        )[0]
-                prompt = self._build_ming_dense_prompt(request, ref_audio_data=ref_audio_data)
-                tts_params = prompt.get("additional_information", {})
-            elif self._tts_model_type in ("moss_tts_nano", "moss_tts"):
-                tts_params = await self._build_moss_tts_params(request)
-                if request.voice:
-                    voice_lower = request.voice.lower()
-                    if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
-                        tts_params["voice_name"] = [voice_lower]
-                        tts_params["voice_created_at"] = [self._voice_created_at(voice_lower)]
-                # Propagate seed from sampling params for deterministic generation.
-                # MOSS-TTS-Nano uses its own internal sampling inside
-                # inference_stream(), which reads seed from additional_information
-                # (not SamplingParams). Without this the model uses ambient RNG
-                # state and produces non-deterministic output.
-                if sampling_params_list and getattr(sampling_params_list[0], "seed", None) is not None:
-                    tts_params["seed"] = [sampling_params_list[0].seed]
-                # Full MOSS-TTS family returns real text_ids from the upstream
-                # processor; use them as prompt_token_ids. Nano keeps the
-                # ``[1]`` placeholder (it owns its own tokenisation internally).
-                if isinstance(tts_params.get("prompt_token_ids"), list):
-                    prompt_token_ids = tts_params.pop("prompt_token_ids")
-                    prompt = tokens_input(prompt_token_ids=prompt_token_ids)
-                else:
-                    prompt = tokens_input(prompt_token_ids=[1])
-                prompt["additional_information"] = tts_params
-                prompt["cache_salt"] = _conditioning_cache_salt(request, tts_params)
-            elif self._adapter is not None and self._adapter.name == "qwen3_tts":
-                # Qwen3-TTS is migrated onto the adapter framework (RFC #4327);
-                # route prompt/param building through the adapter. VoxCPM still
-                # uses the shared default builder via the legacy branch below.
-                prepared = await self._adapter.build(request)
-                prompt = prepared.prompt
-                tts_params = prepared.tts_params
-                qwen3_ref_audio_warmup_artifact_key = prepared.warmup_artifact_key
-            else:
-                (
-                    prompt,
-                    tts_params,
-                    qwen3_ref_audio_warmup_artifact_key,
-                ) = await self._build_default_tts_request(request)
+            prepared = await self._adapter.build(request, sampling_params_list)
+            prompt = prepared.prompt
+            tts_params = prepared.tts_params
+            qwen3_ref_audio_warmup_artifact_key = prepared.warmup_artifact_key
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The

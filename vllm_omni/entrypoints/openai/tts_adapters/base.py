@@ -79,25 +79,15 @@ class TTSModelAdapter(ABC):
     re-implementing them.
     """
 
-    #: Engine ``model_stage`` key(s) this adapter serves (registry key).
-    stage_keys: ClassVar[frozenset[str]]
-    #: Stable discriminator string (used in logs / metrics).
+    #: Stable discriminator string (the model-type from detection); registry key.
     name: ClassVar[str]
+    #: Engine ``model_stage`` key(s) this model uses, for documentation only.
+    stage_keys: ClassVar[frozenset[str]] = frozenset()
     #: Serving backend: ``"ar"`` (engine_client) or ``"diffusion"``.
     backend: ClassVar[str] = "ar"
 
     def __init__(self, ctx: SpeechServingContext) -> None:
         self.ctx = ctx
-
-    @classmethod
-    def matches(cls, stage_keys: set[str], model_arch: str | None) -> bool:
-        """Disambiguate when several adapters share a stage key.
-
-        Default is pure stage-key membership. Models that share a key (e.g.
-        VoxCPM / VoxCPM2 on ``latent_generator``) override this to inspect
-        ``model_arch`` or sibling stages.
-        """
-        return bool(cls.stage_keys & set(stage_keys))
 
     def normalize(self, request: "OpenAICreateSpeechRequest") -> None:
         """In-place request normalization/mutation (e.g. infer task type,
@@ -111,8 +101,16 @@ class TTSModelAdapter(ABC):
         return None
 
     @abstractmethod
-    async def build(self, request: "OpenAICreateSpeechRequest") -> PreparedRequest:
-        """Build the engine prompt + tts_params for this request."""
+    async def build(
+        self,
+        request: "OpenAICreateSpeechRequest",
+        sampling_params_list: list,
+    ) -> PreparedRequest:
+        """Build the engine prompt + tts_params for this request.
+
+        ``sampling_params_list`` is passed read-only for models (e.g. MOSS) that
+        fold the resolved seed into ``additional_information`` at build time.
+        """
 
     def apply_sampling_overrides(
         self,
