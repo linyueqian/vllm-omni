@@ -556,6 +556,12 @@ class OmniDuplexSessionHandler:
                 return
             append_epoch = session.epoch
             response_bound = final or precreate_response
+            if response_bound and isinstance(payload, dict) and payload.get("force_listen") is not True:
+                # An explicit commit/response.create asks for a reply now:
+                # suppress the listen decision for this segment (official
+                # listen_prob_scale -> 0 semantics). Per-chunk auto-response
+                # appends stay fully model-driven.
+                payload = {**payload, "force_speak": True}
             if response_bound:
                 session.active_request_id = self._native_stage0_request_id(session, append_epoch)
             if final:
