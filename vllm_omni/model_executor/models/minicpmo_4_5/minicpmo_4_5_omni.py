@@ -287,7 +287,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             prompt_len = int(full_req_embeds.shape[0])
         pad_token_id = helper.stage_padding_token_id()
         if prompt_len > int(full_req_embeds.shape[0]):
-            suffix_len = int(result.get("prompt_suffix_len") or 0)
             pad_len = prompt_len - int(full_req_embeds.shape[0])
             pad_ids = torch.full(
                 (pad_len,),
@@ -296,18 +295,24 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 device=input_ids.device,
             )
             pad_embeds = self.get_input_embeddings(pad_ids).to(dtype=full_req_embeds.dtype)
-            if suffix_len > 0 and suffix_len < int(full_req_embeds.shape[0]):
-                split_at = int(full_req_embeds.shape[0]) - suffix_len
-                full_req_embeds = torch.cat(
-                    [full_req_embeds[:split_at], pad_embeds, full_req_embeds[split_at:]],
-                    dim=0,
-                )
-                full_input_token_ids = (
-                    full_input_token_ids[:split_at] + [pad_token_id] * pad_len + full_input_token_ids[split_at:]
-                )
-            else:
-                full_req_embeds = torch.cat([pad_embeds, full_req_embeds], dim=0)
-                full_input_token_ids = [pad_token_id] * pad_len + full_input_token_ids
+            # The appended duplex tokens occupy the tail of the request prompt
+            # and the runner schedules the span [num_computed_tokens, prompt_len).
+            # Padding must therefore sit in front of the real chunk embeddings;
+            # otherwise the audio lands outside the scheduled span, is never
+            # forwarded, and generation runs on pad tokens only. Keeping the
+            # embeddings last also places the decode position directly after the
+            # final audio embedding, matching the official listen/speak decision
+            # point.
+            full_req_embeds = torch.cat([pad_embeds, full_req_embeds], dim=0)
+            full_input_token_ids = [pad_token_id] * pad_len + full_input_token_ids
+        elif prompt_len < int(full_req_embeds.shape[0]):
+            logger.warning(
+                "MiniCPM-o duplex append produced %d embeddings but the scheduler "
+                "reserved only %d prompt slots; the tail will be truncated. "
+                "Increase the duplex scheduler token budget.",
+                int(full_req_embeds.shape[0]),
+                prompt_len,
+            )
 
         span_len = int(input_ids.shape[0])
         token_offset = kwargs.get("duplex_token_offset", 0)

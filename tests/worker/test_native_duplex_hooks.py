@@ -781,7 +781,7 @@ def test_minicpmo_stage0_rejects_unknown_special_token_fallbacks():
         runtime._require_special_token_ids()
 
 
-def test_minicpmo_stage0_data_plane_prefill_injects_assistant_tts_bos_for_handoff():
+def test_minicpmo_stage0_data_plane_prefill_matches_official_unit_format():
     import torch
 
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex_runtime import (
@@ -826,11 +826,22 @@ def test_minicpmo_stage0_data_plane_prefill_injects_assistant_tts_bos_for_handof
     runtime._init_token_ids()
     state = _MiniCPMO45Stage0SessionState(session_id="sid-data-plane-prefill")
 
+    # Official duplex format: each unit is <unit> + audio embeddings with no
+    # per-chunk assistant header or <|tts_bos|> boundary. Decoding starts right
+    # after the audio so the first sampled token is the listen/speak decision.
     result = runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=1)
 
     assert result["success"] is True
-    assert result["input_token_ids"] == [1, 11, 201, 5]
-    assert result["prompt_suffix_len"] == 2
+    assert result["input_token_ids"] == [1, 11]
+    assert result["prompt_suffix_len"] == 0
+
+    # Subsequent units must close the previous unit with </unit> first,
+    # mirroring the official finalize_unit() feed.
+    result = runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=2)
+
+    assert result["success"] is True
+    assert result["input_token_ids"] == [2, 1, 11]
+    assert result["prompt_suffix_len"] == 0
 
 
 def test_minicpmo_stage0_data_plane_first_chunk_matches_official_padding():

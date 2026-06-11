@@ -249,11 +249,11 @@ class MiniCPMO45Stage0DuplexRuntime:
             instructions if isinstance(instructions, str) and instructions else "Streaming Omni Conversation."
         )
         ref_audio = self._decode_ref_audio_from_session_config(session_config)
-        prefix = f"<|im_start|>system\n{system_prompt}"
-        suffix = "<|im_end|>"
-        if ref_audio is not None:
-            prefix += "\n<|audio_start|>"
-            suffix = "<|audio_end|>" + suffix
+        # Official duplex prepare() always uses
+        # <|im_start|>system\n{text}\n<|audio_start|>[ref]<|audio_end|><|im_end|>,
+        # with or without reference audio between the audio markers.
+        prefix = f"<|im_start|>system\n{system_prompt}\n<|audio_start|>"
+        suffix = "<|audio_end|><|im_end|>"
         for token_id in self._encode_text(prefix):
             state.context_embeds.append(self._embed_token(token_id))
             state.context_token_ids.append(token_id)
@@ -417,6 +417,13 @@ class MiniCPMO45Stage0DuplexRuntime:
         if state.audio_chunk_idx == 0 and state.context_embeds:
             embed_parts.extend(state.context_embeds)
             token_ids.extend(state.context_token_ids)
+        if state.audio_chunk_idx > 0:
+            # Official duplex closes every unit (finalize_unit feeds the sampled
+            # terminator + </unit>) before the next <unit> opens. The scheduler
+            # session update discards the previous segment's sampled terminator
+            # token, so only the </unit> closure is appended here.
+            embed_parts.append(self._embed_token(self.unit_end_token_id))
+            token_ids.append(self.unit_end_token_id)
         embed_parts.append(self._embed_token(self.unit_token_id))
         token_ids.append(self.unit_token_id)
         embed_parts.append(audio_embeds)
@@ -939,17 +946,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             return str(decode(token_ids, skip_special_tokens=True))
         return ""
 
-    def _assistant_tts_bos_token_ids(self) -> list[int]:
-        ids = self._encode_text("<|im_end|>\n<|im_start|>assistant\n<|tts_bos|>")
-        if not ids:
-            return []
-        if self.tts_bos_token_id >= 0 and ids[-1] != self.tts_bos_token_id:
-            raise ValueError(
-                "MiniCPM-o tokenizer encoded assistant TTS prefix without "
-                f"ending in <|tts_bos|> id {self.tts_bos_token_id}: {ids}"
-            )
-        return ids
-
     def _special_token_ids(self) -> dict[str, int]:
         return {
             name: value
@@ -967,13 +963,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             }.items()
             if isinstance(value, int) and value >= 0
         }
-
-    def _embed_token_ids(self, token_ids: list[int]) -> Any:
-        import torch
-
-        ids = torch.tensor(token_ids, dtype=torch.long, device=self._model_device())
-        embeds = self._token_embedder()(ids)
-        return self._as_2d_tensor(embeds)
 
     @staticmethod
     def _build_tts_omni_payload(token_ids: list[int], hidden_states: list[Any]) -> Any:

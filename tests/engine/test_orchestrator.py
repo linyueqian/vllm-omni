@@ -1944,7 +1944,9 @@ async def test_minicpmo_native_append_routes_stage0_handoff_to_stage1(orchestrat
         assert len(stage0.add_request_calls) == 1
         request = stage0.add_request_calls[0][0]
         assert request.request_id == "duplex-sid-minicpmo-native-e0-stage0"
-        assert len(request.prompt_token_ids) == 64
+        # First append: 64 audio-chunk slots + 64 session-context reserve
+        # (system prompt; no ref audio in this session config).
+        assert len(request.prompt_token_ids) == 128
         assert request.sampling_params.max_tokens == 17
         assert request.resumable is True
         assert request.additional_information is None
@@ -1954,7 +1956,7 @@ async def test_minicpmo_native_append_routes_stage0_handoff_to_stage1(orchestrat
         assert info["duplex"]["mode"] == "append_audio_chunk"
         assert info["duplex"]["payload"] == audio_payload
         assert info["duplex"]["data_plane"] is True
-        assert info["duplex"]["scheduler_token_budget"] == 64
+        assert info["duplex"]["scheduler_token_budget"] == 128
         assert append_msg.stage_results[0]["result"]["data_plane_append"] is True
         assert append_msg.stage_results[0]["result"]["resumable"] is True
 

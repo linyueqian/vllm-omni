@@ -48,6 +48,7 @@ from vllm_omni.engine.duplex import (
     DuplexSessionRuntimeState,
     DuplexSignalSource,
     SessionMode,
+    duplex_first_append_context_reserve,
     duplex_scheduler_token_budget,
 )
 from vllm_omni.engine.messages import (
@@ -859,6 +860,10 @@ class Orchestrator:
         final: bool,
     ) -> dict[str, Any]:
         token_budget = duplex_scheduler_token_budget(payload)
+        if seq <= 1:
+            # The first append also carries the session context (system prompt
+            # and optional reference-audio embeddings) ahead of the first unit.
+            token_budget += duplex_first_append_context_reserve(session.session_config)
         token_id = 0
         extra_body = session.session_config.get("extra_body")
         raw_token_id = session.session_config.get("duplex_scheduler_token_id")
