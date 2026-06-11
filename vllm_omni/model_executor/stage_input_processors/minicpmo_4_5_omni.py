@@ -147,28 +147,34 @@ def _native_tts_boundary_token_ids(special_token_ids):
 
 def _native_duplex_segment_output_ids(
     output_ids: list[int],
+    output_text: str,
     streaming_context,
     *,
     request_id: str,
-) -> list[int]:
+) -> tuple[list[int], str]:
     """Slice the cumulative thinker output down to the current segment.
 
-    Tracks how many output tokens were already handed to the talker in the
-    orchestrator's streaming bridge state. A new request id (new epoch after
-    barge-in) or a shrunken output list resets the counter.
+    Tracks how many output tokens/characters were already handed to the
+    talker in the orchestrator's streaming bridge state. A new request id
+    (new epoch after barge-in) or a shrunken output list resets the counter.
     """
     bridge_states = getattr(streaming_context, "bridge_states", None)
     if not isinstance(bridge_states, dict):
-        return output_ids
+        return output_ids, output_text
     state = bridge_states.setdefault("minicpmo45_tts_handoff", {})
     if state.get("request_id") != request_id:
         state["request_id"] = request_id
         state["sent_output_len"] = 0
+        state["sent_text_len"] = 0
     sent_len = state.get("sent_output_len", 0)
     if not isinstance(sent_len, int) or sent_len < 0 or sent_len > len(output_ids):
         sent_len = 0
+    sent_text_len = state.get("sent_text_len", 0)
+    if not isinstance(sent_text_len, int) or sent_text_len < 0 or sent_text_len > len(output_text):
+        sent_text_len = 0
     state["sent_output_len"] = len(output_ids)
-    return output_ids[sent_len:]
+    state["sent_text_len"] = len(output_text)
+    return output_ids[sent_len:], output_text[sent_text_len:]
 
 
 def _build_tts_scheduler_prompt_token_ids(
@@ -240,16 +246,19 @@ def llm2tts(
         # thinker's recorded output every segment until the TTS engine input
         # buffer overflows.
         llm_output_ids = list(llm_output_ids)
+        thinker_text = getattr(output, "text", "") or ""
         if _has_native_duplex_prompt_metadata(mm_output):
             # The thinker's resumable duplex request reports cumulative
-            # output ids, but earlier segments are already folded into the
-            # prompt by the scheduler session update, and the forwarded
+            # output ids/text, but earlier segments are already folded into
+            # the prompt by the scheduler session update, and the forwarded
             # hidden states only cover the current prompt + current segment.
             # Hand stage 1 exactly one segment per handoff so token/hidden
-            # alignment holds and the talker prompt grows linearly with new
-            # tokens instead of quadratically.
-            llm_output_ids = _native_duplex_segment_output_ids(
+            # alignment holds, the talker prompt grows linearly with new
+            # tokens instead of quadratically, and downstream transcripts
+            # carry per-unit deltas instead of re-sending the whole reply.
+            llm_output_ids, thinker_text = _native_duplex_segment_output_ids(
                 llm_output_ids,
+                thinker_text,
                 _streaming_context,
                 request_id=str(llm_output.request_id),
             )
@@ -264,9 +273,6 @@ def llm2tts(
         thinker_hidden_states = latent.detach()
         if thinker_hidden_states.ndim == 3 and thinker_hidden_states.shape[0] == 1:
             thinker_hidden_states = thinker_hidden_states.squeeze(0)
-
-        # Extract decoded text from thinker output for TTS text extraction
-        thinker_text = getattr(output, "text", "") or ""
 
         # Build full token sequence and extract TTS region
         full_token_ids = prompt_token_ids + llm_output_ids

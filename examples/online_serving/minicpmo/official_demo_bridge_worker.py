@@ -134,9 +134,22 @@ class _VllmSession:
         self.reader_task = asyncio.create_task(self._reader())
 
     async def _reader(self) -> None:
-        """Fold the vLLM realtime event stream into per-chunk decisions."""
+        """Fold the vLLM realtime event stream into per-chunk decisions.
+
+        The serving side keeps one response open for the whole spoken turn
+        and streams one audio/transcript delta pair per speak unit, so each
+        delta pair is flushed as its own per-chunk decision; ``audio.done``
+        and ``response.done`` arrive once per turn.
+        """
         assert self.ws is not None
         speak: dict | None = None
+
+        async def flush_speak() -> None:
+            nonlocal speak
+            if speak is not None and (speak["audio"] or speak["text"]):
+                await self.decisions.put(speak)
+            speak = None
+
         try:
             async for raw in self.ws:
                 msg = json.loads(raw)
@@ -145,6 +158,7 @@ class _VllmSession:
                 if isinstance(kv, int):
                     self.kv_cache_length = kv
                 if mtype == "response.listen":
+                    await flush_speak()
                     if msg.get("buffering") is True:
                         # Sub-chunk append still accumulating server-side;
                         # the official protocol has no such state, report listen.
@@ -152,8 +166,16 @@ class _VllmSession:
                     else:
                         await self.decisions.put({"is_listen": True})
                 elif mtype == "response.speak":
-                    speak = {"is_listen": False, "text": msg.get("text") or "", "audio": []}
+                    text = msg.get("text") or ""
+                    if speak is None:
+                        speak = {"is_listen": False, "text": text, "audio": []}
+                    elif text and text not in speak["text"]:
+                        speak["text"] += text
                 elif mtype in ("response.audio.delta", "response.output_audio.delta"):
+                    if speak is not None and speak["audio"]:
+                        # A new unit's audio while one is pending: flush the
+                        # previous unit as its own per-chunk decision.
+                        await flush_speak()
                     if speak is None:
                         speak = {"is_listen": False, "text": "", "audio": []}
                     delta = msg.get("delta") or msg.get("audio") or ""
@@ -163,11 +185,12 @@ class _VllmSession:
                     if speak is not None and isinstance(msg.get("delta"), str):
                         if msg["delta"] not in speak["text"]:
                             speak["text"] += msg["delta"]
+                    # Audio + transcript complete one speak unit.
+                    await flush_speak()
                 elif mtype in ("response.audio.done", "response.output_audio.done"):
-                    if speak is not None:
-                        await self.decisions.put(speak)
-                        speak = None
+                    await flush_speak()
                 elif mtype == "response.done":
+                    await flush_speak()
                     await self.decisions.put({"end_of_turn": True})
                 elif mtype == "error":
                     await self.decisions.put({"error": str(msg.get("error") or msg)})

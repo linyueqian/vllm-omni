@@ -2172,7 +2172,11 @@ class OmniDuplexSessionHandler:
                 current = self._native_data_plane_tasks.get(session.session_id)
                 if current is task:
                     self._native_data_plane_tasks.pop(session.session_id, None)
-                if close_reason is None:
+                if close_reason is None and not self._session_auto_responds(session):
+                    # Auto-respond sessions keep one resumable stage-1 stream
+                    # whose audio accumulates across speak units; the offset
+                    # must survive drain-task turnover or every unit re-sends
+                    # the reply audio from the start.
                     self._data_plane_audio_offsets.pop(request_id, None)
             if close_reason is None:
                 self._maybe_continue_native_response(send_json, session=session, expected_epoch=expected_epoch)
@@ -2859,6 +2863,13 @@ class OmniDuplexSessionHandler:
             token_ids=token_ids,
             finished=finished,
         )
+        # In auto-respond mode the model speaks one unit per audio chunk and
+        # signals the real end of its reply by deciding to LISTEN on a later
+        # unit (handled by the listen branch, which closes the response). A
+        # segment-finished speak unit must therefore keep the response open:
+        # closing it per unit resets the audio delta offsets and re-delivers
+        # the whole reply cumulatively with every unit.
+        unit_end_of_turn = finished and not (session is not None and self._session_auto_responds(session))
         if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
             logger.info(
                 "duplex data-plane output: request_id=%s finished=%s "
@@ -2921,7 +2932,7 @@ class OmniDuplexSessionHandler:
                     "audio_duration_ms": duration_ms,
                     "audio_text_mark": idx == last_idx,
                     "sample_rate_hz": sample_rate_hz,
-                    "end_of_turn": finished and idx == last_idx,
+                    "end_of_turn": unit_end_of_turn and idx == last_idx,
                     "uses_model_runner_scheduler": True,
                     "runner_kv_backed": True,
                     "runtime_impl": "scheduler_data_plane",
@@ -2956,7 +2967,7 @@ class OmniDuplexSessionHandler:
                     "runner_local_payload_ref": False,
                 }
             return
-        if session is not None and session.playback.sent_ms > 0 and finished:
+        if session is not None and session.playback.sent_ms > 0 and unit_end_of_turn:
             yield {
                 "supported": True,
                 "stage_role": "tts",
@@ -2997,7 +3008,7 @@ class OmniDuplexSessionHandler:
             "data_plane_request_id": data_plane_request_id,
             "text": text if isinstance(text, str) else "",
             "audio_data": "",
-            "end_of_turn": finished,
+            "end_of_turn": unit_end_of_turn,
             "uses_model_runner_scheduler": True,
             "runner_kv_backed": True,
             "runtime_impl": "scheduler_data_plane",

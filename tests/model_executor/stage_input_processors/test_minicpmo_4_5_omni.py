@@ -457,6 +457,7 @@ def test_llm2tts_native_duplex_hands_off_segment_deltas():
     converted1 = llm2tts([handoff1], prompt=[{}], _streaming_context=streaming_context)
     info1 = converted1[0]["model_intermediate_buffer"]
     assert info1["ids"]["output"] == seg1_output
+    assert info1["llm_output_text"] == ["hello"]
     assert converted1[0]["prompt_token_ids"] == [21, 22]
 
     # Segment 2: prompt now contains the folded segment-1 tokens; the
@@ -467,6 +468,9 @@ def test_llm2tts_native_duplex_hands_off_segment_deltas():
     converted2 = llm2tts([handoff2], prompt=[{}], _streaming_context=streaming_context)
     info2 = converted2[0]["model_intermediate_buffer"]
     assert info2["ids"]["output"] == seg2_output
+    # Cumulative text "hello" was fully delivered with segment 1; only the
+    # delta (empty here) rides along with segment 2.
+    assert info2["llm_output_text"] == [""]
     assert converted2[0]["prompt_token_ids"] == [31]
 
 
