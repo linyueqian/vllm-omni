@@ -6,6 +6,7 @@ import binascii
 import inspect
 import json
 import os
+import time
 from collections.abc import AsyncGenerator
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -2645,6 +2646,8 @@ class OmniDuplexSessionHandler:
                 "model_listen": model_listen,
             }
             self._attach_native_runtime_metadata(payload, native_result)
+            if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
+                logger.info("native event sent: response.listen t=%.3f", time.monotonic())
             await send_json(payload)
             response_id = session.active_response_id
             if response_id is not None:
@@ -2760,6 +2763,8 @@ class OmniDuplexSessionHandler:
         if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) > 0:
             payload["sample_rate_hz"] = int(sample_rate_hz)
         self._attach_native_runtime_metadata(payload, native_result)
+        if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
+            logger.info("native event sent: audio.delta t=%.3f", time.monotonic())
         await send_json(payload)
         if end_of_turn:
             data_plane_request_id = native_result.get("data_plane_request_id")
