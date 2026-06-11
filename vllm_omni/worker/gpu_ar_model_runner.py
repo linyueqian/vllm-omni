@@ -215,6 +215,26 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         except (TypeError, ValueError):
             return None
 
+    def _publish_duplex_row_sessions(self, duplex_rows: list[int]) -> None:
+        """Expose row -> duplex session id so the model sampler can record
+        per-session state (e.g. the segment's sampled terminator token, which
+        the scheduler session update discards before the next append)."""
+        if not duplex_rows:
+            if getattr(self.model, "_minicpmo45_duplex_row_sessions", None):
+                self.model._minicpmo45_duplex_row_sessions = {}
+            return
+        req_ids = [str(req_id) for req_id in getattr(self.input_batch, "req_ids", [])]
+        row_sessions: dict[int, str] = {}
+        for row_idx in duplex_rows:
+            if row_idx >= len(req_ids):
+                continue
+            info = self._request_duplex_intermediate_info(req_ids[row_idx])
+            duplex = info.get("duplex") if isinstance(info, dict) else None
+            session_id = duplex.get("session_id") if isinstance(duplex, dict) else None
+            if isinstance(session_id, str) and session_id:
+                row_sessions[row_idx] = session_id
+        self.model._minicpmo45_duplex_row_sessions = row_sessions
+
     def _apply_duplex_force_listen_logits(
         self,
         logits: torch.Tensor,
@@ -1001,6 +1021,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         self.input_batch.positions[self.input_batch.logits_indices],
                     )
                 self._apply_duplex_force_listen_logits(logits, sampling_metadata, duplex_rows)
+                self._publish_duplex_row_sessions(duplex_rows)
                 sampler_output = self._call_model_sampler(
                     model_sample,
                     logits,

@@ -37,6 +37,7 @@ class _MiniCPMO45Stage0SessionState:
     prepared_input_token_ids: list[int] = field(default_factory=list)
     prepared_result: dict[str, Any] = field(default_factory=dict)
     audio_past_key_values: Any | None = None
+    pending_terminator_token: int | None = None
 
 
 class MiniCPMO45Stage0DuplexRuntime:
@@ -440,7 +441,14 @@ class MiniCPMO45Stage0DuplexRuntime:
                 # Official duplex closes every unit (finalize_unit feeds the
                 # sampled terminator + </unit>) before the next <unit> opens.
                 # The scheduler session update discards the previous segment's
-                # sampled terminator token, so only the closure is appended.
+                # sampled terminator token, so it is re-injected here ahead of
+                # the closure; the model's listen/speak policy depends on
+                # seeing its own past decisions in context.
+                pending_terminator = state.pending_terminator_token
+                if pending_terminator is not None and units_built == 0:
+                    state.pending_terminator_token = None
+                    embed_parts.append(self._embed_token(pending_terminator))
+                    token_ids.append(int(pending_terminator))
                 embed_parts.append(self._embed_token(self.unit_end_token_id))
                 token_ids.append(self.unit_end_token_id)
             embed_parts.append(self._embed_token(self.unit_token_id))

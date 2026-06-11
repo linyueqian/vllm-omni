@@ -659,14 +659,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         sampled_ids: list[int] = []
         for row_idx in range(logits.shape[0]):
             row_logits = logits[row_idx : row_idx + 1].clone()
-            sampled_ids.append(
-                self._sample_minicpmo45_native_duplex_row(
-                    row_logits,
-                    sampling_metadata,
-                    row_idx=row_idx,
-                    token_ids=token_ids,
-                )
+            sampled = self._sample_minicpmo45_native_duplex_row(
+                row_logits,
+                sampling_metadata,
+                row_idx=row_idx,
+                token_ids=token_ids,
             )
+            self._record_minicpmo45_duplex_terminator(row_idx, sampled, token_ids)
+            sampled_ids.append(sampled)
         return SamplerOutput(
             sampled_token_ids=torch.tensor(sampled_ids, device=logits.device, dtype=torch.int32).unsqueeze(-1),
             logprobs_tensors=None,
@@ -769,6 +769,31 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         logits = self._top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
         probs = F.softmax(logits, dim=-1)
         return int(torch.multinomial(probs, num_samples=1, generator=generator).item())
+
+    def _record_minicpmo45_duplex_terminator(self, row_idx: int, sampled: int, token_ids: dict[str, int]) -> None:
+        """Remember the segment's sampled terminator for the next append.
+
+        The scheduler session update discards the final sampled token of a
+        segment before the next streaming update, but the official duplex
+        format feeds it (terminator + </unit>) into the KV at every unit
+        boundary, and the model's listen/speak policy depends on seeing its
+        own past decisions. The duplex prefill re-injects it."""
+        terminators = {
+            token_ids.get("listen_token_id", -1),
+            token_ids.get("chunk_eos_token_id", -1),
+            token_ids.get("chunk_tts_eos_token_id", -1),
+            token_ids.get("turn_eos_token_id", -1),
+        }
+        if sampled not in terminators:
+            return
+        row_sessions = getattr(self, "_minicpmo45_duplex_row_sessions", None)
+        session_id = row_sessions.get(row_idx) if isinstance(row_sessions, dict) else None
+        if not session_id:
+            return
+        helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
+        state = helper.sessions.get(session_id) if helper is not None else None
+        if state is not None:
+            state.pending_terminator_token = int(sampled)
 
     def _minicpmo45_listen_decode_params(self) -> tuple[float, int | None]:
         """Listen-token decode controls, matching official StreamDecoder.decode.

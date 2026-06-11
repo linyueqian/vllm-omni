@@ -877,6 +877,10 @@ class Orchestrator:
                     + first_units * (audio_tokens_per_unit + 2)
                     - 1
                 )
+        if seq > 1 and duplex_payload_is_exact_chunks(payload):
+            # Every append after the first re-injects the previous segment's
+            # sampled terminator token ahead of the first unit closure.
+            token_budget += 1
         if final and duplex_payload_is_exact_chunks(payload):
             # A final append closes the turn with exactly one extra worker
             # unit (the zero-padded leftover, or one silence unit).
