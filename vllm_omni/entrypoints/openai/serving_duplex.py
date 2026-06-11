@@ -1221,7 +1221,14 @@ class OmniDuplexSessionHandler:
                                     cancelled = True
                                 asyncio.create_task(self._signal_runtime_session(session, "barge_in", event, send_json))
                                 actor.active_response_task = None
-                        elif not self._input_looks_like_speech(event, payload, session=session):
+                        elif not self._session_auto_responds(session) and not self._input_looks_like_speech(
+                            event, payload, session=session
+                        ):
+                            # Turn-mode only: skip silent chunks so they don't open a
+                            # response. In auto-respond (full-duplex) mode the model owns
+                            # the speak/listen decision and MUST receive silence units --
+                            # the official model typically starts speaking during the
+                            # silence after a question.
                             await send_json(
                                 {
                                     "type": "response.listen",
