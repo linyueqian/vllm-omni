@@ -3192,7 +3192,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # in place. The builders need to know whether the caller supplied audio
         # inline vs. via an uploaded voice.
         has_inline_ref_audio = request.ref_audio is not None
-        if self._adapter is not None:
+        if self._tts_model_type == "ming_flash_omni_tts":
+            # ming_flash_omni is intentionally NOT migrated onto the adapter
+            # framework in this PR (it has no registered adapter); keep it on the
+            # legacy inline dispatch so serving still works.
+            validation_error = self._validate_ming_flash_omni_tts_request(request)
+            if validation_error:
+                raise ValueError(validation_error)
+            prompt = self._build_ming_flash_omni_prompt(request)
+            tts_params = {}
+            qwen3_ref_audio_warmup_artifact_key = None
+        elif self._adapter is not None:
             validation_error = self._adapter.validate(request)
             if validation_error:
                 raise ValueError(validation_error)

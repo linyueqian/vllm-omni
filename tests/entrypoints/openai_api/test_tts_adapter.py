@@ -25,7 +25,6 @@ EXPECTED_MODEL_TYPES = {
     "cosyvoice3",
     "omnivoice",
     "covo_audio",
-    "ming_flash_omni_tts",
     "ming_tts",
     "moss_tts_nano",
     "moss_tts",
@@ -58,6 +57,12 @@ def test_resolve_qwen3_tts_class():
 def test_resolve_unknown_returns_none():
     assert resolve_adapter("not_a_real_model") is None
     assert resolve_adapter(None) is None
+
+
+def test_ming_flash_omni_not_migrated():
+    """ming_flash_omni is intentionally excluded from the adapter migration in
+    this PR; it stays on the legacy inline dispatch in serving_speech.py."""
+    assert resolve_adapter("ming_flash_omni_tts") is None
 
 
 def test_voxcpm2_resolves():
