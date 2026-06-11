@@ -2178,7 +2178,7 @@ class OmniDuplexSessionHandler:
     # official full-duplex behavior where the microphone keeps streaming
     # silence while the assistant speaks; replies span multiple units.
     _NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO = base64.b64encode(bytes(16000 * 4)).decode("ascii")
-    _NATIVE_RESPONSE_MAX_CONTINUATION_UNITS = 30
+    _NATIVE_RESPONSE_MAX_CONTINUATION_UNITS = 8
 
     def _native_response_continuations_remaining(self, session: DuplexSession, response_id: str) -> bool:
         prev_response_id, count = self._native_response_continuations.get(session.session_id, (response_id, 0))
