@@ -268,7 +268,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             seq = int(seq) if seq is not None else None
         except (TypeError, ValueError):
             seq = None
-        result = helper._stage_prefill_embeddings_only(state, audio_waveform, seq=seq)
+        result = helper._stage_prefill_embeddings_only(
+            state,
+            audio_waveform,
+            seq=seq,
+            final=bool(duplex.get("final")),
+        )
         update_result = dict(result)
         update_result.pop("inputs_embeds", None)
         if result.get("success") is not True:

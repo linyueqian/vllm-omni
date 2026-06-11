@@ -370,6 +370,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         audio_waveform: Any,
         *,
         seq: int | None = None,
+        final: bool = False,
     ) -> dict[str, Any]:
         """Build scheduler-owned Stage0 input embeddings for one audio append.
 
@@ -407,9 +408,19 @@ class MiniCPMO45Stage0DuplexRuntime:
         # Consume every complete chunk in the buffer so the appended span and
         # the scheduler's slot reservation for this append agree exactly.
         # Surplus slots become pad embeddings inside the KV and corrupt the
-        # model, so leftover audio must stay buffered, never padded.
+        # model, so leftover audio must stay buffered, never padded. A final
+        # append closes the turn with exactly one extra unit: the zero-padded
+        # leftover if any, otherwise one full silence unit, giving the model
+        # the official post-turn silence beat at its decision step.
         units_built = 0
-        while len(state.audio_buffer) >= chunk_size:
+        final_extra_done = False
+        while True:
+            if len(state.audio_buffer) < chunk_size:
+                if not final or final_extra_done:
+                    break
+                pad = np.zeros(chunk_size - len(state.audio_buffer), dtype=np.float32)
+                state.audio_buffer = np.concatenate([state.audio_buffer, pad])
+                final_extra_done = True
             audio_chunk = state.audio_buffer[:chunk_size]
             batch_feature = self._process_streaming_audio(audio_chunk, state.audio_chunk_idx)
             for name, value in (

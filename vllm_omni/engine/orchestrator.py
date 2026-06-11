@@ -50,6 +50,7 @@ from vllm_omni.engine.duplex import (
     SessionMode,
     duplex_first_append_context_reserve,
     duplex_first_append_unit_count,
+    duplex_payload_is_exact_chunks,
     duplex_scheduler_token_budget,
 )
 from vllm_omni.engine.messages import (
@@ -876,6 +877,10 @@ class Orchestrator:
                     + first_units * (audio_tokens_per_unit + 2)
                     - 1
                 )
+        if final and duplex_payload_is_exact_chunks(payload):
+            # A final append closes the turn with exactly one extra worker
+            # unit (the zero-padded leftover, or one silence unit).
+            token_budget += 12
         token_id = 0
         extra_body = session.session_config.get("extra_body")
         raw_token_id = session.session_config.get("duplex_scheduler_token_id")
