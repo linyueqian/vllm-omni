@@ -240,6 +240,21 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             return input_ids, embeds, {}
 
+        prompt_len_meta = kwargs.get("duplex_prompt_len")
+        token_offset_meta = kwargs.get("duplex_token_offset", 0)
+        if (
+            isinstance(prompt_len_meta, int)
+            and isinstance(token_offset_meta, int)
+            and token_offset_meta >= prompt_len_meta
+        ):
+            # Decode step of the resumable duplex request: input_ids are the
+            # runner-sampled tokens and the normal embedding lookup is the
+            # correct input. Slicing the (prompt-only) duplex embeddings here
+            # would come up empty and pad-fill, feeding a </unit> embedding in
+            # place of every sampled token and corrupting generation.
+            embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
+            return input_ids, embeds, {}
+
         helper = self._duplex_data_plane_helper()
         session_id = str(duplex.get("session_id") or "")
         payload = duplex.get("payload")
