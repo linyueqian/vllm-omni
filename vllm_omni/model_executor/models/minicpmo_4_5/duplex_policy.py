@@ -17,6 +17,40 @@ class MiniCPMO45DuplexPolicy:
     TTS_HANDOFF_MODE = "append_tts_handoff"
     TTS_HANDOFF_TYPE = "minicpmo45_tts_handoff"
 
+    # Audio framing contract shared by serving, orchestrator, and worker.
+    # MiniCPM-o consumes 1 s units at 16 kHz and pools audio to one embedding
+    # per 100 ms, so a unit contributes exactly 10 audio embeddings plus the
+    # <unit> open (and a </unit> closure for every unit after the first).
+    # Scheduler token budgets must match the worker-built embeddings exactly:
+    # surplus slots become pad embeddings inside the KV and measurably corrupt
+    # the model's listen/speak behavior.
+    SAMPLE_RATE_HZ = 16000
+    CHUNK_SAMPLES = 16000
+    SAMPLES_PER_AUDIO_TOKEN = 1600
+
+    @classmethod
+    def audio_token_count(cls, sample_count: int) -> int:
+        """Audio embedding count for a clip of ``sample_count`` samples.
+
+        Matches the whole-clip encoder math (hop 160 mel frames -> CNN stride 2
+        -> avg-pool 5) for any multiple of ``SAMPLES_PER_AUDIO_TOKEN``; serving
+        normalizes clips to that boundary before this is used for budgets.
+        """
+        return max(0, int(sample_count) // cls.SAMPLES_PER_AUDIO_TOKEN)
+
+    @staticmethod
+    def session_context_texts(instructions: object, has_ref_audio: bool) -> tuple[str, str]:
+        """System-context prefix/suffix, matching MiniCPMODuplex.prepare()."""
+        system_prompt = (
+            instructions if isinstance(instructions, str) and instructions else "Streaming Omni Conversation."
+        )
+        prefix = f"<|im_start|>system\n{system_prompt}"
+        suffix = "<|im_end|>"
+        if has_ref_audio:
+            prefix += "\n<|audio_start|>"
+            suffix = "<|audio_end|>" + suffix
+        return prefix, suffix
+
     SPECIAL_TOKEN_FIELDS: dict[str, str] = {
         "unit_token_id": "<unit>",
         "unit_end_token_id": "</unit>",

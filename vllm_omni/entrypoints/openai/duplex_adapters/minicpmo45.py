@@ -19,11 +19,13 @@ class MiniCPMO45PcmAppendBuffer:
         self._buffer = bytearray()
         self._sample_rate_hz: int | None = None
         self._force_listen = False
+        self._emitted_first = False
 
     def clear(self) -> None:
         self._buffer.clear()
         self._sample_rate_hz = None
         self._force_listen = False
+        self._emitted_first = False
 
     def clear_force_listen(self) -> None:
         self._force_listen = False
@@ -64,10 +66,31 @@ class MiniCPMO45PcmAppendBuffer:
         if not flush and buffered_samples < min_samples:
             return None
 
-        emit_samples = buffered_samples if flush else min_samples
+        # Emit whole model chunks only: the engine reserves scheduler slots
+        # from the payload size and the worker consumes one unit per complete
+        # chunk, so partial chunks would turn into pad embeddings inside the
+        # model KV. On flush, the tail is zero-padded (silence) up to the
+        # chunk boundary instead. The very first emission is capped at one
+        # chunk because the worker's first unit consumes the official
+        # first-chunk window (1035 ms) rather than a plain chunk period;
+        # any remainder stays buffered for the next unit, like the official
+        # streaming_prefill buffer.
+        if not self._emitted_first:
+            emit_samples = min(min_samples, buffered_samples)
+            pad_samples = min_samples - emit_samples if flush else 0
+            if not flush and emit_samples < min_samples:
+                return None
+        elif flush:
+            emit_samples = buffered_samples
+            remainder = emit_samples % min_samples
+            pad_samples = (min_samples - remainder) if remainder else 0
+        else:
+            emit_samples = buffered_samples - (buffered_samples % min_samples)
+            pad_samples = 0
         emit_bytes = emit_samples * 4
-        emit_raw = bytes(self._buffer[:emit_bytes])
+        emit_raw = bytes(self._buffer[:emit_bytes]) + b"\x00" * (pad_samples * 4)
         del self._buffer[:emit_bytes]
+        self._emitted_first = True
 
         out = dict(payload)
         out["audio"] = base64.b64encode(emit_raw).decode("ascii")
@@ -123,6 +146,12 @@ class MiniCPMO45NativeDuplexServingAdapter:
         if ref_audio is None:
             default_ref = cls._default_ref_audio_path(config, model_config=model_config)
             if default_ref is None:
+                cls._apply_first_append_context_tokens(
+                    extra_body,
+                    model_config=model_config,
+                    instructions=config.instructions,
+                    ref_sample_count=None,
+                )
                 config.extra_body = extra_body
                 return
             wav_np, sr = cls._load_local_ref_audio(default_ref)
@@ -130,10 +159,22 @@ class MiniCPMO45NativeDuplexServingAdapter:
             wav_np, sr = await cls.resolve_ref_audio(ref_audio, model_config=model_config)
 
         wav_np = cls.normalize_ref_audio(wav_np, int(sr), target_sr=16000)
+        # Trim to a whole number of pooled audio embeddings (100 ms frames) so
+        # the first-append scheduler reserve can count them exactly.
+        usable = (len(wav_np) // MiniCPMO45DuplexPolicy.SAMPLES_PER_AUDIO_TOKEN) * (
+            MiniCPMO45DuplexPolicy.SAMPLES_PER_AUDIO_TOKEN
+        )
+        wav_np = wav_np[:usable]
         ref_audio_bytes = np.ascontiguousarray(wav_np, dtype=np.float32).tobytes()
         extra_body["ref_audio_data"] = base64.b64encode(ref_audio_bytes).decode("ascii")
         extra_body["ref_audio_format"] = "pcm_f32le"
         extra_body["ref_audio_sample_rate_hz"] = 16000
+        cls._apply_first_append_context_tokens(
+            extra_body,
+            model_config=model_config,
+            instructions=config.instructions,
+            ref_sample_count=len(wav_np),
+        )
         config.extra_body = extra_body
         config.ref_audio = None
 
@@ -161,6 +202,41 @@ class MiniCPMO45NativeDuplexServingAdapter:
             scheduler_token_id = cls._native_scheduler_token_id(model_config)
             if scheduler_token_id is not None:
                 extra_body["duplex_scheduler_token_id"] = scheduler_token_id
+
+    @classmethod
+    def _apply_first_append_context_tokens(
+        cls,
+        extra_body: dict[str, object],
+        *,
+        model_config: Any,
+        instructions: object,
+        ref_sample_count: int | None,
+    ) -> None:
+        """Precompute the exact session-context token count for the engine.
+
+        The first data-plane append carries the system template and optional
+        reference-audio embeddings ahead of the first unit. The engine
+        reserves scheduler slots from this count; an inexact count turns into
+        pad embeddings inside the model KV (surplus) or truncated context
+        (deficit), so it is computed with the same template and pooling math
+        the worker uses.
+        """
+        if "duplex_first_append_context_tokens" in extra_body:
+            return
+        tokenizer = cls._load_native_tokenizer(model_config)
+        if tokenizer is None:
+            return
+        prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
+            instructions,
+            ref_sample_count is not None,
+        )
+        try:
+            prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
+            suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
+        except Exception:
+            return
+        ref_tokens = MiniCPMO45DuplexPolicy.audio_token_count(ref_sample_count or 0)
+        extra_body["duplex_first_append_context_tokens"] = len(prefix_ids) + ref_tokens + len(suffix_ids)
 
     @staticmethod
     def _native_stage0_stop_token_ids(model_config: Any) -> list[int]:

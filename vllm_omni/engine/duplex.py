@@ -353,28 +353,53 @@ def duplex_data_plane_request_info(result: dict[str, object]) -> tuple[str | Non
     return None, None
 
 
+# Audio framing contract shared with serving and the MiniCPM-o worker
+# (MiniCPMO45DuplexPolicy): 1 s units at 16 kHz, one pooled audio embedding per
+# 100 ms, plus <unit> and a </unit> closure per unit. Slot budgets must match
+# the worker-built embeddings exactly: surplus slots become pad embeddings in
+# the KV and measurably corrupt the model's listen/speak behavior.
+_DUPLEX_CHUNK_SAMPLES = 16000
+_DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
+
+
+def _duplex_pcm_sample_count(payload: object) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    audio = payload.get("audio") or payload.get("data")
+    if payload.get("format") != "pcm_f32le" or not isinstance(audio, str):
+        return None
+    try:
+        raw = b64decode(audio, validate=True)
+    except (BinasciiError, ValueError):
+        return None
+    return len(raw) // 4
+
+
+def duplex_payload_is_exact_chunks(payload: object) -> bool:
+    """True when the payload is a whole number of model audio chunks."""
+    sample_count = _duplex_pcm_sample_count(payload)
+    return bool(sample_count) and sample_count % _DUPLEX_CHUNK_SAMPLES == 0
+
+
 def duplex_scheduler_token_budget(payload: object, *, default: int = 64) -> int:
-    """Estimate scheduler token slots for a duplex data-plane input.
+    """Scheduler token slots for a duplex data-plane input.
 
     vLLM schedulers still need token-shaped admission data. Keep that budget
     calculation inside the duplex data-plane layer instead of letting clients
     or serving adapters smuggle placeholder-token counts through request
     payloads.
     """
-    if not isinstance(payload, dict):
+    sample_count = _duplex_pcm_sample_count(payload)
+    if sample_count is None:
         return max(1, int(default))
-    audio = payload.get("audio") or payload.get("data")
-    if payload.get("format") != "pcm_f32le" or not isinstance(audio, str):
-        return max(1, int(default))
-    try:
-        raw = b64decode(audio, validate=True)
-    except (BinasciiError, ValueError):
-        return max(1, int(default))
-    sample_count = max(1, len(raw) // 4)
-    # MiniCPM-o's audio encoder pools to one token per 100 ms (1600 samples at
-    # 16 kHz). Keep the margin tight: unused slots become pad tokens that enter
-    # the KV in front of the chunk embeddings.
-    return max(16, min(768, sample_count // 1600 + 8))
+    sample_count = max(1, sample_count)
+    if sample_count % _DUPLEX_CHUNK_SAMPLES == 0:
+        # Exact path used by the serving adapters: per unit, a </unit>
+        # closure + <unit> + the pooled audio embeddings.
+        units = sample_count // _DUPLEX_CHUNK_SAMPLES
+        return units * (2 + _DUPLEX_CHUNK_SAMPLES // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN)
+    # Legacy partial payloads: keep a small margin; the worker pads.
+    return max(16, min(768, sample_count // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN + 8))
 
 
 def duplex_first_append_context_reserve(session_config: object) -> int:
@@ -385,13 +410,19 @@ def duplex_first_append_context_reserve(session_config: object) -> int:
     reserve the worker-built embeddings can exceed the scheduled prompt slots
     and the audio tail would be truncated.
     """
-    reserve = 48  # system prompt template tokens
     if not isinstance(session_config, dict):
-        return reserve
+        return 48
     sources: list[dict[str, Any]] = [session_config]
     extra_body = session_config.get("extra_body")
     if isinstance(extra_body, dict):
         sources.append(extra_body)
+    # Serving adapters precompute the exact context token count (system
+    # template via the tokenizer + pooled reference-audio embeddings).
+    for source in sources:
+        exact = source.get("duplex_first_append_context_tokens")
+        if isinstance(exact, int) and exact >= 0:
+            return exact
+    reserve = 48  # heuristic system prompt template tokens
     for source in sources:
         ref = source.get("ref_audio_data")
         if not isinstance(ref, str) or not ref:
@@ -401,6 +432,6 @@ def duplex_first_append_context_reserve(session_config: object) -> int:
         except (BinasciiError, ValueError):
             continue
         # pcm_f32le reference audio at one pooled token per 100 ms frame.
-        reserve += max(0, (len(raw) // 4) // 1600 + 8)
+        reserve += max(0, (len(raw) // 4) // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN + 8)
         break
     return reserve

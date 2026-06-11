@@ -244,19 +244,16 @@ class MiniCPMO45Stage0DuplexRuntime:
         if not self._stage_runtime_ready():
             return
         self._require_special_token_ids()
-        instructions = session_config.get("instructions")
-        system_prompt = (
-            instructions if isinstance(instructions, str) and instructions else "Streaming Omni Conversation."
-        )
         ref_audio = self._decode_ref_audio_from_session_config(session_config)
         # Matches MiniCPMODuplex.prepare() in the released checkpoint's
         # modeling_minicpmo.py: the <|audio_start|>/<|audio_end|> markers are
-        # only present when reference audio is embedded between them.
-        prefix = f"<|im_start|>system\n{system_prompt}"
-        suffix = "<|im_end|>"
-        if ref_audio is not None:
-            prefix += "\n<|audio_start|>"
-            suffix = "<|audio_end|>" + suffix
+        # only present when reference audio is embedded between them. The
+        # template is shared with the serving adapter so the first-append
+        # scheduler reserve can count these tokens exactly.
+        prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
+            session_config.get("instructions"),
+            ref_audio is not None,
+        )
         for token_id in self._encode_text(prefix):
             state.context_embeds.append(self._embed_token(token_id))
             state.context_token_ids.append(token_id)
@@ -401,38 +398,50 @@ class MiniCPMO45Stage0DuplexRuntime:
                 f"audio not enough: need {chunk_size} samples, only {len(state.audio_buffer)}",
             )
 
-        audio_chunk = state.audio_buffer[:chunk_size]
-        batch_feature = self._process_streaming_audio(audio_chunk, state.audio_chunk_idx)
-        for name, value in (
-            ("chunk_idx", state.audio_chunk_idx),
-            ("use_extra_context", True),
-            ("prefix_extra_frames", 0 if state.audio_chunk_idx == 0 else 2),
-            ("suffix_extra_frames", 2),
-        ):
-            with suppress(Exception):
-                setattr(batch_feature, name, value)
-        audio_embeds = self._stage_audio_embeddings(batch_feature, state=state)
-        if audio_embeds is None:
-            return self._stage_prefill_result(False, start_time, "streaming audio embedding returned empty")
-
         embed_parts: list[Any] = []
         token_ids: list[int] = []
         if state.audio_chunk_idx == 0 and state.context_embeds:
             embed_parts.extend(state.context_embeds)
             token_ids.extend(state.context_token_ids)
-        if state.audio_chunk_idx > 0:
-            # Official duplex closes every unit (finalize_unit feeds the sampled
-            # terminator + </unit>) before the next <unit> opens. The scheduler
-            # session update discards the previous segment's sampled terminator
-            # token, so only the </unit> closure is appended here.
-            embed_parts.append(self._embed_token(self.unit_end_token_id))
-            token_ids.append(self.unit_end_token_id)
-        embed_parts.append(self._embed_token(self.unit_token_id))
-        token_ids.append(self.unit_token_id)
-        embed_parts.append(audio_embeds)
-        token_ids.extend(
-            [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
-        )
+
+        # Consume every complete chunk in the buffer so the appended span and
+        # the scheduler's slot reservation for this append agree exactly.
+        # Surplus slots become pad embeddings inside the KV and corrupt the
+        # model, so leftover audio must stay buffered, never padded.
+        units_built = 0
+        while len(state.audio_buffer) >= chunk_size:
+            audio_chunk = state.audio_buffer[:chunk_size]
+            batch_feature = self._process_streaming_audio(audio_chunk, state.audio_chunk_idx)
+            for name, value in (
+                ("chunk_idx", state.audio_chunk_idx),
+                ("use_extra_context", True),
+                ("prefix_extra_frames", 0 if state.audio_chunk_idx == 0 else 2),
+                ("suffix_extra_frames", 2),
+            ):
+                with suppress(Exception):
+                    setattr(batch_feature, name, value)
+            audio_embeds = self._stage_audio_embeddings(batch_feature, state=state)
+            if audio_embeds is None:
+                if units_built == 0:
+                    return self._stage_prefill_result(False, start_time, "streaming audio embedding returned empty")
+                break
+            if state.audio_chunk_idx > 0:
+                # Official duplex closes every unit (finalize_unit feeds the
+                # sampled terminator + </unit>) before the next <unit> opens.
+                # The scheduler session update discards the previous segment's
+                # sampled terminator token, so only the closure is appended.
+                embed_parts.append(self._embed_token(self.unit_end_token_id))
+                token_ids.append(self.unit_end_token_id)
+            embed_parts.append(self._embed_token(self.unit_token_id))
+            token_ids.append(self.unit_token_id)
+            embed_parts.append(audio_embeds)
+            token_ids.extend(
+                [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
+            )
+            state.audio_buffer = state.audio_buffer[self._consumed_audio_samples(state.audio_chunk_idx, chunk_size) :]
+            state.audio_chunk_idx += 1
+            units_built += 1
+            chunk_size = self._streaming_chunk_size()
         # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
         # turn is opened once at session init; re-emitting the turn-open prefix per chunk
         # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
@@ -442,8 +451,6 @@ class MiniCPMO45Stage0DuplexRuntime:
         import torch
 
         inputs_embeds = torch.cat([self._as_2d_tensor(embed) for embed in embed_parts], dim=0)
-        state.audio_buffer = state.audio_buffer[self._consumed_audio_samples(state.audio_chunk_idx, chunk_size) :]
-        state.audio_chunk_idx += 1
         state.runner_context_len += int(inputs_embeds.shape[0])
         result = self._stage_prefill_result(True, start_time)
         result.update(
