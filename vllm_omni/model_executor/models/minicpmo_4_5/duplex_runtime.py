@@ -216,11 +216,16 @@ class MiniCPMO45Stage0DuplexRuntime:
                 mode="exact",
                 chunk_ms=int(self._stage_param("chunk_ms", 1000)),
                 first_chunk_ms=int(self._stage_param("first_chunk_ms", 1035)),
-                cnn_redundancy_ms=int(self._stage_param("cnn_redundancy_ms", 0)),
+                cnn_redundancy_ms=int(self._stage_param("cnn_redundancy_ms", 20)),
                 enable_sliding_window=True,
                 slide_trigger_seconds=30.0,
                 slide_stride_seconds=10.0,
             )
+            # Match official init_streaming_processor: reset the streaming mel-processor
+            # buffers at session init (modeling_minicpmo_unified.py:207).
+            reset_streaming = getattr(self.processor, "reset_streaming", None)
+            if callable(reset_streaming):
+                reset_streaming()
             return
         configure_streaming = getattr(self.processor, "configure_streaming", None)
         if callable(configure_streaming):
@@ -418,11 +423,11 @@ class MiniCPMO45Stage0DuplexRuntime:
         token_ids.extend(
             [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
         )
-        assistant_bos_ids = self._assistant_tts_bos_token_ids()
-        prompt_suffix_len = len(assistant_bos_ids)
-        if assistant_bos_ids:
-            embed_parts.append(self._embed_token_ids(assistant_bos_ids))
-            token_ids.extend(assistant_bos_ids)
+        # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
+        # turn is opened once at session init; re-emitting the turn-open prefix per chunk
+        # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
+        # model-generated and tracked via current_turn_ended (mirrors streaming_generate).
+        prompt_suffix_len = 0
 
         import torch
 
