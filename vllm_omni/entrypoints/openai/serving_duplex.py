@@ -558,12 +558,6 @@ class OmniDuplexSessionHandler:
                 return
             append_epoch = session.epoch
             response_bound = final or precreate_response
-            if response_bound and isinstance(payload, dict) and payload.get("force_listen") is not True:
-                # An explicit commit/response.create asks for a reply now:
-                # suppress the listen decision for this segment (official
-                # listen_prob_scale -> 0 semantics). Per-chunk auto-response
-                # appends stay fully model-driven.
-                payload = {**payload, "force_speak": True}
             if response_bound:
                 session.active_request_id = self._native_stage0_request_id(session, append_epoch)
             if final:
@@ -2217,8 +2211,11 @@ class OmniDuplexSessionHandler:
             "audio": self._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO,
             "format": "pcm_f32le",
             "sample_rate_hz": 16000,
-            "force_speak": True,
         }
+        if count + 1 >= self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS:
+            # Last chance before the cap: make the model speak rather than
+            # leaving the response open forever.
+            payload["force_speak"] = True
 
         async def _continue() -> None:
             try:
