@@ -512,18 +512,26 @@ class OmniDuplexSessionHandler:
         async def flush_native_audio_buffer(*, send_json) -> tuple[bool, bool]:
             if session is None:
                 return True, False
-            flushed = native_audio_buffer.flush(chunk_period_ms=session.capabilities.chunk_period_ms or 1000)
-            if flushed is None:
-                return True, False
-            append_epoch = session.epoch
-            return await self._append_runtime_input(
-                session,
-                flushed,
-                final=True,
-                send_json=send_json,
-                mode="append_audio_chunk",
-                expected_epoch=append_epoch,
-            )
+            # Drain in whole-chunk payloads: the buffer's first emission is
+            # capped at one chunk (worker first-unit window), so a long first
+            # commit may need several appends to reach the model.
+            result: tuple[bool, bool] | None = None
+            while True:
+                flushed = native_audio_buffer.flush(chunk_period_ms=session.capabilities.chunk_period_ms or 1000)
+                if flushed is None:
+                    break
+                append_epoch = session.epoch
+                result = await self._append_runtime_input(
+                    session,
+                    flushed,
+                    final=not native_audio_buffer.has_pending(),
+                    send_json=send_json,
+                    mode="append_audio_chunk",
+                    expected_epoch=append_epoch,
+                )
+                if result[0] is False:
+                    return result
+            return result if result is not None else (True, False)
 
         def native_response_in_progress() -> bool:
             nonlocal native_response_emitted
