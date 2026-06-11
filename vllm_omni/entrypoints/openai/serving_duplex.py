@@ -2180,6 +2180,12 @@ class OmniDuplexSessionHandler:
     _NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO = base64.b64encode(bytes(16000 * 4)).decode("ascii")
     _NATIVE_RESPONSE_MAX_CONTINUATION_UNITS = 30
 
+    def _native_response_continuations_remaining(self, session: DuplexSession, response_id: str) -> bool:
+        prev_response_id, count = self._native_response_continuations.get(session.session_id, (response_id, 0))
+        if prev_response_id != response_id:
+            count = 0
+        return count < self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS
+
     def _maybe_continue_native_response(
         self,
         send_json,
@@ -2612,6 +2618,16 @@ class OmniDuplexSessionHandler:
             await send_json(payload)
             response_id = session.active_response_id
             if response_id is not None:
+                if self._native_response_continuations_remaining(session, response_id):
+                    # The official model often listens for a silence beat or
+                    # two before answering; keep the response open and give it
+                    # the next silence unit as a decision point.
+                    self._maybe_continue_native_response(
+                        send_json,
+                        session=session,
+                        expected_epoch=expected_epoch,
+                    )
+                    return close_reason, emitted_response
                 session.end_response(commit_text=False)
                 await send_json(
                     {
