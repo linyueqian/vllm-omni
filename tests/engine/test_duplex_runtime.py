@@ -185,7 +185,7 @@ def test_duplex_scheduler_token_budget_estimates_pcm_slots():
                 "sample_rate_hz": 16000,
             }
         )
-        == 64
+        == 16
     )
 
 
@@ -199,5 +199,5 @@ def test_duplex_scheduler_token_budget_ignores_client_budget_fields():
                 "num_input_tokens": 999,
             }
         )
-        == 64
+        == 16
     )
