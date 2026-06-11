@@ -363,6 +363,8 @@ class OmniDuplexSessionHandler:
         self._turn_controller = DuplexTurnController()
         self._data_plane_audio_offsets: dict[str, int] = {}
         self._native_data_plane_tasks: dict[str, asyncio.Task[None]] = {}
+        # session_id -> (response_id, silence continuation units already sent)
+        self._native_response_continuations: dict[str, tuple[str, int]] = {}
         self._response_conversation_modes: dict[str, str] = {}
 
     async def handle_session(
@@ -2171,10 +2173,67 @@ class OmniDuplexSessionHandler:
                     self._native_data_plane_tasks.pop(session.session_id, None)
                 if close_reason is None:
                     self._data_plane_audio_offsets.pop(request_id, None)
+            if close_reason is None:
+                self._maybe_continue_native_response(send_json, session=session, expected_epoch=expected_epoch)
 
         task = asyncio.create_task(_run())
         self._native_data_plane_tasks[session.session_id] = task
         return True
+
+    # One model unit (1 s at 16 kHz) of pcm_f32le silence, matching the
+    # official full-duplex behavior where the microphone keeps streaming
+    # silence while the assistant speaks; replies span multiple units.
+    _NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO = base64.b64encode(bytes(16000 * 4)).decode("ascii")
+    _NATIVE_RESPONSE_MAX_CONTINUATION_UNITS = 30
+
+    def _maybe_continue_native_response(
+        self,
+        send_json,
+        *,
+        session: DuplexSession,
+        expected_epoch: int | None,
+    ) -> None:
+        """Keep an open spoken response going with silence units.
+
+        The model generates one unit per append; official replies span
+        several units, so while a response is still open after a segment
+        finishes, append a silence unit (the official microphone-keeps-
+        streaming beat) until the model ends the turn or the cap is reached.
+        """
+        response_id = session.active_response_id
+        if response_id is None or session.state == DuplexSessionState.CLOSED:
+            self._native_response_continuations.pop(session.session_id, None)
+            return
+        if expected_epoch is not None and session.epoch != expected_epoch:
+            return
+        prev_response_id, count = self._native_response_continuations.get(session.session_id, (response_id, 0))
+        if prev_response_id != response_id:
+            count = 0
+        if count >= self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS:
+            return
+        self._native_response_continuations[session.session_id] = (response_id, count + 1)
+        payload = {
+            "type": "audio",
+            "audio": self._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO,
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+            "force_speak": True,
+        }
+
+        async def _continue() -> None:
+            try:
+                await self._append_runtime_input(
+                    session,
+                    payload,
+                    final=False,
+                    send_json=send_json,
+                    mode="append_audio_chunk",
+                    expected_epoch=expected_epoch,
+                )
+            except Exception as exc:
+                logger.exception("Failed to continue duplex native response: %s", exc)
+
+        asyncio.create_task(_continue())
 
     async def _cancel_native_data_plane_stream(self, session: DuplexSession) -> bool:
         task = self._native_data_plane_tasks.pop(session.session_id, None)

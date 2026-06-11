@@ -247,18 +247,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 continue
             seq = self._request_duplex_seq(req_id)
             segment_key = (req_id, seq if seq is not None else -1)
-            if segment_key in self._duplex_force_listen_applied_segments:
+            if force_listen and segment_key in self._duplex_force_listen_applied_segments:
                 continue
             row_outputs = output_token_ids[row_idx] if row_idx < len(output_token_ids) else []
             if force_listen:
                 logits[row_idx, :] = float("-inf")
                 logits[row_idx, listen_id] = 0.0
+                self._duplex_force_listen_applied_segments.add(segment_key)
             else:
-                # Explicit response.create: the decision token must start a
-                # spoken reply, mirroring the official listen_prob_scale -> 0
-                # knob, so only the listen token is suppressed.
+                # Response-bound segment: the reply must start (and keep
+                # going) instead of listening, mirroring the official
+                # mid-turn listen -> tts_bos replacement, so the listen token
+                # is suppressed at every step; the turn still ends through
+                # turn_eos/chunk_eos.
                 logits[row_idx, listen_id] = float("-inf")
-            self._duplex_force_listen_applied_segments.add(segment_key)
             if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
                 logger.info(
                     "MiniCPM-o duplex %s logits: req_id=%s seq=%s row=%s prior_output_len=%s listen_id=%s",
