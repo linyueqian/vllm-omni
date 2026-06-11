@@ -2204,6 +2204,11 @@ class OmniDuplexSessionHandler:
         if response_id is None or session.state == DuplexSessionState.CLOSED:
             self._native_response_continuations.pop(session.session_id, None)
             return
+        if self._session_auto_responds(session):
+            # Full-duplex clients stream their own (silence) chunks
+            # continuously; server-injected silence units would double-feed
+            # the stream.
+            return
         if expected_epoch is not None and session.epoch != expected_epoch:
             return
         prev_response_id, count = self._native_response_continuations.get(session.session_id, (response_id, 0))
@@ -2618,7 +2623,9 @@ class OmniDuplexSessionHandler:
             await send_json(payload)
             response_id = session.active_response_id
             if response_id is not None:
-                if self._native_response_continuations_remaining(session, response_id):
+                if not self._session_auto_responds(session) and self._native_response_continuations_remaining(
+                    session, response_id
+                ):
                     # The official model often listens for a silence beat or
                     # two before answering; keep the response open and give it
                     # the next silence unit as a decision point.
