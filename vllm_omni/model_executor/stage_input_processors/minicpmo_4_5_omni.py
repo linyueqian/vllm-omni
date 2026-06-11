@@ -145,6 +145,32 @@ def _native_tts_boundary_token_ids(special_token_ids):
     }
 
 
+def _native_duplex_segment_output_ids(
+    output_ids: list[int],
+    streaming_context,
+    *,
+    request_id: str,
+) -> list[int]:
+    """Slice the cumulative thinker output down to the current segment.
+
+    Tracks how many output tokens were already handed to the talker in the
+    orchestrator's streaming bridge state. A new request id (new epoch after
+    barge-in) or a shrunken output list resets the counter.
+    """
+    bridge_states = getattr(streaming_context, "bridge_states", None)
+    if not isinstance(bridge_states, dict):
+        return output_ids
+    state = bridge_states.setdefault("minicpmo45_tts_handoff", {})
+    if state.get("request_id") != request_id:
+        state["request_id"] = request_id
+        state["sent_output_len"] = 0
+    sent_len = state.get("sent_output_len", 0)
+    if not isinstance(sent_len, int) or sent_len < 0 or sent_len > len(output_ids):
+        sent_len = 0
+    state["sent_output_len"] = len(output_ids)
+    return output_ids[sent_len:]
+
+
 def _build_tts_scheduler_prompt_token_ids(
     tts_token_ids: torch.Tensor | None,
     llm_output_ids: list[int],
@@ -207,7 +233,26 @@ def llm2tts(
         llm_output_ids = getattr(output, "token_ids", None)
         if llm_output_ids is None:
             llm_output_ids = getattr(output, "cumulative_token_ids", [])
-        llm_output_ids = list(llm_output_ids) if not isinstance(llm_output_ids, list) else llm_output_ids
+        # Always copy: CompletionOutput.token_ids can alias the upstream
+        # detokenizer's live token list. Forwarding that exact object as the
+        # talker prompt makes the stage-1 streaming update extend the list
+        # with itself (state and update bind the same object), doubling the
+        # thinker's recorded output every segment until the TTS engine input
+        # buffer overflows.
+        llm_output_ids = list(llm_output_ids)
+        if _has_native_duplex_prompt_metadata(mm_output):
+            # The thinker's resumable duplex request reports cumulative
+            # output ids, but earlier segments are already folded into the
+            # prompt by the scheduler session update, and the forwarded
+            # hidden states only cover the current prompt + current segment.
+            # Hand stage 1 exactly one segment per handoff so token/hidden
+            # alignment holds and the talker prompt grows linearly with new
+            # tokens instead of quadratically.
+            llm_output_ids = _native_duplex_segment_output_ids(
+                llm_output_ids,
+                _streaming_context,
+                request_id=str(llm_output.request_id),
+            )
         prompt_token_ids_len = len(prompt_token_ids)
 
         latent = mm_output.get("latent", None)

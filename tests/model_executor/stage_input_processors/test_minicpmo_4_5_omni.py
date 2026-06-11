@@ -403,3 +403,84 @@ def test_tts_streaming_non_final_chunk_does_not_mark_extra_rows_eos():
     sampled = torch.argmax(logits, dim=-1).tolist()
 
     assert sampled == [1, 1, 1]
+
+
+def _native_duplex_meta():
+    return {
+        "tts_bos_token_id": 9301,
+        "tts_eos_token_id": 9302,
+        "listen_token_id": 9303,
+        "speak_token_id": 9304,
+        "tts_pad_token_id": 9305,
+        "unit_token_id": 9306,
+        "unit_end_token_id": 9307,
+        "chunk_eos_token_id": 9308,
+        "chunk_tts_eos_token_id": 9309,
+        "turn_eos_token_id": 9310,
+    }
+
+
+def _native_duplex_handoff(request_id, prompt_ids, cumulative_output_ids):
+    latent = torch.arange(
+        (len(prompt_ids) + len(cumulative_output_ids)) * 4,
+        dtype=torch.float16,
+    ).reshape(-1, 4)
+    output = SimpleNamespace(
+        token_ids=cumulative_output_ids,
+        text="hello",
+        multimodal_output={
+            "latent": latent,
+            "duplex_prompt_token_ids": list(prompt_ids),
+            "meta": _native_duplex_meta(),
+        },
+    )
+    return SimpleNamespace(
+        request_id=request_id,
+        prompt_token_ids=[0, 0, 0],
+        outputs=[output],
+    )
+
+
+def test_llm2tts_native_duplex_hands_off_segment_deltas():
+    """Each duplex handoff must carry only the current segment's tokens.
+
+    The thinker's resumable request reports cumulative output ids while
+    earlier segments are already folded into the prompt, so re-forwarding
+    the full list misaligns the hidden states and grows the talker prompt
+    without bound.
+    """
+    streaming_context = SimpleNamespace(bridge_states={})
+
+    # Segment 1: speak + two text tokens + chunk_eos.
+    seg1_output = [9304, 21, 22, 9308]
+    handoff1 = _native_duplex_handoff("duplex-delta", [101, 102], list(seg1_output))
+    converted1 = llm2tts([handoff1], prompt=[{}], _streaming_context=streaming_context)
+    info1 = converted1[0]["model_intermediate_buffer"]
+    assert info1["ids"]["output"] == seg1_output
+    assert converted1[0]["prompt_token_ids"] == [21, 22]
+
+    # Segment 2: prompt now contains the folded segment-1 tokens; the
+    # cumulative output list still carries segment 1 ahead of segment 2.
+    seg2_output = [9304, 31, 9308]
+    prompt2 = [101, 102, *seg1_output, 555]
+    handoff2 = _native_duplex_handoff("duplex-delta", prompt2, [*seg1_output, *seg2_output])
+    converted2 = llm2tts([handoff2], prompt=[{}], _streaming_context=streaming_context)
+    info2 = converted2[0]["model_intermediate_buffer"]
+    assert info2["ids"]["output"] == seg2_output
+    assert converted2[0]["prompt_token_ids"] == [31]
+
+
+def test_llm2tts_never_aliases_thinker_token_list():
+    """The talker prompt must never be the thinker's live token list object.
+
+    CompletionOutput.token_ids can alias the upstream detokenizer's internal
+    list; forwarding that object lets the stage-1 streaming update extend the
+    list with itself, doubling the recorded output every segment.
+    """
+    live_token_list = [9304, 21, 22, 9308]
+    handoff = _native_duplex_handoff("duplex-alias", [101, 102], live_token_list)
+    converted = llm2tts([handoff], prompt=[{}])
+    scheduler_prompt = converted[0]["prompt_token_ids"]
+    assert scheduler_prompt is not live_token_list
+    scheduler_prompt.extend(scheduler_prompt)
+    assert live_token_list == [9304, 21, 22, 9308]
