@@ -21,6 +21,7 @@ to avoid OOM from vLLM's post-init KV-cache profiling. Mirrors qwen3_tts
 
 from __future__ import annotations
 
+import contextlib
 import tempfile
 import threading
 from collections.abc import Iterable
@@ -36,6 +37,30 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import reinit_rotary_inv_freq
 
 logger = init_logger(__name__)
+
+
+@contextlib.contextmanager
+def _hf_load_without_tp_warmup():
+    """Work around a transformers 5.8.x crash loading some trust_remote_code LMs.
+
+    ``caching_allocator_warmup`` does ``len(model._tp_plan)`` when
+    ``torch.distributed`` is initialized, but the MOSS-TTS-Nano remote model
+    leaves ``_tp_plan`` as ``None`` (it survives ``PreTrainedModel.__init__``),
+    so the warmup raises ``TypeError: object of type 'NoneType' has no len()``.
+    vLLM initializes ``torch.distributed`` even at TP=1, so the crash fires.
+
+    MOSS-TTS-Nano runs single-GPU (no tensor parallelism), so forcing the
+    warmup down its non-distributed branch is byte-for-byte equivalent and
+    sidesteps the ``None`` plan. Scoped to the wrapped ``from_pretrained`` call.
+    """
+    import transformers.modeling_utils as _tmu
+
+    original = _tmu._is_torch_distributed_initialized
+    _tmu._is_torch_distributed_initialized = lambda: False
+    try:
+        yield
+    finally:
+        _tmu._is_torch_distributed_initialized = original
 
 
 def _patch_torchaudio_load() -> None:
@@ -158,11 +183,12 @@ class MossTTSNanoForGeneration(nn.Module):
         logger.info("Loading MOSS-TTS-Nano LM from %s (dtype=%s)", self.model_path, tts_dtype)
         from transformers import AutoModelForCausalLM
 
-        lm = AutoModelForCausalLM.from_pretrained(
-            self.model_path,
-            trust_remote_code=True,
-            torch_dtype=tts_dtype,
-        )
+        with _hf_load_without_tp_warmup():
+            lm = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                trust_remote_code=True,
+                torch_dtype=tts_dtype,
+            )
         if device.type == "cuda":
             try:
                 import flash_attn  # noqa: F401
@@ -197,11 +223,12 @@ class MossTTSNanoForGeneration(nn.Module):
         logger.info("Loading MOSS-Audio-Tokenizer-Nano from %s", codec_path)
         from transformers import AutoModel
 
-        audio_tokenizer = AutoModel.from_pretrained(
-            codec_path,
-            trust_remote_code=True,
-            torch_dtype=torch.float32,
-        )
+        with _hf_load_without_tp_warmup():
+            audio_tokenizer = AutoModel.from_pretrained(
+                codec_path,
+                trust_remote_code=True,
+                torch_dtype=torch.float32,
+            )
         audio_tokenizer.to(device=device)
         audio_tokenizer.eval()
         self._audio_tokenizer: nn.Module = audio_tokenizer
