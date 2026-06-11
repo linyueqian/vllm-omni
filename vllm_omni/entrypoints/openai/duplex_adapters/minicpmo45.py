@@ -19,13 +19,11 @@ class MiniCPMO45PcmAppendBuffer:
         self._buffer = bytearray()
         self._sample_rate_hz: int | None = None
         self._force_listen = False
-        self._emitted_first = False
 
     def clear(self) -> None:
         self._buffer.clear()
         self._sample_rate_hz = None
         self._force_listen = False
-        self._emitted_first = False
 
     def clear_force_listen(self) -> None:
         self._force_listen = False
@@ -67,20 +65,11 @@ class MiniCPMO45PcmAppendBuffer:
             return None
 
         # Emit whole model chunks only: the engine reserves scheduler slots
-        # from the payload size and the worker consumes one unit per complete
-        # chunk, so partial chunks would turn into pad embeddings inside the
+        # from the payload size and the worker consumes whole chunks per
+        # append, so partial chunks would turn into pad embeddings inside the
         # model KV. On flush, the tail is zero-padded (silence) up to the
-        # chunk boundary instead. The very first emission is capped at one
-        # chunk because the worker's first unit consumes the official
-        # first-chunk window (1035 ms) rather than a plain chunk period;
-        # any remainder stays buffered for the next unit, like the official
-        # streaming_prefill buffer.
-        if not self._emitted_first:
-            emit_samples = min(min_samples, buffered_samples)
-            pad_samples = min_samples - emit_samples if flush else 0
-            if not flush and emit_samples < min_samples:
-                return None
-        elif flush:
+        # chunk boundary instead.
+        if flush:
             emit_samples = buffered_samples
             remainder = emit_samples % min_samples
             pad_samples = (min_samples - remainder) if remainder else 0
@@ -90,7 +79,6 @@ class MiniCPMO45PcmAppendBuffer:
         emit_bytes = emit_samples * 4
         emit_raw = bytes(self._buffer[:emit_bytes]) + b"\x00" * (pad_samples * 4)
         del self._buffer[:emit_bytes]
-        self._emitted_first = True
 
         out = dict(payload)
         out["audio"] = base64.b64encode(emit_raw).decode("ascii")

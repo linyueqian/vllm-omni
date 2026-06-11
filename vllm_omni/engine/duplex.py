@@ -381,6 +381,21 @@ def duplex_payload_is_exact_chunks(payload: object) -> bool:
     return bool(sample_count) and sample_count % _DUPLEX_CHUNK_SAMPLES == 0
 
 
+def duplex_first_append_unit_count(payload: object) -> int | None:
+    """Units the worker builds from the first exact-chunk append.
+
+    The first unit consumes the official first-chunk window (~1035 ms), more
+    than one chunk period, so a k-chunk first payload yields k-1 units for
+    k >= 2 (the leftover stays in the worker's audio buffer) and 1 unit for
+    k == 1 (the worker zero-pads the front of the first window).
+    """
+    sample_count = _duplex_pcm_sample_count(payload)
+    if not sample_count or sample_count % _DUPLEX_CHUNK_SAMPLES != 0:
+        return None
+    chunks = sample_count // _DUPLEX_CHUNK_SAMPLES
+    return max(1, chunks - 1)
+
+
 def duplex_scheduler_token_budget(payload: object, *, default: int = 64) -> int:
     """Scheduler token slots for a duplex data-plane input.
 

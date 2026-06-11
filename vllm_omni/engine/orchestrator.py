@@ -49,7 +49,7 @@ from vllm_omni.engine.duplex import (
     DuplexSignalSource,
     SessionMode,
     duplex_first_append_context_reserve,
-    duplex_payload_is_exact_chunks,
+    duplex_first_append_unit_count,
     duplex_scheduler_token_budget,
 )
 from vllm_omni.engine.messages import (
@@ -864,10 +864,18 @@ class Orchestrator:
         if seq <= 1:
             # The first append also carries the session context (system prompt
             # and optional reference-audio embeddings) ahead of the first unit,
-            # and its first unit has no </unit> closure for a previous unit.
+            # its first unit has no </unit> closure, and the first unit
+            # consumes the official first-chunk window (more than one chunk
+            # period), so the unit count differs from the plain chunk count.
             token_budget += duplex_first_append_context_reserve(session.session_config)
-            if duplex_payload_is_exact_chunks(payload):
-                token_budget = max(1, token_budget - 1)
+            first_units = duplex_first_append_unit_count(payload)
+            if first_units is not None:
+                audio_tokens_per_unit = 10
+                token_budget = (
+                    duplex_first_append_context_reserve(session.session_config)
+                    + first_units * (audio_tokens_per_unit + 2)
+                    - 1
+                )
         token_id = 0
         extra_body = session.session_config.get("extra_body")
         raw_token_id = session.session_config.get("duplex_scheduler_token_id")
