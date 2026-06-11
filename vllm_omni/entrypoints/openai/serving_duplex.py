@@ -2458,8 +2458,11 @@ class OmniDuplexSessionHandler:
             return None
 
         close_reason: str | None = None
+        empty_polls = 0
         while close_reason is None:
             if expected_epoch is not None and session.epoch != expected_epoch:
+                return None
+            if session.state == DuplexSessionState.CLOSED:
                 return None
             outputs = await collect_outputs(
                 request_id,
@@ -2469,7 +2472,16 @@ class OmniDuplexSessionHandler:
             if expected_epoch is not None and session.epoch != expected_epoch:
                 return None
             if not outputs:
-                return None
+                # An empty poll means no output arrived within one control
+                # window, not that the stream is over. Exiting here orphans a
+                # decision that lands moments later: it would sit queued until
+                # the NEXT append starts a fresh drain task, adding one full
+                # chunk of latency to every model decision.
+                empty_polls += 1
+                if empty_polls >= 3:
+                    return None
+                continue
+            empty_polls = 0
             drain_result = {
                 "data_plane_outputs": outputs,
             }
@@ -2479,10 +2491,12 @@ class OmniDuplexSessionHandler:
                 session=session,
                 expected_epoch=expected_epoch,
             )
-            if self._data_plane_outputs_finished(drain_result):
+            if self._data_plane_outputs_finished(drain_result) and emitted_response:
                 return close_reason
-            if not emitted_response:
-                return close_reason
+            # A batch without a client-visible event (e.g. the generic
+            # stage-0 final-output message that precedes the listen/speak
+            # decision in the same segment) must not terminate the drain;
+            # the real decision is still in flight.
         return close_reason
 
     @staticmethod

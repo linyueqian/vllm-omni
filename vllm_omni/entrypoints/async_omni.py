@@ -405,7 +405,17 @@ class AsyncOmni(EngineClient, OmniBase):
             if msg.finished or outputs:
                 break
         request_states = getattr(self, "request_states", None)
-        if outputs and outputs[-1].finished and isinstance(request_states, dict):
+        if (
+            outputs
+            and outputs[-1].finished
+            and isinstance(request_states, dict)
+            # Duplex data-plane requests are resumable sessions: every segment
+            # ends with finished=True but the logical request lives on. Keep
+            # the request state so decision events produced between appends
+            # are routed to the queue the drain task is reading instead of an
+            # orphaned auto-created replacement.
+            and not request_id.startswith("duplex-")
+        ):
             request_states.pop(request_id, None)
         return outputs
 
