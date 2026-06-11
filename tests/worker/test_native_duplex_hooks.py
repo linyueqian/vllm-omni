@@ -927,13 +927,16 @@ def test_minicpmo_stage0_context_window_preserves_system_prefix_and_recent_conte
     )
 
     runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
-    runtime.session_config = {
-        "extra_body": {
-            "stage0_context_max_tokens": 6,
-            "stage0_context_previous_max_tokens": 4,
-        }
-    }
-    state = _MiniCPMO45Stage0SessionState(session_id="sid-window")
+    runtime.session_config = {}
+    state = _MiniCPMO45Stage0SessionState(
+        session_id="sid-window",
+        session_config={
+            "extra_body": {
+                "stage0_context_max_tokens": 6,
+                "stage0_context_previous_max_tokens": 4,
+            }
+        },
+    )
     state.system_context_len = 2
     state.context_embeds = [torch.tensor([[float(i)]]) for i in range(10)]
 
@@ -2110,7 +2113,7 @@ def test_minicpmo_stage0_native_sampler_penalizes_repeated_text_token():
                 "<|chunk_eos|>": 151718,
                 "<|chunk_tts_eos|>": 151721,
                 "<|turn_eos|>": 151717,
-            }[token]
+            }.get(token, -1)
 
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model.model_stage = "llm"
@@ -2161,7 +2164,7 @@ def test_minicpmo_stage0_native_sampler_ignores_pending_placeholders():
                 "<|chunk_eos|>": 151718,
                 "<|chunk_tts_eos|>": 151721,
                 "<|turn_eos|>": 151717,
-            }[token]
+            }.get(token, -1)
 
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model.model_stage = "llm"
@@ -2230,7 +2233,7 @@ def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
     runtime._decode_ref_audio_from_session_config = lambda _config: np.array([0.1, -0.1], dtype=np.float32)
     runtime._encode_text = lambda text: token_map[text]
     runtime._embed_token = lambda token_id: torch.full((1, 2), float(token_id))
-    runtime._stage_ref_audio_embeddings = lambda ref_audio: torch.tensor([[10.0, 11.0], [12.0, 13.0]])
+    runtime._stage_ref_audio_embeddings = lambda ref_audio, state=None: torch.tensor([[10.0, 11.0], [12.0, 13.0]])
 
     state = _MiniCPMO45Stage0SessionState(session_id="sid-ref")
     runtime._prepare_session_context(state, {"instructions": "Use speech.", "extra_body": {"ref_audio_data": "x"}})

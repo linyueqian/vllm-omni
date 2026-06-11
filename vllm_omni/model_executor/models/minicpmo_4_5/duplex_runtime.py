@@ -249,11 +249,14 @@ class MiniCPMO45Stage0DuplexRuntime:
             instructions if isinstance(instructions, str) and instructions else "Streaming Omni Conversation."
         )
         ref_audio = self._decode_ref_audio_from_session_config(session_config)
-        # Official duplex prepare() always uses
-        # <|im_start|>system\n{text}\n<|audio_start|>[ref]<|audio_end|><|im_end|>,
-        # with or without reference audio between the audio markers.
-        prefix = f"<|im_start|>system\n{system_prompt}\n<|audio_start|>"
-        suffix = "<|audio_end|><|im_end|>"
+        # Matches MiniCPMODuplex.prepare() in the released checkpoint's
+        # modeling_minicpmo.py: the <|audio_start|>/<|audio_end|> markers are
+        # only present when reference audio is embedded between them.
+        prefix = f"<|im_start|>system\n{system_prompt}"
+        suffix = "<|im_end|>"
+        if ref_audio is not None:
+            prefix += "\n<|audio_start|>"
+            suffix = "<|audio_end|>" + suffix
         for token_id in self._encode_text(prefix):
             state.context_embeds.append(self._embed_token(token_id))
             state.context_token_ids.append(token_id)
@@ -865,15 +868,22 @@ class MiniCPMO45Stage0DuplexRuntime:
             self._ensure_dynamic_cache_compat()
             for target in (self.stage_model, self.thinker):
                 get_audio_embedding = getattr(target, "get_audio_embedding", None)
-                if not callable(get_audio_embedding):
-                    continue
-                try:
-                    chunk_length = getattr(getattr(target, "config", None), "audio_chunk_length", None)
-                    if chunk_length is not None:
-                        return self._cat_nested_tensors(get_audio_embedding(batch_feature, chunk_length=chunk_length))
-                except TypeError:
-                    pass
-                return self._cat_nested_tensors(get_audio_embedding(batch_feature))
+                if callable(get_audio_embedding):
+                    try:
+                        chunk_length = getattr(getattr(target, "config", None), "audio_chunk_length", None)
+                        if chunk_length is not None:
+                            return self._cat_nested_tensors(
+                                get_audio_embedding(batch_feature, chunk_length=chunk_length)
+                            )
+                    except TypeError:
+                        pass
+                    return self._cat_nested_tensors(get_audio_embedding(batch_feature))
+                # The split vLLM stage0 wrapper ports official
+                # get_audio_embedding(chunk_length=...) as
+                # get_audio_hidden_states (chunk_length comes from config).
+                get_hidden = getattr(target, "get_audio_hidden_states", None)
+                if callable(get_hidden):
+                    return self._cat_nested_tensors(get_hidden(batch_feature))
         # The split vLLM stage0 wrapper may only expose the streaming encoder
         # path.  Use it as a fallback so the server-resolved reference audio is
         # still represented in the same system context location as official

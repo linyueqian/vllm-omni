@@ -371,9 +371,10 @@ def duplex_scheduler_token_budget(payload: object, *, default: int = 64) -> int:
     except (BinasciiError, ValueError):
         return max(1, int(default))
     sample_count = max(1, len(raw) // 4)
-    # MiniCPM-o's streaming audio encoder emits roughly one pooled token per
-    # 20 ms frame. Reserve slots for the system prefix and <unit>.
-    return max(64, min(768, sample_count // 320 + 32))
+    # MiniCPM-o's audio encoder pools to one token per 100 ms (1600 samples at
+    # 16 kHz). Keep the margin tight: unused slots become pad tokens that enter
+    # the KV in front of the chunk embeddings.
+    return max(16, min(768, sample_count // 1600 + 8))
 
 
 def duplex_first_append_context_reserve(session_config: object) -> int:
@@ -384,7 +385,7 @@ def duplex_first_append_context_reserve(session_config: object) -> int:
     reserve the worker-built embeddings can exceed the scheduled prompt slots
     and the audio tail would be truncated.
     """
-    reserve = 64  # system prompt template tokens
+    reserve = 48  # system prompt template tokens
     if not isinstance(session_config, dict):
         return reserve
     sources: list[dict[str, Any]] = [session_config]
@@ -399,7 +400,7 @@ def duplex_first_append_context_reserve(session_config: object) -> int:
             raw = b64decode(ref, validate=True)
         except (BinasciiError, ValueError):
             continue
-        # pcm_f32le reference audio at one pooled token per 20 ms frame.
-        reserve += max(0, (len(raw) // 4) // 320 + 16)
+        # pcm_f32le reference audio at one pooled token per 100 ms frame.
+        reserve += max(0, (len(raw) // 4) // 1600 + 8)
         break
     return reserve

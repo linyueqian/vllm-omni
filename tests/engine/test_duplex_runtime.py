@@ -31,8 +31,11 @@ def test_duplex_runtime_tracks_stage_bindings_and_barge_in_epoch():
 
     assert update.seq == 1
     assert new_epoch == 1
-    assert stale_request_ids == ["req-stage0", "req-stage1"]
-    assert session.stage_bindings == {}
+    # Stage0 owns the single long-lived resumable request holding the
+    # conversation KV/context: barge-in tears down only downstream stages.
+    assert stale_request_ids == ["req-stage1"]
+    assert set(session.stage_bindings) == {0}
+    assert session.stage_bindings[0].request_id == "req-stage0"
     assert session.pending_inputs == []
 
 
