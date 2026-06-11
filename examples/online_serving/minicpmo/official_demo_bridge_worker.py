@@ -154,7 +154,7 @@ class _VllmSession:
             async for raw in self.ws:
                 msg = json.loads(raw)
                 mtype = msg.get("type", "")
-                logger.debug("vllm evt %s t=%.3f", mtype, time.monotonic())
+                logger.info("vllm evt %s t=%.3f", mtype, time.monotonic())
                 kv = msg.get("kv_cache_length")
                 if isinstance(kv, int):
                     self.kv_cache_length = kv
@@ -211,7 +211,7 @@ class _VllmSession:
         if force_listen:
             event["force_listen"] = True
         await self.ws.send(json.dumps(event))
-        logger.debug("append sent chunk=%d t=%.3f", self.chunk_idx, time.monotonic())
+        logger.info("append sent chunk=%d t=%.3f", self.chunk_idx, time.monotonic())
         self.chunk_idx += 1
 
         result = {
