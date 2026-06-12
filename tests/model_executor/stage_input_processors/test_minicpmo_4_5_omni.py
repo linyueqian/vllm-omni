@@ -215,6 +215,44 @@ def test_llm2tts_native_duplex_uses_speak_region_without_tts_bos_prompt():
     assert "tts_hidden_states" not in info
 
 
+def test_llm2tts_native_duplex_ignores_stale_tts_bos_inside_folded_prompt():
+    latent = torch.arange(36, dtype=torch.float16).reshape(9, 4)
+    # A continuation unit: the resumable prompt has an EARLIER reply's
+    # <|tts_bos|> folded mid-prompt, and the model decided to LISTEN (no new
+    # speak text). The stale boundary must not re-slice already-spoken text.
+    output = SimpleNamespace(
+        token_ids=[9303, 9309],
+        text="",
+        multimodal_output={
+            "latent": latent,
+            "duplex_prompt_token_ids": [101, 9301, 41, 42, 9306, 9306],
+            "meta": {
+                "tts_bos_token_id": 9301,
+                "tts_eos_token_id": 9302,
+                "listen_token_id": 9303,
+                "speak_token_id": 9304,
+                "tts_pad_token_id": 9305,
+                "unit_token_id": 9306,
+                "unit_end_token_id": 9307,
+                "chunk_eos_token_id": 9308,
+                "chunk_tts_eos_token_id": 9309,
+                "turn_eos_token_id": 9310,
+            },
+        },
+    )
+    llm_output = SimpleNamespace(
+        request_id="duplex-stale-bos",
+        prompt_token_ids=[0, 0, 0, 0, 0, 0],
+        outputs=[output],
+    )
+
+    converted = llm2tts([llm_output], prompt=[{}])
+
+    info = converted[0]["model_intermediate_buffer"]
+    assert "tts" not in info.get("ids", {})
+    assert "tts" not in info.get("hidden_states", {})
+
+
 def test_llm2tts_rejects_native_duplex_output_without_special_token_metadata():
     latent = torch.arange(16, dtype=torch.float16).reshape(4, 4)
     output = SimpleNamespace(

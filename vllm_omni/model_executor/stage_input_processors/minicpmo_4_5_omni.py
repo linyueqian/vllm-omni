@@ -292,8 +292,14 @@ def llm2tts(
             tts_end_ids = set(tts_end_ids) | {151645}
 
         tts_bos_idx = None
-        for idx_t, tid in enumerate(full_token_ids):
-            if tid == tts_bos_id:
+        # For native duplex the resumable prompt folds every earlier unit, so
+        # a <|tts_bos|> from an already-spoken reply can sit mid-prompt; only
+        # a boundary folded as the FINAL prompt token (this unit's decision)
+        # or one inside the current segment may start the slice, or stale
+        # text would be re-handed to the talker on text-less continuations.
+        search_start = max(0, prompt_token_ids_len - 1) if is_native_duplex_handoff else 0
+        for idx_t in range(search_start, len(full_token_ids)):
+            if full_token_ids[idx_t] == tts_bos_id:
                 tts_bos_idx = idx_t + 1
 
         tts_eos_idx = None
