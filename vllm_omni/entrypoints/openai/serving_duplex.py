@@ -2496,7 +2496,17 @@ class OmniDuplexSessionHandler:
                 session=session,
                 expected_epoch=expected_epoch,
             )
-            if self._data_plane_outputs_finished(drain_result) and emitted_response:
+            if (
+                self._data_plane_outputs_finished(drain_result)
+                and emitted_response
+                and not self._session_auto_responds(session)
+            ):
+                # Auto-respond sessions are resumable: every segment ends
+                # with finished=True but the stream continues with the next
+                # audio chunk. Exiting here would make each decision wait for
+                # the next append to start a fresh drain task (one full chunk
+                # of added latency); keep draining until epoch change,
+                # session close, or cancellation by a newer drain task.
                 return close_reason
             # A batch without a client-visible event (e.g. the generic
             # stage-0 final-output message that precedes the listen/speak
