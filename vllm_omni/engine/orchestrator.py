@@ -894,6 +894,25 @@ class Orchestrator:
             token_id = max(0, int(raw_token_id))
         except (TypeError, ValueError):
             token_id = 0
+        # Official duplex forces the first force_listen_count units (default
+        # 3) to listen so the model cannot answer off one second of partial
+        # audio. seq counts appends (~1 unit each); the runner applies the
+        # flag once per segment.
+        raw_force_listen_count = None
+        if isinstance(extra_body, dict):
+            raw_force_listen_count = extra_body.get("force_listen_count")
+        try:
+            force_listen_count = 3 if raw_force_listen_count is None else max(0, int(raw_force_listen_count))
+        except (TypeError, ValueError):
+            force_listen_count = 3
+        if (
+            force_listen_count > 0
+            and seq <= force_listen_count
+            and isinstance(payload, dict)
+            and payload.get("force_speak") is not True
+            and payload.get("force_listen") is not True
+        ):
+            payload = {**payload, "force_listen": True}
         return {
             "prompt_token_ids": [token_id] * token_budget,
             "model_intermediate_buffer": {
