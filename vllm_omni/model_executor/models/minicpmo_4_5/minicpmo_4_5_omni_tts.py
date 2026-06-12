@@ -178,8 +178,69 @@ class _PreallocatedKVCache:
         return self.max_cache_len
 
 
+class _TalkerTurnState:
+    """Per-turn talker continuity for native duplex.
+
+    The official duplex implementation runs ONE TTS stream per spoken turn:
+    each 1s unit appends its condition to the same KV (carried
+    past_key_values + text_start_pos) and the token2wav stream caches and
+    token buffer persist across units, reset only at turn end. Synthesizing
+    units as independent utterances resets prosody every second and garbles
+    the reply.
+    """
+
+    __slots__ = (
+        "generator",
+        "consumed_tts_tokens",
+        "token2wav_buffer",
+        "prompt_wav_path",
+        "temp_prompt_wav_path",
+    )
+
+    def __init__(self, generator, prompt_wav_path, temp_prompt_wav_path):
+        self.generator = generator
+        self.consumed_tts_tokens = 0
+        # Official seeds each turn's vocoder buffer with three silence
+        # tokens so the first synthesized window does not directly abut the
+        # reference-audio prompt cache (audible ref-voice bleed otherwise).
+        self.token2wav_buffer: list[int] = [_T2W_SILENCE_TOKEN] * 3
+        self.prompt_wav_path = prompt_wav_path
+        self.temp_prompt_wav_path = temp_prompt_wav_path
+
+
+_T2W_SILENCE_TOKEN = 4218
+
+
+def _soundfile_patched_save(orig_save):
+    def _patched_save(uri, src, sample_rate, **kw):
+        kw.pop("backend", None)
+        if hasattr(uri, "write"):
+            sf.write(uri, src.cpu().numpy().T, sample_rate, format="WAV")
+            return
+        return orig_save(uri, src, sample_rate, backend="soundfile", **kw)
+
+    return _patched_save
+
+
+def _torch_clone_recursive(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj.clone()
+    if isinstance(obj, dict):
+        return {k: _torch_clone_recursive(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_torch_clone_recursive(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_torch_clone_recursive(v) for v in obj)
+    return obj
+
+
 class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     """MiniCPM-o 4.5 Talker: MiniCPMTTS + Token2wav in a single forward pass."""
+
+    # Native-duplex tts handoffs are per-segment deltas; accumulate them in
+    # the runner's streaming buffer so a handoff arriving while the previous
+    # segment is still synthesizing is queued instead of overwritten.
+    streaming_accumulated_keys = {("ids", "tts"), ("hidden_states", "tts")}
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -194,6 +255,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self.audio_tokenizer = None
         self._assets_loaded = False
         self._stream_gens: dict[str, Any] = {}
+        self._talker_turn_states: dict[str, _TalkerTurnState] = {}
+        self._t2w_base_caches: dict[str, tuple[Any, Any]] = {}
         self._ar_last_chunk_flags: list[bool] = [True]
         self._text_tokenizer = None
 
@@ -575,6 +638,221 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     def _extract_tts_handoff(info: dict[str, Any]) -> tuple[Any, Any]:
         return get_tts_handoff(info)
 
+    def _t2w_pre_lookahead(self) -> int:
+        flow = getattr(self.audio_tokenizer, "flow", None)
+        try:
+            return int(getattr(flow, "pre_lookahead_len", 3) or 3)
+        except (TypeError, ValueError):
+            return 3
+
+    def _begin_turn_vocoder_cache(self, prompt_wav_path: str | None) -> None:
+        """Restore a fresh per-turn clone of the ref-audio vocoder caches."""
+        import torchaudio
+
+        cache_key = prompt_wav_path or ""
+        base = self._t2w_base_caches.get(cache_key)
+        if base is None:
+            _orig_save = torchaudio.save
+            prev_dtype = torch.get_default_dtype()
+            torch.set_default_dtype(torch.float32)
+            try:
+                torchaudio.save = _soundfile_patched_save(_orig_save)
+                stream_cache, hift_cache_dict = self.audio_tokenizer.set_stream_cache(prompt_wav_path)
+            finally:
+                torch.set_default_dtype(prev_dtype)
+                torchaudio.save = _orig_save
+            base = (
+                _torch_clone_recursive(stream_cache),
+                _torch_clone_recursive(hift_cache_dict),
+            )
+            self._t2w_base_caches[cache_key] = base
+        self.audio_tokenizer.stream_cache = _torch_clone_recursive(base[0])
+        self.audio_tokenizer.hift_cache_dict = _torch_clone_recursive(base[1])
+
+    def _t2w_stream_window(self, token_list: list[int], prompt_wav_path: str | None, *, last_chunk: bool):
+        import torchaudio
+
+        _orig_save = torchaudio.save
+        prev_dtype = torch.get_default_dtype()
+        autocast_context, _ = self._token2wav_autocast_context()
+        torch.set_default_dtype(torch.float32)
+        try:
+            torchaudio.save = _soundfile_patched_save(_orig_save)
+            with autocast_context:
+                wav_np = self.audio_tokenizer.stream(
+                    token_list,
+                    prompt_wav_path,
+                    last_chunk=bool(last_chunk),
+                    return_waveform=True,
+                )
+        finally:
+            torch.set_default_dtype(prev_dtype)
+            torchaudio.save = _orig_save
+        return torch.as_tensor(np.asarray(wav_np).reshape(-1), dtype=torch.float32).cpu().contiguous()
+
+    def _close_turn_state(self, key: str) -> None:
+        state = self._talker_turn_states.pop(key, None)
+        if state is None:
+            return
+        if self.audio_tokenizer is not None:
+            self.audio_tokenizer.stream_cache = None
+            self.audio_tokenizer.hift_cache_dict = {}
+        temp_path = state.temp_prompt_wav_path
+        if temp_path and not self._is_cached_ref_audio_prompt_wav(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+    def _create_native_duplex_stream_gen(self, info: dict[str, Any]):
+        """Per-segment generator over a persistent per-turn talker stream.
+
+        Mirrors the official duplex talker: one TTS stream per spoken turn
+        (carried KV + text_start_pos via a single TTSStreamingGenerator fed
+        once per unit), text_eos only at turn end, ~chunk_size codec tokens
+        per unit, and a per-turn token2wav stream with pre_lookahead window
+        overlap. Each handoff still runs as one engine segment: the yields
+        here end with is_last=True per segment while the turn state lives on
+        until <|turn_eos|> arrives in the handed condition.
+        """
+        key = self._stream_request_key(info)
+        meta_info = info.get("meta") if isinstance(info.get("meta"), dict) else {}
+        codes_info = info.get("codes") if isinstance(info.get("codes"), dict) else {}
+        tts_token_ids, tts_hidden_states = self._extract_tts_handoff(info)
+
+        self._lazy_init_tts()
+        generator_cls = getattr(self, "_tts_streaming_generator_cls", None)
+        if (
+            getattr(self, "tts_obj", None) is None
+            or self.audio_tokenizer is None
+            or generator_cls is None
+            or self._tts_gen_logits is None
+        ):
+            logger.warning("4.5 Talker duplex streaming: TTS runtime unavailable")
+            yield self._empty_audio_chunk(), True
+            return
+
+        if isinstance(tts_token_ids, torch.Tensor):
+            ids_list = tts_token_ids.reshape(-1).tolist()
+        elif isinstance(tts_token_ids, list):
+            ids_list = [int(t) for t in tts_token_ids]
+        else:
+            ids_list = []
+
+        state = self._talker_turn_states.get(key)
+        consumed = state.consumed_tts_tokens if state is not None else 0
+        if consumed > len(ids_list):
+            consumed = 0
+        pending_ids = ids_list[consumed:]
+
+        turn_eos_raw = meta_info.get("turn_eos_token_id")
+        try:
+            turn_eos_id = int(turn_eos_raw) if turn_eos_raw is not None else None
+        except (TypeError, ValueError):
+            turn_eos_id = None
+        turn_end = turn_eos_id is not None and turn_eos_id in pending_ids
+
+        if state is None and not pending_ids:
+            # No turn open and nothing new to speak: nothing to synthesize.
+            yield self._empty_audio_chunk(), True
+            return
+
+        self._maybe_compile_tts_model()
+        tts = self.tts_obj
+        if not hasattr(tts.model.config, "rope_theta"):
+            tts.model.config.rope_theta = 10000.0
+        sampling_params = self._build_tts_sampling_params()
+        if sampling_params is None:
+            logger.warning("4.5 Talker duplex streaming: sampling params unavailable")
+            yield self._empty_audio_chunk(), True
+            return
+        chunk_size = self._tts_runtime_config().streaming_generator_chunk
+        if chunk_size <= 0:
+            raise ValueError("MiniCPM-o 4.5 TTS streaming generator chunk must be positive")
+
+        if state is None:
+            ref_audio = codes_info.get("ref", info.get("ref_audio"))
+            ref_audio_sr = meta_info.get("ref_audio_sr", info.get("ref_audio_sr"))
+            prompt_wav_path, temp_prompt_wav_path = self._resolve_prompt_wav_path(ref_audio, ref_audio_sr)
+            _, logits_processors = self._tts_gen_logits(
+                num_code=tts.config.num_audio_tokens,
+                repetition_penalty=sampling_params.repetition_penalty,
+                top_p=sampling_params.top_p,
+                top_k=sampling_params.top_k,
+            )
+            eos_token = torch.tensor(
+                [tts.config.num_audio_tokens - 1],
+                dtype=torch.long,
+                device=tts.emb_text.weight.device,
+            )
+            # Official duplex applies the repetition penalty only; the top-p/
+            # top-k warpers are constructed upstream but never applied.
+            generator = generator_cls(
+                model=tts,
+                temperature=sampling_params.temperature,
+                eos_token=eos_token,
+                chunk_size=chunk_size,
+                logits_processors=logits_processors,
+                logits_warpers=[],
+            )
+            self._begin_turn_vocoder_cache(prompt_wav_path)
+            state = _TalkerTurnState(generator, prompt_wav_path, temp_prompt_wav_path)
+            self._talker_turn_states[key] = state
+
+        if pending_ids:
+            pending_hidden = (
+                tts_hidden_states[consumed:]
+                if isinstance(tts_hidden_states, list)
+                else torch.as_tensor(tts_hidden_states)[consumed:]
+            )
+            cond_ids, cond_hidden = self._normalize_tts_handoff_tensors(pending_ids, pending_hidden)
+            condition = self._build_tts_condition_embeds(cond_ids, cond_hidden).unsqueeze(0)
+        else:
+            # A unit with no new text continues the open turn from a lone
+            # audio_bos (appended inside generate_with_buffer).
+            emb_dim = int(tts.emb_text.weight.shape[1])
+            condition = tts.emb_text.weight.new_zeros((1, 0, emb_dim))
+        state.consumed_tts_tokens = len(ids_list)
+
+        profile_enabled = os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
+        if profile_enabled:
+            logger.info(
+                "4.5 Talker duplex unit: key=%s pending_tokens=%d turn_end=%s t2w_buffer=%d",
+                key,
+                len(pending_ids),
+                turn_end,
+                len(state.token2wav_buffer),
+            )
+
+        pre_lookahead = self._t2w_pre_lookahead()
+        token_iter = state.generator.generate_with_buffer(
+            condition=condition,
+            text_finished=bool(turn_end),
+            max_new_token=chunk_size,
+        )
+        for audio_token_chunk, _gen_last in token_iter:
+            if audio_token_chunk is None:
+                break
+            token_list = audio_token_chunk.reshape(-1).detach().cpu().tolist()
+            state.token2wav_buffer.extend(int(t) for t in token_list)
+            while len(state.token2wav_buffer) >= chunk_size + pre_lookahead:
+                window = state.token2wav_buffer[: chunk_size + pre_lookahead]
+                waveform = self._t2w_stream_window(window, state.prompt_wav_path, last_chunk=False)
+                state.token2wav_buffer = state.token2wav_buffer[chunk_size:]
+                yield waveform, False
+        if turn_end:
+            tail = state.token2wav_buffer
+            state.token2wav_buffer = []
+            if tail:
+                waveform = self._t2w_stream_window(tail, state.prompt_wav_path, last_chunk=True)
+                self._close_turn_state(key)
+                yield waveform, True
+            else:
+                self._close_turn_state(key)
+                yield self._empty_audio_chunk(), True
+            return
+        yield self._empty_audio_chunk(), True
+
     def _create_stream_gen(self, info: dict[str, Any]):
         """Yield waveform chunks from MiniCPM-o remote-code TTS streaming.
 
@@ -582,6 +860,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         through one scheduler step. The older streaming probe still concatenates
         chunks inside generate_speech(), so it cannot improve API TTFA.
         """
+        if info.get("minicpmo45_native_duplex") is True:
+            yield from self._create_native_duplex_stream_gen(info)
+            return
         tts_token_ids, tts_hidden_states = self._extract_tts_handoff(info)
         codes_info = info.get("codes")
         meta_info = info.get("meta")
@@ -1667,6 +1948,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                             gen.close()
                         except Exception:
                             logger.exception("MiniCPM-o 4.5 failed to close stream gen for request %s", req_id)
+            for key in list(self._talker_turn_states):
+                if key in keys:
+                    self._close_turn_state(key)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loaded = set()

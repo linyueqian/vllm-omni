@@ -128,16 +128,17 @@ def _require_native_tts_boundary_metadata(special_token_ids):
 
 
 def _native_tts_boundary_token_ids(special_token_ids):
+    # Official duplex conditions the talker on mid-unit <|speak|> tokens AND
+    # the <|turn_eos|> token+hidden (its embedding is the trained stop
+    # signal); only chunk terminators and framing tokens bound the slice.
     return {
         token_id
         for token_id in (
             special_token_ids.get("tts_eos_token_id"),
             special_token_ids.get("tts_pad_token_id"),
             special_token_ids.get("listen_token_id"),
-            special_token_ids.get("speak_token_id"),
             special_token_ids.get("chunk_eos_token_id"),
             special_token_ids.get("chunk_tts_eos_token_id"),
-            special_token_ids.get("turn_eos_token_id"),
             special_token_ids.get("unit_token_id"),
             special_token_ids.get("unit_end_token_id"),
         )
@@ -359,6 +360,12 @@ def llm2tts(
             stream_output=is_native_duplex_handoff,
             minicpmo45_native_duplex=is_native_duplex_handoff,
         )
+        if is_native_duplex_handoff:
+            turn_eos_id = special_token_ids.get("turn_eos_token_id")
+            if turn_eos_id is not None:
+                # The talker detects turn end from <|turn_eos|> inside the
+                # handed condition (official conditions on its embedding).
+                model_intermediate_buffer.setdefault("meta", {})["turn_eos_token_id"] = int(turn_eos_id)
         req_mm_data = multi_modal_data.get(llm_output.request_id)
         ref_audio = _extract_first_audio_ref(req_mm_data)
         if ref_audio is not None:

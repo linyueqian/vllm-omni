@@ -1921,6 +1921,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                             merged_sub[sk] = inc_tensor
                         else:
                             merged_sub[sk] = torch.cat((old_tensor, inc_tensor), dim=0)
+                    elif (key, sk) in accumulated_keys and isinstance(sv, list):
+                        old_list = merged_sub.get(sk)
+                        merged_sub[sk] = (list(old_list) if isinstance(old_list, list) else []) + sv
                     else:
                         merged_sub[sk] = sv
                 merged_info[key] = merged_sub

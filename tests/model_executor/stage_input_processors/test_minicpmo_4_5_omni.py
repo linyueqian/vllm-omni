@@ -215,6 +215,45 @@ def test_llm2tts_native_duplex_uses_speak_region_without_tts_bos_prompt():
     assert "tts_hidden_states" not in info
 
 
+def test_llm2tts_native_duplex_conditions_on_turn_eos_and_midunit_speak():
+    latent = torch.arange(40, dtype=torch.float16).reshape(10, 4)
+    # Official duplex includes mid-unit <|speak|> tokens AND the <|turn_eos|>
+    # token+hidden in the talker condition (its embedding is the trained
+    # stop signal); only chunk terminators bound the slice.
+    output = SimpleNamespace(
+        token_ids=[9304, 11, 9304, 12, 9310, 9308],
+        text="hello",
+        multimodal_output={
+            "latent": latent,
+            "duplex_prompt_token_ids": [101, 102, 9306],
+            "meta": {
+                "tts_bos_token_id": 9301,
+                "tts_eos_token_id": 9302,
+                "listen_token_id": 9303,
+                "speak_token_id": 9304,
+                "tts_pad_token_id": 9305,
+                "unit_token_id": 9306,
+                "unit_end_token_id": 9307,
+                "chunk_eos_token_id": 9308,
+                "chunk_tts_eos_token_id": 9309,
+                "turn_eos_token_id": 9310,
+            },
+        },
+    )
+    llm_output = SimpleNamespace(
+        request_id="duplex-turn-eos",
+        prompt_token_ids=[0, 0, 0],
+        outputs=[output],
+    )
+
+    converted = llm2tts([llm_output], prompt=[{}])
+
+    info = converted[0]["model_intermediate_buffer"]
+    assert info["ids"]["tts"] == [11, 9304, 12, 9310]
+    assert torch.equal(torch.as_tensor(info["hidden_states"]["tts"]), latent[4:8].float())
+    assert info["meta"]["turn_eos_token_id"] == 9310
+
+
 def test_llm2tts_native_duplex_ignores_stale_tts_bos_inside_folded_prompt():
     latent = torch.arange(36, dtype=torch.float16).reshape(9, 4)
     # A continuation unit: the resumable prompt has an EARLIER reply's
