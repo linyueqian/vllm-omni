@@ -757,7 +757,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             )
             self._begin_turn_vocoder_cache(prompt_wav_path)
             self._t2w_stream_window(
-                [_T2W_SILENCE_TOKEN] * (pre_lookahead + 2),
+                [_T2W_SILENCE_TOKEN] * (chunk_size + pre_lookahead),
                 prompt_wav_path,
                 last_chunk=True,
             )
@@ -940,13 +940,25 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if turn_end:
             tail = state.token2wav_buffer
             state.token2wav_buffer = []
-            if tail:
-                waveform = self._t2w_stream_window(tail, state.prompt_wav_path, last_chunk=True)
-                self._close_turn_state(key)
-                yield waveform, True
-            else:
-                self._close_turn_state(key)
-                yield self._empty_audio_chunk(), True
+            # Pad the flush to one fixed shape: a variable-size last_chunk
+            # window hits a fresh ~20s vocoder compile per new size, and an
+            # empty tail would emit no event at all for the chunk (the
+            # bridge's per-chunk lockstep then times out). Trailing silence
+            # at reply end is inaudible.
+            pad_target = chunk_size + pre_lookahead
+            if len(tail) < pad_target:
+                tail = tail + [_T2W_SILENCE_TOKEN] * (pad_target - len(tail))
+            voc_t0 = time.perf_counter()
+            waveform = self._t2w_stream_window(tail, state.prompt_wav_path, last_chunk=True)
+            if profile_enabled:
+                logger.info(
+                    "4.5 Talker duplex turn-end flush: key=%s tail_tokens=%d vocode_ms=%.1f",
+                    key,
+                    len(tail),
+                    (time.perf_counter() - voc_t0) * 1000,
+                )
+            self._close_turn_state(key)
+            yield waveform, True
             return
         yield self._empty_audio_chunk(), True
 
