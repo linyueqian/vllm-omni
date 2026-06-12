@@ -739,6 +739,49 @@ def test_duplex_listen_latent_does_not_poison_cumulative_audio_offset():
     assert speak_results[0]["text"] == " It was a very"
 
 
+def test_duplex_segment_text_is_attached_once_across_streaming_batches():
+    import torch
+
+    class _ChatService:
+        model_config = _ModelConfig()
+
+        def create_audio(self, audio_obj):
+            return SimpleNamespace(audio_data=f"wav-{int(audio_obj.audio_tensor.shape[0])}")
+
+    handler = OmniDuplexSessionHandler(chat_service=_ChatService())
+    request_id = "duplex-duplex-sess-stage0"
+
+    def _speak(total_samples: int, text: str, *, finished: bool):
+        return SimpleNamespace(
+            request_id=request_id,
+            finished=finished,
+            outputs=[SimpleNamespace(text=text, multimodal_output={})],
+            multimodal_output={
+                "audio": torch.zeros(total_samples, dtype=torch.float32),
+                "sr": 24000,
+            },
+        )
+
+    # One talker segment streams several cumulative-audio batches, each
+    # carrying the SAME segment text; only the first may attach it.
+    batch1 = list(handler._native_results_from_data_plane_output(_speak(100, " movie called", finished=False)))
+    batch2 = list(handler._native_results_from_data_plane_output(_speak(220, " movie called", finished=False)))
+    batch3 = list(handler._native_results_from_data_plane_output(_speak(300, " movie called", finished=True)))
+    assert [r["text"] for r in batch1] == [" movie called"]
+    assert [r["text"] for r in batch2] == [""]
+    assert [r["text"] for r in batch3] == [""]
+
+    # The next segment starts fresh: its text is attached again.
+    batch4 = list(handler._native_results_from_data_plane_output(_speak(400, " Titanic", finished=True)))
+    assert [r["text"] for r in batch4] == [" Titanic"]
+
+    # Text growing within a segment is delivered as suffix deltas.
+    batch5 = list(handler._native_results_from_data_plane_output(_speak(500, " by", finished=False)))
+    batch6 = list(handler._native_results_from_data_plane_output(_speak(600, " by James", finished=True)))
+    assert [r["text"] for r in batch5] == [" by"]
+    assert [r["text"] for r in batch6] == [" James"]
+
+
 @pytest.mark.asyncio
 async def test_duplex_chat_audio_stream_uses_output_audio_delta_event():
     engine = FakeEngineClient()

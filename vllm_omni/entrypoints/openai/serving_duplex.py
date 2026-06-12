@@ -363,6 +363,10 @@ class OmniDuplexSessionHandler:
         )
         self._turn_controller = DuplexTurnController()
         self._data_plane_audio_offsets: dict[str, int] = {}
+        # request_id -> chars of the current talker segment's text already
+        # attached to an emitted audio result; reset at each segment end so
+        # streaming batches of one segment never re-deliver the same text.
+        self._data_plane_sent_text_lens: dict[str, int] = {}
         self._native_data_plane_tasks: dict[str, asyncio.Task[None]] = {}
         # session_id -> (response_id, silence continuation units already sent)
         self._native_response_continuations: dict[str, tuple[str, int]] = {}
@@ -2213,6 +2217,7 @@ class OmniDuplexSessionHandler:
                     # must survive drain-task turnover or every unit re-sends
                     # the reply audio from the start.
                     self._data_plane_audio_offsets.pop(request_id, None)
+                    self._data_plane_sent_text_lens.pop(request_id, None)
             if close_reason is None:
                 self._maybe_continue_native_response(send_json, session=session, expected_epoch=expected_epoch)
 
@@ -2832,6 +2837,7 @@ class OmniDuplexSessionHandler:
             data_plane_request_id = native_result.get("data_plane_request_id")
             if isinstance(data_plane_request_id, str):
                 self._data_plane_audio_offsets.pop(data_plane_request_id, None)
+                self._data_plane_sent_text_lens.pop(data_plane_request_id, None)
             should_commit = self._should_commit_response_to_history(response_id)
             committed_message = session.end_response(commit_text=should_commit)
             if should_commit:
@@ -2996,11 +3002,21 @@ class OmniDuplexSessionHandler:
                 ),
             )
         if audio_chunks:
+            # The talker streams several cumulative-audio batches per segment,
+            # each carrying the SAME segment text (official results are
+            # per-unit deltas): attach only the not-yet-delivered suffix and
+            # reset the counter at segment end so a genuinely repeated next
+            # segment is still delivered.
+            delta_text = text if isinstance(text, str) else ""
+            if data_plane_request_id is not None and delta_text:
+                sent_text_len = self._data_plane_sent_text_lens.get(data_plane_request_id, 0)
+                self._data_plane_sent_text_lens[data_plane_request_id] = max(sent_text_len, len(delta_text))
+                delta_text = delta_text[sent_text_len:] if sent_text_len < len(delta_text) else ""
             last_idx = len(audio_chunks) - 1
             sample_rate_hz = self._data_plane_sample_rate_hz(mm_output)
             audio_text_marks = self._data_plane_audio_text_marks(mm_output)
             fallback_audio_text_marks: list[list[dict[str, int]] | None] = []
-            if not audio_text_marks and isinstance(text, str) and text:
+            if not audio_text_marks and delta_text:
                 total_duration_ms = sum(max(0, int(duration_ms)) for _, duration_ms in audio_chunks)
                 cumulative_duration_ms = 0
                 for _, duration_ms in audio_chunks:
@@ -3008,7 +3024,9 @@ class OmniDuplexSessionHandler:
                     if total_duration_ms <= 0:
                         fallback_audio_text_marks.append(None)
                         continue
-                    text_chars = int(len(text) * max(0.0, min(1.0, cumulative_duration_ms / float(total_duration_ms))))
+                    text_chars = int(
+                        len(delta_text) * max(0.0, min(1.0, cumulative_duration_ms / float(total_duration_ms)))
+                    )
                     fallback_audio_text_marks.append(
                         [
                             {
@@ -3017,13 +3035,15 @@ class OmniDuplexSessionHandler:
                             }
                         ]
                     )
+            if finished and data_plane_request_id is not None:
+                self._data_plane_sent_text_lens.pop(data_plane_request_id, None)
             for idx, (audio, duration_ms) in enumerate(audio_chunks):
                 native_result = {
                     "supported": True,
                     "stage_role": "tts",
                     "is_listen": False,
                     "data_plane_request_id": data_plane_request_id,
-                    "text": text if idx == 0 and isinstance(text, str) else "",
+                    "text": delta_text if idx == 0 else "",
                     "audio_data": audio,
                     "audio_format": session.config.response_format if session is not None else "wav",
                     "audio_duration_ms": duration_ms,
