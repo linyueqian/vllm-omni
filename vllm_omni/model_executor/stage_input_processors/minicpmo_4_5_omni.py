@@ -349,13 +349,19 @@ def llm2tts(
             tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
         elif is_native_duplex_handoff:
             # Official MiniCPM-o duplex does not prefill an assistant
-            # <|tts_bos|> boundary before generation.  The first generated
-            # token is the listen/speak decision; hidden states for TTS start
-            # after that decision token and stop at the next duplex state token.
+            # <|tts_bos|> boundary before generation. A segment delta can
+            # start with SEVERAL unit decisions (forced/model listens from
+            # chunks that produced no handoff accumulate ahead of the speak),
+            # so skip the leading listen run, then the speak decision itself;
+            # hidden states for TTS start after it and stop at the next
+            # chunk terminator.
             listen_id = special_token_ids.get("listen_token_id")
-            generated_start = prompt_token_ids_len
-            if llm_output_ids and llm_output_ids[0] != listen_id:
-                tts_start_idx = generated_start + 1
+            speak_id = special_token_ids.get("speak_token_id")
+            start = prompt_token_ids_len
+            while start < len(full_token_ids) and full_token_ids[start] == listen_id:
+                start += 1
+            if start < len(full_token_ids) and full_token_ids[start] == speak_id:
+                tts_start_idx = start + 1
                 tts_end_idx = len(full_token_ids)
                 for idx_t in range(tts_start_idx, len(full_token_ids)):
                     if full_token_ids[idx_t] in tts_end_ids:

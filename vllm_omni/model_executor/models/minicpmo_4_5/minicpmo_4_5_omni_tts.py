@@ -210,7 +210,6 @@ class _TalkerTurnState:
 
     __slots__ = (
         "generator",
-        "consumed_tts_tokens",
         "token2wav_buffer",
         "prompt_wav_path",
         "temp_prompt_wav_path",
@@ -219,7 +218,6 @@ class _TalkerTurnState:
 
     def __init__(self, generator, prompt_wav_path, temp_prompt_wav_path, eos_suppressor=None):
         self.generator = generator
-        self.consumed_tts_tokens = 0
         self.eos_suppressor = eos_suppressor
         # Official seeds each turn's vocoder buffer with three silence
         # tokens so the first synthesized window does not directly abut the
@@ -276,6 +274,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._assets_loaded = False
         self._stream_gens: dict[str, Any] = {}
         self._talker_turn_states: dict[str, _TalkerTurnState] = {}
+        # Consumed-cursor into the accumulated handoff condition; must
+        # OUTLIVE turn states (the producer accumulates across turns).
+        self._talker_consumed_tokens: dict[str, int] = {}
         self._t2w_base_caches: dict[str, tuple[Any, Any]] = {}
         self._ar_last_chunk_flags: list[bool] = [True]
         self._text_tokenizer = None
@@ -802,7 +803,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             ids_list = []
 
         state = self._talker_turn_states.get(key)
-        consumed = state.consumed_tts_tokens if state is not None else 0
+        consumed = self._talker_consumed_tokens.get(key, 0)
         if consumed > len(ids_list):
             consumed = 0
         pending_ids = ids_list[consumed:]
@@ -875,7 +876,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # audio_bos (appended inside generate_with_buffer).
             emb_dim = int(tts.emb_text.weight.shape[1])
             condition = tts.emb_text.weight.new_zeros((1, 0, emb_dim))
-        state.consumed_tts_tokens = len(ids_list)
+        self._talker_consumed_tokens[key] = len(ids_list)
 
         profile_enabled = os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
         if profile_enabled:
@@ -2085,6 +2086,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             for key in list(self._talker_turn_states):
                 if key in keys:
                     self._close_turn_state(key)
+            for key in list(self._talker_consumed_tokens):
+                if key in keys:
+                    self._talker_consumed_tokens.pop(key, None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loaded = set()
