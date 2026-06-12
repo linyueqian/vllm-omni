@@ -363,10 +363,10 @@ class OmniDuplexSessionHandler:
         )
         self._turn_controller = DuplexTurnController()
         self._data_plane_audio_offsets: dict[str, int] = {}
-        # request_id -> chars of the current talker segment's text already
-        # attached to an emitted audio result; reset at each segment end so
-        # streaming batches of one segment never re-deliver the same text.
-        self._data_plane_sent_text_lens: dict[str, int] = {}
+        # request_id -> the current talker segment's text already attached to
+        # an emitted audio result; reset at each segment end so streaming
+        # batches of one segment never re-deliver the same text.
+        self._data_plane_sent_segment_texts: dict[str, str] = {}
         self._native_data_plane_tasks: dict[str, asyncio.Task[None]] = {}
         # session_id -> (response_id, silence continuation units already sent)
         self._native_response_continuations: dict[str, tuple[str, int]] = {}
@@ -2217,7 +2217,7 @@ class OmniDuplexSessionHandler:
                     # must survive drain-task turnover or every unit re-sends
                     # the reply audio from the start.
                     self._data_plane_audio_offsets.pop(request_id, None)
-                    self._data_plane_sent_text_lens.pop(request_id, None)
+                    self._data_plane_sent_segment_texts.pop(request_id, None)
             if close_reason is None:
                 self._maybe_continue_native_response(send_json, session=session, expected_epoch=expected_epoch)
 
@@ -2837,7 +2837,7 @@ class OmniDuplexSessionHandler:
             data_plane_request_id = native_result.get("data_plane_request_id")
             if isinstance(data_plane_request_id, str):
                 self._data_plane_audio_offsets.pop(data_plane_request_id, None)
-                self._data_plane_sent_text_lens.pop(data_plane_request_id, None)
+                self._data_plane_sent_segment_texts.pop(data_plane_request_id, None)
             should_commit = self._should_commit_response_to_history(response_id)
             committed_message = session.end_response(commit_text=should_commit)
             if should_commit:
@@ -2891,6 +2891,14 @@ class OmniDuplexSessionHandler:
             return
         for output in outputs:
             yield from self._native_results_from_data_plane_output(output, session=session)
+            if getattr(output, "finished", False):
+                # A finished batch ends the talker segment no matter which
+                # branch handled it (including a finished batch whose audio
+                # delta sliced to empty): the next segment's text must be
+                # delivered in full, not suffix-sliced against this one.
+                request_id = getattr(output, "request_id", None)
+                if isinstance(request_id, str) and request_id:
+                    self._data_plane_sent_segment_texts.pop(request_id, None)
 
     def _native_results_from_data_plane_output(self, output: object, *, session: DuplexSession | None = None):
         data_plane_request_id = getattr(output, "request_id", None)
@@ -3004,14 +3012,18 @@ class OmniDuplexSessionHandler:
         if audio_chunks:
             # The talker streams several cumulative-audio batches per segment,
             # each carrying the SAME segment text (official results are
-            # per-unit deltas): attach only the not-yet-delivered suffix and
-            # reset the counter at segment end so a genuinely repeated next
-            # segment is still delivered.
+            # per-unit deltas): attach only the not-yet-delivered part. The
+            # tracking state is cleared at segment end by the caller, so a
+            # genuinely repeated next segment is still delivered.
             delta_text = text if isinstance(text, str) else ""
             if data_plane_request_id is not None and delta_text:
-                sent_text_len = self._data_plane_sent_text_lens.get(data_plane_request_id, 0)
-                self._data_plane_sent_text_lens[data_plane_request_id] = max(sent_text_len, len(delta_text))
-                delta_text = delta_text[sent_text_len:] if sent_text_len < len(delta_text) else ""
+                sent_text = self._data_plane_sent_segment_texts.get(data_plane_request_id)
+                self._data_plane_sent_segment_texts[data_plane_request_id] = delta_text
+                if isinstance(sent_text, str) and sent_text:
+                    if delta_text == sent_text:
+                        delta_text = ""
+                    elif delta_text.startswith(sent_text):
+                        delta_text = delta_text[len(sent_text) :]
             last_idx = len(audio_chunks) - 1
             sample_rate_hz = self._data_plane_sample_rate_hz(mm_output)
             audio_text_marks = self._data_plane_audio_text_marks(mm_output)
@@ -3035,8 +3047,6 @@ class OmniDuplexSessionHandler:
                             }
                         ]
                     )
-            if finished and data_plane_request_id is not None:
-                self._data_plane_sent_text_lens.pop(data_plane_request_id, None)
             for idx, (audio, duration_ms) in enumerate(audio_chunks):
                 native_result = {
                     "supported": True,

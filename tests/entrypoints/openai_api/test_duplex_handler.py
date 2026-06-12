@@ -750,9 +750,13 @@ def test_duplex_segment_text_is_attached_once_across_streaming_batches():
 
     handler = OmniDuplexSessionHandler(chat_service=_ChatService())
     request_id = "duplex-duplex-sess-stage0"
+    session = DuplexSession(
+        session_id="sid-auto-respond",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
 
     def _speak(total_samples: int, text: str, *, finished: bool):
-        return SimpleNamespace(
+        output = SimpleNamespace(
             request_id=request_id,
             finished=finished,
             outputs=[SimpleNamespace(text=text, multimodal_output={})],
@@ -761,25 +765,29 @@ def test_duplex_segment_text_is_attached_once_across_streaming_batches():
                 "sr": 24000,
             },
         )
+        return list(handler._data_plane_native_results({"data_plane_outputs": [output]}, session=session))
 
     # One talker segment streams several cumulative-audio batches, each
     # carrying the SAME segment text; only the first may attach it.
-    batch1 = list(handler._native_results_from_data_plane_output(_speak(100, " movie called", finished=False)))
-    batch2 = list(handler._native_results_from_data_plane_output(_speak(220, " movie called", finished=False)))
-    batch3 = list(handler._native_results_from_data_plane_output(_speak(300, " movie called", finished=True)))
-    assert [r["text"] for r in batch1] == [" movie called"]
-    assert [r["text"] for r in batch2] == [""]
-    assert [r["text"] for r in batch3] == [""]
+    assert [r["text"] for r in _speak(100, " movie called", finished=False)] == [" movie called"]
+    assert [r["text"] for r in _speak(220, " movie called", finished=False)] == [""]
+    assert [r["text"] for r in _speak(300, " movie called", finished=True)] == [""]
 
-    # The next segment starts fresh: its text is attached again.
-    batch4 = list(handler._native_results_from_data_plane_output(_speak(400, " Titanic", finished=True)))
-    assert [r["text"] for r in batch4] == [" Titanic"]
+    # The next segment starts fresh: its text is attached again, even when
+    # it repeats the previous segment's text verbatim.
+    assert [r["text"] for r in _speak(400, " Titanic", finished=True)] == [" Titanic"]
+    assert [r["text"] for r in _speak(500, " Titanic", finished=True)] == [" Titanic"]
 
     # Text growing within a segment is delivered as suffix deltas.
-    batch5 = list(handler._native_results_from_data_plane_output(_speak(500, " by", finished=False)))
-    batch6 = list(handler._native_results_from_data_plane_output(_speak(600, " by James", finished=True)))
-    assert [r["text"] for r in batch5] == [" by"]
-    assert [r["text"] for r in batch6] == [" James"]
+    assert [r["text"] for r in _speak(600, " by", finished=False)] == [" by"]
+    assert [r["text"] for r in _speak(700, " by James", finished=True)] == [" James"]
+
+    # A segment whose finished batch slices to an EMPTY audio delta (all
+    # samples already delivered) must still end the segment: the next
+    # segment's text may not be suffix-sliced against the previous one.
+    assert [r["text"] for r in _speak(800, " James Cameron. The", finished=False)] == [" James Cameron. The"]
+    assert _speak(800, " James Cameron. The", finished=True) == []
+    assert [r["text"] for r in _speak(900, " 997.", finished=False)] == [" 997."]
 
 
 @pytest.mark.asyncio
