@@ -2991,12 +2991,6 @@ class OmniDuplexSessionHandler:
                 "runner_local_payload_ref": False,
             }
             return
-        if session is not None and self._session_auto_responds(session):
-            # Auto-respond: spoken content reaches the client through the
-            # stage-1 audio messages; a text-only batch here is the generic
-            # stage-0 final-output message that accompanies every segment,
-            # not a client-visible event (and not an error).
-            return
         if session is not None and "audio" in session.config.modalities:
             yield {
                 "supported": True,

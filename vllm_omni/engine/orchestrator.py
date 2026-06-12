@@ -1608,7 +1608,17 @@ class Orchestrator:
             req_state.finished_final_output_stage_ids.add(stage_id)
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
-        if self.stage_pools[stage_id].final_output:
+        # Duplex stage-0 segment boundaries are not client-visible outputs:
+        # listen decisions are emitted via _emit_duplex_model_listen_output
+        # below and spoken content flows through the talker stage. Forwarding
+        # the raw stage-0 output as well injects one cumulative-text,
+        # no-audio message per unit that every downstream consumer must
+        # filter out again (the official implementation returns exactly one
+        # result per audio chunk).
+        is_duplex_stage0_segment = (
+            stage_id == 0 and self._is_duplex_session_request(req_state) and req_state.streaming.segment_finished
+        )
+        if self.stage_pools[stage_id].final_output and not is_duplex_stage0_segment:
             await self.output_async_queue.put(
                 OutputMessage(
                     request_id=req_id,
