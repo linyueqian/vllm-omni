@@ -3033,6 +3033,11 @@ class OmniDuplexSessionHandler:
     ) -> str | None:
         if not finished:
             return None
+        # The orchestrator stamps model-listen segments explicitly; honor the
+        # marker before falling back to token heuristics (the wrapped listen
+        # output does not expose completion token ids).
+        if mm_output.get("duplex_native_decision") == "listen" or mm_output.get("model_listen") is True:
+            return "listen"
         special = cls._data_plane_special_token_ids(mm_output)
         listen_id = special.get("listen_token_id")
         if listen_id is None:
