@@ -2914,6 +2914,14 @@ class OmniDuplexSessionHandler:
             mm_output = {}
         if not text:
             text = self._data_plane_llm_output_text(mm_output)
+        profile_logs = os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
+        raw_audio_samples = None
+        offset_before = None
+        if profile_logs:
+            raw_audio = next((mm_output[k] for k in ("audio", "model_outputs", "latent") if k in mm_output), None)
+            raw_audio_samples = self._audio_num_samples(raw_audio)
+            if data_plane_request_id is not None:
+                offset_before = self._data_plane_audio_offsets.get(data_plane_request_id)
         audio_chunks = list(
             self._encode_data_plane_audio_chunks_with_duration(
                 mm_output,
@@ -2937,16 +2945,24 @@ class OmniDuplexSessionHandler:
         # closing it per unit resets the audio delta offsets and re-delivers
         # the whole reply cumulatively with every unit.
         unit_end_of_turn = finished and not (session is not None and self._session_auto_responds(session))
-        if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
+        if profile_logs:
             logger.info(
                 "duplex data-plane output: request_id=%s finished=%s "
-                "text_len=%d audio_chunks=%d native_decision=%s mm_keys=%s",
+                "text_len=%d audio_chunks=%d native_decision=%s mm_keys=%s "
+                "raw_audio_samples=%s offset_before=%s offset_after=%s",
                 getattr(output, "request_id", None),
                 finished,
                 len(text) if isinstance(text, str) else 0,
                 len(audio_chunks),
                 native_decision,
                 sorted(mm_output.keys()),
+                raw_audio_samples,
+                offset_before,
+                (
+                    self._data_plane_audio_offsets.get(data_plane_request_id)
+                    if data_plane_request_id is not None
+                    else None
+                ),
             )
         if native_decision == "listen":
             yield {
