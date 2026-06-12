@@ -2915,6 +2915,45 @@ class OmniDuplexSessionHandler:
         if not text:
             text = self._data_plane_llm_output_text(mm_output)
         profile_logs = os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
+        finished = bool(getattr(output, "finished", False))
+        token_ids = self._data_plane_completion_token_ids(completion)
+        native_decision = self._data_plane_native_decision(
+            completion,
+            mm_output,
+            token_ids=token_ids,
+            finished=finished,
+        )
+        if native_decision == "listen":
+            # A model-listen wrapper carries the thinker's hidden states under
+            # "latent", which the audio encoder's key fallback would treat as
+            # a waveform: encoding it ratchets the cumulative audio offset
+            # (tokens x hidden_dim samples) past the talker's real audio, and
+            # every later speak unit slices to empty and is dropped. Yield the
+            # listen before any audio work so the offset is never touched.
+            if profile_logs:
+                logger.info(
+                    "duplex data-plane output: request_id=%s finished=%s "
+                    "native_decision=listen mm_keys=%s (audio encode skipped)",
+                    getattr(output, "request_id", None),
+                    finished,
+                    sorted(mm_output.keys()),
+                )
+            yield {
+                "supported": True,
+                "stage_role": "llm",
+                "is_listen": True,
+                "model_listen": True,
+                "listen_source": "model_listen",
+                "data_plane_request_id": data_plane_request_id,
+                "end_of_turn": False,
+                "uses_model_runner_scheduler": True,
+                "runner_kv_backed": True,
+                "runtime_impl": "scheduler_data_plane",
+                "owned_runtime": False,
+                "experimental_worker_control_rpc": False,
+                "runner_local_payload_ref": False,
+            }
+            return
         raw_audio_samples = None
         offset_before = None
         if profile_logs:
@@ -2929,14 +2968,6 @@ class OmniDuplexSessionHandler:
                 response_format=(session.config.response_format if session is not None else "wav"),
                 speed=(session.config.speed if session is not None else None),
             )
-        )
-        finished = bool(getattr(output, "finished", False))
-        token_ids = self._data_plane_completion_token_ids(completion)
-        native_decision = self._data_plane_native_decision(
-            completion,
-            mm_output,
-            token_ids=token_ids,
-            finished=finished,
         )
         # In auto-respond mode the model speaks one unit per audio chunk and
         # signals the real end of its reply by deciding to LISTEN on a later
@@ -2964,23 +2995,6 @@ class OmniDuplexSessionHandler:
                     else None
                 ),
             )
-        if native_decision == "listen":
-            yield {
-                "supported": True,
-                "stage_role": "llm",
-                "is_listen": True,
-                "model_listen": True,
-                "listen_source": "model_listen",
-                "data_plane_request_id": data_plane_request_id,
-                "end_of_turn": False,
-                "uses_model_runner_scheduler": True,
-                "runner_kv_backed": True,
-                "runtime_impl": "scheduler_data_plane",
-                "owned_runtime": False,
-                "experimental_worker_control_rpc": False,
-                "runner_local_payload_ref": False,
-            }
-            return
         if audio_chunks:
             last_idx = len(audio_chunks) - 1
             sample_rate_hz = self._data_plane_sample_rate_hz(mm_output)

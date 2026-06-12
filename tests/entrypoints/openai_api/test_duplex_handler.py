@@ -690,6 +690,55 @@ def test_duplex_handler_splits_data_plane_audio_list_into_deltas():
     assert [result["end_of_turn"] for result in native_results] == [False, True]
 
 
+def test_duplex_listen_latent_does_not_poison_cumulative_audio_offset():
+    import torch
+
+    class _ChatService:
+        model_config = _ModelConfig()
+
+        def create_audio(self, audio_obj):
+            return SimpleNamespace(audio_data=f"wav-{int(audio_obj.audio_tensor.shape[0])}")
+
+    handler = OmniDuplexSessionHandler(chat_service=_ChatService())
+    request_id = "duplex-duplex-sess-stage0"
+
+    # A model-listen decision wraps the segment with a latent tensor that is
+    # NOT reply audio; it must not advance the cumulative audio offset.
+    listen_output = SimpleNamespace(
+        request_id=request_id,
+        finished=True,
+        outputs=[],
+        multimodal_output={
+            "duplex_native_decision": "listen",
+            "model_listen": True,
+            "latent": torch.zeros(331776, dtype=torch.float32),
+            "meta": {"sr": 24000},
+        },
+    )
+    listen_results = list(handler._native_results_from_data_plane_output(listen_output))
+    assert [result.get("is_listen") for result in listen_results] == [True]
+
+    # The first speak unit carries cumulative stage-1 audio far smaller than
+    # the listen latent; it must still be delivered from sample 0.
+    speak_output = SimpleNamespace(
+        request_id=request_id,
+        finished=False,
+        outputs=[
+            SimpleNamespace(
+                text=" It was a very",
+                multimodal_output={},
+            )
+        ],
+        multimodal_output={
+            "audio": torch.zeros(32768, dtype=torch.float32),
+            "sr": 24000,
+        },
+    )
+    speak_results = list(handler._native_results_from_data_plane_output(speak_output))
+    assert [result.get("audio_data") for result in speak_results] == ["wav-32768"]
+    assert speak_results[0]["text"] == " It was a very"
+
+
 @pytest.mark.asyncio
 async def test_duplex_chat_audio_stream_uses_output_audio_delta_event():
     engine = FakeEngineClient()
