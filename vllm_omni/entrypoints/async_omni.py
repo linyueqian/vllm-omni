@@ -8,6 +8,7 @@ StageEngineCoreClient instances) instead of OmniStage with worker processes.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
@@ -310,6 +311,18 @@ class AsyncOmni(EngineClient, OmniBase):
         """Collect the next duplex data-plane output batch for a live request."""
         self._final_output_handler()
         req_state = self.request_states.get(request_id)
+        if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
+            duplex_states = {
+                rid: state.queue.qsize()
+                for rid, state in self.request_states.items()
+                if isinstance(rid, str) and rid.startswith("duplex-")
+            }
+            logger.info(
+                "[collect] request_id=%s known=%s duplex_queues=%s",
+                request_id,
+                req_state is not None,
+                duplex_states,
+            )
         if req_state is None:
             return []
         return await self._collect_duplex_data_plane_outputs(
@@ -874,6 +887,18 @@ class AsyncOmni(EngineClient, OmniBase):
 
                     # Route to the per-request queue
                     await req_state.queue.put(msg)
+                    if (
+                        os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
+                        and isinstance(req_state.request_id, str)
+                        and req_state.request_id.startswith("duplex-")
+                    ):
+                        logger.info(
+                            "[pump] routed request_id=%s stage_id=%s finished=%s qsize=%d",
+                            req_state.request_id,
+                            stage_id,
+                            getattr(msg, "finished", None),
+                            req_state.queue.qsize(),
+                        )
 
             except asyncio.CancelledError:
                 raise

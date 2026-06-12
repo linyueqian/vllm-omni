@@ -2078,6 +2078,14 @@ class OmniDuplexSessionHandler:
         if expected_epoch is not None and session.epoch != expected_epoch:
             return True, False
         await self._send_runtime_control_if_needed(send_json, result, session=session)
+        if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1" and isinstance(result, dict):
+            dp_outputs = result.get("data_plane_outputs")
+            logger.info(
+                "[append-result] request_info=%s n_dp_outputs=%s keys=%s",
+                self._data_plane_request_info(result),
+                len(dp_outputs) if isinstance(dp_outputs, list) else None,
+                sorted(result.keys()),
+            )
         close_reason, emitted_response = await self._send_native_duplex_events(
             send_json,
             result,
@@ -2122,7 +2130,15 @@ class OmniDuplexSessionHandler:
         expected_epoch: int | None = None,
     ) -> bool:
         request_id, _ = self._data_plane_request_info(result)
+        profile_logs = os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
         if request_id is None or self._data_plane_outputs_finished(result):
+            if profile_logs:
+                logger.info(
+                    "[drain-start] skip: request_id=%s finished=%s session=%s",
+                    request_id,
+                    self._data_plane_outputs_finished(result),
+                    session.session_id,
+                )
             return False
         session.active_request_id = request_id
 
@@ -2133,7 +2149,19 @@ class OmniDuplexSessionHandler:
                 # single synchronous loop: the resumable data-plane request id
                 # is stable, and cancel/restart on every append orphans any
                 # decision that lands in the swap window.
+                if profile_logs:
+                    logger.info(
+                        "[drain-start] keep-alive: existing drain for session=%s; append request_id=%s",
+                        session.session_id,
+                        request_id,
+                    )
                 return False
+            if profile_logs:
+                logger.info(
+                    "[drain-start] cancel-restart: session=%s new request_id=%s",
+                    session.session_id,
+                    request_id,
+                )
             old_task.cancel()
             try:
                 await asyncio.wait_for(asyncio.gather(old_task, return_exceptions=True), timeout=0.25)
@@ -2188,6 +2216,12 @@ class OmniDuplexSessionHandler:
             if close_reason is None:
                 self._maybe_continue_native_response(send_json, session=session, expected_epoch=expected_epoch)
 
+        if profile_logs:
+            logger.info(
+                "[drain-start] started: session=%s request_id=%s",
+                session.session_id,
+                request_id,
+            )
         task = asyncio.create_task(_run())
         self._native_data_plane_tasks[session.session_id] = task
         return True
@@ -2468,18 +2502,30 @@ class OmniDuplexSessionHandler:
         if not callable(collect_outputs):
             return None
 
+        profile_logs = os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
         close_reason: str | None = None
         empty_polls = 0
         while close_reason is None:
             if expected_epoch is not None and session.epoch != expected_epoch:
+                if profile_logs:
+                    logger.info("[drain] exit epoch-change: request_id=%s", request_id)
                 return None
             if session.state == DuplexSessionState.CLOSED:
+                if profile_logs:
+                    logger.info("[drain] exit session-closed: request_id=%s", request_id)
                 return None
             outputs = await collect_outputs(
                 request_id,
                 response_stage_id=response_stage_id,
                 timeout=self._runtime_control_timeout_s(session),
             )
+            if profile_logs:
+                logger.info(
+                    "[drain] collect: request_id=%s n_outputs=%d finished=%s",
+                    request_id,
+                    len(outputs) if outputs else 0,
+                    bool(outputs) and bool(getattr(outputs[-1], "finished", False)),
+                )
             if expected_epoch is not None and session.epoch != expected_epoch:
                 return None
             if not outputs:
