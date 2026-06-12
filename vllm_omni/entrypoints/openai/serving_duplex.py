@@ -2891,14 +2891,6 @@ class OmniDuplexSessionHandler:
             return
         for output in outputs:
             yield from self._native_results_from_data_plane_output(output, session=session)
-            if getattr(output, "finished", False):
-                # A finished batch ends the talker segment no matter which
-                # branch handled it (including a finished batch whose audio
-                # delta sliced to empty): the next segment's text must be
-                # delivered in full, not suffix-sliced against this one.
-                request_id = getattr(output, "request_id", None)
-                if isinstance(request_id, str) and request_id:
-                    self._data_plane_sent_segment_texts.pop(request_id, None)
 
     def _native_results_from_data_plane_output(self, output: object, *, session: DuplexSession | None = None):
         data_plane_request_id = getattr(output, "request_id", None)
@@ -3010,11 +3002,14 @@ class OmniDuplexSessionHandler:
                 ),
             )
         if audio_chunks:
-            # The talker streams several cumulative-audio batches per segment,
-            # each carrying the SAME segment text (official results are
-            # per-unit deltas): attach only the not-yet-delivered part. The
-            # tracking state is cleared at segment end by the caller, so a
-            # genuinely repeated next segment is still delivered.
+            # The talker streams several cumulative-audio batches per handed
+            # text, INCLUDING continuation units that re-run it with the
+            # same text past finished=True boundaries (every engine segment
+            # ends finished); official results carry per-unit deltas, so
+            # attach only text not yet delivered, comparing by content.
+            # Deliberately no reset at segment or response boundaries: any
+            # reset re-attaches the text on the next same-text continuation
+            # batch and duplicates the transcript.
             delta_text = text if isinstance(text, str) else ""
             if data_plane_request_id is not None and delta_text:
                 sent_text = self._data_plane_sent_segment_texts.get(data_plane_request_id)

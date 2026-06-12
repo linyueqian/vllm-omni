@@ -773,9 +773,13 @@ def test_duplex_segment_text_is_attached_once_across_streaming_batches():
     assert [r["text"] for r in _speak(220, " movie called", finished=False)] == [""]
     assert [r["text"] for r in _speak(300, " movie called", finished=True)] == [""]
 
-    # The next segment starts fresh: its text is attached again, even when
-    # it repeats the previous segment's text verbatim.
-    assert [r["text"] for r in _speak(400, " Titanic", finished=True)] == [" Titanic"]
+    # Continuation units re-run the talker with the SAME handed text past a
+    # finished boundary (every engine segment ends finished=True); the text
+    # must stay suppressed or each continuation duplicates the transcript.
+    assert [r["text"] for r in _speak(400, " movie called", finished=False)] == [""]
+    assert [r["text"] for r in _speak(450, " movie called", finished=True)] == [""]
+
+    # A genuinely new segment text is attached in full.
     assert [r["text"] for r in _speak(500, " Titanic", finished=True)] == [" Titanic"]
 
     # Text growing within a segment is delivered as suffix deltas.
@@ -783,8 +787,7 @@ def test_duplex_segment_text_is_attached_once_across_streaming_batches():
     assert [r["text"] for r in _speak(700, " by James", finished=True)] == [" James"]
 
     # A segment whose finished batch slices to an EMPTY audio delta (all
-    # samples already delivered) must still end the segment: the next
-    # segment's text may not be suffix-sliced against the previous one.
+    # samples already delivered) must not block the next segment's text.
     assert [r["text"] for r in _speak(800, " James Cameron. The", finished=False)] == [" James Cameron. The"]
     assert _speak(800, " James Cameron. The", finished=True) == []
     assert [r["text"] for r in _speak(900, " 997.", finished=False)] == [" 997."]
