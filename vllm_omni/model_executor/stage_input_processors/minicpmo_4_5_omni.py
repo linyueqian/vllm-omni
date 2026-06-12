@@ -357,20 +357,31 @@ def llm2tts(
             # chunk terminator.
             listen_id = special_token_ids.get("listen_token_id")
             speak_id = special_token_ids.get("speak_token_id")
-            start = prompt_token_ids_len
-            while start < len(full_token_ids) and full_token_ids[start] == listen_id:
-                start += 1
-            if start < len(full_token_ids) and full_token_ids[start] == speak_id:
-                tts_start_idx = start + 1
-                tts_end_idx = len(full_token_ids)
-                for idx_t in range(tts_start_idx, len(full_token_ids)):
-                    if full_token_ids[idx_t] in tts_end_ids:
-                        tts_end_idx = idx_t
+            out_ids = llm_output_ids
+            j = 0
+            while j < len(out_ids) and out_ids[j] == listen_id:
+                j += 1
+            if j < len(out_ids) and out_ids[j] == speak_id:
+                out_start = j + 1
+                out_end = len(out_ids)
+                for idx_t in range(out_start, len(out_ids)):
+                    if out_ids[idx_t] in tts_end_ids:
+                        out_end = idx_t
                         break
-                tts_end_idx = min(tts_end_idx, int(thinker_hidden_states.shape[0]))
-                if tts_end_idx > tts_start_idx:
-                    tts_token_ids_slice = torch.tensor(full_token_ids[tts_start_idx:tts_end_idx], dtype=torch.long)
-                    tts_hidden_slice = thinker_hidden_states[tts_start_idx:tts_end_idx].to(torch.float32).contiguous()
+                # Map output indices onto hidden rows by END alignment: the
+                # leading decision tokens of the delta may ALSO be folded into
+                # the resumable prompt (they belong to earlier non-forwarded
+                # segments), so prompt_len + delta over-counts them and
+                # front-aligned indexing truncates the slice. The hidden
+                # tensor's last len(out_ids) rows are the delta's rows.
+                hidden_base = int(thinker_hidden_states.shape[0]) - len(out_ids)
+                if hidden_base >= 0 and out_end > out_start:
+                    tts_token_ids_slice = torch.tensor(out_ids[out_start:out_end], dtype=torch.long)
+                    tts_hidden_slice = (
+                        thinker_hidden_states[hidden_base + out_start : hidden_base + out_end]
+                        .to(torch.float32)
+                        .contiguous()
+                    )
         if profile_enabled:
             logger.info(
                 "llm2tts profile req=%s prompt_tokens=%d output_tokens=%d hidden_shape=%s tts_tokens=%d total_ms=%.3f",

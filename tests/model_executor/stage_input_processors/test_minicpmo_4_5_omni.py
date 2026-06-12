@@ -216,7 +216,7 @@ def test_llm2tts_native_duplex_uses_speak_region_without_tts_bos_prompt():
 
 
 def test_llm2tts_native_duplex_conditions_on_turn_eos_and_midunit_speak():
-    latent = torch.arange(40, dtype=torch.float16).reshape(10, 4)
+    latent = torch.arange(36, dtype=torch.float16).reshape(9, 4)
     # Official duplex includes mid-unit <|speak|> tokens AND the <|turn_eos|>
     # token+hidden in the talker condition (its embedding is the trained
     # stop signal); only chunk terminators bound the slice.
