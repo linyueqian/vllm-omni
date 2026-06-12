@@ -1589,9 +1589,18 @@ class NativeRealtimeSessionProtocol:
                 payloads.extend(self._realtime_audio_delta_events(event, response_id, audio))
                 self._refresh_in_progress_response_item(response_id)
             text = event.get("text")
-            if isinstance(text, str) and text:
+            has_text = isinstance(text, str) and bool(text)
+            if has_text:
                 self._append_response_transcript(response_id, text)
                 self._refresh_in_progress_response_item(response_id)
+            # Keep the audio.delta + transcript.delta pair invariant even for
+            # text-less units (deduplicated continuations, turn-end flush):
+            # clients that treat the pair as unit-complete would otherwise
+            # wait on a transcript that never comes.
+            emit_transcript = has_text or (isinstance(audio, str) and bool(audio))
+            if emit_transcript:
+                if not has_text:
+                    text = ""
                 if self._emit_output_audio_events:
                     payloads.append(
                         {
