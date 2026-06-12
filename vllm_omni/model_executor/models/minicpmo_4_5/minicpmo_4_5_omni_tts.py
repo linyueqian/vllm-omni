@@ -704,6 +704,48 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             except OSError:
                 pass
 
+    def _warmup_duplex_vocoder(self) -> None:
+        """Pre-compile the two token2wav stream() modes used per turn.
+
+        The first stream() call of each mode (mid-turn 25+pre_lookahead
+        window, and the variable-size last_chunk tail flush) costs ~20s of
+        one-time compilation; without this warmup the first spoken turn of
+        the first session stalls for both. Mirrors the official demo's
+        precompile step.
+        """
+        if getattr(self, "_t2w_warmed", False):
+            return
+        self._t2w_warmed = True
+        if os.environ.get("MINICPMO45_SKIP_T2W_WARMUP") == "1":
+            return
+        try:
+            self._lazy_init_tts()
+            if self.audio_tokenizer is None:
+                return
+            prompt_wav_path, _ = self._resolve_prompt_wav_path(None, None)
+            if prompt_wav_path is None:
+                return
+            t0 = time.perf_counter()
+            chunk_size = self._tts_runtime_config().streaming_generator_chunk
+            pre_lookahead = self._t2w_pre_lookahead()
+            self._begin_turn_vocoder_cache(prompt_wav_path)
+            self._t2w_stream_window(
+                [_T2W_SILENCE_TOKEN] * (chunk_size + pre_lookahead),
+                prompt_wav_path,
+                last_chunk=False,
+            )
+            self._begin_turn_vocoder_cache(prompt_wav_path)
+            self._t2w_stream_window(
+                [_T2W_SILENCE_TOKEN] * (pre_lookahead + 2),
+                prompt_wav_path,
+                last_chunk=True,
+            )
+            self.audio_tokenizer.stream_cache = None
+            self.audio_tokenizer.hift_cache_dict = {}
+            logger.info("4.5 Talker duplex vocoder warmup done in %.1fs", time.perf_counter() - t0)
+        except Exception:
+            logger.exception("4.5 Talker duplex vocoder warmup failed")
+
     def _create_native_duplex_stream_gen(self, info: dict[str, Any]):
         """Per-segment generator over a persistent per-turn talker stream.
 
@@ -1834,6 +1876,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     ):
         if additional_information is None:
             additional_information = {}
+        if not additional_information:
+            # Profile/dummy run: use it to pre-compile the per-turn vocoder
+            # stream modes so the first real spoken turn does not stall.
+            self._warmup_duplex_vocoder()
 
         tts_token_ids, tts_hidden_states = self._extract_tts_handoff(additional_information)
         tts_text = additional_information.get("llm_output_text", [""])
