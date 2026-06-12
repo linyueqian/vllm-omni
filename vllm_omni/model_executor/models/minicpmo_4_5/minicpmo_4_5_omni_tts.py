@@ -178,6 +178,25 @@ class _PreallocatedKVCache:
         return self.max_cache_len
 
 
+class _SuppressEosLogitsProcessor:
+    """Mask the audio EOS token while a turn is mid-flight.
+
+    Official duplex pins min=max tokens per mid-turn unit with EOS at -inf,
+    so every 1s unit emits a full vocoder window (~1s audio). Without it a
+    unit that samples EOS early buffers fewer than window-size tokens,
+    yields no audio, and the chunk produces no client-visible result.
+    """
+
+    def __init__(self, eos_token_id: int):
+        self.eos_token_id = int(eos_token_id)
+        self.enabled = True
+
+    def __call__(self, input_ids, scores):
+        if self.enabled:
+            scores[..., self.eos_token_id] = -float("inf")
+        return scores
+
+
 class _TalkerTurnState:
     """Per-turn talker continuity for native duplex.
 
@@ -195,11 +214,13 @@ class _TalkerTurnState:
         "token2wav_buffer",
         "prompt_wav_path",
         "temp_prompt_wav_path",
+        "eos_suppressor",
     )
 
-    def __init__(self, generator, prompt_wav_path, temp_prompt_wav_path):
+    def __init__(self, generator, prompt_wav_path, temp_prompt_wav_path, eos_suppressor=None):
         self.generator = generator
         self.consumed_tts_tokens = 0
+        self.eos_suppressor = eos_suppressor
         # Official seeds each turn's vocoder buffer with three silence
         # tokens so the first synthesized window does not directly abut the
         # reference-audio prompt cache (audible ref-voice bleed otherwise).
@@ -829,16 +850,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             )
             # Official duplex applies the repetition penalty only; the top-p/
             # top-k warpers are constructed upstream but never applied.
+            eos_suppressor = _SuppressEosLogitsProcessor(int(tts.config.num_audio_tokens) - 1)
             generator = generator_cls(
                 model=tts,
                 temperature=sampling_params.temperature,
                 eos_token=eos_token,
                 chunk_size=chunk_size,
-                logits_processors=logits_processors,
+                logits_processors=list(logits_processors) + [eos_suppressor],
                 logits_warpers=[],
             )
             self._begin_turn_vocoder_cache(prompt_wav_path)
-            state = _TalkerTurnState(generator, prompt_wav_path, temp_prompt_wav_path)
+            state = _TalkerTurnState(generator, prompt_wav_path, temp_prompt_wav_path, eos_suppressor)
             self._talker_turn_states[key] = state
 
         if pending_ids:
@@ -866,22 +888,55 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 len(state.token2wav_buffer),
             )
 
+        if state.eos_suppressor is not None:
+            # Mid-turn units must fill a full vocoder window so every chunk
+            # produces audible output; EOS becomes legal again at turn end.
+            state.eos_suppressor.enabled = not turn_end
         pre_lookahead = self._t2w_pre_lookahead()
+        unit_t0 = time.perf_counter()
+        generate_ms = 0.0
+        vocode_ms = 0.0
         token_iter = state.generator.generate_with_buffer(
             condition=condition,
             text_finished=bool(turn_end),
             max_new_token=chunk_size,
         )
-        for audio_token_chunk, _gen_last in token_iter:
+        while True:
+            gen_t0 = time.perf_counter()
+            try:
+                audio_token_chunk, _gen_last = next(token_iter)
+            except StopIteration:
+                generate_ms += (time.perf_counter() - gen_t0) * 1000
+                break
+            generate_ms += (time.perf_counter() - gen_t0) * 1000
             if audio_token_chunk is None:
                 break
             token_list = audio_token_chunk.reshape(-1).detach().cpu().tolist()
             state.token2wav_buffer.extend(int(t) for t in token_list)
             while len(state.token2wav_buffer) >= chunk_size + pre_lookahead:
                 window = state.token2wav_buffer[: chunk_size + pre_lookahead]
+                voc_t0 = time.perf_counter()
                 waveform = self._t2w_stream_window(window, state.prompt_wav_path, last_chunk=False)
+                vocode_ms += (time.perf_counter() - voc_t0) * 1000
                 state.token2wav_buffer = state.token2wav_buffer[chunk_size:]
+                if profile_enabled:
+                    logger.info(
+                        "4.5 Talker duplex unit timing: key=%s generate_ms=%.1f vocode_ms=%.1f total_ms=%.1f",
+                        key,
+                        generate_ms,
+                        vocode_ms,
+                        (time.perf_counter() - unit_t0) * 1000,
+                    )
                 yield waveform, False
+        if profile_enabled:
+            logger.info(
+                "4.5 Talker duplex unit end: key=%s turn_end=%s generate_ms=%.1f vocode_ms=%.1f total_ms=%.1f",
+                key,
+                turn_end,
+                generate_ms,
+                vocode_ms,
+                (time.perf_counter() - unit_t0) * 1000,
+            )
         if turn_end:
             tail = state.token2wav_buffer
             state.token2wav_buffer = []
