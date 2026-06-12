@@ -2128,6 +2128,12 @@ class OmniDuplexSessionHandler:
 
         old_task = self._native_data_plane_tasks.get(session.session_id)
         if old_task is not None and not old_task.done():
+            if self._session_auto_responds(session):
+                # One persistent drain per session, like the official worker's
+                # single synchronous loop: the resumable data-plane request id
+                # is stable, and cancel/restart on every append orphans any
+                # decision that lands in the swap window.
+                return False
             old_task.cancel()
             try:
                 await asyncio.wait_for(asyncio.gather(old_task, return_exceptions=True), timeout=0.25)
