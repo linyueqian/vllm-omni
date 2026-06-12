@@ -88,6 +88,10 @@ def _f32b64_to_wav_data_uri(audio_b64: str, sample_rate: int = 16000) -> str:
 class _VllmSession:
     """One official duplex session mapped onto one vLLM realtime session."""
 
+    # One second at 24 kHz: the official per-result audio rhythm the
+    # prebuilt frontend schedules playback against.
+    _UNIT_SAMPLES = 24000
+
     def __init__(self, system_prompt: str, ref_audio_b64: str | None) -> None:
         self.system_prompt = system_prompt
         self.ref_audio_b64 = ref_audio_b64
@@ -97,6 +101,36 @@ class _VllmSession:
         self.reader_task: asyncio.Task | None = None
         self.chunk_idx = 0
         self.kv_cache_length: int | None = None
+        # Generated reply samples awaiting paced emission (f32, 24 kHz).
+        self._audio_fifo = np.zeros(0, dtype=np.float32)
+
+    def _paced_unit_audio(self, new_f32: np.ndarray | None, *, flush: bool) -> str | None:
+        """Re-pace reply audio onto the official per-result rhythm.
+
+        The official worker returns exactly one second of audio with EVERY
+        result: listens carry silence, non-final speak units are left-padded
+        to one second, and only the turn-final result carries an unpadded
+        tail. The frontend's playback scheduler assumes that rhythm, so
+        forwarding variable-size deltas makes it drift and clip. Buffer the
+        generated samples and emit one unit per result.
+        """
+        if new_f32 is not None and len(new_f32):
+            self._audio_fifo = np.concatenate([self._audio_fifo, new_f32])
+        if flush:
+            out = self._audio_fifo
+            self._audio_fifo = np.zeros(0, dtype=np.float32)
+            if not len(out):
+                return None
+        elif len(self._audio_fifo) >= self._UNIT_SAMPLES:
+            out = self._audio_fifo[: self._UNIT_SAMPLES]
+            self._audio_fifo = self._audio_fifo[self._UNIT_SAMPLES :]
+        else:
+            pending = self._audio_fifo
+            self._audio_fifo = np.zeros(0, dtype=np.float32)
+            out = np.zeros(self._UNIT_SAMPLES, dtype=np.float32)
+            if len(pending):
+                out[-len(pending) :] = pending
+        return base64.b64encode(out.astype("<f4").tobytes()).decode("ascii")
 
     async def open(self) -> None:
         assert ARGS is not None
@@ -228,13 +262,18 @@ class _VllmSession:
             elif decision.get("end_of_turn"):
                 result["end_of_turn"] = True
                 result["is_listen"] = False
+                result["audio_data"] = self._paced_unit_audio(None, flush=True)
             elif decision.get("is_listen") is False:
                 result["is_listen"] = False
                 result["text"] = decision.get("text") or ""
                 pcm16_parts = decision.get("audio") or []
+                new_f32 = None
                 if pcm16_parts:
-                    joined = base64.b64encode(b"".join(base64.b64decode(p) for p in pcm16_parts)).decode("ascii")
-                    result["audio_data"] = _pcm16_b64_to_f32_b64(joined)
+                    pcm16 = np.frombuffer(
+                        b"".join(base64.b64decode(p) for p in pcm16_parts),
+                        dtype=np.int16,
+                    )
+                    new_f32 = (pcm16.astype(np.float32) / 32768.0).astype(np.float32)
                 # A response.done right behind the audio marks the turn end.
                 try:
                     nxt = await asyncio.wait_for(self.decisions.get(), timeout=0.25)
@@ -244,8 +283,14 @@ class _VllmSession:
                         self.decisions.put_nowait(nxt)
                 except asyncio.TimeoutError:
                     pass
+                result["audio_data"] = self._paced_unit_audio(new_f32, flush=result["end_of_turn"])
+            else:
+                # Listen result: the official worker returns one second of
+                # silence so the frontend's playback clock keeps ticking.
+                result["audio_data"] = self._paced_unit_audio(None, flush=False)
         except asyncio.TimeoutError:
             logger.warning("chunk %d: no decision within %ss", self.chunk_idx, ARGS.chunk_timeout_s)
+            result["audio_data"] = self._paced_unit_audio(None, flush=False)
 
         result["wall_clock_ms"] = round((time.perf_counter() - t0) * 1000, 1)
         result["kv_cache_length"] = self.kv_cache_length
