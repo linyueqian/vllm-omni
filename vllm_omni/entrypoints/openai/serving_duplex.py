@@ -3001,6 +3001,12 @@ class OmniDuplexSessionHandler:
                 "runner_local_payload_ref": False,
             }
             return
+        if session is not None and self._session_auto_responds(session):
+            # Auto-respond: a batch whose audio delta sliced to empty (all
+            # samples already delivered) can still carry delta text; that is
+            # normal streaming overlap, not an error, and the text already
+            # rides with the audio messages.
+            return
         if session is not None and "audio" in session.config.modalities:
             yield {
                 "supported": True,
