@@ -551,6 +551,32 @@ def test_llm2tts_native_duplex_hands_off_segment_deltas():
     assert converted2[0]["prompt_token_ids"] == [31]
 
 
+def test_llm2tts_native_duplex_accumulates_tts_condition_across_handoffs():
+    """Every handoff must carry the FULL accumulated tts condition.
+
+    The runner's resume-prefill path REPLACES the streaming buffer (only
+    in-place updates merge), so per-segment tts payloads were silently lost
+    for alternating segments; the talker then vocalized text it never saw.
+    Handing the complete history per handoff makes replacement lossless.
+    """
+    streaming_context = SimpleNamespace(bridge_states={})
+
+    seg1_output = [9304, 21, 22, 9308]
+    handoff1 = _native_duplex_handoff("duplex-acc", [101, 102], list(seg1_output))
+    converted1 = llm2tts([handoff1], prompt=[{}], _streaming_context=streaming_context)
+    info1 = converted1[0]["model_intermediate_buffer"]
+    assert info1["ids"]["tts"] == [21, 22]
+    assert len(info1["hidden_states"]["tts"]) == 2
+
+    seg2_output = [9304, 31, 9308]
+    prompt2 = [101, 102, *seg1_output, 555]
+    handoff2 = _native_duplex_handoff("duplex-acc", prompt2, [*seg1_output, *seg2_output])
+    converted2 = llm2tts([handoff2], prompt=[{}], _streaming_context=streaming_context)
+    info2 = converted2[0]["model_intermediate_buffer"]
+    assert info2["ids"]["tts"] == [21, 22, 31]
+    assert len(info2["hidden_states"]["tts"]) == 3
+
+
 def test_llm2tts_never_aliases_thinker_token_list():
     """The talker prompt must never be the thinker's live token list object.
 

@@ -258,10 +258,9 @@ def _torch_clone_recursive(obj):
 class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     """MiniCPM-o 4.5 Talker: MiniCPMTTS + Token2wav in a single forward pass."""
 
-    # Native-duplex tts handoffs are per-segment deltas; accumulate them in
-    # the runner's streaming buffer so a handoff arriving while the previous
-    # segment is still synthesizing is queued instead of overwritten.
-    streaming_accumulated_keys = {("ids", "tts"), ("hidden_states", "tts")}
+    # llm2tts hands the FULL accumulated condition per handoff (the runner's
+    # resume-prefill path REPLACES the streaming buffer, so runner-side
+    # accumulation is lossy); the per-turn state consumes it by cursor.
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -887,6 +886,28 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 turn_end,
                 len(state.token2wav_buffer),
             )
+
+        cond_dump_dir = os.environ.get("MINICPMO45_DUMP_TTS_COND")
+        if cond_dump_dir:
+            try:
+                if pending_ids:
+                    raw_hidden = (
+                        tts_hidden_states[consumed:]
+                        if isinstance(tts_hidden_states, list)
+                        else torch.as_tensor(tts_hidden_states)[consumed:]
+                    )
+                    _, hid_t = self._normalize_tts_handoff_tensors(pending_ids, raw_hidden)
+                    hid_np = hid_t.cpu().numpy().astype(np.float32)
+                else:
+                    hid_np = np.zeros((0, 4096), dtype=np.float32)
+                np.savez(
+                    f"{cond_dump_dir}/unit_{time.monotonic_ns()}.npz",
+                    ids=np.asarray(pending_ids, dtype=np.int64),
+                    hidden=hid_np,
+                    turn_end=np.asarray([int(bool(turn_end))]),
+                )
+            except Exception:
+                logger.exception("MiniCPM-o 4.5 tts condition dump failed")
 
         if state.eos_suppressor is not None:
             # Mid-turn units must fill a full vocoder window so every chunk

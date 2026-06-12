@@ -167,15 +167,47 @@ def _native_duplex_segment_output_ids(
         state["request_id"] = request_id
         state["sent_output_len"] = 0
         state["sent_text_len"] = 0
+        state["acc_tts_ids"] = []
+        state["acc_tts_hidden"] = []
     sent_len = state.get("sent_output_len", 0)
     if not isinstance(sent_len, int) or sent_len < 0 or sent_len > len(output_ids):
+        # Shrunken cumulative output = epoch reset after barge-in: the talker
+        # condition history is stale too.
         sent_len = 0
+        state["acc_tts_ids"] = []
+        state["acc_tts_hidden"] = []
     sent_text_len = state.get("sent_text_len", 0)
     if not isinstance(sent_text_len, int) or sent_text_len < 0 or sent_text_len > len(output_text):
         sent_text_len = 0
     state["sent_output_len"] = len(output_ids)
     state["sent_text_len"] = len(output_text)
     return output_ids[sent_len:], output_text[sent_text_len:]
+
+
+def _accumulate_native_tts_handoff(streaming_context, new_ids, new_hidden):
+    """Hand the talker the FULL accumulated condition on every handoff.
+
+    The runner's streaming buffer update is not merge-safe for a resumable
+    stage-1 request: in-place updates merge sub-keys, but a resume prefill
+    REPLACES the buffer, silently dropping every earlier segment's tts
+    tokens/hiddens (observed losing alternating reply segments — the talker
+    vocalized text it never saw between islands it did). Accumulate here so
+    the latest handoff always carries the complete history and downstream
+    replace semantics are lossless; the talker consumes by cursor.
+    """
+    bridge_states = getattr(streaming_context, "bridge_states", None)
+    if not isinstance(bridge_states, dict):
+        return new_ids, new_hidden
+    state = bridge_states.setdefault("minicpmo45_tts_handoff", {})
+    acc_ids = state.setdefault("acc_tts_ids", [])
+    acc_hidden = state.setdefault("acc_tts_hidden", [])
+    if new_ids:
+        acc_ids.extend(int(t) for t in new_ids)
+        if new_hidden:
+            acc_hidden.extend(new_hidden)
+    if not acc_ids:
+        return None, None
+    return list(acc_ids), list(acc_hidden)
 
 
 def _build_tts_scheduler_prompt_token_ids(
@@ -371,11 +403,15 @@ def llm2tts(
         if ref_audio is not None:
             ref_waveform, ref_sr = ref_audio
             set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
-        set_tts_handoff(
-            model_intermediate_buffer,
-            _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None,
-            _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None,
-        )
+        handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
+        handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
+        if is_native_duplex_handoff:
+            handoff_ids, handoff_hidden = _accumulate_native_tts_handoff(
+                _streaming_context,
+                handoff_ids,
+                handoff_hidden,
+            )
+        set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
 
         scheduler_prompt_token_ids = _build_tts_scheduler_prompt_token_ids(
             tts_token_ids_slice,
