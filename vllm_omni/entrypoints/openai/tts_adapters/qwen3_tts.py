@@ -39,7 +39,10 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         match. See ``_validate_qwen_tts_request``."""
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
-        return self.ctx.server._validate_qwen_tts_request(request)
+        # Go through the shared dispatcher (which routes to
+        # _validate_qwen_tts_request for this model-type) rather than the leaf
+        # validator directly, matching the pre-adapter qwen3 path.
+        return self.ctx.server._validate_tts_request(request)
 
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool

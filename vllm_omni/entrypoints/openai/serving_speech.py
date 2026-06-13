@@ -489,6 +489,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 self._adapter = adapter_cls(ctx)
                 logger.info("Resolved TTS serving adapter: %s", adapter_cls.__name__)
 
+    def _get_tts_adapter(self):
+        """Return the per-model serving adapter for the current ``_tts_model_type``.
+
+        Resolved lazily (rebuilt if ``_tts_model_type`` changed since the cached
+        instance was built) so callers that set ``_tts_model_type`` after
+        construction still dispatch to the matching adapter. In production
+        ``_tts_model_type`` is fixed at init, so the cached instance is reused.
+        """
+        adapter_cls = resolve_adapter(self._tts_model_type)
+        if adapter_cls is None:
+            self._adapter = None
+            return None
+        if self._adapter is None or type(self._adapter) is not adapter_cls:
+            ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
+            self._adapter = adapter_cls(ctx)
+        return self._adapter
+
     async def warmup(self) -> None:
         """Run a synthetic speech request to trigger all first-request warmup.
 
@@ -3273,11 +3290,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             prompt = self._build_ming_flash_omni_prompt(request)
             tts_params = {}
             qwen3_ref_audio_warmup_artifact_key = None
-        elif self._adapter is not None:
-            validation_error = self._adapter.validate(request)
+        elif (adapter := self._get_tts_adapter()) is not None:
+            validation_error = adapter.validate(request)
             if validation_error:
                 raise ValueError(validation_error)
-            prepared = await self._adapter.build(request, sampling_params_list, has_inline_ref_audio)
+            prepared = await adapter.build(request, sampling_params_list, has_inline_ref_audio)
             prompt = prepared.prompt
             tts_params = prepared.tts_params
             qwen3_ref_audio_warmup_artifact_key = prepared.warmup_artifact_key
