@@ -4,7 +4,7 @@
 from typing import TYPE_CHECKING
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, conditioning_cache_salt
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -24,8 +24,6 @@ class FishSpeechAdapter(ARTTSAdapter):
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
-        from vllm_omni.entrypoints.openai import serving_speech as _ss
-
         server = self.ctx.server
         ref_audio_data = None
         if request.ref_audio is not None:
@@ -35,5 +33,5 @@ class FishSpeechAdapter(ARTTSAdapter):
             request, ref_audio_data=ref_audio_data, has_inline_ref_audio=has_inline_ref_audio
         )
         tts_params = {}
-        prompt["cache_salt"] = _ss._conditioning_cache_salt(request, tts_params)
+        prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="fish_speech")

@@ -21,6 +21,24 @@ if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
 
+_conditioning_cache_salt_fn: "Callable[..., str] | None" = None
+
+
+def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: dict) -> str:
+    """Return the conditioning cache salt for ``request`` + ``tts_params``.
+
+    Lazily imports and caches ``serving_speech._conditioning_cache_salt`` on first
+    use: the import is deferred to break the adapters<->serving_speech import
+    cycle, and cached so it resolves once instead of on every ``build()`` call.
+    """
+    global _conditioning_cache_salt_fn
+    if _conditioning_cache_salt_fn is None:
+        from vllm_omni.entrypoints.openai.serving_speech import _conditioning_cache_salt
+
+        _conditioning_cache_salt_fn = _conditioning_cache_salt
+    return _conditioning_cache_salt_fn(request, tts_params)
+
+
 @dataclass
 class OutputPolicy:
     """How the orchestrator aggregates engine output for a model.

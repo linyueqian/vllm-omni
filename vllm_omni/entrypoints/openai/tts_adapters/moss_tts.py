@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from vllm.inputs import tokens_input
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, conditioning_cache_salt
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -26,8 +26,6 @@ class _MossTTSAdapterBase(ARTTSAdapter):
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
-        from vllm_omni.entrypoints.openai import serving_speech as _ss
-
         server = self.ctx.server
         tts_params = await server._build_moss_tts_params(request)
         if request.voice:
@@ -44,7 +42,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         else:
             prompt = tokens_input(prompt_token_ids=[1])
         prompt["additional_information"] = tts_params
-        prompt["cache_salt"] = _ss._conditioning_cache_salt(request, tts_params)
+        prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type=self.name)
 
 

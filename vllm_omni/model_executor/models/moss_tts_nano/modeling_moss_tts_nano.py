@@ -52,8 +52,18 @@ def _hf_load_without_tp_warmup():
     MOSS-TTS-Nano runs single-GPU (no tensor parallelism), so forcing the
     warmup down its non-distributed branch is byte-for-byte equivalent and
     sidesteps the ``None`` plan. Scoped to the wrapped ``from_pretrained`` call.
+
+    Targets the private ``transformers.modeling_utils._is_torch_distributed_initialized``.
+    Guarded by ``hasattr`` so that if a future transformers renames or removes it
+    (and presumably the crash with it), we no-op instead of raising AttributeError.
     """
     import transformers.modeling_utils as _tmu
+
+    if not hasattr(_tmu, "_is_torch_distributed_initialized"):
+        # Internal hook gone (transformers refactor); assume the upstream crash
+        # is gone too and run the load unpatched.
+        yield
+        return
 
     original = _tmu._is_torch_distributed_initialized
     _tmu._is_torch_distributed_initialized = lambda: False

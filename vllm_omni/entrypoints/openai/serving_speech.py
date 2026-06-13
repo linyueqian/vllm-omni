@@ -3246,15 +3246,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     # ---- Common speech generation helpers ----
 
-    async def _build_default_tts_request(
+    async def _build_qwen3_tts_request(
         self,
         request: OpenAICreateSpeechRequest,
     ) -> tuple[dict[str, Any], dict[str, Any], str | None]:
-        """Build prompt + tts_params for the default placeholder path.
+        """Build prompt + tts_params for Qwen3-TTS.
 
-        Shared by Qwen3-TTS (via ``Qwen3TTSAdapter.build``) and the legacy
-        VoxCPM branch. Extracted verbatim from ``_prepare_speech_generation`` so
-        both callers and the batch path use one implementation. Returns
+        Called from ``Qwen3TTSAdapter.build``. Returns
         ``(prompt, tts_params, warmup_artifact_key)`` where the warmup key is the
         Qwen3-TTS ref-audio artifact tracked after ``generate()``.
         """
@@ -3269,17 +3267,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if ref_audio_source is not None and isinstance(ref_audio_source, str):
             wav_list, sr = await self._resolve_ref_audio(ref_audio_source)
             artifact_key = self._get_resolved_ref_audio_artifact_key(ref_audio_source)
-            if self._tts_model_type == "qwen3_tts" and artifact_key:
+            if artifact_key:
                 tts_params[_QWEN3_TTS_REF_AUDIO_CACHE_KEY] = [artifact_key]
             ref_code_length = self._estimate_ref_code_len([wav_list, sr])
-            if self._tts_model_type == "qwen3_tts" and ref_code_length is not None:
+            if ref_code_length is not None:
                 tts_params["ref_code_length"] = [int(ref_code_length)]
             if self._qwen3_tts_can_use_ref_audio_artifact_only(tts_params, artifact_key):
                 logger.debug("Using Qwen3-TTS ref_audio artifact-only path: %s", artifact_key)
             else:
                 tts_params["ref_audio"] = [[wav_list, sr]]
-                if self._tts_model_type == "qwen3_tts":
-                    qwen3_ref_audio_warmup_artifact_key = artifact_key
+                qwen3_ref_audio_warmup_artifact_key = artifact_key
 
         ph_len = await self._estimate_prompt_len_async(tts_params)
         prompt = tokens_input(prompt_token_ids=[1] * ph_len)
