@@ -16,7 +16,6 @@ Easy, fast, and cheap omni-modality model serving for everyone
 ---
 
 *Latest News* 🔥
-- [2026/06] vLLM-Omni TTS deployment recipes for 12 models across 8 providers (Qwen3-TTS, Voxtral-TTS, Fish-Speech S2 Pro, VoxCPM2, MOSS-TTS, GLM-TTS, Higgs-Audio v3, Ming-omni-tts) are now live on [recipes.vllm.ai](https://recipes.vllm.ai), served via the OpenAI-compatible `/v1/audio/speech` API.
 - [2026/06] We released [0.22.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.22.0) - an **omnimodal world-model** release aligned with vLLM 0.22, featuring [Nvidia Cosmos3](recipes/cosmos3/Cosmos3-Nano.md)/DreamZero world model support, expanded quantization coverage across Blackwell/NPU/XPU, TTS production improvements, new models including MiniCPM-o 4.5, MOSS-TTS, and Lance, plus RL integration with [VeRL-Omni](https://github.com/verl-project/verl-omni).
 - [2026/05] We released [0.20.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.20.0) - refreshes the serving/runtime stack for large-scale omni workloads, and improves diffusion model performance, quantization, and hardware readiness across CUDA, ROCm, MUSA, NPU, and XPU backends.
 - [2026/03] We released [0.18.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.18.0) - strengthens the core runtime through a large entrypoint refactor and scheduler/runtime cleanups, expands unified quantization and diffusion execution, broadens multimodal model coverage, and improves production readiness across audio, omni, image, video, RL, and multi-platform deployments.
