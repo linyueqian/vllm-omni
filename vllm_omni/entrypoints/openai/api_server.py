@@ -1253,7 +1253,12 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
                 status_code=HTTPStatus.NOT_FOUND.value,
                 detail="The model does not support Speech API",
             )
-        return base_server.create_error_response(message="The model does not support Speech API")
+        err = base_server.create_error_response(
+            message="The model does not support Speech API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+        return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
     try:
         result = await handler.create_speech(request, raw_request)
         if isinstance(result, ErrorResponse):
@@ -1286,14 +1291,16 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
                 status_code=HTTPStatus.NOT_FOUND.value,
                 detail="The model does not support Speech API",
             )
-        return base_server.create_error_response(message="The model does not support Speech API")
+        err = base_server.create_error_response(
+            message="The model does not support Speech API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+        return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
     try:
         result = await handler.create_speech_batch(request)
         if isinstance(result, ErrorResponse):
-            return JSONResponse(
-                content=result.model_dump(),
-                status_code=result.error.code if result.error else 400,
-            )
+            return _error_response_to_json_response(result)
         return JSONResponse(content=result.model_dump())
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
@@ -1324,14 +1331,16 @@ async def create_audio_generate(request: OpenAICreateAudioGenerateRequest, raw_r
                 status_code=HTTPStatus.NOT_FOUND.value,
                 detail="The model does not support Audio Generate API",
             )
-        return base_server.create_error_response(message="The model does not support Audio Generate API")
+        err = base_server.create_error_response(
+            message="The model does not support Audio Generate API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+        return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
     try:
         result = await handler.create_audio_generate(request, raw_request)
         if isinstance(result, ErrorResponse):
-            return JSONResponse(
-                content=result.model_dump(),
-                status_code=result.error.code if result.error else 400,
-            )
+            return _error_response_to_json_response(result)
         return result
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)

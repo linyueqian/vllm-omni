@@ -29,6 +29,7 @@ from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
     CreateAudio,
+    OpenAICreateAudioGenerateRequest,
     OpenAICreateSpeechRequest,
     SpeechBatchItem,
 )
@@ -2274,6 +2275,46 @@ def test_api_server_delete_voice_exception_returns_500(mocker: MockerFixture):
         status_code=500,
         message="Failed to delete voice",
         err_type="InternalServerError",
+    )
+
+
+def test_api_server_create_speech_without_handler_returns_404(mocker: MockerFixture):
+    fake_base = _patch_api_server_base(mocker)
+    raw_request = _make_api_server_request(None, path="/v1/audio/speech")
+    raw_request.app.state.openai_serving_tokenization = fake_base
+    request = OpenAICreateSpeechRequest(input="Hello")
+
+    response = asyncio.run(api_server_module.create_speech(request, raw_request))
+
+    _assert_openai_error_response(
+        response, status_code=404, message="does not support Speech API", err_type="NotFoundError"
+    )
+
+
+def test_api_server_create_speech_batch_without_handler_returns_404(mocker: MockerFixture):
+    fake_base = _patch_api_server_base(mocker)
+    raw_request = _make_api_server_request(None, path="/v1/audio/speech/batch")
+    raw_request.app.state.openai_serving_tokenization = fake_base
+    request = BatchSpeechRequest(items=[SpeechBatchItem(input="hi")])
+
+    response = asyncio.run(api_server_module.create_speech_batch(request, raw_request))
+
+    _assert_openai_error_response(
+        response, status_code=404, message="does not support Speech API", err_type="NotFoundError"
+    )
+
+
+def test_api_server_create_audio_generate_without_handler_returns_404(mocker: MockerFixture):
+    fake_base = _patch_api_server_base(mocker)
+    raw_request = _make_api_server_request(None, path="/v1/audio/generate")
+    raw_request.app.state.openai_serving_audio_generate = None
+    raw_request.app.state.openai_serving_tokenization = fake_base
+    request = OpenAICreateAudioGenerateRequest(input="a bird singing")
+
+    response = asyncio.run(api_server_module.create_audio_generate(request, raw_request))
+
+    _assert_openai_error_response(
+        response, status_code=404, message="does not support Audio Generate API", err_type="NotFoundError"
     )
 
 
