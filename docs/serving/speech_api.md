@@ -491,7 +491,13 @@ Each item in the `items` array requires only `input` (the text). All other field
             "index": 0,
             "status": "success",
             "audio_data": "<base64-encoded audio>",
-            "media_type": "audio/wav"
+            "media_type": "audio/wav",
+            "usage": {
+                "input_tokens": 119,
+                "output_tokens": 77,
+                "total_tokens": 196,
+                "input_token_details": { "text_tokens": 18, "audio_tokens": 101 }
+            }
         },
         {
             "index": 1,
@@ -504,6 +510,18 @@ Each item in the `items` array requires only `input` (the text). All other field
     "failed": 1
 }
 ```
+
+Each successful item carries a `usage` object (errored items omit it):
+
+- `input_tokens` = `text_tokens` + `audio_tokens`
+    - `text_tokens`: tokens of the synthesized text (`input` plus `instructions`)
+    - `audio_tokens`: reference-audio codec frames, non-zero only for in-context
+      voice cloning (Base task); `0` for CustomVoice/VoiceDesign or x-vector-only
+- `output_tokens`: generated codec tokens
+- `total_tokens` = `input_tokens` + `output_tokens`
+
+The same `usage` object is emitted on the terminal `speech.audio.done` SSE event
+when streaming with `stream_format="sse"`.
 
 ### Examples
 
