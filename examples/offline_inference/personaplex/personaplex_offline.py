@@ -63,7 +63,10 @@ def main() -> None:
     session = PersonaPlexSession(engine, config)
     session.open()
 
-    user_pcm, sr = sphn.read(args.input_wav, sample_rate=config.sample_rate)
+    # Load exactly like the reference (moshi.lm.load_audio): native read then
+    # explicit resample, so greedy runs stay bit-faithful to `python -m moshi.offline`.
+    user_pcm, src_sr = sphn.read(args.input_wav)
+    user_pcm = sphn.resample(user_pcm, src_sample_rate=src_sr, dst_sample_rate=config.sample_rate)
     audio, text = session.run(np.asarray(user_pcm[0], dtype=np.float32))
 
     sphn.write_wav(args.output_wav, audio, config.sample_rate)
