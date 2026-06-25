@@ -22,6 +22,12 @@ class DuplexSessionConfig:
 
     proactive: bool = False
 
+    # Lockstep / frame-clocked models (Moshi-class, e.g. PersonaPlex) run a single
+    # never-restarted response that consumes inputs as they arrive and drains on
+    # close, rather than the turn-style start/cancel-per-trigger lifecycle. Default
+    # off: turn-based adapters (JoyVL, MiniCPM-o) are unaffected.
+    continuous: bool = False
+
 
 @dataclass
 class DuplexSession:

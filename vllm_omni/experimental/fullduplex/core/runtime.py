@@ -21,6 +21,10 @@ class DuplexRuntime:
         self._capabilities = adapter.capabilities()
 
     async def run(self, inputs: AsyncIterator[dict], emit: Emit) -> None:
+        # Lockstep models (PersonaPlex / Moshi-class) run ONE eternal response that
+        # consumes inputs as they arrive and drains on close, instead of the turn
+        # lifecycle's start/cancel-per-trigger. Default off — turn adapters unchanged.
+        continuous = self.session.config.continuous
         task: asyncio.Task | None = None
         async for event in inputs:
             etype = event.get("type")
@@ -31,23 +35,54 @@ class DuplexRuntime:
                     continue
                 await self.adapter.on_input(self.session, modality, event.get("data"))
                 self.session.state = DuplexState.LISTENING
-                if self.session.config.proactive and self.adapter.should_respond(self.session):
+                if continuous:
+                    task = self._ensure_continuous(task, emit)
+                elif self.session.config.proactive and self.adapter.should_respond(self.session):
                     task = await self._start_response(task, emit)
             elif etype in (ev.INPUT_COMMIT, ev.RESPONSE_CREATE):
-                if self.adapter.should_respond(self.session):
+                if continuous:
+                    task = self._ensure_continuous(task, emit)
+                elif self.adapter.should_respond(self.session):
                     task = await self._start_response(task, emit)
             elif etype == ev.RESPONSE_CANCEL:
+                # In continuous mode barge-in is native: bump the epoch for the
+                # playback cursor but keep the single response streaming.
                 await self._barge_in()
-                await self._cancel(task)
-                task = None
+                if not continuous:
+                    await self._cancel(task)
+                    task = None
                 await emit(ev.cancelled(self.session.response_index))
             elif etype == ev.PLAYBACK_ACK:
                 await self.adapter.on_playback_ack(self.session, int(event.get("cursor", 0)))
             elif etype == ev.CLOSE:
+                if continuous and task is not None and not task.done():
+                    await self.adapter.on_close(self.session)  # signal the loop to drain + stop
                 break
         if task is not None and not task.done():
             await task
         self.session.state = DuplexState.CLOSED
+
+    def _ensure_continuous(self, task: asyncio.Task | None, emit: Emit) -> asyncio.Task:
+        # Start the single eternal response exactly once; never supersede it.
+        if task is None or task.done():
+            return asyncio.create_task(self._respond_continuous(emit))
+        return task
+
+    async def _respond_continuous(self, emit: Emit) -> None:
+        # One response for the whole session. No staleness checks: the loop ends only
+        # when the adapter's respond() returns (after on_close drains its input).
+        response_index, _ = self.session.begin_response()
+        await emit(ev.created(response_index))
+        try:
+            async for chunk in self.adapter.respond(self.session):
+                await emit(ev.delta(response_index, chunk.modality, chunk.data))
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            await emit(ev.error(f"response failed: {err}"))
+        finally:
+            await emit(ev.done(response_index))
+            self.session.end_response()
 
     async def _start_response(self, prev: asyncio.Task | None, emit: Emit) -> asyncio.Task:
         # A new response supersedes any in-flight one. Mark the old response stale and
