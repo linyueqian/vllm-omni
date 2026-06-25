@@ -32,6 +32,15 @@ generic full-duplex framework (exercised by `tests/fullduplex/`), not the servin
 the HTTP orchestrator currently uses — a fused-audio model (e.g. MiniCPM-o) is the case
 `core/` is built for.
 
+`personaplex/` is that fused-audio case made concrete: a Moshi-class, pure-lockstep
+speech-to-speech model (see `recipes/NVIDIA/PersonaPlex.md`). It is the **second** model
+on `core/`, and the one that justified promoting a small lifecycle mode into it: the
+default-off `continuous` flag (`DuplexCapability` / `DuplexSessionConfig`) makes
+`DuplexRuntime` run ONE eternal, frame-clocked response that drains on close, instead of
+the turn-style start/cancel-per-trigger lifecycle. Turn-based adapters (JoyVL,
+MiniCPM-o) are unaffected. Its runnable path is `personaplex/session.py` (lockstep
+driver); `personaplex/adapter.py` is the `core.DuplexAdapter` demonstration.
+
 ## Adding a full-duplex model
 
 The seam is `core.DuplexAdapter`. `core/` owns the session lifecycle, epoch-based
