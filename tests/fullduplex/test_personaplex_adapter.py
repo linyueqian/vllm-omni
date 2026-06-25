@@ -15,10 +15,33 @@ from vllm_omni.experimental.fullduplex.core.runtime import DuplexRuntime
 from vllm_omni.experimental.fullduplex.core.session import DuplexSession, DuplexSessionConfig
 from vllm_omni.experimental.fullduplex.personaplex.adapter import PersonaPlexDuplexAdapter
 from vllm_omni.experimental.fullduplex.personaplex.config import FRAME_SIZE
-
-from .test_personaplex_session import StubStepper
+from vllm_omni.experimental.fullduplex.personaplex.engine import FrameOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+class StubStepper:
+    """Deterministic FrameStepper: frame i -> audio filled with i, text 't{i}' on odds."""
+
+    sample_rate = 24000
+    frame_size = FRAME_SIZE
+
+    def __init__(self) -> None:
+        self.opened: tuple[str | None, str | None] | None = None
+        self.steps = 0
+
+    def open_session(self, voice_prompt=None, persona=None) -> None:
+        self.opened = (voice_prompt, persona)
+        self.steps = 0
+
+    def step(self, user_pcm):
+        assert user_pcm.shape[0] == self.frame_size
+        self.steps += 1
+        i = self.steps
+        return FrameOutput(
+            audio=np.full(self.frame_size, float(i), dtype=np.float32),
+            text=(f"t{i}" if i % 2 else None),
+        )
 
 
 def _collector():
