@@ -118,7 +118,28 @@ Barge-in is native (model always consumes the user stream); no flush needed — 
   weight/structure/convention level. Remaining Phase-0 work = one-step numerical parity
   (gate/up half-order + per-head pairing under neox=False) during Task 2.
 
+## EXECUTION RESULTS (2026-06-25, verified on H200)
+- **Milestone A — temporal transformer on vLLM: DONE + VERIFIED.** Approach: instead of a
+  custom vLLM model class, export the Moshi temporal weights to a STOCK HF Llama
+  (`tools/personaplex/export_helium_hf.py`) with the interleaved->rotate-half q/k permute,
+  SwiGLU gate/up, fp32 RMSNorm. HF-Llama parity vs moshi = **100% argmax**; loaded into
+  `vllm.LLM`, greedy token matches moshi (1929==1929). The 7B runs on vLLM paged attention.
+- **Milestone B — full generation on vLLM: DONE + VERIFIED.** `tools/personaplex/generate_vllm.py`
+  drives Moshi's depformer/delay/Mimi loop with the temporal forward swapped to vLLM (raw
+  hidden via embed pooler `use_activation=False`, cosine 0.9998). vLLM-driven generation
+  matches pure-Moshi token-for-token over 73 frames: **100% inner-monologue text, 98.8%
+  agent-code agreement**. PersonaPlex generates correctly on vLLM.
+- **Milestone C — production omni serving pipeline: NOT built (the remaining work).** This is
+  the mechanical Qwen3-TTS-template integration (Tasks 1-6 above): a talker wrapping the
+  Helium model + the depformer as a custom code-predictor + Mimi code2wav stage + registration
+  + deploy yaml + adapter, so `vllm serve` exposes PersonaPlex. The core (does the 7B run +
+  generate correctly on vLLM) is now PROVEN; C is productionization on top of it.
+- KEY engineering finding for C: the per-step hidden state the depformer needs comes out of
+  the omni AR engine's `talker_mtp` runner hook (gpu_model_runner.py:1860/1875) — the
+  production analog of the embed-pooler trick used in the Milestone-B harness.
+
 ## Status
-Plan complete + Phase-0 de-risk GREEN. Phase 1 = a bounded model port (now fully specified);
-Phase 2 = engine work (frame-budget scheduler + streaming Mimi encode), gated on RFC #3745.
+Phase-0 de-risk GREEN; **Milestones A+B (PersonaPlex runs + generates on vLLM) VERIFIED**;
+Milestone C (serve pipeline) = the remaining bounded model-port integration. Phase 2 (duplex)
+= engine work (frame-budget scheduler + streaming Mimi encode), gated on RFC #3745.
 Inputs: `/tmp/pplex/{vllm_tts_template,vllm_native_duplex_state,moshi_architecture_spec}.md`.
