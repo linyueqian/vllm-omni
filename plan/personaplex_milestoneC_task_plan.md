@@ -107,7 +107,25 @@ REMAINING = personaplex_talker.py (this contract) + registry.py arch entry + sta
 - [ ] model dir + config.json (model_type: personaplex) OR hf_overrides; serving_speech wiring.
 - [ ] BOOT on omni engine (GPU2/3) + parity vs moshi.offline. The real end-to-end verify.
 
+## GATE 2 ACHIEVED — native pipeline BOOTS on the omni engine (2026-06-26, commit 3809bc90)
+Full 2-stage PersonaPlex omni server UP on H200 (health 200, both stage cores alive):
+`vllm serve <repo> --omni --deploy-config personaplex.yaml --trust-remote-code --skip-tokenizer-init`
+(CUDA_VISIBLE_DEVICES=2). Stage-0 talker loaded 15.6 GiB on vLLM paged attention (KV 81k
+tokens, 27x concurrency, torch.compile+cudagraph); stage-1 Mimi loaded (8 cb, 24kHz, 1920/frame).
+This IN-ENGINE verifies the talker load_weights at the SHAPE level (the deferred Gate-1 check).
+BOOT BUGS FIXED (each a real integration gap):
+1. config.json empty -> set config.architectures=[PersonaPlexTalkerForConditionalGeneration]
+   (else vLLM "does not support --runner generate").
+2. talker inheriting SupportsPP (a Protocol) broke vLLM's VllmModelForTextGeneration isinstance
+   -> drop SupportsPP (plain nn.Module, like Qwen3-TTS) + add embed_input_ids (VllmModel protocol).
+3. get_mimi(filename, device) takes no num_codebooks in this moshi build; use set_num_codebooks.
+4. code2wav.load_weights must REPORT mimi.* params as loaded (get_mimi loads them internally)
+   else strict loader "weights not initialized".
+5. need --skip-tokenizer-init (raw spm tokenizer, talker works in token/code space, detokenize:False).
+LAUNCH GOTCHA: pkill -f patterns matching 'personaplex'/'vllm serve'/'pplex_run' SELF-MATCH the
+launching ssh shell and kill it -> use `fuser -k 8123/tcp` only; nohup bash pplex_run.sh >> log.
+
 ## Status
-**Model-side port COMPLETE + VERIFIED** (depformer, embeddings, full composition 100%).
-**Talker core + load_weights routing VERIFIED.** Remaining = preprocess/talker_mtp delay
-state + registry + stage processor + config.json, then the engine boot (the real verify).
+**Model-side port COMPLETE + VERIFIED** (depformer, embeddings, composition 100%).
+**Talker+code2wav pipeline BOOTS on the omni engine (Gate 2).** FINAL remaining = preprocess +
+talker_mtp (the delay-state generation logic) -> then a generation request -> parity vs moshi.offline.
