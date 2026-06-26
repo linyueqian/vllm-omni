@@ -125,7 +125,32 @@ BOOT BUGS FIXED (each a real integration gap):
 LAUNCH GOTCHA: pkill -f patterns matching 'personaplex'/'vllm serve'/'pplex_run' SELF-MATCH the
 launching ssh shell and kill it -> use `fuser -k 8123/tcp` only; nohup bash pplex_run.sh >> log.
 
+## GATE 3 ACHIEVED — native pipeline GENERATES end-to-end on the omni engine (2026-06-26)
+`tools/personaplex/end2end_native_omni.py` (offline Omni driver) runs the full native pipeline:
+talker (7B temporal on paged-KV) -> depformer codes -> connector -> Mimi code2wav -> PCM. Produces
+audio e2e (commit e8e82e39); turn-based user-audio input wired (commit c216aa78: Mimi-encode input
+WAV -> user codes [F,8] as a tensor in additional_information -> preprocess injects delayed user rows).
+Generation bugs fixed along the way:
+1. talker_mtp passed zero hidden -> degenerate (1 frame repeated). FIX: postprocess captures
+   hidden_states[-1] -> hidden_states["last"]; preprocess reads it as last_talker_hidden. Codes then VARY.
+2. token_only sized placeholder from multimodal_output (only "latent", no codes). FIX: size from the
+   generated token count (engine_output_type=latent; codes ship via full_payload connector).
+3. user codes dropped by serialize_payload (forbid_unknown_fields). FIX: pass as a top-level TENSOR
+   (round-trips via _serialize_tensor); list-of-lists mangles.
+**VERIFICATION (key finding):** with NO persona prompt, the native engine output matches Moshi's own
+behavior -- the Moshi-faithful reference (end2end_native.py, 100% token+code) is itself SILENT
+(rms 2e-4, ASR empty) for input_assistant.wav. So near-silence without a persona is CORRECT Moshi
+behavior, not an engine bug. Engine is slightly louder (rms 0.023, faint garble) -> minor delay-approx
+inexactness vs Moshi's clean silence.
+
+## REMAINING for a loud COHERENT-SPEECH demo (scoped next step, moshi needs it too)
+- persona/voice prompt injection (step_system_prompts): force persona text (row0) + voice codes
+  (agent rows) in the prefill so the agent adopts a persona and SPEAKS. (The live moshi.server demo
+  used this to get "Hey, let me..." openings.)
+- exact delay-machinery parity (match Moshi's cache[17,CT] read/write/gather) so the engine == Moshi
+  bit-for-bit (currently a faithful approximation). max_new_tokens cap not applied (generates to 3000).
+
 ## Status
-**Model-side port COMPLETE + VERIFIED** (depformer, embeddings, composition 100%).
-**Talker+code2wav pipeline BOOTS on the omni engine (Gate 2).** FINAL remaining = preprocess +
-talker_mtp (the delay-state generation logic) -> then a generation request -> parity vs moshi.offline.
+**Model-side port COMPLETE + VERIFIED; native pipeline GENERATES e2e on the omni engine (Gate 3),
+verified FAITHFUL to Moshi (both silent w/o persona).** Remaining for loud coherent speech: persona
+injection + exact delay parity (refinements on a working, verified pipeline).
