@@ -41,6 +41,9 @@ def _register_omni_hf_configs() -> None:
             IndexTTS2Config,
         )
         from vllm_omni.model_executor.models.ming_tts.config_ming_tts import MingDenseConfig
+        from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
+            PersonaPlexConfig,
+        )
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
@@ -64,6 +67,7 @@ def _register_omni_hf_configs() -> None:
         ("dense", MingDenseConfig),
         ("indextts2", IndexTTS2Config),
         ("qwen3_tts", Qwen3TTSConfig),
+        ("personaplex", PersonaPlexConfig),
         ("cosyvoice3", CosyVoice3Config),
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
