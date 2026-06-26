@@ -39,7 +39,6 @@ from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.sequence import IntermediateTensors
 
@@ -58,8 +57,15 @@ from vllm_omni.model_executor.models.personaplex.personaplex_embeddings import (
 __all__ = ["PersonaPlexTalkerForConditionalGeneration"]
 
 
-class PersonaPlexTalkerForConditionalGeneration(nn.Module, SupportsPP):
-    """vLLM-native PersonaPlex talker (temporal transformer + depformer)."""
+class PersonaPlexTalkerForConditionalGeneration(nn.Module):
+    """vLLM-native PersonaPlex talker (temporal transformer + depformer).
+
+    Plain ``nn.Module`` (not ``SupportsPP``): inheriting a vLLM Protocol puts
+    ``Protocol`` in the MRO and breaks vLLM's runtime ``isinstance`` check for
+    ``VllmModelForTextGeneration``, which would misclassify the talker as a
+    non-generate model. Qwen3-TTS's talker is plain ``nn.Module`` for the same
+    reason; PersonaPlex does not need pipeline parallelism.
+    """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -108,6 +114,20 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module, SupportsPP):
     # ------------------------------------------------------------------
     # Core forward / logits
     # ------------------------------------------------------------------
+    def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
+        """Placeholder embedding for vLLM's ``VllmModel`` protocol.
+
+        The talker is driven by precomputed ``inputs_embeds`` (built in
+        ``preprocess`` via ``embed_codes``); ``input_ids`` are only in-vocab
+        bookkeeping placeholders. Return a zero embedding of the temporal hidden
+        size — the runner replaces it with the real per-frame ``inputs_embeds``.
+        """
+        return torch.zeros(
+            (input_ids.shape[0], self.mtp_hidden_size),
+            device=input_ids.device,
+            dtype=self.model.dtype if hasattr(self.model, "dtype") else torch.bfloat16,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,

@@ -240,6 +240,12 @@ class PersonaPlexConfig(PretrainedConfig):
 
         super().__init__(**kwargs)
 
+        # The PersonaPlex checkpoint's config.json is empty (no ``architectures``);
+        # supply the primary (stage-0 talker) arch so vLLM's ModelConfig resolves a
+        # generate-capable model. The code2wav stage arch comes from the pipeline.
+        if not getattr(self, "architectures", None):
+            self.architectures = ["PersonaPlexTalkerForConditionalGeneration"]
+
         self.text_vocab_size = text_vocab_size
         self.text_embedding_rows = text_embedding_rows
         self.audio_vocab_size = audio_vocab_size

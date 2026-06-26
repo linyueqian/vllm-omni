@@ -266,15 +266,9 @@ class PersonaPlexCode2Wav(nn.Module):
 
         mimi_path = self._resolve_mimi_weight_path(loaders)
         device = self.vllm_config.device_config.device
-        # get_mimi(filename, device=..., num_codebooks=...) returns a MimiModel.
-        # num_codebooks selects the active (PCM-bearing) codebook count (cb 0..7).
-        self.mimi = loaders.get_mimi(
-            mimi_path,
-            device=str(device),
-            num_codebooks=self._num_codebooks,
-        )
-        # set_num_codebooks is idempotent with the get_mimi arg but kept explicit
-        # so the active count is unambiguous regardless of moshi version.
+        # This moshi build's get_mimi(filename, device) takes no num_codebooks; the
+        # active (PCM-bearing) codebook count is selected via set_num_codebooks.
+        self.mimi = loaders.get_mimi(mimi_path, device=str(device))
         if hasattr(self.mimi, "set_num_codebooks"):
             self.mimi.set_num_codebooks(self._num_codebooks)
         self.mimi.eval()
@@ -291,8 +285,11 @@ class PersonaPlexCode2Wav(nn.Module):
             self._output_sample_rate,
             self._samples_per_frame,
         )
-        # No vLLM-tracked parameters live on this module; report an empty set.
-        return set()
+        # ``get_mimi`` loads the Mimi weights internally, but they now appear under
+        # ``self.mimi`` in this module's named_parameters(). Report them as loaded so
+        # vLLM's strict "all weights initialized" check passes (they are not in the
+        # vLLM safetensors iterator — Mimi owns its own checkpoint format).
+        return {f"mimi.{name}" for name, _ in self.mimi.named_parameters()}
 
     def _resolve_mimi_weight_path(self, loaders: Any) -> str:
         """Resolve the local Mimi weight file path.
