@@ -70,9 +70,7 @@ def main() -> None:
 
     # --- candidate: the vLLM-native port, loaded from the same checkpoint ---
     cfg = PersonaPlexConfig()
-    dep = PersonaPlexDepformer(
-        cfg.depformer_config, temporal_hidden_size=lm.dim, text_card=text_card
-    ).to(dev, dtype)
+    dep = PersonaPlexDepformer(cfg.depformer_config, temporal_hidden_size=lm.dim, text_card=text_card).to(dev, dtype)
     loaded = dep.load_weights(lm.state_dict())
     dep.eval()
     total = sum(1 for _ in dep.named_parameters())

@@ -57,10 +57,7 @@ class PersonaPlexInputEmbeddings(nn.Module):
         Moshi's layout the audio rows carry both the agent and user streams).
         """
         if sequence.dim() != 3 or sequence.shape[1] != self.num_audio_codebooks + 1:
-            raise ValueError(
-                f"sequence must be [B, {self.num_audio_codebooks + 1}, S]; "
-                f"got {tuple(sequence.shape)}"
-            )
+            raise ValueError(f"sequence must be [B, {self.num_audio_codebooks + 1}, S]; got {tuple(sequence.shape)}")
         emb = self.text_emb(sequence[:, 0])  # [B, S, hidden]
         for cb in range(self.num_audio_codebooks):
             emb = emb + self.audio_emb[cb](sequence[:, cb + 1])
@@ -86,8 +83,7 @@ class PersonaPlexInputEmbeddings(nn.Module):
             tensor = src[key]
             if tensor.shape != param.shape:
                 raise ValueError(
-                    f"shape mismatch for {tgt}: checkpoint {tuple(tensor.shape)} "
-                    f"vs param {tuple(param.shape)}"
+                    f"shape mismatch for {tgt}: checkpoint {tuple(tensor.shape)} vs param {tuple(param.shape)}"
                 )
             param.data.copy_(tensor.to(param.dtype))
             loaded.add(tgt)

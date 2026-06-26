@@ -16,8 +16,9 @@ Faithful-port details (all measured from ``nvidia/personaplex-7b-v1``):
   attention in/out projection and its own gating MLP, selected by index (Moshi's
   ``multi_linear``). There are ``dep_q`` weight sets per layer.
 * **No positional embedding** (``depformer_pos_emb="none"``): no RoPE, no sin.
-* **Causal sliding-window attention** with ``context`` inner steps; the KV cache
-  is rebuilt from scratch for every temporal frame.
+* **Causal attention over all inner steps**: Moshi forces the depformer's
+  ``context`` to None, so each step attends to every prior inner step (KV
+  capacity == ``weights_per_step``); the KV cache is rebuilt every temporal frame.
 * **fp32 RMSNorm** (``rms_norm_f32``, eps 1e-8) with the weight stored as
   ``alpha`` of shape ``[1, 1, dim]``.
 * **SiLU gating** MLP (Moshi ``ActivationGating``): ``linear_in`` projects to
@@ -186,21 +187,13 @@ class PersonaPlexDepformer(nn.Module):
         dim = config.hidden_size
 
         # Per-codebook projection of the temporal hidden state (``depformer_multi_linear``).
-        self.depformer_in = nn.ModuleList(
-            [nn.Linear(temporal_hidden_size, dim, bias=False) for _ in range(self.dep_q)]
-        )
+        self.depformer_in = nn.ModuleList([nn.Linear(temporal_hidden_size, dim, bias=False) for _ in range(self.dep_q)])
         # Step-0 conditions on the text token; steps 1..dep_q-1 on the previous audio code.
         self.depformer_text_emb = _ScaledEmbedding(text_card + 1, dim)
-        self.depformer_emb = nn.ModuleList(
-            [_ScaledEmbedding(self.card + 1, dim) for _ in range(self.dep_q - 1)]
-        )
-        self.layers = nn.ModuleList(
-            [_DepformerLayer(config) for _ in range(config.num_hidden_layers)]
-        )
+        self.depformer_emb = nn.ModuleList([_ScaledEmbedding(self.card + 1, dim) for _ in range(self.dep_q - 1)])
+        self.layers = nn.ModuleList([_DepformerLayer(config) for _ in range(config.num_hidden_layers)])
         # Per-codebook output heads (Moshi ``linears``).
-        self.linears = nn.ModuleList(
-            [nn.Linear(dim, self.card, bias=False) for _ in range(self.dep_q)]
-        )
+        self.linears = nn.ModuleList([nn.Linear(dim, self.card, bias=False) for _ in range(self.dep_q)])
 
     @torch.inference_mode()
     def forward(
@@ -227,9 +220,7 @@ class PersonaPlexDepformer(nn.Module):
             per-step logits when ``return_logits`` is set.
         """
         if transformer_out.dim() != 3 or transformer_out.shape[1] != 1:
-            raise ValueError(
-                f"transformer_out must be [B, 1, H]; got {tuple(transformer_out.shape)}"
-            )
+            raise ValueError(f"transformer_out must be [B, 1, H]; got {tuple(transformer_out.shape)}")
         prev = text_token
         kv = [{"k": None, "v": None} for _ in self.layers]
         codes: list[torch.Tensor] = []
@@ -283,8 +274,7 @@ class PersonaPlexDepformer(nn.Module):
             param = params[tgt]
             if tensor.shape != param.shape:
                 raise ValueError(
-                    f"shape mismatch for {tgt}: checkpoint {tuple(tensor.shape)} "
-                    f"vs param {tuple(param.shape)}"
+                    f"shape mismatch for {tgt}: checkpoint {tuple(tensor.shape)} vs param {tuple(param.shape)}"
                 )
             param.data.copy_(tensor.to(param.dtype))
             loaded.add(tgt)
@@ -292,9 +282,7 @@ class PersonaPlexDepformer(nn.Module):
 
     @staticmethod
     def _is_depformer_key(name: str) -> bool:
-        return name.startswith(
-            ("depformer.", "depformer_in.", "depformer_emb.", "depformer_text_emb", "linears.")
-        )
+        return name.startswith(("depformer.", "depformer_in.", "depformer_emb.", "depformer_text_emb", "linears."))
 
     def _weight_plan(self) -> dict[str, _Builder]:
         """Map each of this module's params to a builder over the source state dict."""
