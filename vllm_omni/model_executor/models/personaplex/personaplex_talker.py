@@ -194,24 +194,44 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         text_token: torch.Tensor,
         delay1_agent: torch.Tensor | None,
         device: torch.device,
+        user_d0: torch.Tensor | None = None,
+        user_d1: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Base ``inputs_embeds`` for a decode frame, minus the delay-0 agent cb0.
 
         Acoustic-delay decomposition (delays ``[0, 0,1x7, 0,1x7]``): the frame's
         temporal input is text (delay 0, from ``text_token``), agent cb1..7 (delay
         1, from the previous frame's depformer codes), agent cb0 (delay 0, added in
-        ``talker_mtp`` from the fresh codes), and the user stream (silence for the
-        Phase-1 opening). Build everything except agent cb0 here.
+        ``talker_mtp``), and the user stream — user cb0 (delay 0, ``user_d0``) and
+        user cb1..7 (delay 1, ``user_d1``). User rows default to silence (0).
         """
-        n_q = self.config.num_audio_codebooks
+        n_q = self.config.num_audio_codebooks  # 16 (8 agent + 8 user)
+        n_user = n_q // 2  # 8
         stack = torch.zeros((1, 1 + n_q, 1), dtype=torch.long, device=device)
         stack[:, 0] = text_token.reshape(1)
-        # agent cb0 (row 1) is a placeholder here; talker_mtp adds its embedding.
+        # agent cb0 (row 1) is a placeholder; talker_mtp adds its embedding.
         # agent cb1..7 (rows 2..8) come from the previous frame's codes (delay 1).
         if delay1_agent is not None and delay1_agent.numel() >= 8:
             stack[0, 2:9, 0] = delay1_agent[1:8].to(device)
-        # user rows (9..16) stay 0 (silence) for the Phase-1 opening.
+        # user cb0 (row 9) delay-0; user cb1..7 (rows 10..16) delay-1.
+        user_base = 1 + n_user  # row index 9
+        if user_d0 is not None and user_d0.numel() >= 1:
+            stack[0, user_base, 0] = user_d0.reshape(-1)[0].to(device)
+        if user_d1 is not None and user_d1.numel() >= n_user:
+            stack[0, user_base + 1 : user_base + n_user, 0] = user_d1.reshape(-1)[1:n_user].to(device)
         return self.input_embeddings(stack).reshape(1, -1)  # [1, hidden]
+
+    @staticmethod
+    def _user_frame(info: dict[str, Any], frame_idx: int) -> torch.Tensor | None:
+        """Fetch the Mimi-encoded user codes for ``frame_idx`` (or None / out of range)."""
+        uc = info.get("pplex_user_codes")
+        if uc is None:
+            return None
+        if not isinstance(uc, torch.Tensor):
+            uc = torch.as_tensor(uc, dtype=torch.long)
+        if uc.ndim != 2 or frame_idx < 0 or frame_idx >= uc.shape[0]:
+            return None
+        return uc[frame_idx]
 
     @staticmethod
     def _last_agent_codes(info: dict[str, Any]) -> torch.Tensor | None:
@@ -265,7 +285,11 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         # Decode: input_ids == the text token sampled last step (delay-0 text).
         text_token = input_ids.reshape(-1)[:1]
         delay1_agent = self._last_agent_codes(info_dict)
-        base = self._build_frame_embed(text_token, delay1_agent, device)
+        # Real user stream (Phase-1 turn-based): user cb0 delay-0, cb1..7 delay-1.
+        frame = int(meta.get("pplex_frame", 0))
+        user_d0 = self._user_frame(info_dict, frame - 1)
+        user_d1 = self._user_frame(info_dict, frame - 2)
+        base = self._build_frame_embed(text_token, delay1_agent, device, user_d0, user_d1)
         text_step = self.input_embeddings.text_emb(text_token.reshape(1, 1)).reshape(1, -1)
         # The previous frame's temporal hidden (written by postprocess into
         # hidden_states["last"]) conditions this frame's depformer. Falls back to
