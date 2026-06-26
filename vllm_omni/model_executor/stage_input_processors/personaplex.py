@@ -55,10 +55,41 @@ def _agent_codes_to_codebook_major(audio: torch.Tensor) -> torch.Tensor:
     return agent.transpose(0, 1).contiguous().reshape(-1)
 
 
-def talker2code2wav_token_only(transfer_manager: Any, multimodal_output: Any, request: Any) -> OmniPayloadStruct:
-    """Sync placeholder: a length-only handle; the codec payload ships via full_payload."""
-    del transfer_manager, multimodal_output, request
-    return OmniPayloadStruct(codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)))
+def talker2code2wav_token_only(
+    source_outputs: list,
+    prompt: Any = None,
+    _requires_multimodal_data: bool = False,
+) -> list:
+    """Sync ``process_engine_inputs``: build the code2wav placeholder inputs.
+
+    Returns one :class:`OmniTokensPrompt` per finished talker request, with
+    ``prompt_token_ids`` sized to the flat codebook-major codec length
+    (``num_active_codebooks * num_agent_frames``). The actual codec ids are
+    delivered via the worker connector payload from ``talker2code2wav_full_payload``.
+    """
+    from vllm_omni.inputs.data import OmniTokensPrompt
+
+    del prompt, _requires_multimodal_data
+    inputs: list = []
+    for talker_output in source_outputs:
+        if not getattr(talker_output, "finished", False):
+            continue
+        output = talker_output.outputs[0]
+        # The per-request output is the "latent" (engine_output_type="latent"); the
+        # codes ship via the connector full_payload. Size the placeholder from the
+        # generated token count (one AR token == one Mimi frame). prompt was 1 frame.
+        token_ids = getattr(output, "cumulative_token_ids", None) or getattr(output, "token_ids", None) or []
+        n_frames = max(len(token_ids) - 1, 0)
+        prompt_len = _NUM_ACTIVE_CODEBOOKS * n_frames
+        inputs.append(
+            OmniTokensPrompt(
+                prompt_token_ids=[0] * prompt_len,
+                additional_information=None,
+                multi_modal_data=None,
+                mm_processor_kwargs=None,
+            )
+        )
+    return inputs
 
 
 def talker2code2wav_full_payload(transfer_manager: Any, pooling_output: Any, request: Any) -> OmniPayloadStruct:

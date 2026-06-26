@@ -74,6 +74,7 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         self.config = config
         self.temporal_config = config.temporal_config
         hidden = self.temporal_config.hidden_size
+        self._dtype = getattr(vllm_config.model_config, "dtype", torch.bfloat16)
 
         # Temporal backbone on vLLM paged attention (consumes inputs_embeds).
         self.model = HeliumModel(
@@ -105,6 +106,10 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         # Omni AR runner contract.
         self.have_multimodal_outputs = True
         self.has_preprocess = True
+        self.has_postprocess = True  # capture each frame's hidden for the next depformer step
+        self.requires_full_prefix_cached_hidden_states = False
+        # Keep the per-frame "last" hidden on GPU (avoids a CPU round-trip each step).
+        self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("hidden_states", "last")}
         self.mtp_hidden_size = hidden
         self.talker_mtp_output_key = ("codes", "audio")
         # dep_q audio codebooks per frame; only cb 0..num_active are vocoded.
@@ -125,7 +130,7 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         return torch.zeros(
             (input_ids.shape[0], self.mtp_hidden_size),
             device=input_ids.device,
-            dtype=self.model.dtype if hasattr(self.model, "dtype") else torch.bfloat16,
+            dtype=self._dtype,
         )
 
     def forward(
@@ -170,6 +175,146 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         audio_codes = torch.cat(audio_codes_list, dim=0)
         hidden = hidden[: int(audio_codes.shape[0])]
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs={"codes": {"audio": audio_codes}})
+
+    # ------------------------------------------------------------------
+    # Per-frame omni AR protocol: preprocess (stateful) + talker_mtp (batched)
+    # ------------------------------------------------------------------
+    def _initial_frame_embed(self, device: torch.device) -> torch.Tensor:
+        """``embed_codes`` of Moshi's initial token frame (text+audio SOS)."""
+        text_init = self.config.text_vocab_size  # text_initial_token_id
+        audio_init = self.config.audio_vocab_size  # card == initial audio token
+        n_q = self.config.num_audio_codebooks
+        stack = torch.empty((1, 1 + n_q, 1), dtype=torch.long, device=device)
+        stack[:, 0] = text_init
+        stack[:, 1:] = audio_init
+        return self.input_embeddings(stack).reshape(1, -1)  # [1, hidden]
+
+    def _build_frame_embed(
+        self,
+        text_token: torch.Tensor,
+        delay1_agent: torch.Tensor | None,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Base ``inputs_embeds`` for a decode frame, minus the delay-0 agent cb0.
+
+        Acoustic-delay decomposition (delays ``[0, 0,1x7, 0,1x7]``): the frame's
+        temporal input is text (delay 0, from ``text_token``), agent cb1..7 (delay
+        1, from the previous frame's depformer codes), agent cb0 (delay 0, added in
+        ``talker_mtp`` from the fresh codes), and the user stream (silence for the
+        Phase-1 opening). Build everything except agent cb0 here.
+        """
+        n_q = self.config.num_audio_codebooks
+        stack = torch.zeros((1, 1 + n_q, 1), dtype=torch.long, device=device)
+        stack[:, 0] = text_token.reshape(1)
+        # agent cb0 (row 1) is a placeholder here; talker_mtp adds its embedding.
+        # agent cb1..7 (rows 2..8) come from the previous frame's codes (delay 1).
+        if delay1_agent is not None and delay1_agent.numel() >= 8:
+            stack[0, 2:9, 0] = delay1_agent[1:8].to(device)
+        # user rows (9..16) stay 0 (silence) for the Phase-1 opening.
+        return self.input_embeddings(stack).reshape(1, -1)  # [1, hidden]
+
+    @staticmethod
+    def _last_agent_codes(info: dict[str, Any]) -> torch.Tensor | None:
+        codes = info.get("codes")
+        if isinstance(codes, dict):
+            ac = codes.get("audio")
+            if isinstance(ac, torch.Tensor) and ac.numel() > 0:
+                return (ac[-1] if ac.ndim == 2 else ac).reshape(-1)
+        return None
+
+    def preprocess(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor | None,
+        **info_dict: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Build the current frame's ``inputs_embeds`` and the mtp inputs.
+
+        Prefill emits the initial-token frame embedding; each decode step builds the
+        delayed base frame (everything but agent cb0, which ``talker_mtp`` adds).
+        """
+        additional = info_dict.get("additional_information")
+        if isinstance(additional, dict):
+            merged = {k: v for k, v in info_dict.items() if k != "additional_information"}
+            for k, v in additional.items():
+                merged.setdefault(k, v)
+            info_dict = merged
+        meta = info_dict.get("meta", {}) if isinstance(info_dict.get("meta"), dict) else {}
+
+        device = input_ids.device
+        span = int(input_ids.shape[0])
+        is_prefill_raw = info_dict.get("_omni_is_prefill")
+        if isinstance(is_prefill_raw, bool):
+            is_prefill = is_prefill_raw
+        else:
+            is_prefill = span > 1
+
+        zero_hidden = torch.zeros((1, self.mtp_hidden_size), device=device, dtype=self._dtype)
+
+        if is_prefill:
+            emb = self._initial_frame_embed(device)
+            if span > 1:
+                emb = emb.expand(span, -1).contiguous()
+            ids_out = input_ids.clone()
+            info_update = {
+                "meta": {"pplex_frame": int(meta.get("pplex_frame", 0)) + span},
+                "mtp_inputs": (zero_hidden, zero_hidden),
+            }
+            return ids_out, emb, info_update
+
+        # Decode: input_ids == the text token sampled last step (delay-0 text).
+        text_token = input_ids.reshape(-1)[:1]
+        delay1_agent = self._last_agent_codes(info_dict)
+        base = self._build_frame_embed(text_token, delay1_agent, device)
+        text_step = self.input_embeddings.text_emb(text_token.reshape(1, 1)).reshape(1, -1)
+        # The previous frame's temporal hidden (written by postprocess into
+        # hidden_states["last"]) conditions this frame's depformer. Falls back to
+        # zeros only on the very first decode step (no prior hidden yet).
+        hs = info_dict.get("hidden_states", {}) if isinstance(info_dict.get("hidden_states"), dict) else {}
+        last_hidden = hs.get("last")
+        if isinstance(last_hidden, torch.Tensor) and last_hidden.numel() > 0:
+            last_hidden = last_hidden.reshape(1, -1).to(device=device, dtype=self._dtype)
+        else:
+            last_hidden = zero_hidden
+        info_update = {
+            "meta": {"pplex_frame": int(meta.get("pplex_frame", 0)) + 1},
+            "mtp_inputs": (last_hidden, text_step),
+        }
+        return input_ids, base, info_update
+
+    def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
+        """Capture this frame's last hidden for the next step's depformer (mtp)."""
+        if hidden_states is None or hidden_states.numel() == 0:
+            return {}
+        return {"hidden_states": {"last": hidden_states[-1, :].detach()}}
+
+    def talker_mtp(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        text_step: torch.Tensor,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the depformer for the frame and finish its ``inputs_embeds``.
+
+        Returns ``(inputs_embeds, audio_codes[B, dep_q])``. ``audio_codes`` are
+        stored under ``("codes","audio")``; ``inputs_embeds`` (base from preprocess
+        + the fresh agent cb0 embedding, the delay-0 acoustic token) feeds the next
+        temporal forward.
+        """
+        bsz = int(input_ids.shape[0])
+        dtype = self._dtype
+        text_token = input_ids.reshape(bsz).to(torch.long)
+        hidden = last_talker_hidden.reshape(bsz, 1, -1).to(dtype)
+
+        codes = self.depformer(text_token, hidden)  # [B, dep_q]
+
+        # Add the delay-0 agent cb0 embedding to the base inputs_embeds.
+        cb0 = codes[:, 0:1]  # [B, 1]
+        cb0_embed = self.input_embeddings.audio_emb[0](cb0).reshape(bsz, -1).to(dtype)
+        inputs_embeds = input_embeds.reshape(bsz, -1).to(dtype) + cb0_embed
+        return inputs_embeds, codes.to(torch.long)
 
     # ------------------------------------------------------------------
     # Weight loading
