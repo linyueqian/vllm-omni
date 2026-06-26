@@ -57,5 +57,32 @@ MISSING (the remaining work):
   cb0..7 -> cb8..15 for gating/linears/depformer_in/depformer_emb. Port load_weights mirrors this.
 - moshi ref pulled to ~/Downloads/pplex_moshi_ref/{lm,loaders,transformer}.py
 
+## Phase C result (2026-06-26) — native components compose in the REAL loop, VERIFIED
+`tools/personaplex/end2end_native.py` (commit 400d7aa1): drives Moshi's actual per-frame
+LMGen.step loop (acoustic-delay cache, code feedback, Mimi) with BOTH native components
+swapped in (graphed_main->PersonaPlexInputEmbeddings.embed_codes; graphed_depth->
+PersonaPlexDepformer). e2e H200 input_assistant 6s vs pure Moshi: **text 100% + agent-code
+(cb0..7) 100% over 73 frames.** The ENTIRE native MODEL port is now end-to-end validated.
+embed_codes/depformer signatures match graphed_main/graphed_depth exactly (drop-in).
+
+## Talker (Task 2) contract — REVERSE-ENGINEERED (the remaining engine-integration)
+`talker_mtp(input_ids[B], input_embeds[B,H], last_talker_hidden[B,H], text_step[B,H], ...)
+-> (next_inputs_embeds[B,H], audio_codes[B,Q])`. Runner calls it (gpu_model_runner.py:1133)
+after sampling the text token from compute_logits. Flags: have_multimodal_outputs/has_preprocess
+=True, mtp_hidden_size=temporal hidden, talker_mtp_output_key=("codes","audio"). PersonaPlex map:
+input_ids=sampled TEXT token; last_talker_hidden=temporal transformer_out; run depformer->16
+codes (agent cb1..8 sampled, USER cb9..16 teacher-forced from mic-Mimi codes, only cb0..7 vocoded);
+next_inputs_embeds=embed_codes(next DELAYED 17-row stack). Delay state = Moshi LMGen cache[B,17,
+CT=4] + provided + offset, per-codebook modular read(offset-1)/write(offset+delay)%CT (lm.py
+process_transformer_output:876-953) -> must be carried PER REQUEST in info_dict.
+**FULL-DUPLEX IMPEDANCE:** PersonaPlex consumes a USER AUDIO stream (not text) + dual-stream
+predict + acoustic delays -> does NOT fit the TTS talker contract (text->audio prompt builder,
+preprocess entangled w/ AR prefill-chunk/cache-recovery lifecycle gpu_model_runner.py:610-781).
+Plan Phase 1 = turn-based: preprocess Mimi-encodes the input WAV to user codes (rows 9-16),
+prefill system+voice prompt; talker_mtp teacher-forces user rows. Phase 2 = live duplex (engine).
+REMAINING = personaplex_talker.py (this contract) + registry.py arch entry + stage_input_processors
+/personaplex.py + serving_speech.py wiring; THEN engine boot + parity vs moshi.offline (heavy verify).
+
 ## Status
-**Phase A done; Phase B** — writing personaplex_depformer.py + parity_depformer.py (keystone gate).
+**Model-side port COMPLETE + VERIFIED** (depformer, embeddings, full composition 100%).
+Next = the talker engine-integration (large, full-duplex impedance, needs engine boot to verify).
