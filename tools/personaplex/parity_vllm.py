@@ -170,7 +170,7 @@ def _build_helium(device: torch.device, dtype: torch.dtype) -> HeliumForCausalLM
     model.to(device=device, dtype=dtype)
     model.eval()
     _install_eager_attention_for_parity(model)
-    return model
+    return model, vllm_config
 
 
 def parse_args() -> argparse.Namespace:
@@ -191,30 +191,44 @@ def main() -> None:
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
 
-    lm = loaders.get_moshi_lm(args.moshi_checkpoint, device=str(device))
-    lm.eval()
-    dtype = next(lm.parameters()).dtype
+    import os as _os
 
-    helium = _build_helium(device, dtype)
-    helium.load_weights(lm.state_dict())
+    from vllm.distributed import init_distributed_environment, initialize_model_parallel
 
-    inputs_embeds = torch.randn(
-        1,
-        args.seq_len,
-        HeliumConfig().hidden_size,
-        device=device,
-        dtype=dtype,
-    )
-    positions = torch.arange(args.seq_len, device=device, dtype=torch.long).unsqueeze(0)
+    _os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    _os.environ.setdefault("MASTER_PORT", "29555")
 
-    with torch.inference_mode():
-        ref_hidden, ref_text_logits = lm.forward_embeddings(inputs_embeds)
-        got_hidden = helium(
-            input_ids=None,
-            positions=positions,
-            inputs_embeds=inputs_embeds,
-        )
-        got_text_logits = helium.compute_logits(got_hidden)
+    # One vLLM config wraps the whole flow: parallel-group init AND model construction +
+    # forward both read get_current_vllm_config(), so they must run inside this context.
+    config = HeliumConfig()
+    with _default_dtype(torch.bfloat16):
+        vllm_config = _make_vllm_config(config)
+    if hasattr(vllm_config, "compilation_config"):
+        vllm_config.compilation_config = copy.copy(vllm_config.compilation_config)
+        vllm_config.compilation_config.static_forward_context = {}
+
+    with set_current_vllm_config(vllm_config):
+        init_distributed_environment(world_size=1, rank=0, local_rank=0,
+                                     distributed_init_method="env://", backend="nccl")
+        initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
+        lm = loaders.get_moshi_lm(args.moshi_checkpoint, device=str(device))
+        lm.eval()
+        dtype = next(lm.parameters()).dtype
+
+        with _default_dtype(dtype):
+            helium = HeliumForCausalLM(vllm_config=vllm_config)
+        helium.to(device=device, dtype=dtype)
+        helium.eval()
+        _install_eager_attention_for_parity(helium)
+        helium.load_weights(lm.state_dict())
+
+        inputs_embeds = torch.randn(1, args.seq_len, config.hidden_size, device=device, dtype=dtype)
+        positions = torch.arange(args.seq_len, device=device, dtype=torch.long).unsqueeze(0)
+        with torch.inference_mode():
+            ref_hidden, ref_text_logits = lm.forward_embeddings(inputs_embeds)
+            got_hidden = helium(input_ids=None, positions=positions, inputs_embeds=inputs_embeds)
+            got_text_logits = helium.compute_logits(got_hidden)
 
     assert got_text_logits is not None
     hidden_diff = (ref_hidden - got_hidden).float().abs().max().item()
