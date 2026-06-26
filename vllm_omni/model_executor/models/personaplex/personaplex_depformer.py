@@ -101,7 +101,6 @@ class _DepformerLayer(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.dep_q = config.dep_q
-        self.context = config.max_position_embeddings  # depformer_context (sliding window)
         self.eps = config.rms_norm_eps
 
         # Per-step fused QKV and output projections, stored exactly as Moshi does:
@@ -144,13 +143,14 @@ class _DepformerLayer(nn.Module):
         if kv["k"] is None:
             k_hist, v_hist = k, v
         else:
-            k_hist = torch.cat([kv["k"], k], dim=2)[:, :, -self.context :, :]
-            v_hist = torch.cat([kv["v"], v], dim=2)[:, :, -self.context :, :]
+            k_hist = torch.cat([kv["k"], k], dim=2)
+            v_hist = torch.cat([kv["v"], v], dim=2)
         kv["k"], kv["v"] = k_hist, v_hist
 
-        # The query is the newest step and every retained key is causal w.r.t. it,
-        # so attention over the kept window needs no extra mask (matches Moshi's
-        # RingKVCache(capacity=context) + ``delta < context`` bias).
+        # Moshi forces the depformer's ``context`` to None (lm.py: kwargs_dep[
+        # "context"] = None), so attention spans ALL prior inner steps -- the KV
+        # capacity is ``weights_per_step`` (== dep_q), never windowed. The query is
+        # the newest step and every key is causal w.r.t. it, so no mask is needed.
         attn = F.scaled_dot_product_attention(q, k_hist, v_hist)  # [B, H, 1, Dh]
         attn = attn.reshape(b, self.dim)
         out = F.linear(attn, self._out_proj(step)).unsqueeze(1)  # [B, 1, dim]
