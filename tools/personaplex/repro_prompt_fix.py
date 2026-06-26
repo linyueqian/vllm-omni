@@ -34,6 +34,7 @@ def main() -> None:
     ap.add_argument("--input-wav", required=True)
     ap.add_argument("--mode", choices=["moshi", "broken", "fixed"], required=True)
     ap.add_argument("--seconds", type=float, default=12.0)
+    ap.add_argument("--out-wav", default=None, help="save agent audio for pop analysis")
     args = ap.parse_args()
 
     import sentencepiece
@@ -111,17 +112,52 @@ def main() -> None:
     lm_gen.step_system_prompts(mimi)
     mimi.reset_streaming()
 
+    import time
+
     user = load_audio(args.input_wav, mimi.sample_rate)[:, : int(args.seconds * mimi.sample_rate)]
-    texts = []
+    texts, frames, step_ms = [], [], []
     for enc in encode_from_sphn(mimi, iter_audio(user, sample_interval_size=frame, pad=True), max_batch=1):
         for c in range(enc.shape[-1]):
+            _t = time.time()
             tokens = lm_gen.step(enc[:, :, c : c + 1])
+            torch.cuda.synchronize()
+            step_ms.append((time.time() - _t) * 1000.0)
             if tokens is None:
                 continue
+            frames.append(mimi.decode(tokens[:, 1:9]).detach().cpu().numpy()[0, 0].astype(np.float32))
             tid = int(tokens[0, 0, 0].item())
             if tid not in (0, 3):
                 texts.append(tok.id_to_piece(tid).replace("▁", " "))
     print(f"[mode={args.mode}] agent text: {''.join(texts)!r}")
+
+    # Per-frame latency vs the 80 ms real-time budget (underrun = pop).
+    if step_ms:
+        s = np.asarray(step_ms)
+        half = len(s) // 2
+        print(
+            f"[mode={args.mode}] step latency ms: n={len(s)} mean={s.mean():.1f} p50={np.percentile(s, 50):.1f} "
+            f"p90={np.percentile(s, 90):.1f} max={s.max():.1f} | over80ms={int((s > 80).sum())} "
+            f"| first-half mean={s[:half].mean():.1f} second-half mean={s[half:].mean():.1f}"
+        )
+
+    audio = np.concatenate(frames) if frames else np.zeros(0, dtype=np.float32)
+    # Pop/click metric: count large sample-to-sample jumps AT 80 ms frame boundaries
+    # (where streaming-decode discontinuities show up) vs interior.
+    if audio.size:
+        d = np.abs(np.diff(audio))
+        n = audio.shape[0]
+        bidx = np.arange(frame, n - 1, frame)  # frame-boundary sample indices
+        boundary = d[bidx] if bidx.size else np.zeros(0)
+        big = int((d > 0.15).sum())
+        print(
+            f"[mode={args.mode}] audio {n / mimi.sample_rate:.1f}s | max|dx|={d.max():.3f} "
+            f"jumps>0.15={big} | boundary mean|dx|={boundary.mean():.4f} interior mean|dx|={d.mean():.4f}"
+        )
+    if args.out_wav:
+        import sphn
+
+        sphn.write_wav(args.out_wav, audio, mimi.sample_rate)
+        print(f"[mode={args.mode}] wrote {args.out_wav}")
 
 
 if __name__ == "__main__":
