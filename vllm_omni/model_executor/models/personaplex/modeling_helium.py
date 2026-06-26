@@ -87,9 +87,7 @@ class HeliumMLP(nn.Module):
     ) -> None:
         super().__init__()
         if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported."
-            )
+            raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported.")
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=[intermediate_size] * 2,
@@ -308,16 +306,20 @@ class HeliumModel(nn.Module):
         vllm_config: VllmConfig,
         prefix: str = "",
         layer_type: type[nn.Module] = HeliumDecoderLayer,
+        config: HeliumConfig | None = None,
     ) -> None:
         super().__init__()
-        config = vllm_config.model_config.hf_config
+        # ``config`` lets a composite model (e.g. the PersonaPlex talker) build the
+        # Helium backbone from its temporal sub-config while the engine's top-level
+        # hf_config is the composite PersonaPlexConfig. Defaults to the engine's.
+        config = config or vllm_config.model_config.hf_config
         self.config = config
         self.quant_config = vllm_config.quant_config
         self.vocab_size = config.vocab_size
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: layer_type(vllm_config=vllm_config, prefix=prefix),
+            lambda prefix: layer_type(vllm_config=vllm_config, prefix=prefix, config=config),
             prefix=f"{prefix}.layers",
         )
         if get_pp_group().is_last_rank:
