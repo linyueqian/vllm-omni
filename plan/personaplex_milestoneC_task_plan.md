@@ -83,6 +83,31 @@ prefill system+voice prompt; talker_mtp teacher-forces user rows. Phase 2 = live
 REMAINING = personaplex_talker.py (this contract) + registry.py arch entry + stage_input_processors
 /personaplex.py + serving_speech.py wiring; THEN engine boot + parity vs moshi.offline (heavy verify).
 
+## Talker build progress (2026-06-26, commit faf5358d)
+- `personaplex_talker.py` CORE written: PersonaPlexTalkerForConditionalGeneration =
+  HeliumModel(temporal, config-override) + lm_head(text_linear) + verified embeddings +
+  verified depformer + flags (have_multimodal_outputs/has_preprocess/mtp_hidden_size/
+  talker_mtp_output_key). forward/compute_logits/make_omni_output/load_weights done.
+- `modeling_helium.py` HeliumModel now accepts an optional `config` (temporal sub-config)
+  so the talker builds the backbone while the engine hf_config = PersonaPlexConfig.
+- GATE 1 (routing) VERIFIED H200 `parity_talker_load.py`: load_weights routes 100% of the
+  Moshi checkpoint (194/194 temporal targets, 17/17 emb, 84/84 depformer from 264 ckpt
+  tensors, 0 unrouted). Shape-level weight_loader check deferred to the engine boot.
+- BLOCKER for standalone construct: vLLM config-context tug-of-war (init_distributed wants
+  config=None; initialize_model_parallel wants it set) -> construct only inside the real engine.
+
+## REMAINING for the engine boot (next focused work)
+- [ ] preprocess(): Mimi-encode input WAV -> user codes; build initial inputs_embeds; init
+      Moshi delay cache(B,17,CT=4)+offset in additional_information. Per-request, stateful.
+- [ ] talker_mtp(): depformer(text_token, last_talker_hidden, teacher-force user codes) ->
+      agent codes; build next inputs_embeds via embed_codes(delayed stack). Batched/stateless;
+      delay STATE lives in preprocess's info_dict, talker_mtp adds the delay-0 agent cb0 embed.
+- [ ] stage_input_processors/personaplex.py (talker codes cb0..7 -> code2wav window).
+- [ ] registry.py arch entries (PersonaPlexTalkerForConditionalGeneration + PersonaPlexCode2Wav).
+- [ ] model dir + config.json (model_type: personaplex) OR hf_overrides; serving_speech wiring.
+- [ ] BOOT on omni engine (GPU2/3) + parity vs moshi.offline. The real end-to-end verify.
+
 ## Status
 **Model-side port COMPLETE + VERIFIED** (depformer, embeddings, full composition 100%).
-Next = the talker engine-integration (large, full-duplex impedance, needs engine boot to verify).
+**Talker core + load_weights routing VERIFIED.** Remaining = preprocess/talker_mtp delay
+state + registry + stage processor + config.json, then the engine boot (the real verify).
