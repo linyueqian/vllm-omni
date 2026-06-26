@@ -38,15 +38,23 @@ def _patch_temporal_with_vllm(llm) -> None:
         state = orig_init(self, batch_size)
         buf: list[torch.Tensor] = []
 
-        def vllm_forward_codes(seq: torch.Tensor):
-            emb = self.lm_model.embed_codes(seq)  # [1,1,dim]
+        def vfwd(emb: torch.Tensor):
+            # emb = the per-frame summed embedding [1,1,dim]; re-prefill the growing
+            # sequence through vLLM and return (last hidden, text_logits).
             buf.append(emb.detach())
             full = torch.cat(buf, dim=1)
             out = llm.embed({"prompt_embeds": full.squeeze(0).to(torch.bfloat16).cpu()})
             h = torch.tensor(np.asarray(out[0].outputs.embedding), device=emb.device, dtype=emb.dtype).reshape(1, 1, -1)
             return h, self.lm_model.text_linear(h)[:, None]
 
-        state.graphed_main = vllm_forward_codes
+        # Swap BOTH temporal graphs into the SAME buffer:
+        #  - graphed_main: live loop (gets codes -> embed_codes).
+        #  - graphed_embeddings: the voice-prompt path (step_embeddings) feeds a
+        #    precomputed embedding. Missing this swap left voice-prompt frames out of
+        #    the buffer while LMGen's offset still advanced -> positional misalignment
+        #    -> garbled free-run (verified by tools/personaplex/repro_prompt_fix.py).
+        state.graphed_main = lambda seq: vfwd(self.lm_model.embed_codes(seq))
+        state.graphed_embeddings = vfwd
         return state
 
     lm_mod.LMGen._init_streaming_state = patched_init
