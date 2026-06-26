@@ -19,13 +19,15 @@ MISSING (the remaining work):
 - [ ] serving_speech.py wiring (`_detect_tts_model_type`, `_build_personaplex_request`)
 
 ## Phases (this session)
-- [ ] Phase A: pull moshi depformer reference from H200; port depformer faithfully
-- [ ] Phase B: write `parity_depformer.py`; verify codes match moshi `depformer_step`
-      (greedy) on H200 GPU 2/3 — the keystone numerical gate
-- [ ] Phase C: wire the talker (Task 2) around HeliumForCausalLM + depformer +
-      embed_codes preprocess + talker_mtp
-- [ ] Phase D: registry + stage input processor; boot the model on H200
-- [ ] Phase E (stretch): e2e offline `end2end_native.py` parity vs moshi.offline
+- [x] Phase A: pulled moshi depformer reference from H200; ported depformer faithfully
+- [x] Phase B: `parity_depformer.py` — VERIFIED on H200 GPU2 (commit 5ac58f7c).
+      Teacher-forced logit max-abs-diff <=0.47 across seeds 0/1/7/13 x B=1/4;
+      every argmax flip a proven bf16 tie (ref top-2 gap 0.0625). Bug found+fixed:
+      moshi forces depformer context=None (full inner attention), not window 8.
+- [ ] Phase C: native input embeddings (embed_codes: emb.0..15 + text_emb) + parity
+- [ ] Phase D: wire the talker (Task 2) around HeliumForCausalLM + embed_codes + depformer
+      + talker_mtp/preprocess; registry + stage input processor
+- [ ] Phase E: boot on omni engine + offline parity vs moshi.offline (heavier; may extend)
 
 ## Decisions Made
 - Depformer first: it is the #1 ranked risk and is independently verifiable against
