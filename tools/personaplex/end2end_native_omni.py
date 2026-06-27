@@ -21,13 +21,12 @@ import soundfile as sf
 import torch
 
 
-def _encode_user_codes(model: str, input_wav: str, seconds: float) -> list[list[int]]:
-    """Mimi-encode the user WAV -> per-frame 8-codebook user codes [F][8]."""
+def _encode_streams(model: str, input_wav: str, seconds: float) -> tuple[list[list[int]], list[int]]:
+    """Mimi-encode the user WAV -> per-frame user codes [F][8], plus one silence frame [8]."""
     from moshi.models import loaders
     from moshi.models.lm import _iterate_audio as iter_audio
     from moshi.models.lm import encode_from_sphn, load_audio
 
-    # Resolve the Mimi weight file: local snapshot dir, else HF repo id.
     local = os.path.join(model, loaders.MIMI_NAME)
     if os.path.isfile(local):
         mimi_path = local
@@ -45,8 +44,15 @@ def _encode_user_codes(model: str, input_wav: str, seconds: float) -> list[list[
     for enc in encode_from_sphn(mimi, iter_audio(user, sample_interval_size=frame, pad=True), max_batch=1):
         for c in range(enc.shape[-1]):
             cols.append(enc[0, :8, c].to(torch.long).tolist())
+    # Mimi-encode ~0.5s of silence; take a steady-state frame as the prefill placeholder.
+    mimi.reset_streaming()
+    sil = torch.zeros(1, frame * 6)  # [C, T] on CPU, like load_audio output
+    silence_codes = [0] * 8
+    for enc in encode_from_sphn(mimi, iter_audio(sil, sample_interval_size=frame, pad=True), max_batch=1):
+        if enc.shape[-1] > 0:
+            silence_codes = enc[0, :8, -1].to(torch.long).tolist()
     del mimi
-    return cols
+    return cols, silence_codes
 
 
 def main() -> None:
@@ -80,12 +86,13 @@ def main() -> None:
         print(f"persona prefill: {len(persona_tokens)} text tokens, {prefill_len} prefill frames")
 
     if args.input_wav:
-        user_codes = _encode_user_codes(args.model, args.input_wav, args.seconds)
+        user_codes, silence_codes = _encode_streams(args.model, args.input_wav, args.seconds)
         n_frames = len(user_codes)
         # Pass as a tensor (round-trips cleanly through the omni payload serializer;
         # a nested list mangles through list_data).
         add_info["pplex_user_codes"] = torch.tensor(user_codes, dtype=torch.long)
-        print(f"encoded user stream: {n_frames} frames")
+        add_info["pplex_silence_codes"] = torch.tensor(silence_codes, dtype=torch.long)
+        print(f"encoded user stream: {n_frames} frames; silence={silence_codes}")
     else:
         n_frames = int(args.frames)
     add_info["max_new_tokens"] = [n_frames]

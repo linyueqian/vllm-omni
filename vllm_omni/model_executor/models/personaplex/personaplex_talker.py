@@ -227,24 +227,31 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         offset: int,
         span: int,
         device: torch.device,
+        silence: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Per-frame embeds for the persona system-prompt prefill.
 
-        Each frame forces the persona/silence text token (row 0); agent + user
-        rows use the initial audio token (card) as a silence placeholder, matching
-        Moshi's ``_step_text_prompt`` (text forced, agent silent, no user yet).
+        Each frame forces the persona/silence text token (row 0); the agent + user
+        audio rows use the Mimi-encoded SILENCE frame (Moshi's ``_step_text_prompt``
+        feeds encoded silence for the agent, not the SOS/initial token — feeding SOS
+        for many frames corrupts the context). Falls back to silence code 0.
         """
         n_q = self.config.num_audio_codebooks
-        audio_init = self.config.audio_vocab_size  # card == initial audio token
+        n_user = n_q // 2
         zero_text = 3  # Moshi LMGen.zero_text_code (silence/pad text)
+        sil = (
+            silence.reshape(-1).to(device) if isinstance(silence, torch.Tensor) and silence.numel() >= n_user else None
+        )
         total = int(prefill_text.numel())
         rows = []
         for i in range(span):
             pos = offset + i
             text_tok = int(prefill_text[pos].item()) if pos < total else zero_text
-            stack = torch.empty((1, 1 + n_q, 1), dtype=torch.long, device=device)
+            stack = torch.zeros((1, 1 + n_q, 1), dtype=torch.long, device=device)
             stack[:, 0] = text_tok
-            stack[:, 1:] = audio_init
+            if sil is not None:
+                stack[0, 1 : 1 + n_user, 0] = sil[:n_user]  # agent rows = encoded silence
+                stack[0, 1 + n_user : 1 + 2 * n_user, 0] = sil[:n_user]  # user rows = encoded silence
             rows.append(self.input_embeddings(stack).reshape(1, -1))
         return torch.cat(rows, dim=0)  # [span, hidden]
 
@@ -305,7 +312,8 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             offset = max(0, int(info_dict.get("_omni_num_computed_tokens", 0) or 0))
             if isinstance(prefill_text, torch.Tensor) and prefill_text.numel() > 0:
                 # Persona system-prompt prefill (step_system_prompts analog).
-                emb = self._build_prefill_embed(prefill_text, offset, span, device)
+                silence = info_dict.get("pplex_silence_codes")
+                emb = self._build_prefill_embed(prefill_text, offset, span, device, silence)
             else:
                 emb = self._initial_frame_embed(device)
                 if span > 1:
