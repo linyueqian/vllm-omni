@@ -192,34 +192,60 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
     def _build_frame_embed(
         self,
         text_token: torch.Tensor,
-        delay1_agent: torch.Tensor | None,
+        last_agent: torch.Tensor | None,
+        prev_agent: torch.Tensor | None,
         device: torch.device,
         user_d0: torch.Tensor | None = None,
         user_d1: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Base ``inputs_embeds`` for a decode frame, minus the delay-0 agent cb0.
+        """Full ``inputs_embeds`` for a decode frame (Moshi cache read at offset-1).
 
         Acoustic-delay decomposition (delays ``[0, 0,1x7, 0,1x7]``): the frame's
-        temporal input is text (delay 0, from ``text_token``), agent cb1..7 (delay
-        1, from the previous frame's depformer codes), agent cb0 (delay 0, added in
-        ``talker_mtp``), and the user stream — user cb0 (delay 0, ``user_d0``) and
-        user cb1..7 (delay 1, ``user_d1``). User rows default to silence (0).
+        temporal input is text (delay 0, ``text_token``), agent cb0 (delay 0 =
+        gen[t-1], ``last_agent``), agent cb1..7 (delay 1 = gen[t-2], ``prev_agent``),
+        and the user stream — user cb0 (delay 0, ``user_d0``) and user cb1..7 (delay
+        1, ``user_d1``). Unfilled positions default to the initial token (card).
         """
         n_q = self.config.num_audio_codebooks  # 16 (8 agent + 8 user)
         n_user = n_q // 2  # 8
-        stack = torch.zeros((1, 1 + n_q, 1), dtype=torch.long, device=device)
+        audio_init = self.config.audio_vocab_size  # card == initial audio token (Moshi cache default)
+        # No-history / not-yet-generated delayed positions = the initial token (card),
+        # NOT 0 (verified against Moshi's per-frame input stack).
+        stack = torch.full((1, 1 + n_q, 1), audio_init, dtype=torch.long, device=device)
         stack[:, 0] = text_token.reshape(1)
-        # agent cb0 (row 1) is a placeholder; talker_mtp adds its embedding.
-        # agent cb1..7 (rows 2..8) come from the previous frame's codes (delay 1).
-        if delay1_agent is not None and delay1_agent.numel() >= 8:
-            stack[0, 2:9, 0] = delay1_agent[1:8].to(device)
+        # agent cb0 (row 1, delay 0) = the PREVIOUS frame's depformer code gen[t-1]
+        # (last_agent); agent cb1..7 (rows 2..8, delay 1) = gen[t-2] (prev_agent).
+        # The full agent stack is built here (talker_mtp no longer adds cb0), matching
+        # Moshi's cache read at offset-1.
+        if last_agent is not None and last_agent.numel() >= 1:
+            stack[0, 1, 0] = last_agent.reshape(-1)[0].to(device)
+        if prev_agent is not None and prev_agent.numel() >= 8:
+            stack[0, 2:9, 0] = prev_agent.reshape(-1)[1:8].to(device)
         # user cb0 (row 9) delay-0; user cb1..7 (rows 10..16) delay-1.
         user_base = 1 + n_user  # row index 9
         if user_d0 is not None and user_d0.numel() >= 1:
             stack[0, user_base, 0] = user_d0.reshape(-1)[0].to(device)
         if user_d1 is not None and user_d1.numel() >= n_user:
             stack[0, user_base + 1 : user_base + n_user, 0] = user_d1.reshape(-1)[1:n_user].to(device)
+        self._dump_stack(stack)
         return self.input_embeddings(stack).reshape(1, -1)  # [1, hidden]
+
+    def _dump_stack(self, stack: torch.Tensor) -> None:
+        """Diagnostic: append the per-decode-frame 17-row input stack for Moshi parity."""
+        import os
+
+        path = os.environ.get("PPLEX_DUMP_STACK")
+        if not path:
+            return
+        try:
+            acc = getattr(self, "_stack_acc", None)
+            if acc is None:
+                acc = []
+                self._stack_acc = acc
+            acc.append(stack.reshape(-1).to(torch.long).cpu())
+            torch.save(torch.stack(acc, dim=0), path)  # [F, 17]
+        except Exception:
+            pass
 
     def _build_prefill_embed(
         self,
@@ -330,15 +356,23 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
 
         # Decode: input_ids == the text token sampled last step (delay-0 text).
         text_token = input_ids.reshape(-1)[:1]
-        delay1_agent = self._last_agent_codes(info_dict)
+        # Agent acoustic delay: cb0 (delay 0) = gen[t-1] = the last stored codes;
+        # cb1..7 (delay 1) = gen[t-2] = the codes carried from the previous frame.
+        last_agent = self._last_agent_codes(info_dict)
+        prev_agent = info_dict.get("pplex_prev_agent")
+        if prev_agent is not None and not isinstance(prev_agent, torch.Tensor):
+            prev_agent = torch.as_tensor(prev_agent, dtype=torch.long)
         # Real user stream (Phase-1 turn-based): user cb0 delay-0, cb1..7 delay-1.
         # Index into the user stream relative to the first decode frame (after the
         # persona prefill), so the user audio aligns with the agent's response.
         prefill_len = int(meta.get("pplex_prefill_len", prefill_len) or 0)
-        decode_frame = max(0, int(meta.get("pplex_frame", 0)) - prefill_len)
+        # -1: the prefill frame (initial token) consumes one pplex_frame tick, so the
+        # first decode is acoustic frame 0. user cb0 = enc[frame-1] (delay 0, read at
+        # offset-1), user cb1..7 = enc[frame-2] (delay 1).
+        decode_frame = max(0, int(meta.get("pplex_frame", 0)) - prefill_len - 1)
         user_d0 = self._user_frame(info_dict, decode_frame - 1)
         user_d1 = self._user_frame(info_dict, decode_frame - 2)
-        base = self._build_frame_embed(text_token, delay1_agent, device, user_d0, user_d1)
+        base = self._build_frame_embed(text_token, last_agent, prev_agent, device, user_d0, user_d1)
         text_step = self.input_embeddings.text_emb(text_token.reshape(1, 1)).reshape(1, -1)
         # The previous frame's temporal hidden (written by postprocess into
         # hidden_states["last"]) conditions this frame's depformer. Falls back to
@@ -353,6 +387,9 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             "meta": {"pplex_frame": int(meta.get("pplex_frame", 0)) + 1},
             "mtp_inputs": (last_hidden, text_step),
         }
+        # Carry this frame's gen[t-1] forward; next frame reads it as gen[t-2] (cb1..7).
+        if last_agent is not None:
+            info_update["pplex_prev_agent"] = last_agent.detach().to(torch.long).cpu()
         return input_ids, base, info_update
 
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
@@ -381,12 +418,12 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         text_token = input_ids.reshape(bsz).to(torch.long)
         hidden = last_talker_hidden.reshape(bsz, 1, -1).to(dtype)
 
-        codes = self.depformer(text_token, hidden)  # [B, dep_q]
+        codes = self.depformer(text_token, hidden)  # [B, dep_q] == gen[t]
 
-        # Add the delay-0 agent cb0 embedding to the base inputs_embeds.
-        cb0 = codes[:, 0:1]  # [B, 1]
-        cb0_embed = self.input_embeddings.audio_emb[0](cb0).reshape(bsz, -1).to(dtype)
-        inputs_embeds = input_embeds.reshape(bsz, -1).to(dtype) + cb0_embed
+        # The frame's inputs_embeds is built fully in preprocess (Moshi cache read at
+        # offset-1, with agent cb0 = gen[t-1]); gen[t] feeds the NEXT frame, so pass
+        # the embed through unchanged and just emit this frame's codes.
+        inputs_embeds = input_embeds.reshape(bsz, -1).to(dtype)
         return inputs_embeds, codes.to(torch.long)
 
     # ------------------------------------------------------------------

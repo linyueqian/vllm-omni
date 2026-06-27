@@ -53,6 +53,7 @@ def main() -> None:
 
     dev, dtype = "cuda", torch.bfloat16
     mimi = loaders.get_mimi(hf_hub_download(args.repo, loaders.MIMI_NAME), dev)
+    mimi.set_num_codebooks(8)  # match the omni driver's user encoding (8 active codebooks)
     lm = loaders.get_moshi_lm(hf_hub_download(args.repo, loaders.MOSHI_NAME), device=dev, dtype=dtype).eval()
     frame = int(mimi.sample_rate / mimi.frame_rate)
     mimi.streaming_forever(1)  # enter streaming mode so reset_streaming() is valid
@@ -68,15 +69,21 @@ def main() -> None:
     nat_dep.load_weights(lm.state_dict())
     nat_dep.eval()
 
+    _moshi_stacks: list = []
+
     def native_forward_codes(seq: torch.Tensor):
         # Swap embed_codes for the native embeddings; keep Moshi's temporal forward.
+        # seq is exactly Moshi's per-frame 17-row input stack (LMGen.step cache read).
+        _moshi_stacks.append(seq.reshape(-1).to(torch.long).cpu())
         emb = nat_emb(seq)
         return lm.forward_embeddings(emb)
 
     def native_depformer_step(text_token, transformer_out, audio_tokens, audio_provided):
         return nat_dep(text_token, transformer_out, audio_tokens=audio_tokens, audio_provided=audio_provided)
 
-    # Pre-encode user audio once so both runs see identical inputs.
+    # Pre-encode user audio once so both runs see identical inputs. Reset the Mimi
+    # streaming state first so the encoding matches the omni driver's (_encode_streams).
+    mimi.reset_streaming()
     user = load_audio(args.input_wav, mimi.sample_rate)[:, : int(args.seconds * mimi.sample_rate)]
     enc_cols: list[torch.Tensor] = []
     for enc in encode_from_sphn(mimi, iter_audio(user, sample_interval_size=frame, pad=True), max_batch=1):
@@ -134,6 +141,10 @@ def main() -> None:
         # Save pure-Moshi agent codes [F, 8] (rows 1..8) as the parity reference.
         torch.save(ref[:, 1:9].cpu(), _os.environ["PPLEX_DUMP_CODES"])
         print(f"saved moshi agent codes {tuple(ref[:, 1:9].shape)} -> {_os.environ['PPLEX_DUMP_CODES']}")
+    if _os.environ.get("PPLEX_DUMP_STACK") and _moshi_stacks:
+        st = torch.stack(_moshi_stacks, dim=0)  # [F, 17] Moshi per-frame input stacks
+        torch.save(st, _os.environ["PPLEX_DUMP_STACK"])
+        print(f"saved moshi input stacks {tuple(st.shape)} -> {_os.environ['PPLEX_DUMP_STACK']}")
 
     if args.out_wav and frames:
         import sphn
