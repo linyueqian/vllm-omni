@@ -37,22 +37,31 @@ def _empty_finished_payload() -> OmniPayloadStruct:
 
 
 def _agent_codes_to_codebook_major(audio: torch.Tensor) -> torch.Tensor:
-    """``[F, dep_q]`` agent+user codes -> flat codebook-major ``[8 * F]`` (agent only).
+    """``[F, dep_q]`` raw depformer agent codes -> de-delayed flat codebook-major.
 
-    Keeps the leading ``_NUM_ACTIVE_CODEBOOKS`` codebooks and drops frames that are
-    out of range / all-zero padding, then transposes to ``[8, F]`` and flattens.
+    The talker emits the raw per-frame depformer codes ``gen[t]`` (cb 0..7). Mimi
+    needs them ACOUSTICALLY DE-DELAYED to a common time step (Moshi agent delays
+    ``[0, 1, 1, 1, 1, 1, 1, 1]``): acoustic frame t's cb_k is predicted at step
+    ``t + delay[k]``, so output frame t = ``[gen[t][0], gen[t+1][1:8]]`` (cb0 from
+    the current step, cb1..7 from the NEXT step, since the delayed codebooks lag).
+    Without this the codebooks are misaligned by one frame and Mimi decodes garble.
+    The last frame has no successor for cb1..7, so it is dropped (the delay warmup).
     """
-    if audio.ndim != 2 or audio.shape[0] == 0:
+    if audio.ndim != 2 or audio.shape[0] < 2:
         return torch.empty(0, dtype=torch.long)
     audio = audio.to(torch.long)
     k = min(_NUM_ACTIVE_CODEBOOKS, int(audio.shape[1]))
     agent = audio[:, :k]
     valid = (agent >= 0).all(dim=1)
     agent = agent[valid]
-    if agent.numel() == 0:
+    if agent.shape[0] < 2:
         return torch.empty(0, dtype=torch.long)
-    # [F, k] -> [k, F] -> flat [k * F] (codebook-major), as Code2Wav expects.
-    return agent.transpose(0, 1).contiguous().reshape(-1)
+    # De-delay: cb0 from frame t, cb1..7 from frame t+1 (drop the last frame).
+    cb0 = agent[:-1, 0:1]  # [F-1, 1]
+    cb_rest = agent[1:, 1:k]  # [F-1, k-1]
+    dd = torch.cat([cb0, cb_rest], dim=1)  # [F-1, k] de-delayed
+    # [F-1, k] -> [k, F-1] -> flat [k * (F-1)] (codebook-major), as Code2Wav expects.
+    return dd.transpose(0, 1).contiguous().reshape(-1)
 
 
 def talker2code2wav_token_only(

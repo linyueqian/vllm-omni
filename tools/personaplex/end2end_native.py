@@ -78,8 +78,12 @@ def main() -> None:
         emb = nat_emb(seq)
         return lm.forward_embeddings(emb)
 
+    _dep_out: list = []
+
     def native_depformer_step(text_token, transformer_out, audio_tokens, audio_provided):
-        return nat_dep(text_token, transformer_out, audio_tokens=audio_tokens, audio_provided=audio_provided)
+        out = nat_dep(text_token, transformer_out, audio_tokens=audio_tokens, audio_provided=audio_provided)
+        _dep_out.append(out.reshape(1, -1)[:, :8].to(torch.long).cpu())  # raw depformer agent codes gen[t]
+        return out
 
     # Pre-encode user audio once so both runs see identical inputs. Reset the Mimi
     # streaming state first so the encoding matches the omni driver's (_encode_streams).
@@ -129,6 +133,26 @@ def main() -> None:
     nat_gen._streaming_state.graphed_main = native_forward_codes
     nat_gen._streaming_state.graphed_depth = native_depformer_step
     nat_tokens, frames = run(nat_gen.step, decode=args.out_wav is not None)
+
+    import os as _os1
+
+    if _os1.environ.get("PPLEX_DUMP_DEDELAY") and _dep_out:
+        gen = torch.cat(_dep_out, 0).cpu()  # [F, 8] raw depformer agent codes gen[t]
+        nt = torch.cat(nat_tokens, 0)[:, 1:9].cpu()  # [F, 8] de-delayed Mimi input tokens[t]
+        m = min(gen.shape[0], nt.shape[0])
+        gen, nt = gen[:m], nt[:m]
+        print("=== de-delay: per-codebook shift s where tokens[t]==gen[t+s] ===")
+        for k in range(8):
+            best_s, best_a = 0, -1.0
+            for s in range(-3, 4):
+                if s >= 0:
+                    ta, ga = nt[: m - s, k], gen[s:, k]
+                else:
+                    ta, ga = nt[-s:, k], gen[: m + s, k]
+                a = (ta == ga).float().mean().item() if ta.numel() else 0.0
+                if a > best_a:
+                    best_a, best_s = a, s
+            print(f"  cb{k}: shift={best_s} agree={best_a:.2f}")
 
     # --- pure Moshi reference on identical input ---
     mimi.reset_streaming()
