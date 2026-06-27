@@ -167,6 +167,21 @@ input-embed delay assembly (preprocess) is not yet an exact replica of Moshi's c
 divergence cascades via feedback. Diag gotcha: code2wav dump accumulates WARMUP zeros (8200 frames)
 before the real ~80 -> drop leading all-zero rows when comparing.
 
+## RESOLVED 2026-06-27e — COHERENT E2E SPEECH; ROOT CAUSE = missing acoustic de-delay (commit 50a66e39)
+The native PersonaPlex pipeline now produces COHERENT end-to-end speech on the omni engine.
+ASR (greedy + persona, H200): "Thank you." in the first 4s then silence (clean response, rms 0.20) --
+previously garble at the same loudness.
+ROOT CAUSE: the code2wav input path fed Mimi the RAW per-frame depformer codes gen[t] WITHOUT undoing
+the acoustic delay. Found by elimination: teacher-forced hidden parity proved the HeliumModel temporal
+matches Moshi (cos 0.999) -> bug downstream. Derived the de-delay empirically (PPLEX_DUMP_DEDELAY in
+end2end_native: per-codebook shift where tokens[t]==gen[t+s], agree=1.00): tokens[t] = [gen[t][0],
+gen[t+1][1:8]] (cb0 delay-0 from step t, cb1..7 delay-1 from step t+1). Applied in
+_agent_codes_to_codebook_major. THE FIX.
+Everything else that was "ruled out" was genuinely fine (temporal, depformer, user index, positions).
+REMAINING (refinement, not blocker): greedy is reliably coherent; sampling (temp 0.9) still diverges
+(temporal hidden cos 0.999 not bit-exact -> chaotic sampling amplifies). Options: ship greedy/low-temp
+default, or tighten temporal numerics for sampling. Tooling: parity_hidden.py, PPLEX_DUMP_DEDELAY.
+
 ## UPDATE 2026-06-27d — COHERENT SPEECH ACHIEVED ONCE; blocker isolated to temporal fidelity
 Native pipeline produced COHERENT on-persona speech once (ASR: "Greetings, welcome to the Mayans Eye")
 -- proving the architecture + components + delay structure are sound. But it is NOT reliably
