@@ -90,6 +90,15 @@ def main() -> None:
         for c in range(enc.shape[-1]):
             enc_cols.append(enc[:, :, c : c + 1].clone())
 
+    import os as _os0
+
+    if _os0.environ.get("PPLEX_DUMP_USER"):
+        # Export Moshi's exact per-frame user codes [F, 8] so the omni driver can feed
+        # the IDENTICAL user stream (disambiguates encoding-nondeterminism vs hidden drift).
+        u = torch.cat([e.reshape(1, -1)[:, :8] for e in enc_cols], dim=0).to(torch.long).cpu()
+        torch.save(u, _os0.environ["PPLEX_DUMP_USER"])
+        print(f"saved moshi user codes {tuple(u.shape)} -> {_os0.environ['PPLEX_DUMP_USER']}")
+
     def make_lmgen() -> LMGen:
         g = LMGen(
             lm,

@@ -227,25 +227,7 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             stack[0, user_base, 0] = user_d0.reshape(-1)[0].to(device)
         if user_d1 is not None and user_d1.numel() >= n_user:
             stack[0, user_base + 1 : user_base + n_user, 0] = user_d1.reshape(-1)[1:n_user].to(device)
-        self._dump_stack(stack)
         return self.input_embeddings(stack).reshape(1, -1)  # [1, hidden]
-
-    def _dump_stack(self, stack: torch.Tensor) -> None:
-        """Diagnostic: append the per-decode-frame 17-row input stack for Moshi parity."""
-        import os
-
-        path = os.environ.get("PPLEX_DUMP_STACK")
-        if not path:
-            return
-        try:
-            acc = getattr(self, "_stack_acc", None)
-            if acc is None:
-                acc = []
-                self._stack_acc = acc
-            acc.append(stack.reshape(-1).to(torch.long).cpu())
-            torch.save(torch.stack(acc, dim=0), path)  # [F, 17]
-        except Exception:
-            pass
 
     def _build_prefill_embed(
         self,
@@ -366,10 +348,11 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         # Index into the user stream relative to the first decode frame (after the
         # persona prefill), so the user audio aligns with the agent's response.
         prefill_len = int(meta.get("pplex_prefill_len", prefill_len) or 0)
-        # -1: the prefill frame (initial token) consumes one pplex_frame tick, so the
-        # first decode is acoustic frame 0. user cb0 = enc[frame-1] (delay 0, read at
-        # offset-1), user cb1..7 = enc[frame-2] (delay 1).
-        decode_frame = max(0, int(meta.get("pplex_frame", 0)) - prefill_len - 1)
+        # decode_frame = pplex_frame - prefill_len (the prefill frame already advanced
+        # pplex_frame, so this is d+1 at decode step d). Verified vs Moshi's per-frame
+        # stack: user cb0 (delay 0) = enc[decode_frame-1] = enc[d]; cb1..7 (delay 1) =
+        # enc[decode_frame-2]. (The agent stream lags one more: agent cb0 = gen[d-1].)
+        decode_frame = max(0, int(meta.get("pplex_frame", 0)) - prefill_len)
         user_d0 = self._user_frame(info_dict, decode_frame - 1)
         user_d1 = self._user_frame(info_dict, decode_frame - 2)
         base = self._build_frame_embed(text_token, last_agent, prev_agent, device, user_d0, user_d1)

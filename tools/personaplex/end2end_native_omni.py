@@ -67,6 +67,11 @@ def main() -> None:
         help="persona system prompt; empty to disable",
     )
     ap.add_argument("--out", default="/home/yueqian/pplex_native_omni.wav")
+    ap.add_argument(
+        "--user-codes-file",
+        default=None,
+        help="load user codes [F,8] from a .pt file instead of Mimi-encoding (parity debug)",
+    )
     args = ap.parse_args()
 
     add_info: dict = {}
@@ -85,7 +90,15 @@ def main() -> None:
         prefill_len = len(prefill_text)
         print(f"persona prefill: {len(persona_tokens)} text tokens, {prefill_len} prefill frames")
 
-    if args.input_wav:
+    if args.user_codes_file:
+        # Parity debug: feed the exact same user codes Moshi saw (PPLEX_DUMP_USER), so
+        # the only remaining difference is the temporal forward (paged-KV vs Moshi).
+        uc = torch.load(args.user_codes_file).to(torch.long)
+        n_frames = int(uc.shape[0])
+        add_info["pplex_user_codes"] = uc
+        add_info["pplex_silence_codes"] = torch.zeros(8, dtype=torch.long)
+        print(f"loaded user codes from {args.user_codes_file}: {tuple(uc.shape)}")
+    elif args.input_wav:
         user_codes, silence_codes = _encode_streams(args.model, args.input_wav, args.seconds)
         n_frames = len(user_codes)
         # Pass as a tensor (round-trips cleanly through the omni payload serializer;
