@@ -27,16 +27,19 @@ import contextlib
 import json
 import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 
 from vllm_omni.experimental.fullduplex.personaplex.config import PersonaPlexConfig
 from vllm_omni.experimental.fullduplex.personaplex.engine import PersonaPlexEngine
 from vllm_omni.experimental.fullduplex.personaplex.session import PersonaPlexSession
 
 logger = logging.getLogger(__name__)
+_STATIC = Path(__file__).parent / "static"
 
 
 class DuplexServer:
@@ -108,6 +111,10 @@ def create_app(config: PersonaPlexConfig) -> FastAPI:
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/")
+    async def index() -> FileResponse:
+        return FileResponse(_STATIC / "index.html")
 
     @app.websocket("/v1/audio/duplex")
     async def duplex(ws: WebSocket) -> None:
