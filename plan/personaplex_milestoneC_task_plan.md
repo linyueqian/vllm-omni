@@ -167,6 +167,34 @@ input-embed delay assembly (preprocess) is not yet an exact replica of Moshi's c
 divergence cascades via feedback. Diag gotcha: code2wav dump accumulates WARMUP zeros (8200 frames)
 before the real ~80 -> drop leading all-zero rows when comparing.
 
+## UPDATE 2026-06-27c — per-frame delay assembly FIXED + VERIFIED vs Moshi (commit 2a5dc804)
+Built a frame-by-frame input-stack parity harness (dump the 17-row stack the engine feeds embed_codes
+via PPLEX_DUMP_STACK; dump Moshi's per-frame stack = the `seq` passed to native_forward_codes in
+end2end_native.py). Diffing row-by-row pinned + fixed the delay assembly:
+- no-history/not-yet-generated delayed codes = the INITIAL token (card=2048), NOT 0 (Moshi cache default).
+- agent cb0 (delay 0) = gen[t-1] (last stored codes, built in preprocess); agent cb1..7 (delay 1) =
+  gen[t-2] (carried as pplex_prev_agent). talker_mtp NO LONGER adds cb0 (was injecting current gen[t],
+  1 frame early); it just emits gen[t] for the next frame.
+- user: decode_frame = pplex_frame - prefill_len - 1 (the prefill initial-token frame consumes one tick),
+  user cb0=enc[t-1], cb1..7=enc[t-2].
+RESULT (greedy stack diff): engine per-frame stack now MATCHES Moshi's STRUCTURE -- at f1 agent cb0=1049,
+cb1..7=2048, user cb1..7=2048 all align. THE DELAY ASSEMBLY IS CORRECT.
+**Two confounders remain (why stack-diff-vs-Moshi past f1 still diverges + audio still garbled):**
+1. USER ENCODING NONDETERMINISM: the omni driver (_encode_streams) and end2end_native produce DIFFERENT
+   Mimi codes for the SAME wav despite both set_num_codebooks(8)+reset_streaming (engine enc[0]=1049 vs
+   Moshi enc[0]=127). Different user input -> different frame_0 -> hidden_0 differs -> greedy text flips
+   (f1: 262 vs 3) -> cascade. So STACK-DIFF-VS-MOSHI IS THE WRONG BAR (the trajectories legitimately
+   differ). Investigate: dtype/device of the two get_mimi calls; is the encoder deterministic across
+   processes? Pin both to identical encode (or feed the engine Moshi's exact enc_cols) before comparing.
+2. TEMPORAL HIDDEN PAGED-KV PARITY: even on matched input, the incremental paged-KV decode may accumulate
+   error vs Moshi/Milestone-B (which re-prefilled the full sequence each frame). parity_vllm passed at
+   1e-2 on a SINGLE forward; the multi-frame KV path is unverified. Capture engine hidden per frame vs
+   Moshi transformer_out (teacher-forced same input) to confirm/measure.
+The real bar is COHERENCE on the engine's OWN valid input (persona+sampling), still garbled (ASR empty).
+Likely gated by (1)+(2) and/or persona-prefill correctness. These are deep, interacting; not loop-able
+via edit->run->ASR. Diagnostic harnesses (PPLEX_DUMP_STACK in talker _dump_stack, PPLEX_DUMP_CODES) are
+in place for the next focused session.
+
 ## UPDATE 2026-06-27b — persona injection done; ROOT CAUSE NARROWED to the delay assembly
 Persona system-prompt prefill implemented (commit 412f631a): silence-pad + tokenized persona +
 silence-pad, agent/user rows = Mimi-encoded SILENCE (NOT SOS/card — SOS corrupts). e2e: agent
