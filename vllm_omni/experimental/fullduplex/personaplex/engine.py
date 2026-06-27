@@ -89,6 +89,9 @@ class PersonaPlexEngine:
         self._other_mimi = None
         self._lm_gen = None
         self._tokenizer = None
+        self._lm = None
+        self._nat_emb = None
+        self._nat_dep = None
 
     # -- load -------------------------------------------------------------
 
@@ -143,10 +146,58 @@ class PersonaPlexEngine:
         self._other_mimi.streaming_forever(1)
         self._lm_gen.streaming_forever(1)
 
+        self._lm = lm
+        if cfg.use_native_components:
+            self._build_native_components(lm, torch)
+
         logger.info("PersonaPlex: warming up CUDA graphs")
         self._warmup(torch)
         self._loaded = True
         return self
+
+    def _build_native_components(self, lm, torch) -> None:
+        """Build the vLLM-native embed_codes + depformer ports and load Moshi weights.
+
+        Swapped into LMGen's per-frame seam (graphed_main / graphed_depth) in
+        ``open_session``; verified bit/parity-identical to Moshi by
+        ``tools/personaplex/end2end_native.py`` (100% agreement).
+        """
+        from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
+            PersonaPlexConfig as _PPModelConfig,
+        )
+        from vllm_omni.model_executor.models.personaplex.personaplex_depformer import (
+            PersonaPlexDepformer,
+        )
+        from vllm_omni.model_executor.models.personaplex.personaplex_embeddings import (
+            PersonaPlexInputEmbeddings,
+        )
+
+        dtype = next(lm.parameters()).dtype
+        ppcfg = _PPModelConfig()
+        emb = PersonaPlexInputEmbeddings(ppcfg).to(self.config.device, dtype)
+        emb.load_weights(lm.state_dict())
+        emb.eval()
+        dep = PersonaPlexDepformer(
+            ppcfg.depformer_config, temporal_hidden_size=lm.dim, text_card=lm.text_card
+        ).to(self.config.device, dtype)
+        dep.load_weights(lm.state_dict())
+        dep.eval()
+        self._nat_emb = emb
+        self._nat_dep = dep
+        logger.info("PersonaPlex: native embed_codes + depformer installed")
+
+    def _install_native_swap(self) -> None:
+        """Point LMGen's per-frame seam at the native components (after reset_streaming)."""
+        lm, emb, dep = self._lm, self._nat_emb, self._nat_dep
+
+        def native_main(seq):
+            return lm.forward_embeddings(emb(seq))
+
+        def native_depth(text_token, transformer_out, audio_tokens, audio_provided):
+            return dep(text_token, transformer_out, audio_tokens=audio_tokens, audio_provided=audio_provided)
+
+        self._lm_gen._streaming_state.graphed_main = native_main
+        self._lm_gen._streaming_state.graphed_depth = native_depth
 
     def _warmup(self, torch) -> None:
         """Prime CUDA graphs + streaming state (offline.py:warmup)."""
@@ -189,6 +240,10 @@ class PersonaPlexEngine:
         self._mimi.reset_streaming()
         self._other_mimi.reset_streaming()
         self._lm_gen.reset_streaming()
+        if self.config.use_native_components:
+            # reset_streaming rebuilds _streaming_state, so (re)install the native
+            # seam here, before step_system_prompts runs the persona prefill.
+            self._install_native_swap()
         self._lm_gen.step_system_prompts(self._mimi)
         self._mimi.reset_streaming()  # drop the voice-encode state before the live loop
 

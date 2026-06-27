@@ -59,6 +59,12 @@ class PersonaPlexConfig:
     topk_text: int = 25
     seed: int | None = None
 
+    # Swap the heavy per-frame compute (embed_codes + depformer) for the vLLM-native
+    # ports (PersonaPlexInputEmbeddings + PersonaPlexDepformer, both parity-verified
+    # vs moshi). The LMGen streaming/delay-cache machinery and the Helium temporal
+    # forward stay moshi for now; this is the first step of the native serve path.
+    use_native_components: bool = False
+
     @property
     def sample_rate(self) -> int:
         return SAMPLE_RATE
