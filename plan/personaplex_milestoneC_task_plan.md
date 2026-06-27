@@ -167,6 +167,32 @@ input-embed delay assembly (preprocess) is not yet an exact replica of Moshi's c
 divergence cascades via feedback. Diag gotcha: code2wav dump accumulates WARMUP zeros (8200 frames)
 before the real ~80 -> drop leading all-zero rows when comparing.
 
+## UPDATE 2026-06-27d — COHERENT SPEECH ACHIEVED ONCE; blocker isolated to temporal fidelity
+Native pipeline produced COHERENT on-persona speech once (ASR: "Greetings, welcome to the Mayans Eye")
+-- proving the architecture + components + delay structure are sound. But it is NOT reliably
+reproducible (that exact run was a transient state, lost to a stale-.pyc edit-masking sequence).
+**EXHAUSTIVELY RULED OUT as the garble cause (via a robust clear-pycache->run->ASR harness,
+tools/personaplex/_eval_remote.sh):**
+- user-delay index: all 3 variants (decode_frame, -1, +1) garble -> not the cause; locked to the
+  Moshi-stack-verified form (user cb0=enc[decode_frame-1], cb1..7=enc[decode_frame-2]).
+- generation length: capped (90/160) and full (3000) both garble; the agent listens through the 6s
+  user (first ~75 frames near-silent rms 0.007), responds in frames ~75-160.
+- RoPE positions: CORRECT, increment 33,34,35,.. (33 = persona prefill len); not stuck/offset.
+- CUDA graph vs eager: both garble (enforce_eager:true tested) -> not a cudagraph numerics issue.
+- depformer hidden timing: mtp_inputs feeds (hidden_{t-1}, text_{t-1}) -- a CONSISTENT pair =
+  gen_{t-1}; identical pattern to Qwen3-TTS (works). Not the cause.
+**REMAINING BLOCKER:** the temporal hidden numerical fidelity in the engine's HeliumModel paged-KV
+decode -- the ONLY piece differing from the 100%-verified offline composition (end2end_native, which
+uses Moshi's OWN temporal). text_0 matches Moshi (hidden_0 ok) but text_1 flips (hidden_1 diverges) ->
+accumulating drift. parity_vllm verified HeliumForCausalLM only EAGER / SINGLE-forward; the multi-frame
+incremental paged-KV path is unverified.
+**DECISIVE NEXT TEST (focused, not loop):** Milestone B (vLLM temporal via exported HF Llama +
+Moshi delay) WAS coherent; the engine (native HeliumModel + my delay) garbles, and the delay is
+verified -> so compare engine HeliumModel hidden vs the Milestone-B exported-HF-Llama path over a
+multi-frame teacher-forced sequence. If native HeliumModel drifts where exported-HF doesn't, that is
+the bug (weight-map / RoPE-interleave / norm in the multi-frame path). Tooling: _eval_remote.sh +
+PPLEX_DUMP_CODES (end2end_native saves Moshi ref). ~30 commits on feat/personaplex-duplex.
+
 ## UPDATE 2026-06-27c — per-frame delay assembly FIXED + VERIFIED vs Moshi (commit 2a5dc804)
 Built a frame-by-frame input-stack parity harness (dump the 17-row stack the engine feeds embed_codes
 via PPLEX_DUMP_STACK; dump Moshi's per-frame stack = the `seq` passed to native_forward_codes in
