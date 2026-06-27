@@ -36,8 +36,19 @@ interface so `session.py` + a WS server work unchanged.
 - [ ] Phase 4: WS endpoint on session.py (PCM in/out frames), wire into api_server.
 - [ ] Phase 5: e2e serve test (client sends user wav frames over WS, gets coherent agent audio).
 
-## Status
-Phase 1 — choosing the streaming-temporal strategy.
+## Status — DONE (e2e verified 2026-06-27)
+Native-component duplex serve VERIFIED end-to-end over WebSocket:
+- Phase 1-2: native embed_codes + depformer swapped into LMGen's per-frame seam
+  (use_native_components). [commit 72d2eef0]
+- Phase 3: standalone FrameStepper test -> coherent detailed reply ("...rinse the rice...").
+- Phase 4-5: serving/server.py (FastAPI WS /v1/audio/duplex) + test_duplex_ws.py client;
+  e2e WS: server READY 24s, client streams user wav, gets 16s coherent agent audio,
+  ASR "You can rinse the rice a few times until the water runs clear. Then use a pot that
+  has a tight fit. Bring it to a boil, then lower the heat and let it simmer without a lid."
+  [commit 39663183]
+REMAINING (refinement, not blocker): temporal still lm.forward_embeddings (moshi); swap to
+HeliumForCausalLM streaming for full-native temporal. Multi-session (currently 1 conn at a
+time). Sampling (greedy default; sampling needs bit-exact temporal).
 
 ## Notes / gotchas
 - Remote eval: tool-held ssh (not nohup/setsid). pycache must be cleared per code change.
