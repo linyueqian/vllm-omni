@@ -167,6 +167,24 @@ input-embed delay assembly (preprocess) is not yet an exact replica of Moshi's c
 divergence cascades via feedback. Diag gotcha: code2wav dump accumulates WARMUP zeros (8200 frames)
 before the real ~80 -> drop leading all-zero rows when comparing.
 
+## SERVE-PATH LANDSCAPE (investigated per user "check 3907, new endpoint") 2026-06-27
+The TTS adapter path (tts_adapters/personaplex.py + _build_personaplex_request) is the WRONG path for
+a duplex S2S model. The duplex serve framework is vllm_omni/experimental/fullduplex/ (the #3907 pattern):
+- core/ = model-agnostic DuplexRuntime/Session/Adapter (+ the `continuous` lockstep mode PersonaPlex added).
+- personaplex/ = engine.py (FrameStepper) wraps the EXTERNAL moshi package (moshi.models LMGen/loaders)
+  -- i.e. the ORCHESTRATION WRAPPER, NOT the native vLLM engine. session.py is the runnable lockstep
+  driver (one 80ms PCM frame -> one agent frame). NO serving/ dir => NO HTTP endpoint for PersonaPlex.
+- Existing endpoints: /v1/audio/speech/stream (one-way streaming TTS) + OpenAIServingRealtime (ASR).
+  Neither is duplex S2S.
+CONCLUSION (confirmed w/ user): PersonaPlex serve needs a NEW duplex WebSocket endpoint. Two ways to
+connect the NATIVE engine (the verified omni talker+code2wav, replacing the moshi wrapper):
+  (A) Make fullduplex/personaplex/engine.py's FrameStepper drive the native omni engine (talker paged-KV
+      + code2wav) instead of moshi -- keeps the core/ duplex runtime + session; swaps the backend behind
+      the FrameStepper seam. Most aligned with "native, not wrapper".
+  (B) New WS endpoint that drives the omni staged pipeline directly in lockstep.
+Both are substantial real-time-streaming features (the omni engine is batched-AR, not natively frame-clocked).
+This is the next deliverable; the native engine e2e (coherent audio) is already DONE+verified offline.
+
 ## REMAINING — HTTP serve path (offline Omni driver e2e is DONE)
 The engine e2e (talker + de-delay + code2wav -> coherent audio) is verified via the offline Omni
 driver. The `vllm serve` HTTP path is NOT wired: tts_adapters/personaplex.py is a skeleton that
