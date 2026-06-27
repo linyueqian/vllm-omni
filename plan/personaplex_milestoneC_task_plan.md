@@ -150,7 +150,25 @@ inexactness vs Moshi's clean silence.
 - exact delay-machinery parity (match Moshi's cache[17,CT] read/write/gather) so the engine == Moshi
   bit-for-bit (currently a faithful approximation). max_new_tokens cap not applied (generates to 3000).
 
+## UPDATE 2026-06-27 — native pipeline emits REAL SPEECH; codes-flow bug fixed (commit a4e03752)
+The earlier "near-silence" was partly a CODES-FLOW BUG: the talker's agent codes were lost in the
+talker->code2wav handoff (code2wav decoded the zero placeholder). Root causes fixed:
+- the connector calls the input processor as (transfer_manager, multimodal_output, request,
+  is_finished); my full_payload had a stale (transfer_manager, pooling_output, request) signature ->
+  swallowed TypeError -> empty payload. AND the codes live in request.additional_information
+  ("codes","audio") (talker_mtp_output_key), NOT in multimodal_output (the engine "latent" output).
+  Fixed full_payload + async_chunk to read from request.additional_information. (Active path =
+  async_chunk; deploy async_chunk:true.)
+- token_only sizes the code2wav placeholder from the generated token count.
+RESULT e2e H200: pipeline now emits LOUD speech (peak 0.07->0.45; ASR returns words).
+**KNOWN GAP (not bit-faithful yet):** greedy engine vs greedy Moshi, frame-0 cb0 MATCHES (1049==1049)
+but cb1-7 diverge, and the engine babbles where Moshi (no persona) is silent -> the per-frame
+input-embed delay assembly (preprocess) is not yet an exact replica of Moshi's cache[17,CT] machinery;
+divergence cascades via feedback. Diag gotcha: code2wav dump accumulates WARMUP zeros (8200 frames)
+before the real ~80 -> drop leading all-zero rows when comparing.
+
 ## Status
-**Model-side port COMPLETE + VERIFIED; native pipeline GENERATES e2e on the omni engine (Gate 3),
-verified FAITHFUL to Moshi (both silent w/o persona).** Remaining for loud coherent speech: persona
-injection + exact delay parity (refinements on a working, verified pipeline).
+**Model-side port COMPLETE + VERIFIED; native pipeline BOOTS + GENERATES REAL SPEECH e2e on the omni
+engine.** Remaining for bit-faithful coherent speech: (1) exact Moshi cache[17,CT] input-embed parity
+in preprocess (cb0 matches f0, cb1-7 diverge), (2) persona/voice injection (step_system_prompts).
+Both are precise, well-scoped reworks on a functionally-complete pipeline.
