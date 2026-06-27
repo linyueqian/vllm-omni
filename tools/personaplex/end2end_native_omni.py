@@ -72,7 +72,7 @@ def main() -> None:
 
     from vllm_omni import Omni
 
-    omni = Omni(model=args.model, skip_tokenizer_init=True, trust_remote_code=True, async_chunk=False)
+    omni = Omni(model=args.model, skip_tokenizer_init=True, trust_remote_code=True)
     inputs = {"prompt_token_ids": [0], "additional_information": add_info}
 
     got_audio = False

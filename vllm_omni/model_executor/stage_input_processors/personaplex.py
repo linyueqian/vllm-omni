@@ -92,15 +92,31 @@ def talker2code2wav_token_only(
     return inputs
 
 
-def talker2code2wav_full_payload(transfer_manager: Any, pooling_output: Any, request: Any) -> OmniPayloadStruct:
-    """Producer: collect the talker's accumulated agent codes -> Code2Wav input."""
-    del transfer_manager, request
-    if not isinstance(pooling_output, dict):
-        return _empty_finished_payload()
-    audio = pooling_output.get("codes.audio")
-    if audio is None:
-        nested = pooling_output.get("codes")
+def talker2code2wav_full_payload(
+    transfer_manager: Any = None,
+    multimodal_output: Any = None,
+    request: Any = None,
+    is_finished: bool = False,
+    **_: Any,
+) -> OmniPayloadStruct:
+    """Producer: collect the talker's accumulated agent codes -> Code2Wav input.
+
+    Called by the connector with (transfer_manager, multimodal_output, request,
+    is_finished). The codes live in the request's additional_information under
+    ("codes","audio") (talker_mtp_output_key), NOT in multimodal_output (which is
+    the engine "latent" output); read them from the request.
+    """
+    del transfer_manager, is_finished
+    info = getattr(request, "additional_information", None)
+    audio = None
+    if isinstance(info, dict):
+        nested = info.get("codes")
         audio = nested.get("audio") if isinstance(nested, dict) else None
+        if audio is None:
+            audio = info.get("codes.audio")
+    if audio is None and isinstance(multimodal_output, dict):
+        nested = multimodal_output.get("codes")
+        audio = nested.get("audio") if isinstance(nested, dict) else multimodal_output.get("codes.audio")
     if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
         return _empty_finished_payload()
     flat = _agent_codes_to_codebook_major(audio)
@@ -132,10 +148,19 @@ def talker2code2wav_async_chunk(
         transfer_manager._pplex_frames = buf
     frames = buf.setdefault(request_id, [])
 
-    if isinstance(multimodal_output, dict):
-        audio = multimodal_output.get("codes", {}).get("audio")
-        if isinstance(audio, torch.Tensor) and audio.ndim == 2 and audio.shape[0] > 0:
-            frames.append(audio[-1].to(torch.long).cpu())
+    # Codes live in the server-side request's additional_information under
+    # ("codes","audio") (talker_mtp_output_key), not in multimodal_output (latent).
+    def _codes_from(src: Any) -> torch.Tensor | None:
+        if isinstance(src, dict):
+            nested = src.get("codes")
+            a = nested.get("audio") if isinstance(nested, dict) else None
+            return a if a is not None else src.get("codes.audio")
+        return None
+
+    audio = _codes_from(getattr(request, "additional_information", None)) or _codes_from(multimodal_output)
+    if isinstance(audio, torch.Tensor) and audio.numel() > 0:
+        a = audio if audio.ndim == 2 else audio.reshape(1, -1)
+        frames.append(a[-1].to(torch.long).cpu())  # latest frame's codes
 
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}

@@ -128,6 +128,13 @@ def main() -> None:
     print(f"text-token agreement:  {text_agree * 100:.1f}%")
     print(f"agent-code agreement (cb0..7): {code_agree * 100:.1f}%")
 
+    import os as _os
+
+    if _os.environ.get("PPLEX_DUMP_CODES"):
+        # Save pure-Moshi agent codes [F, 8] (rows 1..8) as the parity reference.
+        torch.save(ref[:, 1:9].cpu(), _os.environ["PPLEX_DUMP_CODES"])
+        print(f"saved moshi agent codes {tuple(ref[:, 1:9].shape)} -> {_os.environ['PPLEX_DUMP_CODES']}")
+
     if args.out_wav and frames:
         import sphn
 
