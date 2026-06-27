@@ -55,10 +55,30 @@ def main() -> None:
     ap.add_argument("--input-wav", default=None, help="user audio; if unset, silence opening")
     ap.add_argument("--seconds", type=float, default=6.0)
     ap.add_argument("--frames", type=int, default=50, help="frames when no input-wav")
+    ap.add_argument(
+        "--persona",
+        default="You are a warm, helpful assistant. Answer the user clearly and naturally.",
+        help="persona system prompt; empty to disable",
+    )
     ap.add_argument("--out", default="/home/yueqian/pplex_native_omni.wav")
     args = ap.parse_args()
 
     add_info: dict = {}
+    prefill_len = 1
+    if args.persona:
+        import os as _os
+
+        import sentencepiece
+
+        spm_path = _os.path.join(args.model, "tokenizer_spm_32k_3.model")
+        tok = sentencepiece.SentencePieceProcessor(spm_path)
+        persona_tokens = tok.encode(f"<system> {args.persona} <system>")
+        # ~0.5s silence (zero_text_code=3) before/after the persona text, like Moshi.
+        prefill_text = [3] * 6 + persona_tokens + [3] * 6
+        add_info["pplex_prefill_text"] = torch.tensor(prefill_text, dtype=torch.long)
+        prefill_len = len(prefill_text)
+        print(f"persona prefill: {len(persona_tokens)} text tokens, {prefill_len} prefill frames")
+
     if args.input_wav:
         user_codes = _encode_user_codes(args.model, args.input_wav, args.seconds)
         n_frames = len(user_codes)
@@ -73,7 +93,7 @@ def main() -> None:
     from vllm_omni import Omni
 
     omni = Omni(model=args.model, skip_tokenizer_init=True, trust_remote_code=True)
-    inputs = {"prompt_token_ids": [0], "additional_information": add_info}
+    inputs = {"prompt_token_ids": [0] * prefill_len, "additional_information": add_info}
 
     got_audio = False
     for stage_outputs in omni.generate([inputs]):

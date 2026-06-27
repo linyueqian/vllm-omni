@@ -221,6 +221,33 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             stack[0, user_base + 1 : user_base + n_user, 0] = user_d1.reshape(-1)[1:n_user].to(device)
         return self.input_embeddings(stack).reshape(1, -1)  # [1, hidden]
 
+    def _build_prefill_embed(
+        self,
+        prefill_text: torch.Tensor,
+        offset: int,
+        span: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Per-frame embeds for the persona system-prompt prefill.
+
+        Each frame forces the persona/silence text token (row 0); agent + user
+        rows use the initial audio token (card) as a silence placeholder, matching
+        Moshi's ``_step_text_prompt`` (text forced, agent silent, no user yet).
+        """
+        n_q = self.config.num_audio_codebooks
+        audio_init = self.config.audio_vocab_size  # card == initial audio token
+        zero_text = 3  # Moshi LMGen.zero_text_code (silence/pad text)
+        total = int(prefill_text.numel())
+        rows = []
+        for i in range(span):
+            pos = offset + i
+            text_tok = int(prefill_text[pos].item()) if pos < total else zero_text
+            stack = torch.empty((1, 1 + n_q, 1), dtype=torch.long, device=device)
+            stack[:, 0] = text_tok
+            stack[:, 1:] = audio_init
+            rows.append(self.input_embeddings(stack).reshape(1, -1))
+        return torch.cat(rows, dim=0)  # [span, hidden]
+
     @staticmethod
     def _user_frame(info: dict[str, Any], frame_idx: int) -> torch.Tensor | None:
         """Fetch the Mimi-encoded user codes for ``frame_idx`` (or None / out of range)."""
@@ -271,13 +298,24 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
 
         zero_hidden = torch.zeros((1, self.mtp_hidden_size), device=device, dtype=self._dtype)
 
+        prefill_text = info_dict.get("pplex_prefill_text")
+        prefill_len = int(prefill_text.numel()) if isinstance(prefill_text, torch.Tensor) else 0
+
         if is_prefill:
-            emb = self._initial_frame_embed(device)
-            if span > 1:
-                emb = emb.expand(span, -1).contiguous()
+            offset = max(0, int(info_dict.get("_omni_num_computed_tokens", 0) or 0))
+            if isinstance(prefill_text, torch.Tensor) and prefill_text.numel() > 0:
+                # Persona system-prompt prefill (step_system_prompts analog).
+                emb = self._build_prefill_embed(prefill_text, offset, span, device)
+            else:
+                emb = self._initial_frame_embed(device)
+                if span > 1:
+                    emb = emb.expand(span, -1).contiguous()
             ids_out = input_ids.clone()
             info_update = {
-                "meta": {"pplex_frame": int(meta.get("pplex_frame", 0)) + span},
+                "meta": {
+                    "pplex_frame": int(meta.get("pplex_frame", 0)) + span,
+                    "pplex_prefill_len": prefill_len,
+                },
                 "mtp_inputs": (zero_hidden, zero_hidden),
             }
             return ids_out, emb, info_update
@@ -286,9 +324,12 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         text_token = input_ids.reshape(-1)[:1]
         delay1_agent = self._last_agent_codes(info_dict)
         # Real user stream (Phase-1 turn-based): user cb0 delay-0, cb1..7 delay-1.
-        frame = int(meta.get("pplex_frame", 0))
-        user_d0 = self._user_frame(info_dict, frame - 1)
-        user_d1 = self._user_frame(info_dict, frame - 2)
+        # Index into the user stream relative to the first decode frame (after the
+        # persona prefill), so the user audio aligns with the agent's response.
+        prefill_len = int(meta.get("pplex_prefill_len", prefill_len) or 0)
+        decode_frame = max(0, int(meta.get("pplex_frame", 0)) - prefill_len)
+        user_d0 = self._user_frame(info_dict, decode_frame - 1)
+        user_d1 = self._user_frame(info_dict, decode_frame - 2)
         base = self._build_frame_embed(text_token, delay1_agent, device, user_d0, user_d1)
         text_step = self.input_embeddings.text_emb(text_token.reshape(1, 1)).reshape(1, -1)
         # The previous frame's temporal hidden (written by postprocess into
