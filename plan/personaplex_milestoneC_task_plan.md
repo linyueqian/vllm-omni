@@ -167,8 +167,33 @@ input-embed delay assembly (preprocess) is not yet an exact replica of Moshi's c
 divergence cascades via feedback. Diag gotcha: code2wav dump accumulates WARMUP zeros (8200 frames)
 before the real ~80 -> drop leading all-zero rows when comparing.
 
+## UPDATE 2026-06-27b — persona injection done; ROOT CAUSE NARROWED to the delay assembly
+Persona system-prompt prefill implemented (commit 412f631a): silence-pad + tokenized persona +
+silence-pad, agent/user rows = Mimi-encoded SILENCE (NOT SOS/card — SOS corrupts). e2e: agent
+quiets to rms 0.039 but STILL not coherent (ASR empty). So PERSONA IS NOT THE BLOCKER.
+**KEY DIAGNOSTIC (Milestone-B contrast):** Milestone B = vLLM temporal + MOSHI's LMGen.step delay
+loop = COHERENT (live demo worked). Engine = native temporal + MY delay assembly = garbled. So the
+divergence is in MY per-frame delay/feedback assembly (preprocess/talker_mtp), NOT the temporal or
+the verified components. Greedy engine-vs-greedy-Moshi: frame-0 cb0 MATCHES (1049==1049) but cb1-7
+cascade -> a subtle per-frame depformer-input/hidden divergence.
+**WHY the loop stalled here:** fixing this needs FRAME-BY-FRAME parity capture of the depformer
+inputs (hidden + text token + the delayed 17-row stack) engine-vs-Moshi to find the exact mismatch.
+The edit->run->ASR autonomous loop can't resolve it (ASR too coarse; code dumps confounded by
+code2wav WARMUP zeros, sampling-vs-greedy, comparison-point mismatch). This is deliberate interactive
+debugging, not loop cycles.
+
+## RECOMMENDED next-session approach (deterministic parity)
+1. Greedy everywhere (deploy temperature 0/top_k 1) + cap max_tokens ~80.
+2. Instrument talker_mtp to dump, per REAL decode frame (skip code2wav warmup), the tuple
+   (text_token, last_talker_hidden, the 17-row input stack used by embed_codes) to a file.
+3. Run the SAME input through a pure-Moshi LMGen.step harness dumping the same tuple per frame.
+4. Diff frame 0 first: if the input stack matches but hidden differs -> paged-KV temporal bug; if the
+   stack differs -> delay/user-code assembly bug (fix the offset). Walk forward to first divergence.
+5. Most likely fix: replicate Moshi's exact cache[17,CT] read(offset-1)/write(offset+delay) instead
+   of the hand-rolled delay decomposition.
+
 ## Status
 **Model-side port COMPLETE + VERIFIED; native pipeline BOOTS + GENERATES REAL SPEECH e2e on the omni
-engine.** Remaining for bit-faithful coherent speech: (1) exact Moshi cache[17,CT] input-embed parity
-in preprocess (cb0 matches f0, cb1-7 diverge), (2) persona/voice injection (step_system_prompts).
-Both are precise, well-scoped reworks on a functionally-complete pipeline.
+engine; persona injection implemented.** NOT YET coherent: the per-frame delay/feedback assembly
+diverges from Moshi's exact cache machinery (localized via the Milestone-B contrast). Fix = the
+frame-by-frame parity debug above (deliberate, not loop-able).
