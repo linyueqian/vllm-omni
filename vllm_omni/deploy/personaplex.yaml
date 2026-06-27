@@ -42,8 +42,12 @@ stages:
     output_connectors:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
-      temperature: 0.9
-      top_k: 50
+      # Greedy talker decoding: the HeliumModel temporal matches Moshi within cos
+      # 0.999 (not bit-exact), and chaotic sampling amplifies that into divergence.
+      # Greedy is reliably coherent; raise temperature only once the temporal is
+      # bit-exact (see plan/personaplex_milestoneC_task_plan.md).
+      temperature: 0.0
+      top_k: 1
       max_tokens: 3000
       seed: 42
       repetition_penalty: 1.0
