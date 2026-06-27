@@ -167,6 +167,21 @@ input-embed delay assembly (preprocess) is not yet an exact replica of Moshi's c
 divergence cascades via feedback. Diag gotcha: code2wav dump accumulates WARMUP zeros (8200 frames)
 before the real ~80 -> drop leading all-zero rows when comparing.
 
+## REMAINING — HTTP serve path (offline Omni driver e2e is DONE)
+The engine e2e (talker + de-delay + code2wav -> coherent audio) is verified via the offline Omni
+driver. The `vllm serve` HTTP path is NOT wired: tts_adapters/personaplex.py is a skeleton that
+delegates to serving_speech.py `_build_personaplex_request` (does NOT exist) and a PersonaPlex branch
+in `_detect_tts_model_type` (NOT added). To finish:
+  1. `_detect_tts_model_type`: map model_arch=="PersonaPlexTalkerForConditionalGeneration" (or the
+     stage) -> "personaplex".
+  2. `_build_personaplex_request`: replicate the offline driver's prompt build -- prompt_token_ids=
+     [0]*prefill_len + additional_information{pplex_prefill_text(persona, SPM-tokenized), pplex_user_codes
+     (Mimi-encoded user wav), pplex_silence_codes, max_new_tokens}. Greedy params (temporal not bit-exact).
+  3. `_validate_tts_request` PersonaPlex branch.
+DESIGN DECISION NEEDED (duplex S2S over a text->speech endpoint): where does the USER audio come from?
+options = (a) ref_audio field carries the user query wav; (b) a new request field; (c) persona-monologue
+mode (no user input, input text = persona). Mirror Qwen3-TTS adapter's build() for the plumbing.
+
 ## RESOLVED 2026-06-27e — COHERENT E2E SPEECH; ROOT CAUSE = missing acoustic de-delay (commit 50a66e39)
 The native PersonaPlex pipeline now produces COHERENT end-to-end speech on the omni engine.
 ASR (greedy + persona, H200): "Thank you." in the first 4s then silence (clean response, rms 0.20) --
