@@ -17,6 +17,7 @@ rm -f "$OUT"
 
 cd /home/yueqian/pplex-wt || exit 1
 export HF_TOKEN="$(cat ~/.hf_token 2>/dev/null)" VLLM_USE_FLASHINFER_SAMPLER=0 CUDA_VISIBLE_DEVICES=2 PYTHONPATH=/home/yueqian/pplex-wt
+export VLLM_ATTENTION_BACKEND="${PPLEX_ATTN_BACKEND:-}"
 /home/yueqian/vllm-omni-main/.venv/bin/python tools/personaplex/end2end_native_omni.py \
   --model "$SNAP" --input-wav "$WAV" --seconds 6 --out "$OUT" "$@" > "$LOG" 2>&1
 
