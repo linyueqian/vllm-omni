@@ -177,9 +177,9 @@ class PersonaPlexEngine:
         emb = PersonaPlexInputEmbeddings(ppcfg).to(self.config.device, dtype)
         emb.load_weights(lm.state_dict())
         emb.eval()
-        dep = PersonaPlexDepformer(
-            ppcfg.depformer_config, temporal_hidden_size=lm.dim, text_card=lm.text_card
-        ).to(self.config.device, dtype)
+        dep = PersonaPlexDepformer(ppcfg.depformer_config, temporal_hidden_size=lm.dim, text_card=lm.text_card).to(
+            self.config.device, dtype
+        )
         dep.load_weights(lm.state_dict())
         dep.eval()
         self._nat_emb = emb
