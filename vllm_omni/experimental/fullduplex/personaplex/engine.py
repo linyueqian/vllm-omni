@@ -187,7 +187,16 @@ class PersonaPlexEngine:
         logger.info("PersonaPlex: native embed_codes + depformer installed")
 
     def _install_native_swap(self) -> None:
-        """Point LMGen's per-frame seam at the native components (after reset_streaming)."""
+        """Point LMGen's per-frame seam at the native components (after reset_streaming).
+
+        Wrap the native functions in moshi's ``CUDAGraphed`` -- exactly what moshi does
+        for its own forwards (lm.py: graphed_main/graphed_depth). Eager native is ~2.5x
+        slower (75ms vs 30ms/frame) with large spikes (max ~167ms) that blow the 80ms
+        real-time budget and make the duplex audio choppy; graphing restores moshi-class
+        latency while keeping the native compute.
+        """
+        from moshi.utils.compile import CUDAGraphed
+
         lm, emb, dep = self._lm, self._nat_emb, self._nat_dep
 
         def native_main(seq):
@@ -196,8 +205,8 @@ class PersonaPlexEngine:
         def native_depth(text_token, transformer_out, audio_tokens, audio_provided):
             return dep(text_token, transformer_out, audio_tokens=audio_tokens, audio_provided=audio_provided)
 
-        self._lm_gen._streaming_state.graphed_main = native_main
-        self._lm_gen._streaming_state.graphed_depth = native_depth
+        self._lm_gen._streaming_state.graphed_main = CUDAGraphed(native_main)
+        self._lm_gen._streaming_state.graphed_depth = CUDAGraphed(native_depth)
 
     def _warmup(self, torch) -> None:
         """Prime CUDA graphs + streaming state (offline.py:warmup)."""
