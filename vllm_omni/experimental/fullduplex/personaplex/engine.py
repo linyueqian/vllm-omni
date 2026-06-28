@@ -159,8 +159,8 @@ class PersonaPlexEngine:
         """Build the vLLM-native embed_codes + depformer ports and load Moshi weights.
 
         Swapped into LMGen's per-frame seam (graphed_main / graphed_depth) in
-        ``open_session``; verified bit/parity-identical to Moshi by
-        ``tools/personaplex/end2end_native.py`` (100% agreement).
+        ``open_session``; verified bit/parity-identical to Moshi (full-generation
+        composition agrees 100%).
         """
         from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
             PersonaPlexConfig as _PPModelConfig,

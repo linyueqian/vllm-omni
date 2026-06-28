@@ -45,7 +45,7 @@ stages:
       # Greedy talker decoding: the HeliumModel temporal matches Moshi within cos
       # 0.999 (not bit-exact), and chaotic sampling amplifies that into divergence.
       # Greedy is reliably coherent; raise temperature only once the temporal is
-      # bit-exact (see plan/personaplex_milestoneC_task_plan.md).
+      # bit-exact.
       temperature: 0.0
       top_k: 1
       max_tokens: 3000
