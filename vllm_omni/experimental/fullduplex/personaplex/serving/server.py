@@ -6,6 +6,11 @@ Serves the official PersonaPlex web UI (``dist.tgz`` from ``nvidia/personaplex-7
 the same bundle ``moshi.server`` downloads) and implements its WebSocket protocol at
 ``/api/chat`` -- but driven by our native-component engine instead of moshi's server.
 
+Built on **aiohttp**, mirroring ``moshi.server`` exactly: aiohttp writes+drains each
+WebSocket frame promptly, whereas uvicorn's ``websockets`` backend coalesces many small
+(~80 ms Opus) frames into a send buffer, which makes browser playback choppy even when
+the engine is real-time. aiohttp ships as a moshi dependency, so this adds nothing new.
+
 Moshi protocol (binary WS messages, first byte = tag):
   server -> client  ``\\x00``                 handshake (ready, after system prompts)
   client -> server  ``\\x01`` + opus bytes    mic audio (Opus @ 24kHz)
@@ -29,15 +34,11 @@ import contextlib
 import json
 import logging
 import tarfile
-from collections.abc import AsyncIterator
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import sphn
-import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
+from aiohttp import WSMsgType, web
 from huggingface_hub import hf_hub_download
 
 from vllm_omni.experimental.fullduplex.personaplex.config import PersonaPlexConfig
@@ -72,54 +73,43 @@ class DuplexServer:
     def load(self) -> None:
         self.engine.load()
 
-    # ---- official Moshi protocol (Opus) -------------------------------------
+    # ---- official Moshi protocol (Opus over aiohttp WS) ---------------------
 
-    async def handle_chat(self, ws: WebSocket) -> None:
-        await ws.accept()
-        q = ws.query_params
-        persona = (q.get("text_prompt") or "").strip() or None
-        voice = (q.get("voice_prompt") or "").strip() or None
+    async def handle_chat(self, request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        persona = (request.query.get("text_prompt") or "").strip() or None
+        voice = (request.query.get("voice_prompt") or "").strip() or None
         sr = self.engine.sample_rate
         session = PersonaPlexSession(self.engine, self.config)
-        session.open(voice_prompt=voice, persona=persona)  # system prompts (sync)
+        session.open(voice_prompt=voice, persona=persona)  # system-prompt prefill
 
         reader = sphn.OpusStreamReader(sr)
         writer = sphn.OpusStreamWriter(sr)
         state = {"close": False}
-        feed_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="personaplex-feed")
-        loop = asyncio.get_running_loop()
-        pending_pcm = np.zeros(0, dtype=np.float32)
         await ws.send_bytes(b"\x00")  # ready handshake
 
         async def recv_loop() -> None:
             try:
-                while not state["close"]:
-                    data = await ws.receive_bytes()
-                    if data and data[0] == 1:
-                        reader.append_bytes(data[1:])
-            except (WebSocketDisconnect, RuntimeError):
-                pass
+                async for msg in ws:
+                    if msg.type == WSMsgType.BINARY:
+                        data = msg.data
+                        if data and data[0] == 1:
+                            reader.append_bytes(data[1:])
+                    elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
+                        break
             finally:
                 state["close"] = True
 
         async def proc_loop() -> None:
-            nonlocal pending_pcm
-            frame_size = session.frame_size
+            # Mirror moshi.server's opus_loop: drain decoded PCM and step the model,
+            # appending agent audio to the Opus writer; the send loop streams it out.
             while not state["close"]:
                 await asyncio.sleep(0.001)
                 pcm = reader.read_pcm()
-                if pcm is not None and pcm.shape[-1] != 0:
-                    samples = np.ascontiguousarray(pcm, dtype=np.float32).reshape(-1)
-                    pending_pcm = np.concatenate([pending_pcm, samples]) if pending_pcm.size else samples
-                if pending_pcm.shape[0] < frame_size:
+                if pcm is None or pcm.shape[-1] == 0:
                     continue
-                frame, pending_pcm = pending_pcm[:frame_size], pending_pcm[frame_size:]
-                outputs = await loop.run_in_executor(
-                    feed_executor,
-                    session.feed,
-                    np.ascontiguousarray(frame, dtype=np.float32),
-                )
-                for frame_out in outputs:
+                for frame_out in session.feed(np.asarray(pcm, dtype=np.float32)):
                     if frame_out.audio is not None:
                         writer.append_pcm(np.ascontiguousarray(frame_out.audio, dtype=np.float32))
                     if frame_out.text:
@@ -140,23 +130,21 @@ class DuplexServer:
                 with contextlib.suppress(asyncio.CancelledError):
                     await t
         finally:
-            feed_executor.shutdown(wait=False, cancel_futures=True)
             with contextlib.suppress(Exception):
                 await ws.close()
+        return ws
 
-    # ---- simple raw-PCM protocol (no Opus, for tests) -----------------------
+    # ---- simple raw-PCM protocol (no Opus, for tests) ----------------------
 
-    async def handle_raw(self, ws: WebSocket) -> None:
-        await ws.accept()
+    async def handle_raw(self, request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
         session = PersonaPlexSession(self.engine, self.config)
         opened = False
         try:
-            while True:
-                msg = await ws.receive()
-                if msg.get("type") == "websocket.disconnect":
-                    break
-                if (text := msg.get("text")) is not None:
-                    req = json.loads(text)
+            async for msg in ws:
+                if msg.type == WSMsgType.TEXT:
+                    req = json.loads(msg.data)
                     if req.get("type") == "open":
                         session.open(voice_prompt=req.get("voice"), persona=req.get("persona"))
                         opened = True
@@ -166,22 +154,20 @@ class DuplexServer:
                             await self._emit(ws, session.flush())
                         await ws.send_json({"type": "done"})
                         break
-                    continue
-                data = msg.get("bytes")
-                if data is None:
-                    continue
-                if not opened:
-                    session.open()
-                    opened = True
-                await self._emit(ws, session.feed(np.frombuffer(data, dtype=np.float32)))
-        except WebSocketDisconnect:
-            pass
+                elif msg.type == WSMsgType.BINARY:
+                    if not opened:
+                        session.open()
+                        opened = True
+                    await self._emit(ws, session.feed(np.frombuffer(msg.data, dtype=np.float32)))
+                elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
+                    break
         finally:
             with contextlib.suppress(Exception):
                 await ws.close()
+        return ws
 
     @staticmethod
-    async def _emit(ws: WebSocket, outputs: list) -> None:
+    async def _emit(ws: web.WebSocketResponse, outputs: list) -> None:
         for frame_out in outputs:
             if frame_out.audio is not None:
                 await ws.send_bytes(np.ascontiguousarray(frame_out.audio, dtype=np.float32).tobytes())
@@ -189,38 +175,39 @@ class DuplexServer:
                 await ws.send_json({"type": "text", "text": frame_out.text})
 
 
-def create_app(config: PersonaPlexConfig) -> FastAPI:
+def create_app(config: PersonaPlexConfig) -> web.Application:
     server = DuplexServer(config)
     web_dir = _official_web_dir()
 
-    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    async def _startup(_app: web.Application) -> None:
         logger.info("PersonaPlex duplex server: loading engine")
         server.load()
         logger.info("PersonaPlex duplex server: ready (official web: %s)", bool(web_dir))
-        yield
 
-    app = FastAPI(title="vLLM-Omni PersonaPlex Duplex Server", lifespan=lifespan)
+    app = web.Application()
+    app.on_startup.append(_startup)
 
-    @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    async def health(_request: web.Request) -> web.Response:
+        return web.json_response({"status": "ok"})
 
-    @app.websocket("/api/chat")
-    async def chat(ws: WebSocket) -> None:
-        await server.handle_chat(ws)
+    app.router.add_get("/health", health)
+    app.router.add_get("/api/chat", server.handle_chat)
+    app.router.add_get("/v1/audio/duplex", server.handle_raw)
 
-    @app.websocket("/v1/audio/duplex")
-    async def duplex(ws: WebSocket) -> None:
-        await server.handle_raw(ws)
-
-    # Mount the official PersonaPlex web client LAST so explicit routes win.
+    # Serve the official PersonaPlex web client (explicit routes are matched first).
     if web_dir is not None:
-        app.mount("/", StaticFiles(directory=str(web_dir), html=True), name="web")
+
+        async def index(_request: web.Request) -> web.FileResponse:
+            return web.FileResponse(web_dir / "index.html")
+
+        app.router.add_get("/", index)
+        app.router.add_static("/", path=str(web_dir), follow_symlinks=True, name="web")
     else:
 
-        @app.get("/")
-        async def index() -> dict[str, str]:
-            return {"error": f"official web client unavailable; check access to {_HF_REPO} (dist.tgz)"}
+        async def index_missing(_request: web.Request) -> web.Response:
+            return web.json_response({"error": f"official web client unavailable; check access to {_HF_REPO}"})
+
+        app.router.add_get("/", index_missing)
 
     return app
 
@@ -241,7 +228,7 @@ def main() -> None:
         voice_prompt=args.voice,
         **({"persona": args.persona} if args.persona else {}),
     )
-    uvicorn.run(create_app(cfg), host=args.host, port=args.port)
+    web.run_app(create_app(cfg), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
