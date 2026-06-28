@@ -104,11 +104,11 @@ class DuplexServer:
                 pcm = reader.read_pcm()
                 if pcm is None or pcm.shape[-1] == 0:
                     continue
-                for fo in session.feed(np.asarray(pcm, dtype=np.float32)):
-                    if fo.audio is not None:
-                        writer.append_pcm(np.ascontiguousarray(fo.audio, dtype=np.float32))
-                    if fo.text:
-                        await ws.send_bytes(b"\x02" + fo.text.encode("utf8"))
+                for frame_out in session.feed(np.asarray(pcm, dtype=np.float32)):
+                    if frame_out.audio is not None:
+                        writer.append_pcm(np.ascontiguousarray(frame_out.audio, dtype=np.float32))
+                    if frame_out.text:
+                        await ws.send_bytes(b"\x02" + frame_out.text.encode("utf8"))
 
         async def send_loop() -> None:
             while not state["close"]:
@@ -166,11 +166,11 @@ class DuplexServer:
 
     @staticmethod
     async def _emit(ws: WebSocket, outputs: list) -> None:
-        for fo in outputs:
-            if fo.audio is not None:
-                await ws.send_bytes(np.ascontiguousarray(fo.audio, dtype=np.float32).tobytes())
-            if fo.text:
-                await ws.send_json({"type": "text", "text": fo.text})
+        for frame_out in outputs:
+            if frame_out.audio is not None:
+                await ws.send_bytes(np.ascontiguousarray(frame_out.audio, dtype=np.float32).tobytes())
+            if frame_out.text:
+                await ws.send_json({"type": "text", "text": frame_out.text})
 
 
 def create_app(config: PersonaPlexConfig) -> FastAPI:
