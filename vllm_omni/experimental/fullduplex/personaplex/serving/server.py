@@ -17,7 +17,7 @@ Run (auto-downloads the official UI; open http://<host>:8124/):
     HF_TOKEN=... CUDA_VISIBLE_DEVICES=0 python -m \\
         vllm_omni.experimental.fullduplex.personaplex.serving.server --port 8124
 
-A raw-PCM endpoint (``/v1/audio/duplex``) + a minimal page (``/simple``) remain for
+A raw-PCM endpoint (``/v1/audio/duplex``, JSON ``open`` + float32 frames) remains for
 tooling/tests that do not want an Opus dependency.
 """
 
@@ -36,7 +36,6 @@ import numpy as np
 import sphn
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from huggingface_hub import hf_hub_download
 
@@ -45,7 +44,6 @@ from vllm_omni.experimental.fullduplex.personaplex.engine import PersonaPlexEngi
 from vllm_omni.experimental.fullduplex.personaplex.session import PersonaPlexSession
 
 logger = logging.getLogger(__name__)
-_STATIC = Path(__file__).parent / "static"
 _HF_REPO = "nvidia/personaplex-7b-v1"
 
 
@@ -59,7 +57,7 @@ def _official_web_dir() -> Path | None:
                 tar.extractall(path=tgz.parent)  # noqa: S202 - trusted first-party bundle
         return dist if dist.exists() else None
     except Exception as exc:  # network / auth / layout
-        logger.warning("official web client unavailable (%s); falling back to /simple", exc)
+        logger.warning("official web client unavailable (%s); / will return an error note", exc)
         return None
 
 
@@ -191,10 +189,6 @@ def create_app(config: PersonaPlexConfig) -> FastAPI:
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/simple")
-    async def simple() -> FileResponse:
-        return FileResponse(_STATIC / "index.html")
-
     @app.websocket("/api/chat")
     async def chat(ws: WebSocket) -> None:
         await server.handle_chat(ws)
@@ -203,14 +197,14 @@ def create_app(config: PersonaPlexConfig) -> FastAPI:
     async def duplex(ws: WebSocket) -> None:
         await server.handle_raw(ws)
 
-    # Mount the official web client LAST so explicit routes win.
+    # Mount the official PersonaPlex web client LAST so explicit routes win.
     if web_dir is not None:
         app.mount("/", StaticFiles(directory=str(web_dir), html=True), name="web")
     else:
 
         @app.get("/")
-        async def index() -> FileResponse:
-            return FileResponse(_STATIC / "index.html")
+        async def index() -> dict[str, str]:
+            return {"error": f"official web client unavailable; check access to {_HF_REPO} (dist.tgz)"}
 
     return app
 
