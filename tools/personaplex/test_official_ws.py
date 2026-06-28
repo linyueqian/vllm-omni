@@ -28,6 +28,7 @@ async def run(url: str, pcm: np.ndarray, sr: int) -> tuple[np.ndarray, str]:
     pieces: list[str] = []
     ready = asyncio.Event()
     last_audio = {"t": 0.0}
+    arrivals: list[float] = []  # inter-arrival times of agent audio packets (delivery smoothness)
 
     async with websockets.connect(url, max_size=None) as ws:
 
@@ -45,7 +46,10 @@ async def run(url: str, pcm: np.ndarray, sr: int) -> tuple[np.ndarray, str]:
                     ready.set()
                 elif tag == 1:
                     reader.append_bytes(bytes(payload))
-                    last_audio["t"] = loop.time()
+                    t = loop.time()
+                    if last_audio["t"]:
+                        arrivals.append((t - last_audio["t"]) * 1000.0)
+                    last_audio["t"] = t
                 elif tag == 2:
                     pieces.append(payload.decode("utf8", errors="replace"))
 
@@ -78,6 +82,15 @@ async def run(url: str, pcm: np.ndarray, sr: int) -> tuple[np.ndarray, str]:
             break
         chunks.append(np.asarray(out, dtype=np.float32))
     audio = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+    if arrivals:
+        a = sorted(arrivals)
+        n = len(a)
+        mean = sum(a) / n
+        p95 = a[min(n - 1, int(0.95 * n))]
+        print(
+            f"audio-packet inter-arrival (server delivery): n={n} mean={mean:.0f}ms "
+            f"p50={a[n // 2]:.0f}ms p95={p95:.0f}ms max={a[-1]:.0f}ms"
+        )
     return audio, "".join(pieces)
 
 

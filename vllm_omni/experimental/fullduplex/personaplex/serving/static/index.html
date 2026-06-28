@@ -92,6 +92,10 @@
 
 <script>
 const SR = 24000;
+// Jitter buffer: build this many seconds of lead before playing so network
+// variance (high-RTT / remote tunnels) doesn't cause stutter. Raise if choppy.
+const TARGET_LEAD = 0.8;
+const MIN_LEAD = 0.15;
 const $ = (id) => document.getElementById(id);
 const ui = {
   connect: $("connect"), stop: $("stop"), status: $("status"), dot: $("dot"),
@@ -187,13 +191,16 @@ function playPCM(samples) {
   const buf = audioCtx.createBuffer(1, samples.length, SR);
   buf.copyToChannel(samples, 0);
   const node = audioCtx.createBufferSource();
-  node.buffer = buf; node.connect(audioCtx.destination);
+  node.buffer = buf;
+  node.connect(audioCtx.destination);
   const now = audioCtx.currentTime;
-  if (playHead < now) playHead = now + 0.02; // small jitter cushion after a gap
+  // Startup or underrun: rebuild a full TARGET_LEAD of buffer ahead of the playhead
+  // so subsequent frames play gaplessly even when they arrive late/jittery.
+  if (playHead < now + MIN_LEAD) playHead = now + TARGET_LEAD;
   node.start(playHead);
   playHead += buf.duration;
-  setStatus("agent speaking", "busy");
-  node.onended = () => { if (running && Math.abs(playHead - audioCtx.currentTime) < 0.05) setStatus("listening", "on"); };
+  const lead = playHead - now;
+  setStatus(`agent speaking · buffer ${(lead * 1000) | 0}ms`, "busy");
 }
 
 function stop() {
