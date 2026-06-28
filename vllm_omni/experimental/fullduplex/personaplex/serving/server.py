@@ -30,6 +30,7 @@ import json
 import logging
 import tarfile
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -85,6 +86,9 @@ class DuplexServer:
         reader = sphn.OpusStreamReader(sr)
         writer = sphn.OpusStreamWriter(sr)
         state = {"close": False}
+        feed_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="personaplex-feed")
+        loop = asyncio.get_running_loop()
+        pending_pcm = np.zeros(0, dtype=np.float32)
         await ws.send_bytes(b"\x00")  # ready handshake
 
         async def recv_loop() -> None:
@@ -99,12 +103,23 @@ class DuplexServer:
                 state["close"] = True
 
         async def proc_loop() -> None:
+            nonlocal pending_pcm
+            frame_size = session.frame_size
             while not state["close"]:
                 await asyncio.sleep(0.001)
                 pcm = reader.read_pcm()
-                if pcm is None or pcm.shape[-1] == 0:
+                if pcm is not None and pcm.shape[-1] != 0:
+                    samples = np.ascontiguousarray(pcm, dtype=np.float32).reshape(-1)
+                    pending_pcm = np.concatenate([pending_pcm, samples]) if pending_pcm.size else samples
+                if pending_pcm.shape[0] < frame_size:
                     continue
-                for frame_out in session.feed(np.asarray(pcm, dtype=np.float32)):
+                frame, pending_pcm = pending_pcm[:frame_size], pending_pcm[frame_size:]
+                outputs = await loop.run_in_executor(
+                    feed_executor,
+                    session.feed,
+                    np.ascontiguousarray(frame, dtype=np.float32),
+                )
+                for frame_out in outputs:
                     if frame_out.audio is not None:
                         writer.append_pcm(np.ascontiguousarray(frame_out.audio, dtype=np.float32))
                     if frame_out.text:
@@ -125,6 +140,7 @@ class DuplexServer:
                 with contextlib.suppress(asyncio.CancelledError):
                     await t
         finally:
+            feed_executor.shutdown(wait=False, cancel_futures=True)
             with contextlib.suppress(Exception):
                 await ws.close()
 
