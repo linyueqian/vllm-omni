@@ -374,9 +374,7 @@ class TestCodePredictorPerRowGenerators:
         assert torch.equal(batched[0:1], torch.multinomial(probs[0:1], num_samples=1, generator=seeded(11)))
         assert torch.equal(batched[2:3], torch.multinomial(probs[2:3], num_samples=1, generator=seeded(22)))
 
-    def test_forward_per_row_generators_are_row_independent(
-        self, mocker: MockerFixture, loaded_target_classes
-    ) -> None:
+    def test_forward_per_row_generators_are_row_independent(self, mocker: MockerFixture, loaded_target_classes) -> None:
         predictor, talker_config = self._make_predictor(mocker, loaded_target_classes)
         hidden = talker_config.hidden_size
         torch.manual_seed(123)
