@@ -320,6 +320,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.talker_mtp_output_key = ("codes", "audio")
         # talker_mtp samples with per-row generators, so explicitly-seeded
         # requests stay batched instead of one scalar forward per row (#4883).
+        # Only valid while talker_mtp receives the unpadded active batch (this
+        # talker is not graph-wrapped); a padded batch would need the runner to
+        # pad the generators list as well.
         self.talker_mtp_accepts_per_row_generators = True
 
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
