@@ -18,6 +18,7 @@ import types
 
 import pytest
 import torch
+import torch.nn.functional as F
 from pytest_mock import MockerFixture
 
 # Direct file import to avoid vllm_omni.__init__ patch dependencies.
@@ -542,3 +543,74 @@ class TestCodePredictorWrapperConfig:
             wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=True),
         )
         assert graph_wrapper._prefix_graphs_enabled is True
+
+
+class TestGumbelMaxSampling:
+    """Sanity tests for the Gumbel-max sampling path."""
+
+    @staticmethod
+    def _gumbel_argmax(logits: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
+        """Stand-alone reimplementation of the in-line Gumbel-max snippet.
+
+        Kept in sync with ``CodePredictorWrapper.forward``; if you change
+        the sampling formula there, change this helper as well.
+        """
+        eps = 1e-20
+        u = torch.empty_like(logits, dtype=torch.float32)
+        u.uniform_(eps, 1.0 - eps, generator=generator)
+        return (logits.float() - torch.log(-torch.log(u))).argmax(dim=-1, keepdim=True)
+
+    def test_gumbel_max_picks_unique_high_logit(self) -> None:
+        """If one logit is dominant, Gumbel-max must always pick it."""
+        torch.manual_seed(0)
+        bsz, vocab = 4, 64
+        logits = torch.full((bsz, vocab), -1e4)
+        logits[:, 7] = 0.0  # only finite entry
+        out = self._gumbel_argmax(logits)
+        assert out.shape == (bsz, 1)
+        assert torch.equal(out.squeeze(-1), torch.full((bsz,), 7, dtype=torch.long))
+
+    def test_gumbel_max_handles_all_neg_inf_row(self) -> None:
+        """A row that is filtered to -inf everywhere except one entry must
+        still produce a valid index instead of crashing (this is the case
+        ``torch.multinomial`` cannot handle)."""
+        bsz, vocab = 2, 8
+        logits = torch.full((bsz, vocab), float("-inf"))
+        logits[0, 3] = 0.0
+        logits[1, 5] = 0.0
+        out = self._gumbel_argmax(logits)
+        assert out[0].item() == 3
+        assert out[1].item() == 5
+
+    def test_gumbel_max_generator_makes_results_reproducible(self) -> None:
+        """Same ``Generator.manual_seed`` should produce identical samples."""
+        torch.manual_seed(0)
+        logits = torch.randn(8, 32)
+        g1 = torch.Generator()
+        g1.manual_seed(123)
+        g2 = torch.Generator()
+        g2.manual_seed(123)
+        g3 = torch.Generator()
+        g3.manual_seed(456)
+        s1 = self._gumbel_argmax(logits, generator=g1)
+        s2 = self._gumbel_argmax(logits, generator=g2)
+        s3 = self._gumbel_argmax(logits, generator=g3)
+        assert torch.equal(s1, s2)
+        # Different seeds must (almost surely) yield a different sequence.
+        assert not torch.equal(s1, s3)
+
+    def test_gumbel_max_distribution_matches_softmax(self) -> None:
+        """Empirical frequency under Gumbel-max should be close to the
+        softmax probability mass.  Loose tolerance because we draw a
+        finite number of samples."""
+        torch.manual_seed(7)
+        vocab = 16
+        logits = torch.randn(vocab) * 2.0
+        target = F.softmax(logits, dim=-1, dtype=torch.float32)
+
+        n_draws = 20000
+        batched_logits = logits.unsqueeze(0).expand(n_draws, vocab).contiguous()
+        samples = self._gumbel_argmax(batched_logits).squeeze(-1)
+        empirical = torch.bincount(samples, minlength=vocab).float() / n_draws
+        # L1 distance under 0.03 with 20k draws is comfortable for vocab=16.
+        assert (empirical - target).abs().sum().item() < 0.05

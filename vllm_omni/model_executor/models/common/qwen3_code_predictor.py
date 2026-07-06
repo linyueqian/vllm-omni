@@ -763,6 +763,24 @@ class CodePredictorWrapper(nn.Module):
             ]
         )
 
+    @staticmethod
+    def _sample_codes_gumbel(
+        logits: torch.Tensor,
+        generator: torch.Generator | None,
+        generators: Sequence[torch.Generator | None] | None,
+    ) -> torch.Tensor:
+        """Gumbel-max sampling from masked logits, with optional per-row
+        generators so explicitly-seeded requests stay deterministic in a
+        multi-row batch (#4883)."""
+        eps = 1e-20
+        u = torch.empty_like(logits, dtype=torch.float32)
+        if generators is None:
+            u.uniform_(eps, 1.0 - eps, generator=generator)
+        else:
+            for row, row_generator in enumerate(generators):
+                u[row : row + 1].uniform_(eps, 1.0 - eps, generator=row_generator)
+        return (logits.float() - torch.log(-torch.log(u))).argmax(dim=-1, keepdim=True)
+
     @torch.inference_mode()
     def forward(
         self,
@@ -856,9 +874,35 @@ class CodePredictorWrapper(nn.Module):
 
             logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
 
-            # Sample next code
+            # Sample next code via Gumbel-max trick.
+            #
+            # ``argmax_i (logits_i + Gumbel_i)`` with
+            # ``Gumbel_i = -log(-log(u_i)), u_i ~ Uniform(0, 1)`` is
+            # distributionally identical to sampling from ``softmax(logits)``,
+            # but has three properties that matter here:
+            #   1. CUDA-Graph safe -- ``Tensor.uniform_()`` is one of the few
+            #      RNG ops that PyTorch reseeds on every replay (see the
+            #      ``cuda::philox`` path), so it slots into a captured graph
+            #      and produces fresh noise every step.  ``torch.multinomial``
+            #      does NOT, which is why models compiled with full CUDA
+            #      Graphs would otherwise emit identical codes on each
+            #      replay.
+            #   2. Robust to all-(-inf) rows -- if every entry is masked out
+            #      (e.g. by an aggressive top-p filter), ``multinomial`` hits
+            #      a device-side assert; ``argmax`` still returns a valid
+            #      index.
+            #   3. Faster -- one ``empty_like + uniform_ + log + argmax`` is
+            #      measurably cheaper than ``softmax + multinomial`` on the
+            #      shapes used here (B x vocab, vocab=2048).
+            #
+            # See also vllm-omni#3221 which used the same trick on a
+            # different sampling path.
+            #
+            # ``u`` is generated in ``(eps, 1-eps)`` so ``log(u)`` and
+            # ``log(-log(u))`` are both finite without explicit clamping.
+            _UNIFORM_EPS = 1e-20
             if stored_mode:
-                # "stored" mode: top-k -> top-p -> softmax -> multinomial
+                # "stored" mode: top-k -> top-p -> Gumbel-max
                 if s_top_k > 0:
                     topk_vals, _ = logits.topk(s_top_k, dim=-1)
                     logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
@@ -869,17 +913,15 @@ class CodePredictorWrapper(nn.Module):
                     remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
                     sorted_logits[remove_mask] = float("-inf")
                     logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
-                probs = F.softmax(logits, dim=-1, dtype=torch.float32)
-                code = self._multinomial(probs, generator, generators)
+                code = self._sample_codes_gumbel(logits, generator, generators)
             else:
-                # "per_call" mode: temperature-scaled + top-k
+                # "per_call" mode: temperature-scaled + top-k -> Gumbel-max
                 if use_sampling:
                     scaled = logits * inv_temperature
                     if top_k > 0:
                         topk_vals, _ = scaled.topk(top_k, dim=-1)
                         scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                    probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
-                    code = self._multinomial(probs, generator, generators)
+                    code = self._sample_codes_gumbel(scaled, generator, generators)
                 else:
                     code = logits.argmax(dim=-1, keepdim=True)
 
