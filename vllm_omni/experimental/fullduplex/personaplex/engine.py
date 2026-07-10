@@ -111,6 +111,13 @@ class PersonaPlexEngine:
             ) from exc
 
         cfg = self.config
+        if cfg.batch_size > 1:
+            # Elastic batching needs the per-slot moshi patches installed before
+            # LMGen builds its streaming state (see elastic.py). At batch_size=1
+            # the stock moshi code paths run untouched.
+            from vllm_omni.experimental.fullduplex.personaplex.elastic import apply_elastic_patches
+
+            apply_elastic_patches()
         if cfg.seed is not None and cfg.seed >= 0:
             _seed_all(cfg.seed)
 
@@ -142,9 +149,9 @@ class PersonaPlexEngine:
             top_k=cfg.topk_audio,
             top_k_text=cfg.topk_text,
         )
-        self._mimi.streaming_forever(1)
-        self._other_mimi.streaming_forever(1)
-        self._lm_gen.streaming_forever(1)
+        self._mimi.streaming_forever(cfg.batch_size)
+        self._other_mimi.streaming_forever(cfg.batch_size)
+        self._lm_gen.streaming_forever(cfg.batch_size)
 
         self._lm = lm
         if cfg.use_native_components:
@@ -205,13 +212,22 @@ class PersonaPlexEngine:
         def native_depth(text_token, transformer_out, audio_tokens, audio_provided):
             return dep(text_token, transformer_out, audio_tokens=audio_tokens, audio_provided=audio_provided)
 
-        self._lm_gen._streaming_state.graphed_main = CUDAGraphed(native_main)
-        self._lm_gen._streaming_state.graphed_depth = CUDAGraphed(native_depth)
+        state = self._lm_gen._streaming_state
+        if self.config.batch_size > 1:
+            # Elastic mode runs the split path (embed graph -> temporal graph) on
+            # every tick, so the native swap targets the embed stage; the temporal
+            # graph stays graphed_embeddings (the same forward native_main calls).
+            state.graphed_embed = CUDAGraphed(emb)
+        else:
+            state.graphed_main = CUDAGraphed(native_main)
+        state.graphed_depth = CUDAGraphed(native_depth)
 
     def _warmup(self, torch) -> None:
         """Prime CUDA graphs + streaming state (offline.py:warmup)."""
         for _ in range(4):
-            chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.config.device)
+            chunk = torch.zeros(
+                self.config.batch_size, 1, self.frame_size, dtype=torch.float32, device=self.config.device
+            )
             codes = self._mimi.encode(chunk)
             self._other_mimi.encode(chunk)
             for c in range(codes.shape[-1]):

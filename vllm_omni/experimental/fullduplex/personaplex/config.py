@@ -43,6 +43,9 @@ class PersonaPlexConfig:
             inner-monologue text head.
         topk_audio / topk_text: Top-k for the audio / text heads.
         seed: RNG seed; ``None`` leaves global RNG untouched.
+        batch_size: Concurrent conversation slots sharing one engine. ``1`` is
+            the classic single-session path; ``> 1`` enables elastic batching
+            (``elastic.py``) with per-slot recycle for new callers.
     """
 
     hf_repo: str = "nvidia/personaplex-7b-v1"
@@ -58,6 +61,7 @@ class PersonaPlexConfig:
     topk_audio: int = 250
     topk_text: int = 25
     seed: int | None = None
+    batch_size: int = 1
 
     # Swap the heavy per-frame compute (embed_codes + depformer) for the vLLM-native
     # ports (PersonaPlexInputEmbeddings + PersonaPlexDepformer, both parity-verified

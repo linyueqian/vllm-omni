@@ -34,6 +34,7 @@ import contextlib
 import json
 import logging
 import tarfile
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -41,8 +42,10 @@ import sphn
 from aiohttp import WSMsgType, web
 from huggingface_hub import hf_hub_download
 
+from vllm_omni.experimental.fullduplex.personaplex.batched_engine import BatchedPersonaPlexEngine
 from vllm_omni.experimental.fullduplex.personaplex.config import PersonaPlexConfig
 from vllm_omni.experimental.fullduplex.personaplex.engine import PersonaPlexEngine
+from vllm_omni.experimental.fullduplex.personaplex.serving.batched import BatchedSessionManager
 from vllm_omni.experimental.fullduplex.personaplex.session import PersonaPlexSession
 
 logger = logging.getLogger(__name__)
@@ -175,17 +178,181 @@ class DuplexServer:
                 await ws.send_json({"type": "text", "text": frame_out.text})
 
 
+class BatchedDuplexServer:
+    """Serve ``batch_size`` concurrent duplex conversations on one engine.
+
+    Same wire protocols as :class:`DuplexServer`; each connection claims a slot
+    from the shared :class:`BatchedSessionManager`, whose stepping thread ticks
+    all live slots in lockstep at 12.5 Hz wall clock. A connection with a custom
+    ``text_prompt`` (or reusing a previously used slot) waits while the slot's
+    system prompt is replayed per-row (voice embeddings + persona), then gets the
+    ready handshake. Per-connection custom voices are not supported in batched
+    mode (fixed default voice; ``voice_prompt`` is ignored with a warning).
+    """
+
+    def __init__(self, config: PersonaPlexConfig) -> None:
+        self.config = config
+        self.engine = BatchedPersonaPlexEngine(config)
+        self.manager: BatchedSessionManager | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def load(self) -> None:
+        self.engine.load()
+        self.engine.open_batch()
+        self.manager = BatchedSessionManager(self.engine)
+        self._thread = threading.Thread(
+            target=self.manager.run_forever, args=(self._stop,), daemon=True, name="pplex-tick"
+        )
+        self._thread.start()
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    async def _acquire(self, ws: web.WebSocketResponse, persona: str | None):
+        """Claim a slot and wait until it is live. Returns the slot or None."""
+        acquired = self.manager.acquire(persona=persona)
+        if acquired is None:
+            await ws.close(code=1013, message=b"all conversation slots busy")
+            return None
+        slot, ready_now = acquired
+        loop = asyncio.get_running_loop()
+        outq: asyncio.Queue = asyncio.Queue()
+        ready = asyncio.Event()
+        with self.manager.lock:
+            slot.on_output = lambda frame_out: loop.call_soon_threadsafe(outq.put_nowait, frame_out)
+            if ready_now:
+                ready.set()
+            else:
+                slot.on_ready = lambda: loop.call_soon_threadsafe(ready.set)
+        await ready.wait()
+        return slot, outq
+
+    async def handle_chat(self, request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        persona = (request.query.get("text_prompt") or "").strip() or None
+        if (request.query.get("voice_prompt") or "").strip():
+            logger.warning("batched mode ignores per-connection voice_prompt (fixed default voice)")
+        got = await self._acquire(ws, persona)
+        if got is None:
+            return ws
+        slot, outq = got
+        epoch = slot.epoch
+        sr = self.engine.sample_rate
+        reader = sphn.OpusStreamReader(sr)
+        writer = sphn.OpusStreamWriter(sr)
+        state = {"close": False}
+        await ws.send_bytes(b"\x00")  # ready handshake
+
+        async def recv_loop() -> None:
+            try:
+                async for msg in ws:
+                    if msg.type == WSMsgType.BINARY:
+                        data = msg.data
+                        if data and data[0] == 1:
+                            reader.append_bytes(data[1:])
+                            pcm = reader.read_pcm()
+                            if pcm is not None and pcm.shape[-1] > 0:
+                                self.manager.feed(slot, np.asarray(pcm, dtype=np.float32), epoch)
+                    elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
+                        break
+            finally:
+                state["close"] = True
+
+        async def out_loop() -> None:
+            while not state["close"]:
+                try:
+                    frame_out = await asyncio.wait_for(outq.get(), timeout=0.25)
+                except asyncio.TimeoutError:
+                    continue
+                if frame_out.audio is not None:
+                    writer.append_pcm(np.ascontiguousarray(frame_out.audio, dtype=np.float32))
+                if frame_out.text:
+                    await ws.send_bytes(b"\x02" + frame_out.text.encode("utf8"))
+                msg = writer.read_bytes()
+                if msg:
+                    await ws.send_bytes(b"\x01" + msg)
+
+        tasks = [asyncio.create_task(recv_loop()), asyncio.create_task(out_loop())]
+        try:
+            _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await t
+        finally:
+            self.manager.release(slot)
+            with contextlib.suppress(Exception):
+                await ws.close()
+        return ws
+
+    async def handle_raw(self, request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        slot = None
+        sender: asyncio.Task | None = None
+        epoch = 0
+
+        async def pump(outq: asyncio.Queue) -> None:
+            # Forward slot output continuously (the tick loop produces in realtime).
+            while True:
+                frame_out = await outq.get()
+                if frame_out.audio is not None:
+                    await ws.send_bytes(np.ascontiguousarray(frame_out.audio, dtype=np.float32).tobytes())
+                if frame_out.text:
+                    await ws.send_json({"type": "text", "text": frame_out.text})
+
+        try:
+            async for msg in ws:
+                if msg.type == WSMsgType.TEXT:
+                    req = json.loads(msg.data)
+                    if req.get("type") == "open":
+                        got = await self._acquire(ws, (req.get("persona") or "").strip() or None)
+                        if got is None:
+                            return ws
+                        slot, outq = got
+                        epoch = slot.epoch
+                        sender = asyncio.create_task(pump(outq))
+                        await ws.send_json({"type": "ready"})
+                    elif req.get("type") == "close":
+                        await asyncio.sleep(0.3)  # let in-flight frames flush via pump
+                        await ws.send_json({"type": "done"})
+                        break
+                elif msg.type == WSMsgType.BINARY and slot is not None:
+                    self.manager.feed(slot, np.frombuffer(msg.data, dtype=np.float32), epoch)
+                elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
+                    break
+        finally:
+            if sender is not None:
+                sender.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await sender
+            if slot is not None:
+                self.manager.release(slot)
+            with contextlib.suppress(Exception):
+                await ws.close()
+        return ws
+
+
 def create_app(config: PersonaPlexConfig) -> web.Application:
-    server = DuplexServer(config)
+    server = BatchedDuplexServer(config) if config.batch_size > 1 else DuplexServer(config)
     web_dir = _official_web_dir()
 
     async def _startup(_app: web.Application) -> None:
-        logger.info("PersonaPlex duplex server: loading engine")
+        logger.info("PersonaPlex duplex server: loading engine (batch_size=%d)", config.batch_size)
         server.load()
         logger.info("PersonaPlex duplex server: ready (official web: %s)", bool(web_dir))
 
+    async def _cleanup(_app: web.Application) -> None:
+        if isinstance(server, BatchedDuplexServer):
+            server.shutdown()
+
     app = web.Application()
     app.on_startup.append(_startup)
+    app.on_cleanup.append(_cleanup)
 
     async def health(_request: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
@@ -219,6 +386,12 @@ def main() -> None:
     ap.add_argument("--persona", default=None)
     ap.add_argument("--voice", default="NATF2.pt")
     ap.add_argument("--greedy", action="store_true", default=True)
+    ap.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Concurrent conversation slots on one engine (elastic batching when > 1).",
+    )
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
     cfg = PersonaPlexConfig(
@@ -226,6 +399,7 @@ def main() -> None:
         greedy=args.greedy,
         seed=42,
         voice_prompt=args.voice,
+        batch_size=args.batch_size,
         **({"persona": args.persona} if args.persona else {}),
     )
     web.run_app(create_app(cfg), host=args.host, port=args.port)
