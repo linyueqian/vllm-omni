@@ -8,14 +8,14 @@ around the Moshi/Mimi lockstep loop) and writes the agent's audio + inner-monolo
 text. It mirrors ``python -m moshi.offline`` but goes through our ``FrameStepper``
 seam, so a green run validates that the session/adapter plumbing is faithful.
 
-Prereqs: ``pip install moshi/.`` from a clone of https://github.com/NVIDIA/personaplex
-and HF access to ``nvidia/personaplex-7b-v1`` (``export HF_TOKEN=...``).
+Prereqs: HF access to ``nvidia/personaplex-7b-v1`` (``export HF_TOKEN=...``). The
+stack is moshi-free (native temporal + depformer + streaming Mimi via
+``transformers``); decoding is greedy.
 
 Example:
     python examples/offline_inference/personaplex/personaplex_offline.py \\
         --input-wav input_assistant.wav --output-wav out.wav \\
-        --voice-prompt NATF2.pt --persona "You are a wise and friendly teacher." \\
-        --seed 42424242 --greedy
+        --voice-prompt NATF2.pt --persona "You are a wise and friendly teacher."
 """
 
 from __future__ import annotations
@@ -43,8 +43,6 @@ def main() -> None:
     parser.add_argument("--hf-repo", default="nvidia/personaplex-7b-v1")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--cpu-offload", action="store_true")
-    parser.add_argument("--greedy", action="store_true", help="Deterministic decoding")
-    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
     import sphn  # local import: only the runnable driver needs the audio I/O dep
@@ -55,8 +53,6 @@ def main() -> None:
         persona=args.persona,
         device=args.device,
         cpu_offload=args.cpu_offload,
-        greedy=args.greedy,
-        seed=args.seed,
     )
 
     engine = PersonaPlexEngine(config).load()

@@ -41,11 +41,7 @@ RECYCLE_AT = 10
 
 
 def _make_engine() -> BatchedPersonaPlexEngine:
-    cfg = PersonaPlexConfig(
-        batch_size=B,
-        greedy=True,
-        seed=42,
-    )
+    cfg = PersonaPlexConfig(batch_size=B)  # native stepper is greedy-only
     return BatchedPersonaPlexEngine(cfg).load()
 
 
@@ -207,7 +203,7 @@ def _bench(batch_sizes: list[int]) -> None:
     import time
 
     for bs in batch_sizes:
-        cfg = PersonaPlexConfig(batch_size=max(bs, 2), greedy=True, seed=42, use_native_components=True)
+        cfg = PersonaPlexConfig(batch_size=max(bs, 2))
         eng = BatchedPersonaPlexEngine(cfg).load()
         eng.open_batch()
         frame = eng.frame_size

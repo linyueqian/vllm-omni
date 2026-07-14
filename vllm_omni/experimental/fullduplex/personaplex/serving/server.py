@@ -44,9 +44,7 @@ from huggingface_hub import hf_hub_download
 
 from vllm_omni.experimental.fullduplex.personaplex.config import PersonaPlexConfig
 from vllm_omni.experimental.fullduplex.personaplex.engine import PersonaPlexEngine
-from vllm_omni.experimental.fullduplex.personaplex.native_stepper import (
-    NativePersonaPlexEngine as BatchedPersonaPlexEngine,
-)
+from vllm_omni.experimental.fullduplex.personaplex.native_stepper import NativePersonaPlexEngine
 from vllm_omni.experimental.fullduplex.personaplex.serving.batched import BatchedSessionManager
 from vllm_omni.experimental.fullduplex.personaplex.session import PersonaPlexSession
 
@@ -213,7 +211,7 @@ class BatchedDuplexServer:
 
     def __init__(self, config: PersonaPlexConfig) -> None:
         self.config = config
-        self.engine = BatchedPersonaPlexEngine(config)
+        self.engine = NativePersonaPlexEngine(config)
         self.manager: BatchedSessionManager | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -404,7 +402,6 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8124)
     ap.add_argument("--persona", default=None)
     ap.add_argument("--voice", default="NATF2.pt")
-    ap.add_argument("--greedy", action="store_true", default=True)
     ap.add_argument(
         "--batch-size",
         type=int,
@@ -414,8 +411,6 @@ def main() -> None:
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
     cfg = PersonaPlexConfig(
-        greedy=args.greedy,
-        seed=42,
         voice_prompt=args.voice,
         batch_size=args.batch_size,
         **({"persona": args.persona} if args.persona else {}),

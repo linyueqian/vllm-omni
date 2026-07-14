@@ -37,14 +37,13 @@ class PersonaPlexConfig:
         device: Torch device for the backend (``"cuda"`` / ``"cpu"``).
         cpu_offload: Offload LM layers to CPU when GPU memory is tight (needs
             ``accelerate``).
-        greedy: Disable sampling (deterministic decoding).
-        temp_audio / temp_text: Sampling temperatures for the audio depformer /
-            inner-monologue text head.
-        topk_audio / topk_text: Top-k for the audio / text heads.
-        seed: RNG seed; ``None`` leaves global RNG untouched.
         batch_size: Concurrent conversation slots sharing one engine. ``1`` is
-            the classic single-session path; ``> 1`` enables elastic batching
-            (``elastic.py``) with per-slot recycle for new callers.
+            the single-session path; ``> 1`` enables elastic batching with
+            per-slot recycle for new callers.
+
+    Note: the native stepper decodes greedily (argmax) for both the text head
+    and the depformer, so there are no sampling knobs here yet. Temperature /
+    top-k / seed fields will be added if and when a sampling path is wired in.
     """
 
     hf_repo: str = "nvidia/personaplex-7b-v1"
@@ -54,12 +53,6 @@ class PersonaPlexConfig:
     device: str = "cuda"
     cpu_offload: bool = False
 
-    greedy: bool = False
-    temp_audio: float = 0.8
-    temp_text: float = 0.7
-    topk_audio: int = 250
-    topk_text: int = 25
-    seed: int | None = None
     batch_size: int = 1
 
     @property
