@@ -107,6 +107,13 @@ class _RingKV:
         invalid = idx >= self.end_offset
         end_index = self.end_offset % self.capacity
         delta = idx - end_index
+        # `delta <= 0` (not `< 0`) is moshi's exact convention (transformer.py
+        # RingKVCache.complete). It labels the just-past-newest slot as the future
+        # write position, so once the ring has wrapped the single oldest in-window
+        # cell is excluded and the effective window is capacity-1. This is inherited
+        # verbatim from the reference and only shows after the window fills (Helium
+        # ~3000 frames / 240 s); it costs one frame out of thousands. Do NOT change
+        # this to `< 0`: it would diverge from moshi and break greedy bit-parity.
         positions = torch.where(delta <= 0, self.end_offset + delta, self.end_offset + delta - self.capacity)
         positions = torch.where(invalid, torch.full_like(positions, -1), positions)
         positions = positions.view(1, -1)  # [1, capacity]
