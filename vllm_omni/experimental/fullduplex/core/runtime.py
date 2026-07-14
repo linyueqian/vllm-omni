@@ -21,9 +21,11 @@ class DuplexRuntime:
         self._capabilities = adapter.capabilities()
 
     async def run(self, inputs: AsyncIterator[dict], emit: Emit) -> None:
-        # Lockstep models (PersonaPlex / Moshi-class) run ONE eternal response that
-        # consumes inputs as they arrive and drains on close, instead of the turn
-        # lifecycle's start/cancel-per-trigger. Default off — turn adapters unchanged.
+        # EXTENSION (ours, pending upstream discussion on PR #3907): lockstep
+        # models (PersonaPlex / Moshi-class) run ONE eternal response that consumes
+        # inputs as they arrive and drains on close, instead of the turn
+        # lifecycle's start/cancel-per-trigger. Default off — turn adapters
+        # unchanged.
         continuous = self.session.config.continuous
         task: asyncio.Task | None = None
         async for event in inputs:
