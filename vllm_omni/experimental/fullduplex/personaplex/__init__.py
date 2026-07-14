@@ -10,25 +10,29 @@ speech-to-speech model. This package plugs it into the model-agnostic
 - :class:`PersonaPlexEngine`   real Moshi/Mimi backend (``FrameStepper``)
 - :class:`PersonaPlexSession`  lockstep driver (the runnable serving primitive)
 - :class:`PersonaPlexDuplexAdapter`  the ``core.DuplexAdapter`` (continuous mode)
-- :class:`BatchedPersonaPlexEngine`  B concurrent slots on one model
-  (elastic per-slot recycle; see ``elastic.py`` and ``serving/batched.py``)
+- :class:`NativePersonaPlexEngine`  the moshi-free lockstep engine (single
+  session and B concurrent slots with elastic per-slot recycle)
 """
 
 from vllm_omni.experimental.fullduplex.personaplex.adapter import PersonaPlexDuplexAdapter
-from vllm_omni.experimental.fullduplex.personaplex.batched_engine import (
-    BatchedPersonaPlexEngine,
-    PrefillStep,
-)
 from vllm_omni.experimental.fullduplex.personaplex.config import PersonaPlexConfig
 from vllm_omni.experimental.fullduplex.personaplex.engine import (
     FrameOutput,
     FrameStepper,
     PersonaPlexEngine,
 )
+from vllm_omni.experimental.fullduplex.personaplex.native_stepper import (
+    NativePersonaPlexEngine,
+    PrefillStep,
+)
+from vllm_omni.experimental.fullduplex.personaplex.native_stepper import (
+    NativePersonaPlexEngine as BatchedPersonaPlexEngine,
+)
 from vllm_omni.experimental.fullduplex.personaplex.session import PersonaPlexSession
 
 __all__ = [
     "BatchedPersonaPlexEngine",
+    "NativePersonaPlexEngine",
     "FrameOutput",
     "FrameStepper",
     "PersonaPlexConfig",

@@ -5,8 +5,7 @@
 PersonaPlex (``nvidia/personaplex-7b-v1``) is a Moshi finetune: a pure-lockstep
 full-duplex speech-to-speech model running at the Mimi codec frame rate
 (12.5 Hz / 80 ms). One config drives both the offline driver and the duplex
-adapter. All values mirror PersonaPlex's ``offline.py`` defaults so the wrapper
-stays bit-for-bit faithful to the reference loop.
+adapter. Defaults mirror the PersonaPlex reference loop.
 """
 
 from __future__ import annotations
@@ -62,12 +61,6 @@ class PersonaPlexConfig:
     topk_text: int = 25
     seed: int | None = None
     batch_size: int = 1
-
-    # Swap the heavy per-frame compute (embed_codes + depformer) for the vLLM-native
-    # ports (PersonaPlexInputEmbeddings + PersonaPlexDepformer, both parity-verified
-    # vs moshi). The LMGen streaming/delay-cache machinery and the Helium temporal
-    # forward stay moshi for now; this is the first step of the native serve path.
-    use_native_components: bool = False
 
     @property
     def sample_rate(self) -> int:

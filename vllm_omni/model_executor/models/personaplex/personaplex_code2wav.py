@@ -20,15 +20,14 @@ Layout contract (mirrors ``Qwen3TTSCode2Wav``):
   exact shape ``Qwen3TTSCode2Wav`` returns, so the downstream audio packer is
   unchanged.
 
-The Mimi decoder weights live in the ``moshi`` package's checkpoint format, not
+The Mimi decoder is the transformers ``MimiModel`` (kyutai/mimi weights), not
 in vLLM's safetensors loader, so they are loaded eagerly in ``load_weights``
-via ``moshi.models.loaders.get_mimi`` (guarded import; see ``engine.py`` in the
+part of the vLLM weights iterator (the codec owns its own checkpoint; see the
 experimental fullduplex package for the same pattern).
 """
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -41,23 +40,6 @@ from vllm.logger import init_logger
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
-
-
-def _require_moshi() -> Any:
-    """Import the ``moshi.models.loaders`` module or raise a helpful error.
-
-    Guarded so importing this module (e.g. at registry build time) never fails
-    on a machine without ``moshi`` installed; the dependency is only needed when
-    weights are actually loaded.
-    """
-    try:
-        from moshi.models import loaders  # noqa: PLC0415
-    except ImportError as exc:  # pragma: no cover - environment dependent
-        raise ImportError(
-            "PersonaPlex Code2Wav requires the external 'moshi' package for the "
-            "Mimi codec. Install it with `pip install moshi`."
-        ) from exc
-    return loaders
 
 
 class PersonaPlexCode2Wav(nn.Module):
@@ -203,7 +185,8 @@ class PersonaPlexCode2Wav(nn.Module):
             # [k * F] -> [k, F] -> [1, k, F] (Mimi expects [B, K, T]).
             codes_kf = flat.reshape(k, frames).to(device=device)
             codes_bkf = codes_kf.unsqueeze(0)
-            wav = self.mimi.decode(codes_bkf)
+            wav = self.mimi.decode(codes_bkf, return_dict=True).audio_values
+            wav = wav[..., : frames * self._samples_per_frame]
             wav = self._flatten_wav(wav)
             if wav.numel() > 0:
                 audios[i] = (wav if wav.dtype == torch.float32 else wav.to(torch.float32)).reshape(-1)
@@ -262,70 +245,18 @@ class PersonaPlexCode2Wav(nn.Module):
         for _ in weights:
             pass
 
-        loaders = _require_moshi()
+        from transformers import MimiModel
 
-        mimi_path = self._resolve_mimi_weight_path(loaders)
         device = self.vllm_config.device_config.device
-        # This moshi build's get_mimi(filename, device) takes no num_codebooks; the
-        # active (PCM-bearing) codebook count is selected via set_num_codebooks.
-        self.mimi = loaders.get_mimi(mimi_path, device=str(device))
-        if hasattr(self.mimi, "set_num_codebooks"):
-            self.mimi.set_num_codebooks(self._num_codebooks)
-        self.mimi.eval()
+        self.mimi = MimiModel.from_pretrained("kyutai/mimi").to(str(device)).eval()
         self._mimi_device = torch.device(str(device))
-
-        # Trust Mimi's own reported rates when present; the config defaults are a
-        # fallback for offline construction.
-        reported_sr = getattr(self.mimi, "sample_rate", None)
+        reported_sr = getattr(self.mimi.config, "sampling_rate", None)
         if reported_sr is not None:
             self._output_sample_rate = int(reported_sr)
         logger.info(
-            "PersonaPlex Code2Wav loaded Mimi: num_codebooks=%d sample_rate=%d samples_per_frame=%d",
+            "PersonaPlex Code2Wav loaded Mimi (transformers): num_codebooks=%d sample_rate=%d samples_per_frame=%d",
             self._num_codebooks,
             self._output_sample_rate,
             self._samples_per_frame,
         )
-        # ``get_mimi`` loads the Mimi weights internally, but they now appear under
-        # ``self.mimi`` in this module's named_parameters(). Report them as loaded so
-        # vLLM's strict "all weights initialized" check passes (they are not in the
-        # vLLM safetensors iterator — Mimi owns its own checkpoint format).
         return {f"mimi.{name}" for name, _ in self.mimi.named_parameters()}
-
-    def _resolve_mimi_weight_path(self, loaders: Any) -> str:
-        """Resolve the local Mimi weight file path.
-
-        Order of preference:
-          1. ``<model_path>/<mimi_name>`` when the checkpoint bundles Mimi.
-          2. ``hf_hub_download(model_path, mimi_name)`` when ``model_path`` is a
-             HF repo id.
-          3. ``hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME)`` as the
-             canonical moshi fallback.
-        """
-        mimi_name = self._mimi_name or getattr(loaders, "MIMI_NAME", None)
-        if mimi_name is None:
-            raise ValueError("Could not determine Mimi weight filename; set mimi_config.mimi_name or install moshi.")
-
-        if os.path.isdir(self.model_path):
-            local = os.path.join(self.model_path, mimi_name)
-            if os.path.isfile(local):
-                return local
-
-        from huggingface_hub import hf_hub_download  # noqa: PLC0415
-
-        # Prefer the model's own repo, then moshi's canonical default repo.
-        try:
-            return hf_hub_download(self.model_path, mimi_name)
-        except Exception:
-            default_repo = getattr(loaders, "DEFAULT_REPO", None)
-            if default_repo is None:
-                raise
-            logger.info(
-                "Mimi weight %s not found in %s; falling back to moshi DEFAULT_REPO %s",
-                mimi_name,
-                self.model_path,
-                default_repo,
-            )
-            return hf_hub_download(default_repo, getattr(loaders, "MIMI_NAME", mimi_name))
-
-
-__all__ = ["PersonaPlexCode2Wav"]

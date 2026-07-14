@@ -42,9 +42,11 @@ import sphn
 from aiohttp import WSMsgType, web
 from huggingface_hub import hf_hub_download
 
-from vllm_omni.experimental.fullduplex.personaplex.batched_engine import BatchedPersonaPlexEngine
 from vllm_omni.experimental.fullduplex.personaplex.config import PersonaPlexConfig
 from vllm_omni.experimental.fullduplex.personaplex.engine import PersonaPlexEngine
+from vllm_omni.experimental.fullduplex.personaplex.native_stepper import (
+    NativePersonaPlexEngine as BatchedPersonaPlexEngine,
+)
 from vllm_omni.experimental.fullduplex.personaplex.serving.batched import BatchedSessionManager
 from vllm_omni.experimental.fullduplex.personaplex.session import PersonaPlexSession
 
@@ -395,7 +397,6 @@ def main() -> None:
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
     cfg = PersonaPlexConfig(
-        use_native_components=True,
         greedy=args.greedy,
         seed=42,
         voice_prompt=args.voice,
