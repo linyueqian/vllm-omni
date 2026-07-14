@@ -166,7 +166,11 @@ def talker2code2wav_async_chunk(
             return a if a is not None else src.get("codes.audio")
         return None
 
-    audio = _codes_from(getattr(request, "additional_information", None)) or _codes_from(multimodal_output)
+    # Explicit None fallback: `a or b` would evaluate bool(a) on a multi-element
+    # Tensor and raise "Boolean value of Tensor ... is ambiguous".
+    audio = _codes_from(getattr(request, "additional_information", None))
+    if audio is None:
+        audio = _codes_from(multimodal_output)
     if isinstance(audio, torch.Tensor) and audio.numel() > 0:
         a = audio if audio.ndim == 2 else audio.reshape(1, -1)
         frames.append(a[-1].to(torch.long).cpu())  # latest frame's codes
@@ -182,8 +186,11 @@ def talker2code2wav_async_chunk(
         return _empty_finished_payload() if finished else None
 
     stacked = torch.stack(frames, dim=0)  # [F, dep_q]
-    buf[request_id] = []
     flat = _agent_codes_to_codebook_major(stacked)
+    # De-delay drops the last frame (its cb1..7 come from the NEXT frame), so it
+    # must seed the next chunk or one acoustic frame is lost per chunk boundary.
+    # On finish there is no successor, so the tail is legitimately dropped.
+    buf[request_id] = [] if finished else [frames[-1]]
     return OmniPayloadStruct(
         codes=CodesStruct(audio=flat),
         meta=MetaStruct(finished=torch.tensor(bool(finished), dtype=torch.bool)),

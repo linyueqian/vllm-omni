@@ -23,6 +23,11 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "IndexTTS2S2MelDecoder": "indextts2",
     "IndexTTS2TalkerForConditionalGeneration": "indextts2",
     "OmniVoiceModel": "omnivoice",
+    # PersonaPlex ships an empty config.json, so create_model_config() must patch
+    # model_type=personaplex from the arch name or the staged pipeline can't load
+    # the HF config without manual overrides.
+    "PersonaPlexTalkerForConditionalGeneration": "personaplex",
+    "PersonaPlexCode2Wav": "personaplex",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
 
