@@ -54,6 +54,28 @@ logger = logging.getLogger(__name__)
 _HF_REPO = "nvidia/personaplex-7b-v1"
 
 
+def _opus_encode(writer: sphn.OpusStreamWriter, pcm: np.ndarray) -> bytes:
+    """Encode one PCM frame to Opus bytes, across sphn API versions.
+
+    sphn 0.2.x returns the encoded bytes straight from ``append_pcm``; the older
+    0.1.x buffers and requires a ``read_bytes`` drain. Handle both.
+    """
+    out = writer.append_pcm(np.ascontiguousarray(pcm, dtype=np.float32))
+    if out is None and hasattr(writer, "read_bytes"):
+        out = writer.read_bytes()
+    return out or b""
+
+
+def _opus_decode(reader: sphn.OpusStreamReader, data: bytes) -> np.ndarray | None:
+    """Decode Opus bytes to PCM, across sphn API versions (see ``_opus_encode``)."""
+    out = reader.append_bytes(data)
+    if out is None and hasattr(reader, "read_pcm"):
+        out = reader.read_pcm()
+    if out is None or getattr(out, "shape", (0,))[-1] == 0:
+        return None
+    return np.asarray(out, dtype=np.float32)
+
+
 def _official_web_dir() -> Path | None:
     """Download + extract the official PersonaPlex web client (dist.tgz)."""
     try:
@@ -91,6 +113,7 @@ class DuplexServer:
 
         reader = sphn.OpusStreamReader(sr)
         writer = sphn.OpusStreamWriter(sr)
+        pcm_q: asyncio.Queue = asyncio.Queue()
         state = {"close": False}
         await ws.send_bytes(b"\x00")  # ready handshake
 
@@ -100,34 +123,30 @@ class DuplexServer:
                     if msg.type == WSMsgType.BINARY:
                         data = msg.data
                         if data and data[0] == 1:
-                            reader.append_bytes(data[1:])
+                            pcm = _opus_decode(reader, data[1:])
+                            if pcm is not None:
+                                pcm_q.put_nowait(pcm)
                     elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
                         break
             finally:
                 state["close"] = True
 
         async def proc_loop() -> None:
-            # Mirror moshi.server's opus_loop: drain decoded PCM and step the model,
-            # appending agent audio to the Opus writer; the send loop streams it out.
+            # Drain decoded PCM and step the model, streaming agent Opus + text out.
             while not state["close"]:
-                await asyncio.sleep(0.001)
-                pcm = reader.read_pcm()
-                if pcm is None or pcm.shape[-1] == 0:
+                try:
+                    pcm = await asyncio.wait_for(pcm_q.get(), timeout=0.25)
+                except asyncio.TimeoutError:
                     continue
-                for frame_out in session.feed(np.asarray(pcm, dtype=np.float32)):
+                for frame_out in session.feed(pcm):
                     if frame_out.audio is not None:
-                        writer.append_pcm(np.ascontiguousarray(frame_out.audio, dtype=np.float32))
+                        opus = _opus_encode(writer, frame_out.audio)
+                        if opus:
+                            await ws.send_bytes(b"\x01" + opus)
                     if frame_out.text:
                         await ws.send_bytes(b"\x02" + frame_out.text.encode("utf8"))
 
-        async def send_loop() -> None:
-            while not state["close"]:
-                await asyncio.sleep(0.001)
-                msg = writer.read_bytes()
-                if msg:
-                    await ws.send_bytes(b"\x01" + msg)
-
-        tasks = [asyncio.create_task(recv_loop()), asyncio.create_task(proc_loop()), asyncio.create_task(send_loop())]
+        tasks = [asyncio.create_task(recv_loop()), asyncio.create_task(proc_loop())]
         try:
             _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for t in pending:
@@ -255,10 +274,9 @@ class BatchedDuplexServer:
                     if msg.type == WSMsgType.BINARY:
                         data = msg.data
                         if data and data[0] == 1:
-                            reader.append_bytes(data[1:])
-                            pcm = reader.read_pcm()
-                            if pcm is not None and pcm.shape[-1] > 0:
-                                self.manager.feed(slot, np.asarray(pcm, dtype=np.float32), epoch)
+                            pcm = _opus_decode(reader, data[1:])
+                            if pcm is not None:
+                                self.manager.feed(slot, pcm, epoch)
                     elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
                         break
             finally:
@@ -271,12 +289,11 @@ class BatchedDuplexServer:
                 except asyncio.TimeoutError:
                     continue
                 if frame_out.audio is not None:
-                    writer.append_pcm(np.ascontiguousarray(frame_out.audio, dtype=np.float32))
+                    msg = _opus_encode(writer, frame_out.audio)
+                    if msg:
+                        await ws.send_bytes(b"\x01" + msg)
                 if frame_out.text:
                     await ws.send_bytes(b"\x02" + frame_out.text.encode("utf8"))
-                msg = writer.read_bytes()
-                if msg:
-                    await ws.send_bytes(b"\x01" + msg)
 
         tasks = [asyncio.create_task(recv_loop()), asyncio.create_task(out_loop())]
         try:
