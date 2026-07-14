@@ -30,10 +30,10 @@ pytest.importorskip("moshi")
 if not torch.cuda.is_available():  # noqa: E402
     pytest.skip("needs CUDA", allow_module_level=True)
 
-from vllm_omni.experimental.fullduplex.personaplex.batched_engine import (  # noqa: E402
-    BatchedPersonaPlexEngine,
-)
 from vllm_omni.experimental.fullduplex.personaplex.config import PersonaPlexConfig  # noqa: E402
+from vllm_omni.experimental.fullduplex.personaplex.native_stepper import (  # noqa: E402
+    NativePersonaPlexEngine as BatchedPersonaPlexEngine,
+)
 
 B = 4
 LIVE_TICKS = 40  # live frames compared per claim
@@ -45,7 +45,6 @@ def _make_engine() -> BatchedPersonaPlexEngine:
         batch_size=B,
         greedy=True,
         seed=42,
-        use_native_components=True,
     )
     return BatchedPersonaPlexEngine(cfg).load()
 

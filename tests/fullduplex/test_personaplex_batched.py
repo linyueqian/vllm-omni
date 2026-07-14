@@ -6,8 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from vllm_omni.experimental.fullduplex.personaplex.batched_engine import PrefillStep
-from vllm_omni.experimental.fullduplex.personaplex.engine import FrameOutput
+from vllm_omni.experimental.fullduplex.personaplex.engine import FrameOutput, PrefillStep
 from vllm_omni.experimental.fullduplex.personaplex.serving.batched import (
     BatchedSessionManager,
     SlotPhase,
