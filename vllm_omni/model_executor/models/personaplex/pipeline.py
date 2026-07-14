@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""PersonaPlex pipeline: Talker (text -> Mimi codebooks) -> Code2Wav (codebooks -> 24 kHz PCM).
+"""PersonaPlex pipeline: Talker (AR decode -> Mimi codebooks) -> Code2Wav (codebooks -> 24 kHz PCM).
 
-PersonaPlex is a Moshi finetune ported as a 2-stage vllm-omni pipeline, mirroring
-the Qwen3-TTS topology:
+PersonaPlex is a Moshi finetune (full-duplex speech-to-speech). For offline/batch
+runs it is served as a 2-stage vllm-omni audio->audio pipeline, reusing the
+Qwen3-TTS staged topology:
 
 * Stage 0 (``personaplex``) is the AR talker: the Helium temporal transformer
   plus the depformer (both built by the lead). It emits the per-frame audio

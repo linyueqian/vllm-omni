@@ -1,8 +1,9 @@
 # PersonaPlex deploy: talker -> code2wav (Mimi) via shared-memory chunk streaming.
 #
-# PersonaPlex is a Moshi finetune served as a 2-stage TTS, mirroring the
-# Qwen3-TTS deploy layout. Fields omitted from a stage fall back to
-# StageDeployConfig defaults (see vllm_omni/config/stage_config.py).
+# PersonaPlex is a Moshi finetune (full-duplex S2S), served offline as a 2-stage
+# audio->audio pipeline that reuses the Qwen3-TTS staged deploy layout. Fields
+# omitted from a stage fall back to StageDeployConfig defaults (see
+# vllm_omni/config/stage_config.py).
 #
 # Notable choices for this model:
 #   * Stage 0 (talker) keeps a small max_num_batched_tokens for async-chunk

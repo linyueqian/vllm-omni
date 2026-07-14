@@ -129,7 +129,7 @@ _OMNI_MODELS = {
         "qwen3_tts_code2wav",
         "Qwen3TTSCode2Wav",
     ),
-    ## personaplex (Moshi finetune, 2-stage TTS)
+    ## personaplex (Moshi finetune, full-duplex S2S; 2-stage audio->audio offline pipeline)
     # built by lead: personaplex_talker module + PersonaPlexTalkerForConditionalGeneration.
     "PersonaPlexTalkerForConditionalGeneration": (
         "personaplex",

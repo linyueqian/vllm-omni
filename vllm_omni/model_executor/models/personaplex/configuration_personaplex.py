@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Configuration for PersonaPlex (a Moshi finetune served as a 2-stage TTS).
+"""Configuration for PersonaPlex (a Moshi finetune; 2-stage audio->audio pipeline).
 
 PersonaPlex is a staged AR speech model composed of:
 
