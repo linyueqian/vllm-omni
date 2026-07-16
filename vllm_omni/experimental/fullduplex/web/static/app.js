@@ -37,6 +37,8 @@
   let assistantActive = false;
   let captureRate = INPUT_RATE;
   let cameraStream = null;
+  let uploadHadSpeech = false;
+  let uploadSilenceMs = 0;
   let cameraTimer = null;
   let cameraPendingFrame = null;
   const cameraCanvas = document.createElement('canvas');
@@ -241,6 +243,19 @@
       format: 'pcm16',
       sample_rate_hz: INPUT_RATE,
     };
+    // End-of-utterance commit: the duplex runtime schedules the response on
+    // input_audio_buffer.commit. Detect ~0.8 s of post-speech silence
+    // client-side and commit the turn (the official scenario client commits
+    // explicitly; a mic client must do the equivalent).
+    let sumSq = 0;
+    for (let i = 0; i < pcm.length; i += 1) sumSq += (pcm[i] / 32768) * (pcm[i] / 32768);
+    const rms = Math.sqrt(sumSq / Math.max(1, pcm.length));
+    if (rms > 0.015) {
+      uploadHadSpeech = true;
+      uploadSilenceMs = 0;
+    } else if (uploadHadSpeech) {
+      uploadSilenceMs += SEND_INTERVAL_MS;
+    }
     // Omni duplex: ~1 fps camera frame rides the audio append (official
     // MiniCPM-o-Demo contract: one base64 JPEG per ~1 s chunk).
     if (cameraPendingFrame) {
@@ -248,6 +263,12 @@
       cameraPendingFrame = null;
     }
     socket.send(JSON.stringify(appendEvent));
+    if (uploadHadSpeech && uploadSilenceMs >= 800) {
+      uploadHadSpeech = false;
+      uploadSilenceMs = 0;
+      socket.send(JSON.stringify({ type: 'input_audio_buffer.commit', final: true }));
+      appendLog('turn committed (end of utterance)');
+    }
   }
 
   function beginAssistant(responseId) {
@@ -471,6 +492,8 @@
       running = true;
       muted = false;
       assistantActive = false;
+      uploadHadSpeech = false;
+      uploadSilenceMs = 0;
       sendTimer = window.setInterval(flushCapture, SEND_INTERVAL_MS);
       startClock();
       callButton.textContent = 'End session';
