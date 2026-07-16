@@ -21,11 +21,11 @@ from vllm_omni.experimental.fullduplex.personaplex.engine import (
     FrameStepper,
     PersonaPlexEngine,
 )
-from vllm_omni.experimental.fullduplex.personaplex.native_stepper import (
+from vllm_omni.experimental.fullduplex.personaplex.runtime import (
     NativePersonaPlexEngine,
     PrefillStep,
 )
-from vllm_omni.experimental.fullduplex.personaplex.native_stepper import (
+from vllm_omni.experimental.fullduplex.personaplex.runtime import (
     NativePersonaPlexEngine as BatchedPersonaPlexEngine,
 )
 from vllm_omni.experimental.fullduplex.personaplex.session import PersonaPlexSession

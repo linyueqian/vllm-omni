@@ -34,46 +34,29 @@ from __future__ import annotations
 import logging
 import os
 import tarfile
-from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from vllm_omni.experimental.fullduplex.personaplex.config import PersonaPlexConfig
+from vllm_omni.experimental.fullduplex.personaplex.policy import (
+    AUDIO_INITIAL_TOKEN,
+    AUDIO_SILENCE_FRAME_CNT,
+    NON_TEXT_TOKEN_IDS,
+    SILENCE_TOKENS,
+    SINE_TOKENS,
+    TEXT_INITIAL_TOKEN,
+    TEXT_VOCAB_SIZE,
+    ZERO_TEXT_TOKEN,
+    PrefillStep,
+    wrap_with_system_tags,
+)
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
-
-# Inner-monologue token ids that carry no displayable text (EPAD, PAD).
-_NON_TEXT_TOKEN_IDS = frozenset({0, 3})
-_ZERO_TEXT = 3
-# Mimi token constants for the hybrid system prompt (agent silence / user sine).
-_SILENCE_TOKENS = (948, 243, 1178, 546, 1736, 1030, 1978, 2008)
-_SINE_TOKENS = (430, 1268, 381, 1611, 1095, 1495, 56, 472)
-# LM initial ("beginning of stream") token ids: audio rows use the codec
-# cardinality, the text row uses the text vocabulary size.
-_AUDIO_INITIAL = 2048
-_TEXT_INITIAL = 32000
-_AUDIO_SILENCE_FRAME_CNT = 6  # 0.5 s at 12.5 Hz
-
-
-@dataclass(frozen=True)
-class PrefillStep:
-    """One tick of a recycled slot's system-prompt replay (see batched serving)."""
-
-    kind: str  # "sacrifice" | "voice" | "voice_end" | "tokens"
-    embedding: Any = None  # [1, 1, H] tensor for kind == "voice"
-    moshi_tokens: Any = None  # [8] tensor for kind == "tokens"
-    text_token: int | None = None
-    user_sine: bool = False
-
-
-def _wrap_with_system_tags(text: str) -> str:
-    t = text.strip()
-    return t if t.startswith("<system>") else f"<system> {t} <system>"
 
 
 class NativePersonaPlexEngine:
@@ -163,13 +146,15 @@ class NativePersonaPlexEngine:
 
         K = 17
         self._delays = [0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1]  # text, agent cb0..7, user cb0..7
-        self._initial = torch.tensor([_TEXT_INITIAL] + [_AUDIO_INITIAL] * 16, dtype=torch.long, device=cfg.device)
+        self._initial = torch.tensor(
+            [TEXT_INITIAL_TOKEN] + [AUDIO_INITIAL_TOKEN] * 16, dtype=torch.long, device=cfg.device
+        )
         ct = max(self._delays) + 3
-        self._cache = torch.full((B, K, ct), _AUDIO_INITIAL, dtype=torch.long, device=cfg.device)
+        self._cache = torch.full((B, K, ct), AUDIO_INITIAL_TOKEN, dtype=torch.long, device=cfg.device)
         self._provided = torch.zeros((B, K, ct), dtype=torch.bool, device=cfg.device)
         self._local = torch.zeros(B, dtype=torch.long)
-        self._sine = torch.tensor(_SINE_TOKENS, dtype=torch.long, device=cfg.device)
-        self._silence = torch.tensor(_SILENCE_TOKENS, dtype=torch.long, device=cfg.device)
+        self._sine = torch.tensor(SINE_TOKENS, dtype=torch.long, device=cfg.device)
+        self._silence = torch.tensor(SILENCE_TOKENS, dtype=torch.long, device=cfg.device)
 
         self._load_voice(cfg.voice_prompt)
         self._loaded = True
@@ -205,8 +190,8 @@ class NativePersonaPlexEngine:
     def _reset_all_streaming(self) -> None:
         self._codec.reset_streaming()
         self._temporal.reset_streaming()
-        self._cache.fill_(_AUDIO_INITIAL)
-        self._cache[:, 0, :] = _TEXT_INITIAL
+        self._cache.fill_(AUDIO_INITIAL_TOKEN)
+        self._cache[:, 0, :] = TEXT_INITIAL_TOKEN
         self._provided.fill_(False)
         self._phys = 0
         self._local.zero_()
@@ -305,7 +290,7 @@ class NativePersonaPlexEngine:
         dev = self.config.device
         dummy_user = self._initial[9:].view(1, 8).expand(B, 8)
         dummy_moshi = self._initial[1:9].view(1, 8).expand(B, 8)
-        zero_text = torch.full((B,), _ZERO_TEXT, dtype=torch.long, device=dev)
+        zero_text = torch.full((B,), ZERO_TEXT_TOKEN, dtype=torch.long, device=dev)
         all_rows = torch.ones(B, dtype=torch.bool, device=dev)
 
         for e in self._voice_embeddings:
@@ -319,8 +304,12 @@ class NativePersonaPlexEngine:
         sine = self._sine.view(1, 8).expand(B, 8)
         silence = self._silence.view(1, 8).expand(B, 8)
         text = persona if persona is not None else self.config.persona
-        toks = self._tokenizer.encode(_wrap_with_system_tags(text)) if text else []
-        for phase_toks in ([_ZERO_TEXT] * _AUDIO_SILENCE_FRAME_CNT, toks, [_ZERO_TEXT] * _AUDIO_SILENCE_FRAME_CNT):
+        toks = self._tokenizer.encode(wrap_with_system_tags(text)) if text else []
+        for phase_toks in (
+            [ZERO_TEXT_TOKEN] * AUDIO_SILENCE_FRAME_CNT,
+            toks,
+            [ZERO_TEXT_TOKEN] * AUDIO_SILENCE_FRAME_CNT,
+        ):
             for t in phase_toks:
                 tt = torch.full((B,), int(t), dtype=torch.long, device=dev)
                 self._tick(sine, silence, tt, all_rows)
@@ -339,8 +328,8 @@ class NativePersonaPlexEngine:
     def prefill_steps(self, persona: str | None = None) -> list[PrefillStep]:
         zero = self._silence
         silence = [
-            PrefillStep("tokens", moshi_tokens=zero, text_token=_ZERO_TEXT, user_sine=True)
-            for _ in range(_AUDIO_SILENCE_FRAME_CNT)
+            PrefillStep("tokens", moshi_tokens=zero, text_token=ZERO_TEXT_TOKEN, user_sine=True)
+            for _ in range(AUDIO_SILENCE_FRAME_CNT)
         ]
         steps: list[PrefillStep] = [PrefillStep("sacrifice")]
         for e in self._voice_embeddings:
@@ -349,7 +338,7 @@ class NativePersonaPlexEngine:
         steps.extend(silence)
         text = persona if persona is not None else self.config.persona
         if text:
-            for tok in self._tokenizer.encode(_wrap_with_system_tags(text)):
+            for tok in self._tokenizer.encode(wrap_with_system_tags(text)):
                 steps.append(PrefillStep("tokens", moshi_tokens=zero, text_token=int(tok), user_sine=True))
         steps.extend(silence)
         return steps
@@ -400,7 +389,7 @@ class NativePersonaPlexEngine:
             embed_rows = torch.zeros(B, dtype=torch.bool, device=dev)
             emb_full = None
             forced_moshi = self._initial[1:9].view(1, 8).expand(B, 8).clone()
-            forced_text = torch.full((B,), _ZERO_TEXT, dtype=torch.long, device=dev)
+            forced_text = torch.full((B,), ZERO_TEXT_TOKEN, dtype=torch.long, device=dev)
             for b, stp in prefill.items():
                 if stp.kind == "voice_end":
                     raise ValueError("voice_end is not a tick; call engine.voice_end(b)")
@@ -461,6 +450,6 @@ class NativePersonaPlexEngine:
         return outs[0] if outs[0] is not None else FrameOutput(audio=None, text=None)
 
     def _decode_text(self, token_id: int) -> str | None:
-        if token_id in _NON_TEXT_TOKEN_IDS or token_id >= 32000:
+        if token_id in NON_TEXT_TOKEN_IDS or token_id >= TEXT_VOCAB_SIZE:
             return None
         return self._tokenizer.id_to_piece(token_id).replace("▁", " ")

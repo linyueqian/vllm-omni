@@ -44,7 +44,7 @@ from huggingface_hub import hf_hub_download
 
 from vllm_omni.experimental.fullduplex.personaplex.config import PersonaPlexConfig
 from vllm_omni.experimental.fullduplex.personaplex.engine import PersonaPlexEngine
-from vllm_omni.experimental.fullduplex.personaplex.native_stepper import NativePersonaPlexEngine
+from vllm_omni.experimental.fullduplex.personaplex.runtime import NativePersonaPlexEngine
 from vllm_omni.experimental.fullduplex.personaplex.serving.batched import BatchedSessionManager
 from vllm_omni.experimental.fullduplex.personaplex.session import PersonaPlexSession
 

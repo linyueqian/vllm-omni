@@ -5,7 +5,7 @@
 Defines the narrow ``FrameStepper`` seam (one 80 ms user frame in, one agent
 frame + text piece out) that the session driver, the duplex adapter and the
 GPU-free tests depend on, and re-exports the native lockstep engine that
-implements it. The implementation lives in ``native_stepper.py`` and is built
+implements it. The implementation lives in ``runtime.py`` and is built
 entirely from vllm-omni-native components (streaming Helium temporal, input
 embeddings, depformer, streaming Mimi codec) — the external ``moshi`` package
 is no longer used.
@@ -61,7 +61,7 @@ class FrameStepper(Protocol):
         ...
 
 
-from vllm_omni.experimental.fullduplex.personaplex.native_stepper import (  # noqa: E402
+from vllm_omni.experimental.fullduplex.personaplex.runtime import (  # noqa: E402
     NativePersonaPlexEngine,
     PrefillStep,
 )

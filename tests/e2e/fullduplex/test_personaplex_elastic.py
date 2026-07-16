@@ -31,7 +31,7 @@ if not torch.cuda.is_available():  # noqa: E402
     pytest.skip("needs CUDA", allow_module_level=True)
 
 from vllm_omni.experimental.fullduplex.personaplex.config import PersonaPlexConfig  # noqa: E402
-from vllm_omni.experimental.fullduplex.personaplex.native_stepper import (  # noqa: E402
+from vllm_omni.experimental.fullduplex.personaplex.runtime import (  # noqa: E402
     NativePersonaPlexEngine as BatchedPersonaPlexEngine,
 )
 
