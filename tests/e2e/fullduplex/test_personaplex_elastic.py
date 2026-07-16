@@ -11,8 +11,8 @@ Greedy decoding makes every cross-slot leak observable as a bit difference:
 3. Coherence (behavioral): a recycled slot fed a real spoken question produces
    a real reply in its inner-monologue text stream.
 
-Run (needs the PersonaPlex moshi fork + ~30 GB GPU; set PPLEX_QUESTION_WAV to a
-spoken-question wav to enable the coherence test):
+Run (moshi-free native stack; ~30 GB GPU + HF access to the gated repo; set
+PPLEX_QUESTION_WAV to a spoken-question wav to enable the coherence test):
     pytest tests/e2e/fullduplex/test_personaplex_elastic.py -v -s
 
 Bench (B sweep, ms/tick vs the 80 ms budget):
@@ -25,7 +25,6 @@ import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
-pytest.importorskip("moshi")
 
 if not torch.cuda.is_available():  # noqa: E402
     pytest.skip("needs CUDA", allow_module_level=True)
