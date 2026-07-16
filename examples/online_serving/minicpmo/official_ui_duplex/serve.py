@@ -64,6 +64,12 @@ def build_overlay(demo_root: str) -> str:
         path = os.path.join(src, name)
         if os.path.isdir(path):
             shutil.copytree(path, os.path.join(overlay, name))
+    # The pages also load a few loose top-level scripts (e.g. the RefAudioPlayer
+    # component at /static/ref-audio-player.js); copy them so imports resolve.
+    for entry in os.listdir(src):
+        entry_path = os.path.join(src, entry)
+        if os.path.isfile(entry_path) and entry.endswith((".js", ".css")):
+            shutil.copy(entry_path, os.path.join(overlay, entry))
 
     here = os.path.dirname(os.path.abspath(__file__))
     shutil.copy(
