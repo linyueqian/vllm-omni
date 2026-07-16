@@ -49,4 +49,7 @@ for clients that do not want an Opus dependency.
 - **Run the client near the server.** Real-time 80 ms audio is sensitive to network
   latency/jitter; over a high-latency remote link playback can stutter regardless of
   engine speed. On localhost it is smooth.
-- Greedy decoding by default; one conversation per server instance.
+- Greedy decoding by default. One conversation per server by default; pass
+  `--batch-size N` to host N concurrent conversations on one engine (elastic
+  batching; connections beyond N are rejected until a slot frees).
+- Full runbook: [`recipes/NVIDIA/PersonaPlex.md`](../../../recipes/NVIDIA/PersonaPlex.md).
