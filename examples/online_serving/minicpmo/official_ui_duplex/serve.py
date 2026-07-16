@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import json
 import logging
 import os
 import shutil
@@ -47,7 +48,7 @@ _default_ref_cache: dict | None = None
 
 # Static subtrees the audio-duplex page depends on. Other demo pages
 # (omni, half-duplex, turn-based, mobile, admin) are intentionally not served.
-_STATIC_SUBTREES = ("audio-duplex", "duplex", "shared", "lib", "assets", "faq")
+_STATIC_SUBTREES = ("audio-duplex", "omni", "duplex", "shared", "lib", "assets", "faq")
 
 _OLD_IMPORT = "from '../duplex/lib/duplex-session.js'"
 _NEW_IMPORT = "from '../duplex/lib/realtime-duplex-session.js'"
@@ -81,6 +82,20 @@ def build_overlay(demo_root: str) -> str:
         )
     with open(app_js, "w", encoding="utf-8") as f:
         f.write(content.replace(_OLD_IMPORT, _NEW_IMPORT))
+
+    # The omni page's RealtimeSession speaks a near-Realtime dialect (result-
+    # shaped response.output_audio.delta, f32 appends without a format field,
+    # no commit). Point it at the translating proxy route; the page itself is
+    # otherwise unmodified.
+    rt_js = os.path.join(overlay, "duplex", "lib", "realtime-session.js")
+    if os.path.exists(rt_js):
+        with open(rt_js, encoding="utf-8") as f:
+            rt_content = f.read()
+        rt_patched = rt_content.replace("{location.host}/v1/realtime", "{location.host}/v1/realtime/omni")
+        if rt_patched == rt_content:
+            logger.warning("realtime-session.js WS URL not found; omni page may bypass the translating proxy")
+        with open(rt_js, "w", encoding="utf-8") as f:
+            f.write(rt_patched)
 
     logger.info("overlay built at %s", overlay)
     return overlay
@@ -243,6 +258,189 @@ async def realtime_proxy(ws: WebSocket) -> None:
             _pump_client_to_backend(ws, backend),
             _pump_backend_to_client(ws, backend),
         )
+    finally:
+        with contextlib.suppress(Exception):
+            await backend.close()
+
+
+# ---------------------------------------------------------------------------
+# Omni-page translating proxy
+#
+# The official omni page's RealtimeSession dialect differs from the runtime's
+# realtime protocol in four ways; this route adapts both directions so the
+# page itself stays unmodified:
+#   client->backend: f32 appends gain format/sample_rate_hz; ref_audio_base64
+#     maps to extra_body.ref_audio; a commit is injected after end-of-utterance
+#     silence (the runtime schedules responses on commit); max_slice_nums is
+#     stripped (HD slicing unsupported).
+#   backend->client: response.audio.delta + transcript deltas are aggregated
+#     into result-shaped response.output_audio.delta events (f32le audio),
+#     with end_of_turn derived from response.done.
+# ---------------------------------------------------------------------------
+
+_OMNI_SILENCE_COMMIT_MS = 500
+_OMNI_SPEECH_RMS = 0.015
+
+
+def _f32b64_to_wav_data_uri(audio_b64: str, sample_rate: int = 16000) -> str:
+    import io
+    import wave
+
+    f32 = np.frombuffer(base64.b64decode(audio_b64), dtype=np.float32)
+    pcm16 = np.clip(f32 * 32767.0, -32768, 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm16.tobytes())
+    return "data:audio/wav;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _omni_translate_client_event(event: dict, state: dict) -> list[dict]:
+    etype = event.get("type")
+    if etype == "session.update":
+        session = event.get("session") if isinstance(event.get("session"), dict) else {}
+        extra_body: dict = {"auto_response": True, "minicpmo45_native_duplex": True}
+        ref_b64 = session.get("tts_ref_audio_base64") or session.get("ref_audio_base64")
+        if isinstance(ref_b64, str) and ref_b64:
+            extra_body["ref_audio"] = _f32b64_to_wav_data_uri(ref_b64)
+        out_session: dict = {
+            "modalities": ["audio", "text"],
+            "input_audio_format": "pcm_f32le",
+            "output_audio_format": "pcm16",
+            "extra_body": extra_body,
+        }
+        if isinstance(session.get("instructions"), str):
+            out_session["instructions"] = session["instructions"]
+        return [{"type": "session.update", "session": out_session}]
+    if etype == "input_audio_buffer.append":
+        out = {
+            "type": "input_audio_buffer.append",
+            "audio": event.get("audio"),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+        }
+        if event.get("force_listen"):
+            out["force_listen"] = True
+        frames = event.get("video_frames")
+        if isinstance(frames, list) and frames:
+            out["video_frames"] = frames
+        events = [out]
+        # End-of-utterance commit injection (the omni page never commits).
+        audio_b64 = event.get("audio")
+        rms = 0.0
+        duration_ms = 1000
+        if isinstance(audio_b64, str) and audio_b64:
+            try:
+                f32 = np.frombuffer(base64.b64decode(audio_b64), dtype=np.float32)
+                if f32.size:
+                    rms = float(np.sqrt(np.mean(np.square(f32, dtype=np.float64))))
+                    duration_ms = int(f32.size * 1000 / 16000)
+            except Exception:  # noqa: BLE001 - treat undecodable audio as silence
+                pass
+        if rms > _OMNI_SPEECH_RMS:
+            state["had_speech"] = True
+            state["silence_ms"] = 0
+        elif state.get("had_speech"):
+            state["silence_ms"] = state.get("silence_ms", 0) + duration_ms
+            if state["silence_ms"] >= _OMNI_SILENCE_COMMIT_MS:
+                state["had_speech"] = False
+                state["silence_ms"] = 0
+                events.append({"type": "input_audio_buffer.commit", "final": True})
+        return events
+    return [event]
+
+
+def _pcm16_b64_to_f32_b64(delta_b64: str) -> str:
+    pcm16 = np.frombuffer(base64.b64decode(delta_b64), dtype="<i2")
+    f32 = (pcm16.astype(np.float32) / 32768.0).astype("<f4")
+    return base64.b64encode(f32.tobytes()).decode("ascii")
+
+
+def _omni_translate_backend_event(event: dict, state: dict) -> list[dict]:
+    etype = event.get("type")
+    if etype in ("response.audio_transcript.delta", "response.output_audio_transcript.delta"):
+        delta = event.get("delta")
+        if isinstance(delta, str):
+            state["pending_text"] = state.get("pending_text", "") + delta
+        return []
+    if etype == "response.audio.delta":
+        audio_b64 = event.get("delta") or ""
+        fmt = str(event.get("format") or "pcm16").lower()
+        if isinstance(audio_b64, str) and audio_b64 and "f32" not in fmt:
+            try:
+                audio_b64 = _pcm16_b64_to_f32_b64(audio_b64)
+            except Exception:  # noqa: BLE001 - pass through undecodable audio
+                pass
+        text = state.pop("pending_text", "")
+        return [{"type": "response.output_audio.delta", "audio": audio_b64, "text": text, "end_of_turn": False}]
+    if etype == "response.done":
+        text = state.pop("pending_text", "")
+        return [{"type": "response.output_audio.delta", "audio": "", "text": text, "end_of_turn": True}]
+    if etype == "response.output_audio.delta":
+        # Internal dialect duplicate of response.audio.delta; drop it so the
+        # page does not double-play audio.
+        return []
+    return [event]
+
+
+@app.websocket("/v1/realtime/omni")
+async def realtime_omni_proxy(ws: WebSocket) -> None:
+    assert ARGS is not None
+    backend_url = ARGS.ws_backend.rstrip("/") + "/v1/realtime?duplex=1"
+    await ws.accept()
+    try:
+        backend = await websockets.connect(backend_url, max_size=64 * 1024 * 1024)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the client
+        logger.error("backend connect failed: %s", exc)
+        with contextlib.suppress(Exception):
+            await ws.close(code=1013, reason=f"backend unavailable: {exc}")
+        return
+    state: dict = {}
+
+    async def client_to_backend() -> None:
+        try:
+            while True:
+                message = await ws.receive()
+                if message["type"] == "websocket.disconnect":
+                    with contextlib.suppress(Exception):
+                        await backend.close()
+                    return
+                text = message.get("text")
+                if text is None:
+                    continue
+                try:
+                    event = json.loads(text)
+                except ValueError:
+                    await backend.send(text)
+                    continue
+                for out in _omni_translate_client_event(event, state):
+                    await backend.send(json.dumps(out))
+        except (WebSocketDisconnect, websockets.ConnectionClosed):
+            with contextlib.suppress(Exception):
+                await backend.close()
+
+    async def backend_to_client() -> None:
+        try:
+            async for message in backend:
+                if isinstance(message, bytes):
+                    await ws.send_bytes(message)
+                    continue
+                try:
+                    event = json.loads(message)
+                except ValueError:
+                    await ws.send_text(message)
+                    continue
+                for out in _omni_translate_backend_event(event, state):
+                    await ws.send_text(json.dumps(out))
+        except (WebSocketDisconnect, websockets.ConnectionClosed):
+            pass
+        with contextlib.suppress(Exception):
+            await ws.close()
+
+    try:
+        await asyncio.gather(client_to_backend(), backend_to_client())
     finally:
         with contextlib.suppress(Exception):
             await backend.close()
