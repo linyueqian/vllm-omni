@@ -912,6 +912,11 @@ class DuplexSessionRunnerMixin:
                         "sample_rate_hz": sample_rate_hz,
                         "force_listen": force_listen,
                     }
+                    video_frames = event.get("video_frames")
+                    if isinstance(video_frames, list):
+                        frames = [frame for frame in video_frames if isinstance(frame, str) and frame]
+                        if frames:
+                            payload["video_frames"] = frames
                     # Speech/silence tag for the Stage0 turn-ended latch.
                     payload["is_speech"] = self._input_looks_like_speech(event, payload, session=session)
                     defer_native_append = False

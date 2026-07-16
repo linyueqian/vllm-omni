@@ -577,6 +577,17 @@ class OmniDuplexSessionHandler(
         merged = dict(second)
         merged["audio"] = base64.b64encode(first_raw + second_raw).decode("ascii")
         merged["sample_rate_hz"] = first_rate
+        merged_frames = [
+            frame
+            for source in (first.get("video_frames"), second.get("video_frames"))
+            if isinstance(source, list)
+            for frame in source
+            if isinstance(frame, str) and frame
+        ]
+        if merged_frames:
+            merged["video_frames"] = merged_frames
+        else:
+            merged.pop("video_frames", None)
         merged["force_listen"] = bool(first.get("force_listen", False)) or bool(second.get("force_listen", False))
         merged.pop("force_speak", None)
         merged["is_speech"] = bool(first.get("is_speech", False)) or bool(second.get("is_speech", False))
