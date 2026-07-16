@@ -27,6 +27,8 @@ from vllm_omni.experimental.fullduplex.core.session import (
     DuplexState,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def test_fence_is_frozen_value_identity():
     f = DuplexFence(session_id="s1")

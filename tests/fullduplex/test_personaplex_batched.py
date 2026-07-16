@@ -5,12 +5,15 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from vllm_omni.experimental.fullduplex.personaplex.engine import FrameOutput, PrefillStep
 from vllm_omni.experimental.fullduplex.personaplex.serving.batched import (
     BatchedSessionManager,
     SlotPhase,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 FRAME = 4
 
