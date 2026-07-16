@@ -4,6 +4,8 @@
   const config = window.FULL_DUPLEX_CONFIG || {};
   const callButton = document.getElementById('callButton');
   const muteButton = document.getElementById('muteButton');
+  const cameraButton = document.getElementById('cameraButton');
+  const cameraPreview = document.getElementById('cameraPreview');
   const connectionState = document.getElementById('connectionState');
   const modelState = document.getElementById('modelState');
   const playbackState = document.getElementById('playbackState');
@@ -34,6 +36,10 @@
   let muted = false;
   let assistantActive = false;
   let captureRate = INPUT_RATE;
+  let cameraStream = null;
+  let cameraTimer = null;
+  let cameraPendingFrame = null;
+  const cameraCanvas = document.createElement('canvas');
   let playbackRate = OUTPUT_RATE;
   let pendingCapture = [];
   let currentResponseId = null;
@@ -229,12 +235,19 @@
     }
     pendingCapture = [];
     const pcm = resampleInt16(merged, captureRate, INPUT_RATE);
-    socket.send(JSON.stringify({
+    const appendEvent = {
       type: 'input_audio_buffer.append',
       audio: int16ToBase64(pcm),
       format: 'pcm16',
       sample_rate_hz: INPUT_RATE,
-    }));
+    };
+    // Omni duplex: ~1 fps camera frame rides the audio append (official
+    // MiniCPM-o-Demo contract: one base64 JPEG per ~1 s chunk).
+    if (cameraPendingFrame) {
+      appendEvent.video_frames = [cameraPendingFrame];
+      cameraPendingFrame = null;
+    }
+    socket.send(JSON.stringify(appendEvent));
   }
 
   function beginAssistant(responseId) {
@@ -463,6 +476,7 @@
       callButton.textContent = 'End session';
       callButton.classList.add('is-active');
       muteButton.disabled = false;
+      cameraButton.disabled = false;
       setConnection('Connected', 'online');
       setModel('Listening');
       appendLog('session started');
@@ -475,6 +489,49 @@
       callButton.disabled = false;
     }
   }
+
+  async function startCamera() {
+    if (cameraStream) return;
+    cameraStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    cameraPreview.srcObject = cameraStream;
+    cameraPreview.style.display = '';
+    await cameraPreview.play().catch(() => {});
+    // Official omni-duplex cadence: one JPEG (quality 0.7) per ~1 s chunk,
+    // no client-side resize (the server normalizes at scale_resolution=448).
+    cameraTimer = window.setInterval(() => {
+      if (!cameraStream || cameraPreview.videoWidth === 0) return;
+      cameraCanvas.width = cameraPreview.videoWidth;
+      cameraCanvas.height = cameraPreview.videoHeight;
+      cameraCanvas.getContext('2d').drawImage(cameraPreview, 0, 0);
+      cameraPendingFrame = cameraCanvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+    }, 1000);
+    cameraButton.textContent = 'Camera off';
+    cameraButton.classList.add('is-active');
+    appendLog('camera on (1 fps omni frames)');
+  }
+
+  function stopCamera() {
+    if (cameraTimer !== null) clearInterval(cameraTimer);
+    cameraTimer = null;
+    if (cameraStream) {
+      for (const track of cameraStream.getTracks()) track.stop();
+    }
+    cameraStream = null;
+    cameraPendingFrame = null;
+    cameraPreview.srcObject = null;
+    cameraPreview.style.display = 'none';
+    cameraButton.textContent = 'Camera';
+    cameraButton.classList.remove('is-active');
+  }
+
+  cameraButton.addEventListener('click', () => {
+    if (cameraStream) {
+      stopCamera();
+      appendLog('camera off');
+      return;
+    }
+    startCamera().catch((error) => appendLog(`camera failed: ${error.message || error}`, true));
+  });
 
   async function stopSession() {
     running = false;
@@ -495,6 +552,8 @@
       for (const track of mediaStream.getTracks()) track.stop();
     }
     mediaStream = null;
+    stopCamera();
+    cameraButton.disabled = true;
     if (captureContext) await captureContext.close().catch(() => {});
     if (playbackContext) await playbackContext.close().catch(() => {});
     captureContext = null;

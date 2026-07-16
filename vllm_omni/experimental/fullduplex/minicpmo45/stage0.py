@@ -123,6 +123,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         state: _MiniCPMO45Stage0SessionState,
         audio_waveform: Any,
         *,
+        video_frames: list[Any] | None = None,
         seq: int | None = None,
         final: bool = False,
         new_user_turn: bool = False,
@@ -143,6 +144,15 @@ class MiniCPMO45Stage0DuplexRuntime:
         self._require_special_token_ids()
         if audio_waveform is None or len(audio_waveform) == 0:
             return self._stage_prefill_result(False, start_time, "empty audio")
+        # Omni duplex: encode this append's camera frames up front so the unit
+        # loop can interleave one <image> block per unit, mirroring official
+        # streaming_prefill (feed <unit>, then image embeds, then audio).
+        frame_blocks: list[Any] = []
+        if video_frames:
+            self._require_vision_token_ids()
+            frame_blocks = self._stage_vision_embeddings(video_frames)
+            if frame_blocks is None or len(frame_blocks) != len(video_frames):
+                return self._stage_prefill_result(False, start_time, "streaming vision embedding failed")
         prefix_new_user_turn = bool(new_user_turn)
         if prefix_new_user_turn:
             state.current_turn_ended = True
@@ -215,6 +225,17 @@ class MiniCPMO45Stage0DuplexRuntime:
                     token_ids.append(int(token_id))
             embed_parts.append(self._embed_token(self.unit_token_id))
             token_ids.append(self.unit_token_id)
+            if frame_blocks:
+                # Official order inside a unit: <image> + 64 resampler
+                # embeddings + </image> ahead of the unit's audio embeddings
+                # (max_slice_nums=1 in streaming, one frame per unit).
+                vision_block = self._as_2d_tensor(frame_blocks.pop(0))
+                embed_parts.append(self._embed_token(self.image_start_token_id))
+                token_ids.append(int(self.image_start_token_id))
+                embed_parts.append(vision_block)
+                token_ids.extend([self._vision_embedding_placeholder_token_id()] * int(vision_block.shape[0]))
+                embed_parts.append(self._embed_token(self.image_end_token_id))
+                token_ids.append(int(self.image_end_token_id))
             embed_parts.append(audio_embeds)
             token_ids.extend(
                 [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
@@ -223,6 +244,16 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.audio_chunk_idx += 1
             units_built += 1
             chunk_size = self._streaming_chunk_size()
+        if frame_blocks:
+            # The engine reserved 66 scheduler slots per frame in this append;
+            # leaving a frame unfed would desynchronize the reservation from
+            # the built span. Serving aligns frames to whole units, so this
+            # only fires on a protocol violation.
+            return self._stage_prefill_result(
+                False,
+                start_time,
+                f"{len(frame_blocks)} video frame(s) left without a matching audio unit",
+            )
         # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
         # turn is opened once at session init; re-emitting the turn-open prefix per chunk
         # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
@@ -619,3 +650,90 @@ class MiniCPMO45Stage0DuplexRuntime:
         if fmt != "pcm_f32le":
             raise ValueError(f"MiniCPM-o stage0 expects pcm_f32le audio, got {fmt!r}")
         return np.frombuffer(base64.b64decode(audio), dtype=np.float32)
+
+    @staticmethod
+    def _decode_video_frames_payload(payload: dict[str, Any]) -> list[Any]:
+        """Decode omni-duplex camera frames (base64 JPEG/PNG) to PIL images."""
+        frames = payload.get("video_frames")
+        if not isinstance(frames, list) or not frames:
+            return []
+        from io import BytesIO
+
+        from PIL import Image
+
+        decoded: list[Any] = []
+        for frame_b64 in frames:
+            if not isinstance(frame_b64, str) or not frame_b64:
+                continue
+            try:
+                raw = base64.b64decode(frame_b64, validate=True)
+                image = Image.open(BytesIO(raw))
+                image.load()
+            except Exception as exc:  # noqa: BLE001 - normalized below
+                raise ValueError("invalid omni duplex video frame payload") from exc
+            decoded.append(image.convert("RGB"))
+        return decoded
+
+    def _vision_embedding_placeholder_token_id(self) -> int:
+        unk_token_id = getattr(self.tokenizer, "unk_token_id", None)
+        if isinstance(unk_token_id, int) and unk_token_id >= 0:
+            return unk_token_id
+        return self._required_optional_token_id("image_start_token_id")
+
+    def _required_optional_token_id(self, field_name: str) -> int:
+        token_id = getattr(self, field_name, None)
+        if not isinstance(token_id, int) or token_id < 0:
+            token = _MINICPMO45_OPTIONAL_TOKEN_FIELDS.get(field_name, field_name)
+            raise ValueError(f"MiniCPM-o 4.5 missing required special token id for {token}")
+        return token_id
+
+    def _require_vision_token_ids(self) -> None:
+        missing = [
+            _MINICPMO45_OPTIONAL_TOKEN_FIELDS[field_name]
+            for field_name in ("image_start_token_id", "image_end_token_id")
+            if not isinstance(getattr(self, field_name, None), int) or getattr(self, field_name) < 0
+        ]
+        if missing:
+            raise ValueError(
+                "MiniCPM-o 4.5 omni duplex requires tokenizer-defined image tokens, "
+                f"missing or unknown: {', '.join(missing)}"
+            )
+
+    def _stage_vision_embeddings(self, frames: list[Any]) -> list[Any] | None:
+        """Encode camera frames via the official duplex vision path.
+
+        Mirrors ``MiniCPMODuplex.streaming_prefill``: ``processor.process_image``
+        (``max_slice_nums=1`` in streaming, so exactly one 64-embedding block
+        per frame) followed by ``get_vision_embedding`` (vpm + resampler).
+        Returns one ``[64, hidden]`` block per frame, or ``None`` on failure.
+        """
+        process_image = getattr(self.processor, "process_image", None)
+        if not callable(process_image):
+            return None
+        try:
+            processed = process_image(frames, max_slice_nums=1)
+        except Exception:
+            return None
+        if hasattr(processed, "to"):
+            with suppress(Exception):
+                processed = processed.to(self._model_device())
+        for target in (self.stage_model, self.thinker):
+            get_vision = getattr(target, "get_vision_embedding", None)
+            if not callable(get_vision):
+                continue
+            try:
+                vision_hidden_states = get_vision(processed)
+            except Exception:
+                return None
+            if vision_hidden_states is None or len(vision_hidden_states) == 0:
+                return None
+            blocks = vision_hidden_states[0]
+            expected = MiniCPMO45DuplexPolicy.VISION_EMBEDS_PER_FRAME
+            out: list[Any] = []
+            for block in blocks:
+                block_2d = self._as_2d_tensor(block)
+                if int(block_2d.shape[0]) != expected:
+                    return None
+                out.append(block_2d)
+            return out
+        return None

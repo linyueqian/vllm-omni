@@ -20,6 +20,18 @@ from vllm_omni.engine.resumable import ResumableSegmentPolicy
 
 _DUPLEX_CHUNK_SAMPLES = 16000
 _DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
+# <image> + 64 resampler embeddings + </image> per frame (max_slice_nums=1),
+# matching MiniCPMO45DuplexPolicy.VISION_TOKENS_PER_FRAME.
+_DUPLEX_VISION_TOKENS_PER_FRAME = 66
+
+
+def _duplex_frame_count(payload: object) -> int:
+    if not isinstance(payload, dict):
+        return 0
+    frames = payload.get("video_frames")
+    if not isinstance(frames, list):
+        return 0
+    return sum(1 for frame in frames if isinstance(frame, str) and frame)
 
 
 def _duplex_pcm_sample_count(payload: object) -> int | None:
@@ -48,14 +60,15 @@ def duplex_first_append_unit_count(payload: object) -> int | None:
 
 
 def duplex_scheduler_token_budget(payload: object, *, default: int = 64) -> int:
+    vision_tokens = _duplex_frame_count(payload) * _DUPLEX_VISION_TOKENS_PER_FRAME
     sample_count = _duplex_pcm_sample_count(payload)
     if sample_count is None:
-        return max(1, int(default))
+        return max(1, int(default)) + vision_tokens
     sample_count = max(1, sample_count)
     if sample_count % _DUPLEX_CHUNK_SAMPLES == 0:
         units = sample_count // _DUPLEX_CHUNK_SAMPLES
-        return units * (2 + _DUPLEX_CHUNK_SAMPLES // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN)
-    return max(16, min(768, sample_count // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN + 8))
+        return units * (2 + _DUPLEX_CHUNK_SAMPLES // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN) + vision_tokens
+    return max(16, min(768, sample_count // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN + 8)) + vision_tokens
 
 
 def duplex_first_append_context_reserve(runtime_config: object) -> int:
@@ -115,7 +128,9 @@ def build_duplex_data_plane_prompt(
         token_budget += context_reserve
         first_units = duplex_first_append_unit_count(payload)
         if first_units is not None:
-            token_budget = context_reserve + first_units * 12 - 1
+            token_budget = (
+                context_reserve + first_units * 12 - 1 + _duplex_frame_count(payload) * _DUPLEX_VISION_TOKENS_PER_FRAME
+            )
     if (
         seq > 1
         and duplex_payload_is_exact_chunks(payload)

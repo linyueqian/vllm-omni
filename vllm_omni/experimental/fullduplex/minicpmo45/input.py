@@ -17,6 +17,7 @@ class MiniCPMO45PcmAppendReservation:
         "_raw",
         "_sample_rate_hz",
         "_turn_had_speech",
+        "_video_frames",
         "operation_id",
         "payload",
     )
@@ -33,6 +34,7 @@ class MiniCPMO45PcmAppendReservation:
         is_speech: bool,
         new_user_turn: bool,
         turn_had_speech: bool = False,
+        video_frames: list[str] | None = None,
     ) -> None:
         self._owner = owner
         self.operation_id = operation_id
@@ -43,6 +45,7 @@ class MiniCPMO45PcmAppendReservation:
         self._is_speech = is_speech
         self._new_user_turn = new_user_turn
         self._turn_had_speech = turn_had_speech
+        self._video_frames = list(video_frames or [])
         self._active = True
 
     @property
@@ -100,12 +103,16 @@ class MiniCPMO45PcmAppendBuffer:
         self._turn_had_speech = False
         self._reservation_seq = 0
         self._reservations: list[MiniCPMO45PcmAppendReservation] = []
+        # Omni duplex: queued camera frames (base64 JPEG), consumed FIFO at
+        # one frame per emitted model unit alongside the unit's audio.
+        self._frame_queue: list[str] = []
 
     def clear(self) -> None:
         for reservation in self._reservations:
             reservation._active = False
         self._reservations.clear()
         self._buffer.clear()
+        self._frame_queue.clear()
         self._sample_rate_hz = None
         self._force_listen = False
         self._is_speech = False
@@ -164,6 +171,9 @@ class MiniCPMO45PcmAppendBuffer:
             raise ValueError("MiniCPM-o native duplex audio append sample_rate_hz changed within a session")
         self._sample_rate_hz = sample_rate_hz
         self._buffer.extend(raw)
+        frames_in = payload.get("video_frames")
+        if isinstance(frames_in, list):
+            self._frame_queue.extend(frame for frame in frames_in if isinstance(frame, str) and frame)
         self._turn_had_speech = self._turn_had_speech or bool(payload.get("is_speech", False))
         self._force_listen = self._force_listen or bool(payload.get("force_listen", False))
         self._is_speech = self._is_speech or bool(payload.get("is_speech", False))
@@ -195,8 +205,18 @@ class MiniCPMO45PcmAppendBuffer:
 
         out = dict(payload)
         out.pop("force_speak", None)
+        out.pop("video_frames", None)
         out["audio"] = base64.b64encode(emit_raw).decode("ascii")
         out["sample_rate_hz"] = sample_rate_hz
+        # Omni duplex: attach at most one queued camera frame per emitted
+        # model unit (official cadence: one frame per 1 s chunk). The engine
+        # budgets 66 scheduler slots per attached frame from this payload.
+        emitted_units = (emit_samples + pad_samples) // min_samples
+        attached_frames: list[str] = []
+        if emitted_units > 0 and self._frame_queue:
+            attached_frames = self._frame_queue[:emitted_units]
+            del self._frame_queue[: len(attached_frames)]
+            out["video_frames"] = attached_frames
         out["force_listen"] = self._force_listen
         out["is_speech"] = self._is_speech
         if self._new_user_turn:
@@ -215,6 +235,7 @@ class MiniCPMO45PcmAppendBuffer:
             is_speech=bool(out.get("is_speech", False)),
             new_user_turn=bool(out.get("new_user_turn", False)),
             turn_had_speech=self._turn_had_speech,
+            video_frames=attached_frames,
         )
         self._reservations.append(reservation)
         return reservation
@@ -312,6 +333,9 @@ class MiniCPMO45PcmAppendBuffer:
         rolled_back = self._reservations[index:]
         restored = b"".join(item._raw for item in rolled_back)
         self._buffer[:0] = restored
+        restored_frames = [frame for item in rolled_back for frame in item._video_frames]
+        if restored_frames:
+            self._frame_queue[:0] = restored_frames
         self._sample_rate_hz = self._sample_rate_hz or reservation._sample_rate_hz
         self._force_listen = self._force_listen or any(item._force_listen for item in rolled_back)
         self._is_speech = self._is_speech or any(item._is_speech for item in rolled_back)

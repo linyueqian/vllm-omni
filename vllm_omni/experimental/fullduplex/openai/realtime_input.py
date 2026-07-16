@@ -280,6 +280,20 @@ class RealtimeInputTranslator:
                 "format": fmt,
                 "sample_rate_hz": sample_rate_hz,
             }
+            video_frames = event.get("video_frames")
+            if video_frames is not None:
+                frames_error = self._validate_realtime_video_frames(video_frames, event.get("max_slice_nums"))
+                if frames_error is not None:
+                    await self._send_realtime_payload(
+                        self._realtime_error_payload(
+                            "invalid_video_frames",
+                            frames_error,
+                            event_id=event.get("event_id"),
+                            param="video_frames",
+                        )
+                    )
+                    return None
+                payload["video_frames"] = [frame for frame in video_frames if isinstance(frame, str) and frame]
             self._copy_realtime_input_hints(event, payload)
             if not looks_like_speech:
                 payload["is_speech"] = False
@@ -936,6 +950,29 @@ class RealtimeInputTranslator:
         if isinstance(session_payload.get("playback_commit_policy"), str):
             fields["playback_commit_policy"] = session_payload["playback_commit_policy"]
         return fields
+
+    @staticmethod
+    def _validate_realtime_video_frames(video_frames: object, max_slice_nums: object) -> str | None:
+        """Validate omni-duplex camera frames on input_audio_buffer.append.
+
+        Wire contract matches the official MiniCPM-o-Demo omni client: one
+        base64 JPEG per ~1 s audio chunk. HD slicing (max_slice_nums > 1) is
+        not implemented by the duplex adapter yet and is rejected explicitly
+        rather than silently ignored.
+        """
+        if max_slice_nums not in (None, 1):
+            return "max_slice_nums > 1 (HD slicing) is not implemented by the duplex Realtime adapter"
+        if not isinstance(video_frames, list):
+            return "video_frames must be a list of base64-encoded images"
+        frames = [frame for frame in video_frames if frame is not None]
+        if len(frames) > 2:
+            return "video_frames carries more than 2 frames for one append; send ~1 frame per 1 s chunk"
+        for frame in frames:
+            if not isinstance(frame, str) or not frame:
+                return "video_frames entries must be non-empty base64 strings"
+            if len(frame) > 4_000_000:
+                return "video_frames entry exceeds 4MB base64; reduce capture resolution or JPEG quality"
+        return None
 
     @staticmethod
     def _validate_realtime_turn_detection(session_payload: dict[str, object]) -> str | None:

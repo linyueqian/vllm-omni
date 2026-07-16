@@ -21,6 +21,12 @@ class MiniCPMO45DuplexPolicy:
     SAMPLE_RATE_HZ = 16000
     CHUNK_SAMPLES = 16000
     SAMPLES_PER_AUDIO_TOKEN = 1600
+    # Vision framing contract (omni duplex). Official streaming_prefill feeds
+    # each frame as <image> + 64 resampler embeddings + </image> inside the
+    # unit, ahead of the unit's audio embeddings (max_slice_nums=1 in
+    # streaming, so exactly one 64-token block per frame).
+    VISION_EMBEDS_PER_FRAME = 64
+    VISION_TOKENS_PER_FRAME = VISION_EMBEDS_PER_FRAME + 2  # <image> + embeds + </image>
     DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 64
     DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY = 8
     NEW_USER_TURN_PREFIX_INTERRUPTED_TTS = "interrupted_tts"
@@ -84,6 +90,8 @@ class MiniCPMO45DuplexPolicy:
     }
     OPTIONAL_TOKEN_FIELDS: dict[str, str] = {
         "audio_placeholder_token_id": "<|audio|>",
+        "image_start_token_id": "<image>",
+        "image_end_token_id": "</image>",
     }
 
     @classmethod
