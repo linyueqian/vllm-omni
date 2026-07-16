@@ -22,6 +22,10 @@
           <button id="callButton" class="primary" type="button">Start session</button>
           <button id="muteButton" class="secondary" type="button" disabled>Mute</button>
           <button id="cameraButton" class="secondary" type="button" disabled>Camera</button>
+          <label style="display:inline-flex;align-items:center;gap:6px;font-size:13px;opacity:.85">
+            <input id="autoCommitToggle" type="checkbox" checked>
+            Auto-commit (client VAD)
+          </label>
           <video id="cameraPreview" muted playsinline style="display:none;width:96px;height:72px;border-radius:8px;object-fit:cover;background:#000"></video>
         </div>
         <div class="meter" aria-label="Microphone level">

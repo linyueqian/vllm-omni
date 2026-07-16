@@ -6,6 +6,7 @@
   const muteButton = document.getElementById('muteButton');
   const cameraButton = document.getElementById('cameraButton');
   const cameraPreview = document.getElementById('cameraPreview');
+  const autoCommitToggle = document.getElementById('autoCommitToggle');
   const connectionState = document.getElementById('connectionState');
   const modelState = document.getElementById('modelState');
   const playbackState = document.getElementById('playbackState');
@@ -243,18 +244,24 @@
       format: 'pcm16',
       sample_rate_hz: INPUT_RATE,
     };
-    // End-of-utterance commit: the duplex runtime schedules the response on
-    // input_audio_buffer.commit. Detect ~0.8 s of post-speech silence
-    // client-side and commit the turn (the official scenario client commits
-    // explicitly; a mic client must do the equivalent).
-    let sumSq = 0;
-    for (let i = 0; i < pcm.length; i += 1) sumSq += (pcm[i] / 32768) * (pcm[i] / 32768);
-    const rms = Math.sqrt(sumSq / Math.max(1, pcm.length));
-    if (rms > 0.015) {
-      uploadHadSpeech = true;
+    // Optional end-of-utterance commit: the current duplex runtime only
+    // schedules a response on input_audio_buffer.commit, so by default the
+    // client detects ~0.5 s of post-speech silence and commits the turn.
+    // Untick "Auto-commit" for the original pure auto-response design (the
+    // runtime must then create responses from server-side decisions).
+    if (autoCommitToggle && autoCommitToggle.checked) {
+      let sumSq = 0;
+      for (let i = 0; i < pcm.length; i += 1) sumSq += (pcm[i] / 32768) * (pcm[i] / 32768);
+      const rms = Math.sqrt(sumSq / Math.max(1, pcm.length));
+      if (rms > 0.015) {
+        uploadHadSpeech = true;
+        uploadSilenceMs = 0;
+      } else if (uploadHadSpeech) {
+        uploadSilenceMs += SEND_INTERVAL_MS;
+      }
+    } else {
+      uploadHadSpeech = false;
       uploadSilenceMs = 0;
-    } else if (uploadHadSpeech) {
-      uploadSilenceMs += SEND_INTERVAL_MS;
     }
     // Omni duplex: ~1 fps camera frame rides the audio append (official
     // MiniCPM-o-Demo contract: one base64 JPEG per ~1 s chunk).
@@ -263,7 +270,7 @@
       cameraPendingFrame = null;
     }
     socket.send(JSON.stringify(appendEvent));
-    if (uploadHadSpeech && uploadSilenceMs >= 800) {
+    if (uploadHadSpeech && uploadSilenceMs >= 500) {
       uploadHadSpeech = false;
       uploadSilenceMs = 0;
       socket.send(JSON.stringify({ type: 'input_audio_buffer.commit', final: true }));
