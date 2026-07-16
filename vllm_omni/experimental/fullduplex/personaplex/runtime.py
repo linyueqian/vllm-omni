@@ -81,6 +81,7 @@ class NativePersonaPlexEngine:
         self._dep = None
         self._voice_embeddings = None  # [T, 1, 1, H]
         self._voice_cache = None  # [1, K, CT]
+        self._loaded_voice = None  # name/path of the currently loaded voice
         # lockstep state (built at open time)
         self._cache = None  # [B, K, CT] long
         self._provided = None  # [B, K, CT] bool
@@ -163,12 +164,15 @@ class NativePersonaPlexEngine:
     def _load_voice(self, voice: str) -> None:
         import torch
 
+        if voice == self._loaded_voice:
+            return
         path = self._resolve_voice_prompt(voice)
         if not path.endswith(".pt"):
             raise ValueError(f"native stack needs a .pt voice-embedding bundle; got {path!r}")
         state = torch.load(path, map_location=self.config.device, weights_only=True)
         self._voice_embeddings = state["embeddings"].to(self.config.device)
         self._voice_cache = state["cache"].to(self.config.device)
+        self._loaded_voice = voice
 
     def _resolve_voice_prompt(self, voice: str) -> str:
         from huggingface_hub import hf_hub_download
@@ -434,8 +438,9 @@ class NativePersonaPlexEngine:
     def open_session(self, voice_prompt: str | None = None, persona: str | None = None) -> None:
         if not self._loaded:
             self.load()
-        if voice_prompt:
-            self._load_voice(voice_prompt)
+        # Always resolve a voice: falling back to the configured default here
+        # keeps a previous session's custom voice from leaking into this one.
+        self._load_voice(voice_prompt or self.config.voice_prompt)
         self._reset_all_streaming()
         self._boot_prefill(persona)
         self._opened = True

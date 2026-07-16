@@ -11,7 +11,10 @@ actually runs end to end (offline driver and any WS server build on it); the
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import asyncio
+import contextlib
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -20,6 +23,40 @@ from vllm_omni.experimental.fullduplex.personaplex.engine import FrameOutput, Fr
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+
+# Realtime queue bounds: 80 ms/frame, so 50 frames = 4 s of backlog. Anything
+# beyond that means the peer cannot keep up and old frames are already useless.
+MAX_PENDING_INPUT = 50
+MAX_PENDING_OUTPUT = 50
+
+
+def offer_realtime(queue: asyncio.Queue, item: Any) -> None:
+    """Enqueue with a drop-oldest policy (realtime streams must never grow unbounded)."""
+    while True:
+        try:
+            queue.put_nowait(item)
+            return
+        except asyncio.QueueFull:
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+
+
+@dataclass
+class PersonaPlexServingSessionState:
+    """Mutable per-connection serving state (the minicpmo45 ``session.py`` role).
+
+    One instance per WebSocket connection, for both server modes: the
+    single-session server uses ``pcm_queue`` (decoded mic PCM awaiting the
+    engine); the batched server uses ``out_queue`` + ``slot``/``epoch`` (engine
+    output awaiting send, and the claimed slot lease). ``closed`` tears both
+    pump loops down.
+    """
+
+    pcm_queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=MAX_PENDING_INPUT))
+    out_queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=MAX_PENDING_OUTPUT))
+    closed: bool = False
+    slot: Any = None  # batched mode: the claimed serving/batched.py Slot
+    epoch: int = 0  # batched mode: slot epoch at claim time (stale-guard)
 
 
 class PersonaPlexSession:
