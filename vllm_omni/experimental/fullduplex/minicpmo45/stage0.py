@@ -723,8 +723,17 @@ class MiniCPMO45Stage0DuplexRuntime:
                 continue
             try:
                 vision_hidden_states = get_vision(processed)
-            except Exception:
+            except Exception as exc:  # TEMP-DEBUG
+                print(f"[vision-debug] get_vision_embedding raised on {type(target).__name__}: {exc!r}", file=sys.stderr, flush=True)  # TEMP-DEBUG
                 return None
+            try:  # TEMP-DEBUG
+                pv = processed["pixel_values"][0][0] if isinstance(processed, dict) or hasattr(processed, "__getitem__") else None  # TEMP-DEBUG
+                pv_stats = (float(pv.float().mean()), float(pv.float().std())) if pv is not None and hasattr(pv, "float") else None  # TEMP-DEBUG
+                blk = vision_hidden_states[0]  # TEMP-DEBUG
+                blk_stats = (float(blk.float().mean()), float(blk.float().std()), tuple(blk.shape))  # TEMP-DEBUG
+                print(f"[vision-debug] target={type(target).__name__} pixels(mean,std)={pv_stats} embeds(mean,std,shape)={blk_stats}", file=sys.stderr, flush=True)  # TEMP-DEBUG
+            except Exception as exc:  # TEMP-DEBUG
+                print(f"[vision-debug] stats failed: {exc!r}", file=sys.stderr, flush=True)  # TEMP-DEBUG
             if vision_hidden_states is None or len(vision_hidden_states) == 0:
                 return None
             blocks = vision_hidden_states[0]
@@ -736,4 +745,5 @@ class MiniCPMO45Stage0DuplexRuntime:
                     return None
                 out.append(block_2d)
             return out
+        print("[vision-debug] no target exposes get_vision_embedding", file=sys.stderr, flush=True)  # TEMP-DEBUG
         return None
