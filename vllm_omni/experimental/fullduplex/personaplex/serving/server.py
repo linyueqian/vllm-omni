@@ -46,7 +46,11 @@ from vllm_omni.experimental.fullduplex.personaplex.config import PersonaPlexConf
 from vllm_omni.experimental.fullduplex.personaplex.engine import PersonaPlexEngine
 from vllm_omni.experimental.fullduplex.personaplex.runtime import NativePersonaPlexEngine
 from vllm_omni.experimental.fullduplex.personaplex.serving.batched import BatchedSessionManager
-from vllm_omni.experimental.fullduplex.personaplex.session import PersonaPlexSession
+from vllm_omni.experimental.fullduplex.personaplex.session import (
+    PersonaPlexServingSessionState,
+    PersonaPlexSession,
+    offer_realtime,
+)
 
 logger = logging.getLogger(__name__)
 _HF_REPO = "nvidia/personaplex-7b-v1"
@@ -89,71 +93,94 @@ def _official_web_dir() -> Path | None:
 
 
 class DuplexServer:
-    """Owns the loaded engine; serves one duplex conversation at a time."""
+    """Owns the loaded engine; serves one duplex conversation at a time.
+
+    A capacity-one lease covers the entire WebSocket lifetime on BOTH endpoints:
+    the engine is a single shared streaming state, so a second concurrent
+    connection would reset and corrupt the live conversation. Extra connections
+    are rejected with 1013 (try again later). Engine work (``open``/``feed``,
+    synchronous CUDA) runs on a worker thread so the event loop stays free for
+    WebSocket traffic and close handling.
+    """
 
     def __init__(self, config: PersonaPlexConfig) -> None:
         self.config = config
         self.engine = PersonaPlexEngine(config)
+        self._active = False  # capacity-one session lease (event-loop confined)
 
     def load(self) -> None:
         self.engine.load()
+
+    async def _lease(self, ws: web.WebSocketResponse) -> bool:
+        """Try to claim the single-session lease; reject the connection if held."""
+        if self._active:
+            await ws.close(code=1013, message=b"another conversation is active")
+            return False
+        self._active = True
+        return True
 
     # ---- official Moshi protocol (Opus over aiohttp WS) ---------------------
 
     async def handle_chat(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        persona = (request.query.get("text_prompt") or "").strip() or None
-        voice = (request.query.get("voice_prompt") or "").strip() or None
-        sr = self.engine.sample_rate
-        session = PersonaPlexSession(self.engine, self.config)
-        session.open(voice_prompt=voice, persona=persona)  # system-prompt prefill
-
-        reader = sphn.OpusStreamReader(sr)
-        writer = sphn.OpusStreamWriter(sr)
-        pcm_q: asyncio.Queue = asyncio.Queue()
-        state = {"close": False}
-        await ws.send_bytes(b"\x00")  # ready handshake
-
-        async def recv_loop() -> None:
-            try:
-                async for msg in ws:
-                    if msg.type == WSMsgType.BINARY:
-                        data = msg.data
-                        if data and data[0] == 1:
-                            pcm = _opus_decode(reader, data[1:])
-                            if pcm is not None:
-                                pcm_q.put_nowait(pcm)
-                    elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
-                        break
-            finally:
-                state["close"] = True
-
-        async def proc_loop() -> None:
-            # Drain decoded PCM and step the model, streaming agent Opus + text out.
-            while not state["close"]:
-                try:
-                    pcm = await asyncio.wait_for(pcm_q.get(), timeout=0.25)
-                except asyncio.TimeoutError:
-                    continue
-                for frame_out in session.feed(pcm):
-                    if frame_out.audio is not None:
-                        opus = _opus_encode(writer, frame_out.audio)
-                        if opus:
-                            await ws.send_bytes(b"\x01" + opus)
-                    if frame_out.text:
-                        await ws.send_bytes(b"\x02" + frame_out.text.encode("utf8"))
-
-        tasks = [asyncio.create_task(recv_loop()), asyncio.create_task(proc_loop())]
+        if not await self._lease(ws):
+            return ws
         try:
-            _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for t in pending:
-                t.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await t
+            persona = (request.query.get("text_prompt") or "").strip() or None
+            voice = (request.query.get("voice_prompt") or "").strip() or None
+            sr = self.engine.sample_rate
+            session = PersonaPlexSession(self.engine, self.config)
+            # System-prompt prefill is seconds of GPU work; keep it off the loop.
+            await asyncio.to_thread(session.open, voice_prompt=voice, persona=persona)
+
+            reader = sphn.OpusStreamReader(sr)
+            writer = sphn.OpusStreamWriter(sr)
+            state = PersonaPlexServingSessionState()
+            await ws.send_bytes(b"\x00")  # ready handshake
+
+            async def recv_loop() -> None:
+                try:
+                    async for msg in ws:
+                        if msg.type == WSMsgType.BINARY:
+                            data = msg.data
+                            if data and data[0] == 1:
+                                pcm = _opus_decode(reader, data[1:])
+                                if pcm is not None:
+                                    offer_realtime(state.pcm_queue, pcm)
+                        elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
+                            break
+                finally:
+                    state.closed = True
+
+            async def proc_loop() -> None:
+                # Drain decoded PCM and step the model, streaming agent Opus + text
+                # out. The synchronous engine step runs on a worker thread.
+                while not state.closed:
+                    try:
+                        pcm = await asyncio.wait_for(state.pcm_queue.get(), timeout=0.25)
+                    except asyncio.TimeoutError:
+                        continue
+                    for frame_out in await asyncio.to_thread(session.feed, pcm):
+                        if frame_out.audio is not None:
+                            opus = _opus_encode(writer, frame_out.audio)
+                            if opus:
+                                await ws.send_bytes(b"\x01" + opus)
+                        if frame_out.text:
+                            await ws.send_bytes(b"\x02" + frame_out.text.encode("utf8"))
+
+            tasks = [asyncio.create_task(recv_loop()), asyncio.create_task(proc_loop())]
+            try:
+                _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for t in pending:
+                    t.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await t
+            finally:
+                with contextlib.suppress(Exception):
+                    await ws.close()
         finally:
-            with contextlib.suppress(Exception):
-                await ws.close()
+            self._active = False
         return ws
 
     # ---- simple raw-PCM protocol (no Opus, for tests) ----------------------
@@ -161,6 +188,8 @@ class DuplexServer:
     async def handle_raw(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        if not await self._lease(ws):
+            return ws
         session = PersonaPlexSession(self.engine, self.config)
         opened = False
         try:
@@ -168,22 +197,24 @@ class DuplexServer:
                 if msg.type == WSMsgType.TEXT:
                     req = json.loads(msg.data)
                     if req.get("type") == "open":
-                        session.open(voice_prompt=req.get("voice"), persona=req.get("persona"))
+                        await asyncio.to_thread(session.open, voice_prompt=req.get("voice"), persona=req.get("persona"))
                         opened = True
                         await ws.send_json({"type": "ready"})
                     elif req.get("type") == "close":
                         if opened:
-                            await self._emit(ws, session.flush())
+                            await self._emit(ws, await asyncio.to_thread(session.flush))
                         await ws.send_json({"type": "done"})
                         break
                 elif msg.type == WSMsgType.BINARY:
                     if not opened:
-                        session.open()
+                        await asyncio.to_thread(session.open)
                         opened = True
-                    await self._emit(ws, session.feed(np.frombuffer(msg.data, dtype=np.float32)))
+                    pcm = np.frombuffer(msg.data, dtype=np.float32)
+                    await self._emit(ws, await asyncio.to_thread(session.feed, pcm))
                 elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
                     break
         finally:
+            self._active = False
             with contextlib.suppress(Exception):
                 await ws.close()
         return ws
@@ -231,23 +262,35 @@ class BatchedDuplexServer:
             self._thread.join(timeout=2.0)
 
     async def _acquire(self, ws: web.WebSocketResponse, persona: str | None):
-        """Claim a slot and wait until it is live. Returns the slot or None."""
+        """Claim a slot and wait until it is live.
+
+        Returns ``PersonaPlexServingSessionState`` (slot + bounded output queue)
+        or ``None`` when the server is full. Exception-safe: if this coroutine
+        is cancelled (client gone mid-prefill) or the wait fails, the slot is
+        released instead of leaking in the PREFILL/LIVE phase.
+        """
         acquired = self.manager.acquire(persona=persona)
         if acquired is None:
             await ws.close(code=1013, message=b"all conversation slots busy")
             return None
         slot, ready_now = acquired
-        loop = asyncio.get_running_loop()
-        outq: asyncio.Queue = asyncio.Queue()
-        ready = asyncio.Event()
-        with self.manager.lock:
-            slot.on_output = lambda frame_out: loop.call_soon_threadsafe(outq.put_nowait, frame_out)
-            if ready_now:
-                ready.set()
-            else:
-                slot.on_ready = lambda: loop.call_soon_threadsafe(ready.set)
-        await ready.wait()
-        return slot, outq
+        try:
+            loop = asyncio.get_running_loop()
+            state = PersonaPlexServingSessionState(slot=slot, epoch=slot.epoch)
+            ready = asyncio.Event()
+            with self.manager.lock:
+                # Bounded handoff: the tick thread produces one frame per 80 ms;
+                # a client that stops reading gets drop-oldest, not unbounded RAM.
+                slot.on_output = lambda frame_out: loop.call_soon_threadsafe(offer_realtime, state.out_queue, frame_out)
+                if ready_now:
+                    ready.set()
+                else:
+                    slot.on_ready = lambda: loop.call_soon_threadsafe(ready.set)
+            await ready.wait()
+        except BaseException:
+            self.manager.release(slot)
+            raise
+        return state
 
     async def handle_chat(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
@@ -255,53 +298,50 @@ class BatchedDuplexServer:
         persona = (request.query.get("text_prompt") or "").strip() or None
         if (request.query.get("voice_prompt") or "").strip():
             logger.warning("batched mode ignores per-connection voice_prompt (fixed default voice)")
-        got = await self._acquire(ws, persona)
-        if got is None:
+        state = await self._acquire(ws, persona)
+        if state is None:
             return ws
-        slot, outq = got
-        epoch = slot.epoch
-        sr = self.engine.sample_rate
-        reader = sphn.OpusStreamReader(sr)
-        writer = sphn.OpusStreamWriter(sr)
-        state = {"close": False}
-        await ws.send_bytes(b"\x00")  # ready handshake
-
-        async def recv_loop() -> None:
-            try:
-                async for msg in ws:
-                    if msg.type == WSMsgType.BINARY:
-                        data = msg.data
-                        if data and data[0] == 1:
-                            pcm = _opus_decode(reader, data[1:])
-                            if pcm is not None:
-                                self.manager.feed(slot, pcm, epoch)
-                    elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
-                        break
-            finally:
-                state["close"] = True
-
-        async def out_loop() -> None:
-            while not state["close"]:
-                try:
-                    frame_out = await asyncio.wait_for(outq.get(), timeout=0.25)
-                except asyncio.TimeoutError:
-                    continue
-                if frame_out.audio is not None:
-                    msg = _opus_encode(writer, frame_out.audio)
-                    if msg:
-                        await ws.send_bytes(b"\x01" + msg)
-                if frame_out.text:
-                    await ws.send_bytes(b"\x02" + frame_out.text.encode("utf8"))
-
-        tasks = [asyncio.create_task(recv_loop()), asyncio.create_task(out_loop())]
         try:
+            sr = self.engine.sample_rate
+            reader = sphn.OpusStreamReader(sr)
+            writer = sphn.OpusStreamWriter(sr)
+            await ws.send_bytes(b"\x00")  # ready handshake
+
+            async def recv_loop() -> None:
+                try:
+                    async for msg in ws:
+                        if msg.type == WSMsgType.BINARY:
+                            data = msg.data
+                            if data and data[0] == 1:
+                                pcm = _opus_decode(reader, data[1:])
+                                if pcm is not None:
+                                    self.manager.feed(state.slot, pcm, state.epoch)
+                        elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
+                            break
+                finally:
+                    state.closed = True
+
+            async def out_loop() -> None:
+                while not state.closed:
+                    try:
+                        frame_out = await asyncio.wait_for(state.out_queue.get(), timeout=0.25)
+                    except asyncio.TimeoutError:
+                        continue
+                    if frame_out.audio is not None:
+                        msg = _opus_encode(writer, frame_out.audio)
+                        if msg:
+                            await ws.send_bytes(b"\x01" + msg)
+                    if frame_out.text:
+                        await ws.send_bytes(b"\x02" + frame_out.text.encode("utf8"))
+
+            tasks = [asyncio.create_task(recv_loop()), asyncio.create_task(out_loop())]
             _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for t in pending:
                 t.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await t
         finally:
-            self.manager.release(slot)
+            self.manager.release(state.slot)
             with contextlib.suppress(Exception):
                 await ws.close()
         return ws
@@ -309,9 +349,8 @@ class BatchedDuplexServer:
     async def handle_raw(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        slot = None
+        state: PersonaPlexServingSessionState | None = None
         sender: asyncio.Task | None = None
-        epoch = 0
 
         async def pump(outq: asyncio.Queue) -> None:
             # Forward slot output continuously (the tick loop produces in realtime).
@@ -327,28 +366,37 @@ class BatchedDuplexServer:
                 if msg.type == WSMsgType.TEXT:
                     req = json.loads(msg.data)
                     if req.get("type") == "open":
-                        got = await self._acquire(ws, (req.get("persona") or "").strip() or None)
-                        if got is None:
+                        if state is not None:
+                            # One slot lease per connection; a second `open` would
+                            # silently leak the first slot and its pump.
+                            await ws.send_json({"type": "error", "error": "session already open"})
+                            continue
+                        state = await self._acquire(ws, (req.get("persona") or "").strip() or None)
+                        if state is None:
                             return ws
-                        slot, outq = got
-                        epoch = slot.epoch
-                        sender = asyncio.create_task(pump(outq))
+                        sender = asyncio.create_task(pump(state.out_queue))
                         await ws.send_json({"type": "ready"})
                     elif req.get("type") == "close":
                         await asyncio.sleep(0.3)  # let in-flight frames flush via pump
                         await ws.send_json({"type": "done"})
                         break
-                elif msg.type == WSMsgType.BINARY and slot is not None:
-                    self.manager.feed(slot, np.frombuffer(msg.data, dtype=np.float32), epoch)
+                elif msg.type == WSMsgType.BINARY and state is not None:
+                    self.manager.feed(state.slot, np.frombuffer(msg.data, dtype=np.float32), state.epoch)
                 elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
                     break
         finally:
+            # Release FIRST and unconditionally: a pump that already failed (e.g.
+            # peer reset mid-send) re-raises on await and must not leak the slot.
+            if state is not None:
+                self.manager.release(state.slot)
             if sender is not None:
                 sender.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
+                try:
                     await sender
-            if slot is not None:
-                self.manager.release(slot)
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.debug("raw output pump ended with an error", exc_info=True)
             with contextlib.suppress(Exception):
                 await ws.close()
         return ws

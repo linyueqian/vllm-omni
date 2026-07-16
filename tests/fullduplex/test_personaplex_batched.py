@@ -94,6 +94,21 @@ def test_custom_persona_prefills_and_recycles_on_tick_thread():
     assert ready == [True]
 
 
+def test_pristine_slot_after_ticking_requires_recycle():
+    # step_batch advances EVERY row each tick, so a pristine idle row that has
+    # lived through ticks has drifted from its boot prefill and must be
+    # recycled before a client may join it.
+    eng = StubEngine()
+    mgr = BatchedSessionManager(eng)
+    first, ready_now = mgr.acquire()
+    assert ready_now is True  # claimed before any tick: truly pristine
+    mgr.tick()
+    second, ready_now2 = mgr.acquire()
+    assert second.index != first.index
+    assert ready_now2 is False
+    assert second.phase is SlotPhase.PREFILL
+
+
 def test_used_slot_requires_recycle_even_with_default_persona():
     eng = StubEngine()
     mgr = BatchedSessionManager(eng)

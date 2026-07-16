@@ -60,16 +60,23 @@ class BatchedSessionManager:
         self.max_buffered_frames = max_buffered_frames
         self.slots = [Slot(index=i) for i in range(self.batch_size)]
         self.lock = threading.Lock()
+        # step_batch advances EVERY row each tick (lockstep), so once any tick has
+        # run, "pristine" idle rows have silently drifted from their boot prefill
+        # and must be recycled before a client may join them.
+        self._ticked = False
 
     # -- connection side (asyncio thread) ------------------------------------
 
     def acquire(self, persona: str | None = None) -> tuple[Slot, bool] | None:
         """Claim an idle slot. Returns ``(slot, ready_now)`` or ``None`` if full.
 
-        A pristine slot (never used since boot) already carries the default
-        voice + persona from ``open_batch`` and is live immediately when no
-        custom persona is requested; otherwise the slot is recycled and its
-        system prompt replayed over the next ticks (``ready_now == False``).
+        A pristine slot (never used since boot, and claimed before the first
+        engine tick) still carries the default voice + persona from
+        ``open_batch`` and is live immediately when no custom persona is
+        requested. Otherwise the slot is recycled and its system prompt
+        replayed over the next ticks (``ready_now == False``) -- including
+        pristine rows after ticking has started, because lockstep stepping
+        advances every row whether or not a client is attached.
         """
         with self.lock:
             slot = next((s for s in self.slots if s.phase is SlotPhase.IDLE), None)
@@ -79,7 +86,7 @@ class BatchedSessionManager:
             slot.pending = np.zeros(0, dtype=np.float32)
             slot.inq.clear()
             slot.prefill.clear()
-            if not slot.used and persona is None:
+            if not slot.used and persona is None and not self._ticked:
                 slot.phase = SlotPhase.LIVE
                 slot.used = True
                 return slot, True
@@ -122,6 +129,7 @@ class BatchedSessionManager:
         with self.lock:
             if all(s.phase is SlotPhase.IDLE for s in self.slots):
                 return False
+            self._ticked = True
             pcm = np.zeros((self.batch_size, self.frame_size), dtype=np.float32)
             prefill: dict[int, Any] = {}
             emitters: list[tuple[Slot, int]] = []
