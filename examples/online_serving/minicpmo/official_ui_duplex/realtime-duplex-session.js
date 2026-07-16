@@ -14,6 +14,9 @@ import { AudioPlayer } from './audio-player.js';
 import { resampleAudio } from './duplex-utils.js';
 
 const INPUT_RATE = 16000;
+const SILENCE_COMMIT_MS = 500;
+const SPEECH_RMS = 0.015;
+const CHUNK_MS_EST = 1000;
 
 // ---- base64 <-> typed array helpers -------------------------------------
 
@@ -105,6 +108,8 @@ export class DuplexSession {
         });
         this.sessionId = '';
         this.chunksSent = 0;
+        this._hadSpeech = false;
+        this._silenceMs = 0;
         this.paused = false;
         this.pauseState = 'active';
         this.forceListenActive = false;
@@ -221,7 +226,12 @@ export class DuplexSession {
         }
     }
 
-    /** Page sends {type:'audio_chunk', audio_base64:<f32le16k b64>} — translate. */
+    /**
+     * Page sends {type:'audio_chunk', audio_base64:<f32le16k b64>,
+     * frame_base64_list?, max_slice_nums?} — translate to a realtime append.
+     * The omni page carries camera frames; a per-utterance commit is injected
+     * because the runtime schedules a response on input_audio_buffer.commit.
+     */
     sendChunk(msg) {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         if (this.paused) return;
@@ -232,9 +242,34 @@ export class DuplexSession {
             sample_rate_hz: INPUT_RATE,
         };
         if (this.forceListenActive) event.force_listen = true;
+        // Omni page camera frames (base64 JPEG). HD slicing is unsupported by
+        // the duplex adapter, so only max_slice_nums<=1 frames are forwarded.
+        if (Array.isArray(msg.frame_base64_list) && msg.frame_base64_list.length
+            && (!msg.max_slice_nums || msg.max_slice_nums <= 1)) {
+            event.video_frames = msg.frame_base64_list;
+        }
         this.ws.send(JSON.stringify(event));
         this.chunksSent++;
         this.onMetrics({ type: 'result', chunksSent: this.chunksSent });
+
+        // End-of-utterance commit (client VAD): the page never commits, but the
+        // runtime creates a response on commit.
+        let sumSq = 0;
+        const f32 = new Float32Array(b64ToBytes(msg.audio_base64).buffer);
+        for (let i = 0; i < f32.length; i += 1) sumSq += f32[i] * f32[i];
+        const rms = f32.length ? Math.sqrt(sumSq / f32.length) : 0;
+        const durMs = f32.length ? Math.round((f32.length / INPUT_RATE) * 1000) : CHUNK_MS_EST;
+        if (rms > SPEECH_RMS) {
+            this._hadSpeech = true;
+            this._silenceMs = 0;
+        } else if (this._hadSpeech) {
+            this._silenceMs += durMs;
+            if (this._silenceMs >= SILENCE_COMMIT_MS) {
+                this._hadSpeech = false;
+                this._silenceMs = 0;
+                this.ws.send(JSON.stringify({ type: 'input_audio_buffer.commit', final: true }));
+            }
+        }
     }
 
     /** Client-side pause: stop feeding audio (no server pause in realtime). */
@@ -301,6 +336,8 @@ export class DuplexSession {
 
     _reset() {
         this.chunksSent = 0;
+        this._hadSpeech = false;
+        this._silenceMs = 0;
         this.currentSpeakText = '';
         this._speakHandle = null;
         this.paused = false;
