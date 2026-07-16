@@ -972,6 +972,12 @@ class RealtimeInputTranslator:
                 return "video_frames entries must be non-empty base64 strings"
             if len(frame) > 4_000_000:
                 return "video_frames entry exceeds 4MB base64; reduce capture resolution or JPEG quality"
+            try:
+                header = base64.b64decode(frame[:64] + "=" * (-len(frame[:64]) % 4))
+            except (binascii.Error, ValueError):
+                return "video_frames entries must be valid base64"
+            if not (header.startswith(b"\xff\xd8") or header.startswith(b"\x89PNG")):
+                return "video_frames entries must be JPEG or PNG images"
         return None
 
     @staticmethod

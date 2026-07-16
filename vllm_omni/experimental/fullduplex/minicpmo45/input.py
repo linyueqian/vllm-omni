@@ -132,6 +132,10 @@ class MiniCPMO45PcmAppendBuffer:
         operation_id: str,
     ) -> MiniCPMO45PcmAppendReservation:
         sample_rate_hz = payload.get("sample_rate_hz")
+        if isinstance(payload, dict) and "video_frames" in payload:
+            # Frames align to whole audio units; a passthrough payload has no
+            # unit framing for Stage0 to interleave against.
+            payload = {key: value for key, value in payload.items() if key != "video_frames"}
         reservation = MiniCPMO45PcmAppendReservation(
             owner=self,
             operation_id=operation_id,
@@ -211,11 +215,13 @@ class MiniCPMO45PcmAppendBuffer:
         # Omni duplex: attach at most one queued camera frame per emitted
         # model unit (official cadence: one frame per 1 s chunk). The engine
         # budgets 66 scheduler slots per attached frame from this payload.
-        emitted_units = (emit_samples + pad_samples) // min_samples
+        # Official omni cadence is one frame per ~1 s chunk, and the first
+        # append consumes extra samples (1035 ms first window), so per-unit
+        # attachment could outrun the units Stage0 actually builds. Attach at
+        # most ONE frame per emitted payload; the rest stay queued.
         attached_frames: list[str] = []
-        if emitted_units > 0 and self._frame_queue:
-            attached_frames = self._frame_queue[:emitted_units]
-            del self._frame_queue[: len(attached_frames)]
+        if emit_samples + pad_samples >= min_samples and self._frame_queue:
+            attached_frames = [self._frame_queue.pop(0)]
             out["video_frames"] = attached_frames
         out["force_listen"] = self._force_listen
         out["is_speech"] = self._is_speech

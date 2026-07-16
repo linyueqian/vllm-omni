@@ -709,12 +709,10 @@ class MiniCPMO45Stage0DuplexRuntime:
         """
         process_image = getattr(self.processor, "process_image", None)
         if not callable(process_image):
-            print("[vision-debug] processor lacks process_image", file=sys.stderr, flush=True)  # TEMP-DEBUG
             return None
         try:
             processed = process_image(frames, max_slice_nums=1)
         except Exception as exc:  # noqa: BLE001 - prefill fails with a reason
-            print(f"[vision-debug] process_image raised: {exc!r}", file=sys.stderr, flush=True)  # TEMP-DEBUG
             return None
         targets = (self.stage_model, self.thinker, getattr(self.stage_model, "model", None))
         for target in targets:
@@ -742,29 +740,13 @@ class MiniCPMO45Stage0DuplexRuntime:
                 with torch.no_grad():
                     hidden = get_hidden({"pixel_values": flat_pixels, "tgt_sizes": tgt_sizes})
             except Exception as exc:  # noqa: BLE001 - prefill fails with a reason
-                name = type(target).__name__  # TEMP-DEBUG
-                print(  # TEMP-DEBUG
-                    f"[vision-debug] get_vision_hidden_states raised on {name}: {exc!r}",  # TEMP-DEBUG
-                    file=sys.stderr,  # TEMP-DEBUG
-                    flush=True,  # TEMP-DEBUG
-                )  # TEMP-DEBUG
                 return None
             expected = MiniCPMO45DuplexPolicy.VISION_EMBEDS_PER_FRAME
             out: list[Any] = []
             for block in hidden:
                 block_2d = self._as_2d_tensor(block)
                 if int(block_2d.shape[0]) != expected:
-                    shape = tuple(block_2d.shape)  # TEMP-DEBUG
-                    print(f"[vision-debug] unexpected block shape {shape}", file=sys.stderr, flush=True)  # TEMP-DEBUG
                     return None
                 out.append(block_2d)
-            stats = f"{float(out[0].float().mean()):.5f},{float(out[0].float().std()):.5f}"  # TEMP-DEBUG
-            print(  # TEMP-DEBUG
-                f"[vision-debug] {type(target).__name__} blocks={len(out)} stats={stats}",  # TEMP-DEBUG
-                file=sys.stderr,  # TEMP-DEBUG
-                flush=True,  # TEMP-DEBUG
-            )  # TEMP-DEBUG
             return out
-        print("[vision-debug] no vision target", file=sys.stderr, flush=True)  # TEMP-DEBUG
         return None
-
