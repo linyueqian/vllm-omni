@@ -716,7 +716,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         except Exception as exc:  # noqa: BLE001 - prefill fails with a reason
             print(f"[vision-debug] process_image raised: {exc!r}", file=sys.stderr, flush=True)  # TEMP-DEBUG
             return None
-        for target in (self.stage_model, self.thinker, getattr(self.stage_model, "model", None)):
+        targets = (self.stage_model, self.thinker, getattr(self.stage_model, "model", None))
+        for target in targets:
             if target is None:
                 continue
             get_hidden = getattr(target, "get_vision_hidden_states", None)
@@ -735,130 +736,35 @@ class MiniCPMO45Stage0DuplexRuntime:
                 for image_slices, image_tgt in zip(pixel_nested, tgt_nested):
                     for slice_pixels in image_slices:
                         flat_pixels.append(slice_pixels.to(device=device, dtype=dtype))
-                    image_tgt_tensor = image_tgt if hasattr(image_tgt, "reshape") else torch.tensor(image_tgt)
-                    flat_tgt.append(image_tgt_tensor.reshape(-1, 2))
+                    tgt_tensor = image_tgt if hasattr(image_tgt, "reshape") else torch.tensor(image_tgt)
+                    flat_tgt.append(tgt_tensor.reshape(-1, 2))
                 tgt_sizes = torch.cat(flat_tgt, dim=0).to(device=device, dtype=torch.int64)
                 with torch.no_grad():
                     hidden = get_hidden({"pixel_values": flat_pixels, "tgt_sizes": tgt_sizes})
             except Exception as exc:  # noqa: BLE001 - prefill fails with a reason
-                print(f"[vision-debug] get_vision_hidden_states raised on {type(target).__name__}: {exc!r}", file=sys.stderr, flush=True)  # TEMP-DEBUG
+                name = type(target).__name__  # TEMP-DEBUG
+                print(  # TEMP-DEBUG
+                    f"[vision-debug] get_vision_hidden_states raised on {name}: {exc!r}",  # TEMP-DEBUG
+                    file=sys.stderr,  # TEMP-DEBUG
+                    flush=True,  # TEMP-DEBUG
+                )  # TEMP-DEBUG
                 return None
             expected = MiniCPMO45DuplexPolicy.VISION_EMBEDS_PER_FRAME
             out: list[Any] = []
             for block in hidden:
                 block_2d = self._as_2d_tensor(block)
                 if int(block_2d.shape[0]) != expected:
-                    print(f"[vision-debug] unexpected block shape {tuple(block_2d.shape)}", file=sys.stderr, flush=True)  # TEMP-DEBUG
+                    shape = tuple(block_2d.shape)  # TEMP-DEBUG
+                    print(f"[vision-debug] unexpected block shape {shape}", file=sys.stderr, flush=True)  # TEMP-DEBUG
                     return None
                 out.append(block_2d)
-            print(f"[vision-debug] target={type(target).__name__} blocks={len(out)} embeds(mean,std)={float(out[0].float().mean()):.5f},{float(out[0].float().std()):.5f}", file=sys.stderr, flush=True)  # TEMP-DEBUG
+            stats = f"{float(out[0].float().mean()):.5f},{float(out[0].float().std()):.5f}"  # TEMP-DEBUG
+            print(  # TEMP-DEBUG
+                f"[vision-debug] {type(target).__name__} blocks={len(out)} stats={stats}",  # TEMP-DEBUG
+                file=sys.stderr,  # TEMP-DEBUG
+                flush=True,  # TEMP-DEBUG
+            )  # TEMP-DEBUG
             return out
-        print("[vision-debug] no target exposes get_vision_hidden_states+vpm", file=sys.stderr, flush=True)  # TEMP-DEBUG
+        print("[vision-debug] no vision target", file=sys.stderr, flush=True)  # TEMP-DEBUG
         return None
 
-    @staticmethod
-    def _decode_audio_payload(payload: dict[str, Any]) -> Any:
-        audio = payload.get("audio") or payload.get("data")
-        if not isinstance(audio, str):
-            raise ValueError("audio append payload requires base64 audio")
-        fmt = payload.get("format") or "pcm_f32le"
-        if fmt != "pcm_f32le":
-            raise ValueError(f"MiniCPM-o stage0 expects pcm_f32le audio, got {fmt!r}")
-        return np.frombuffer(base64.b64decode(audio), dtype=np.float32)
-
-    @staticmethod
-    def _decode_video_frames_payload(payload: dict[str, Any]) -> list[Any]:
-        """Decode omni-duplex camera frames (base64 JPEG/PNG) to PIL images."""
-        frames = payload.get("video_frames")
-        if not isinstance(frames, list) or not frames:
-            return []
-        from io import BytesIO
-
-        from PIL import Image
-
-        decoded: list[Any] = []
-        for frame_b64 in frames:
-            if not isinstance(frame_b64, str) or not frame_b64:
-                continue
-            try:
-                raw = base64.b64decode(frame_b64, validate=True)
-                image = Image.open(BytesIO(raw))
-                image.load()
-            except Exception as exc:  # noqa: BLE001 - normalized below
-                raise ValueError("invalid omni duplex video frame payload") from exc
-            decoded.append(image.convert("RGB"))
-        return decoded
-
-    def _vision_embedding_placeholder_token_id(self) -> int:
-        unk_token_id = getattr(self.tokenizer, "unk_token_id", None)
-        if isinstance(unk_token_id, int) and unk_token_id >= 0:
-            return unk_token_id
-        return self._required_optional_token_id("image_start_token_id")
-
-    def _required_optional_token_id(self, field_name: str) -> int:
-        token_id = getattr(self, field_name, None)
-        if not isinstance(token_id, int) or token_id < 0:
-            token = _MINICPMO45_OPTIONAL_TOKEN_FIELDS.get(field_name, field_name)
-            raise ValueError(f"MiniCPM-o 4.5 missing required special token id for {token}")
-        return token_id
-
-    def _require_vision_token_ids(self) -> None:
-        missing = [
-            _MINICPMO45_OPTIONAL_TOKEN_FIELDS[field_name]
-            for field_name in ("image_start_token_id", "image_end_token_id")
-            if not isinstance(getattr(self, field_name, None), int) or getattr(self, field_name) < 0
-        ]
-        if missing:
-            raise ValueError(
-                "MiniCPM-o 4.5 omni duplex requires tokenizer-defined image tokens, "
-                f"missing or unknown: {', '.join(missing)}"
-            )
-
-    def _stage_vision_embeddings(self, frames: list[Any]) -> list[Any] | None:
-        """Encode camera frames via the official duplex vision path.
-
-        Mirrors ``MiniCPMODuplex.streaming_prefill``: ``processor.process_image``
-        (``max_slice_nums=1`` in streaming, so exactly one 64-embedding block
-        per frame) followed by ``get_vision_embedding`` (vpm + resampler).
-        Returns one ``[64, hidden]`` block per frame, or ``None`` on failure.
-        """
-        process_image = getattr(self.processor, "process_image", None)
-        if not callable(process_image):
-            return None
-        try:
-            processed = process_image(frames, max_slice_nums=1)
-        except Exception:
-            return None
-        if hasattr(processed, "to"):
-            with suppress(Exception):
-                processed = processed.to(self._model_device())
-        for target in (self.stage_model, self.thinker):
-            get_vision = getattr(target, "get_vision_embedding", None)
-            if not callable(get_vision):
-                continue
-            try:
-                vision_hidden_states = get_vision(processed)
-            except Exception as exc:  # TEMP-DEBUG
-                print(f"[vision-debug] get_vision_embedding raised on {type(target).__name__}: {exc!r}", file=sys.stderr, flush=True)  # TEMP-DEBUG
-                return None
-            try:  # TEMP-DEBUG
-                pv = processed["pixel_values"][0][0] if isinstance(processed, dict) or hasattr(processed, "__getitem__") else None  # TEMP-DEBUG
-                pv_stats = (float(pv.float().mean()), float(pv.float().std())) if pv is not None and hasattr(pv, "float") else None  # TEMP-DEBUG
-                blk = vision_hidden_states[0]  # TEMP-DEBUG
-                blk_stats = (float(blk.float().mean()), float(blk.float().std()), tuple(blk.shape))  # TEMP-DEBUG
-                print(f"[vision-debug] target={type(target).__name__} pixels(mean,std)={pv_stats} embeds(mean,std,shape)={blk_stats}", file=sys.stderr, flush=True)  # TEMP-DEBUG
-            except Exception as exc:  # TEMP-DEBUG
-                print(f"[vision-debug] stats failed: {exc!r}", file=sys.stderr, flush=True)  # TEMP-DEBUG
-            if vision_hidden_states is None or len(vision_hidden_states) == 0:
-                return None
-            blocks = vision_hidden_states[0]
-            expected = MiniCPMO45DuplexPolicy.VISION_EMBEDS_PER_FRAME
-            out: list[Any] = []
-            for block in blocks:
-                block_2d = self._as_2d_tensor(block)
-                if int(block_2d.shape[0]) != expected:
-                    return None
-                out.append(block_2d)
-            return out
-        print("[vision-debug] no target exposes get_vision_embedding", file=sys.stderr, flush=True)  # TEMP-DEBUG
-        return None
