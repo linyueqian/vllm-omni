@@ -15,7 +15,6 @@ import { resampleAudio } from './duplex-utils.js';
 
 const INPUT_RATE = 16000;
 const SILENCE_COMMIT_MS = 500;
-const ECHO_GUARD_MS = 400;
 const SPEECH_RMS = 0.015;
 const CHUNK_MS_EST = 1000;
 
@@ -111,8 +110,6 @@ export class DuplexSession {
         this.chunksSent = 0;
         this._hadSpeech = false;
         this._silenceMs = 0;
-        this._assistantActive = false;
-        this._echoGuardMs = 0;
         this.paused = false;
         this.pauseState = 'active';
         this.forceListenActive = false;
@@ -256,27 +253,12 @@ export class DuplexSession {
         this.onMetrics({ type: 'result', chunksSent: this.chunksSent });
 
         // End-of-utterance commit (client VAD): the page never commits, but the
-        // runtime creates a response on commit. Gate the VAD on assistant
-        // state so speaker->mic echo of the assistant's own TTS is not
-        // mistaken for the user still speaking (which otherwise blocks the
-        // next commit and stalls the conversation after one turn).
-        const f32 = new Float32Array(b64ToBytes(msg.audio_base64).buffer);
-        const durMs = f32.length ? Math.round((f32.length / INPUT_RATE) * 1000) : CHUNK_MS_EST;
-        if (this._assistantActive) {
-            // Assistant is speaking: ignore mic (echo) and arm a short guard
-            // so residual playback right after the turn is also ignored.
-            this._hadSpeech = false;
-            this._silenceMs = 0;
-            this._echoGuardMs = ECHO_GUARD_MS;
-            return;
-        }
-        if (this._echoGuardMs > 0) {
-            this._echoGuardMs = Math.max(0, this._echoGuardMs - durMs);
-            return;
-        }
+        // runtime creates a response on commit.
         let sumSq = 0;
+        const f32 = new Float32Array(b64ToBytes(msg.audio_base64).buffer);
         for (let i = 0; i < f32.length; i += 1) sumSq += f32[i] * f32[i];
         const rms = f32.length ? Math.sqrt(sumSq / f32.length) : 0;
+        const durMs = f32.length ? Math.round((f32.length / INPUT_RATE) * 1000) : CHUNK_MS_EST;
         if (rms > SPEECH_RMS) {
             this._hadSpeech = true;
             this._silenceMs = 0;
@@ -356,8 +338,6 @@ export class DuplexSession {
         this.chunksSent = 0;
         this._hadSpeech = false;
         this._silenceMs = 0;
-        this._assistantActive = false;
-        this._echoGuardMs = 0;
         this.currentSpeakText = '';
         this._speakHandle = null;
         this.paused = false;
@@ -386,7 +366,6 @@ export class DuplexSession {
                     if (!this.audioPlayer.turnActive) this.audioPlayer.beginTurn();
                     this.audioPlayer.playChunk(bytesToB64(new Uint8Array(f32.buffer)), now);
                 }
-                this._assistantActive = true;
                 if (this._firstDeltaOfResponse) {
                     this._firstDeltaOfResponse = false;
                     const ttfs = this._lastSpeechStopTime > 0 ? now - this._lastSpeechStopTime : null;
@@ -414,7 +393,6 @@ export class DuplexSession {
 
             case 'response.listen':
                 if (this.audioPlayer.turnActive) this.audioPlayer.endTurn();
-                this._assistantActive = false;
                 this._emitModelState('listening');
                 break;
 
@@ -438,10 +416,6 @@ export class DuplexSession {
                 this._speakHandle = null;
                 this.currentSpeakText = '';
                 this._firstDeltaOfResponse = true;
-                this._assistantActive = false;
-                this._echoGuardMs = ECHO_GUARD_MS;
-                this._hadSpeech = false;
-                this._silenceMs = 0;
                 this.onSystemLog('— end of turn —');
                 this._emitModelState('end_of_turn');
                 break;
