@@ -105,6 +105,23 @@ def build_overlay(demo_root: str) -> str:
             "pin the demo checkout to a compatible commit (see README)."
         )
 
+    # Enable browser acoustic echo cancellation on mic capture so the
+    # assistant's own TTS played through the speakers does not re-enter the
+    # microphone as "user speech" and stall the conversation after one turn.
+    for subdir, filename in page_apps:
+        app_js = os.path.join(overlay, subdir, filename)
+        if not os.path.exists(app_js):
+            continue
+        with open(app_js, encoding="utf-8") as f:
+            content = f.read()
+        patched = content.replace(
+            "audio: { channelCount: 1,",
+            "audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true,",
+        )
+        if patched != content:
+            with open(app_js, "w", encoding="utf-8") as f:
+                f.write(patched)
+
     logger.info("overlay built at %s", overlay)
     return overlay
 
