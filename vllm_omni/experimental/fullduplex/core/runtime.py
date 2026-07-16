@@ -19,6 +19,12 @@ class DuplexRuntime:
         self.session = session
         self.adapter = adapter
         self._capabilities = adapter.capabilities()
+        # EXTENSION (ours, pending upstream discussion on PR #3907): the adapter's
+        # capability is the single source of truth for the lockstep lifecycle;
+        # mirror it into the session config so a default-constructed session does
+        # not silently run a continuous adapter with turn-based semantics.
+        if getattr(self._capabilities, "continuous", False):
+            session.config.continuous = True
 
     async def run(self, inputs: AsyncIterator[dict], emit: Emit) -> None:
         # EXTENSION (ours, pending upstream discussion on PR #3907): lockstep
@@ -57,9 +63,12 @@ class DuplexRuntime:
             elif etype == ev.PLAYBACK_ACK:
                 await self.adapter.on_playback_ack(self.session, int(event.get("cursor", 0)))
             elif etype == ev.CLOSE:
-                if continuous and task is not None and not task.done():
-                    await self.adapter.on_close(self.session)  # signal the loop to drain + stop
                 break
+        # Signal the continuous loop to drain + stop on EVERY exit path: an input
+        # iterator that ends without an explicit CLOSE (transport dropped) must
+        # not leave the eternal response blocked on its inbox forever.
+        if continuous and task is not None and not task.done():
+            await self.adapter.on_close(self.session)
         if task is not None and not task.done():
             await task
         self.session.state = DuplexState.CLOSED

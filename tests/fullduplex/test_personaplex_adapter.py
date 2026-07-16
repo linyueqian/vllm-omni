@@ -7,6 +7,8 @@ Proves the generic framework expresses pure lockstep: the adapter declares
 user frame, and drains on close — all with a GPU-free stub stepper.
 """
 
+import asyncio
+
 import numpy as np
 import pytest
 
@@ -120,3 +122,60 @@ async def test_close_without_input_is_clean():
     # no input -> response never started -> no created/done, no error
     assert not any(e["type"] == ev.ERROR for e in out)
     assert not any(e["type"] == ev.RESPONSE_CREATED for e in out)
+
+
+@pytest.mark.asyncio
+async def test_iterator_eof_without_close_drains_and_stops():
+    # Transport drop: the input iterator ends WITHOUT an explicit CLOSE event.
+    # The runtime must still signal on_close so the eternal response drains
+    # instead of blocking on its inbox forever.
+    stub = StubStepper()
+    adapter = PersonaPlexDuplexAdapter(stub)
+    rt = DuplexRuntime(_continuous_session(), adapter)
+    out, emit = _collector()
+    frame = np.zeros(FRAME_SIZE, dtype=np.float32)
+    events = [{"type": ev.INPUT_APPEND, "modality": "audio", "data": frame}]
+    await asyncio.wait_for(rt.run(_feed(events), emit), timeout=5.0)
+    types = [e["type"] for e in out]
+    assert types.count(ev.RESPONSE_DONE) == 1
+    assert stub.steps == 1
+
+
+@pytest.mark.asyncio
+async def test_adapter_capability_drives_continuous_lifecycle():
+    # The adapter's capability is the single source of truth: a default session
+    # config (continuous unset) must still get the lockstep lifecycle.
+    stub = StubStepper()
+    adapter = PersonaPlexDuplexAdapter(stub)
+    session = DuplexSession(
+        "s",
+        DuplexSessionConfig(input_modalities=("audio",), output_modalities=("audio", "text")),
+    )
+    rt = DuplexRuntime(session, adapter)
+    assert session.config.continuous is True  # mirrored from capabilities
+    out, emit = _collector()
+    frame = np.zeros(FRAME_SIZE, dtype=np.float32)
+    events = [{"type": ev.INPUT_APPEND, "modality": "audio", "data": frame}, {"type": ev.CLOSE}]
+    await rt.run(_feed(events), emit)
+    types = [e["type"] for e in out]
+    assert types.count(ev.RESPONSE_CREATED) == 1
+    assert types.count(ev.RESPONSE_DONE) == 1
+    assert stub.steps == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_tail_is_padded_and_stepped_on_close():
+    # A trailing sub-frame chunk is zero-padded and stepped at close (same
+    # contract as PersonaPlexSession.flush) rather than silently dropped.
+    stub = StubStepper()
+    adapter = PersonaPlexDuplexAdapter(stub)
+    rt = DuplexRuntime(_continuous_session(), adapter)
+    out, emit = _collector()
+    events = [
+        {"type": ev.INPUT_APPEND, "modality": "audio", "data": np.ones(FRAME_SIZE // 2, dtype=np.float32)},
+        {"type": ev.CLOSE},
+    ]
+    await rt.run(_feed(events), emit)
+    audio = [e for e in out if e["type"] == ev.RESPONSE_DELTA and e["modality"] == "audio"]
+    assert len(audio) == 1
+    assert stub.steps == 1

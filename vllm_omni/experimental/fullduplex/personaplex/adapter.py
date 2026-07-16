@@ -25,6 +25,7 @@ import numpy as np
 from vllm_omni.experimental.fullduplex.core.adapter import DuplexAdapter, DuplexCapability, OutputChunk
 from vllm_omni.experimental.fullduplex.core.session import DuplexSession
 from vllm_omni.experimental.fullduplex.personaplex.engine import FrameStepper
+from vllm_omni.experimental.fullduplex.personaplex.session import MAX_PENDING_INPUT, offer_realtime
 
 _CLOSE = object()  # sentinel: drain the inbox and end the eternal response
 
@@ -43,7 +44,9 @@ class PersonaPlexDuplexAdapter(DuplexAdapter):
         self._voice_prompt = voice_prompt
         self._persona = persona
         self._frame_size = stepper.frame_size
-        self._inbox: asyncio.Queue[Any] = asyncio.Queue()
+        # Bounded, drop-oldest: input arriving faster than the stepper can run
+        # must shed stale frames (realtime), not grow memory + latency unbounded.
+        self._inbox: asyncio.Queue[Any] = asyncio.Queue(maxsize=MAX_PENDING_INPUT)
         self._pending = np.zeros(0, dtype=np.float32)
         self._opened = False
 
@@ -64,7 +67,7 @@ class PersonaPlexDuplexAdapter(DuplexAdapter):
         n = self._frame_size
         while self._pending.shape[0] >= n:
             frame, self._pending = self._pending[:n], self._pending[n:]
-            await self._inbox.put(frame)
+            offer_realtime(self._inbox, frame)
 
     async def respond(self, session: DuplexSession) -> AsyncIterator[OutputChunk]:
         """The eternal lockstep loop: one user frame in, one agent frame + text out."""
@@ -82,7 +85,14 @@ class PersonaPlexDuplexAdapter(DuplexAdapter):
                 yield OutputChunk("text", out.text)
 
     async def on_close(self, session: DuplexSession) -> None:
-        await self._inbox.put(_CLOSE)
+        # Pad + flush a partial final frame (same contract as PersonaPlexSession
+        # .flush()) so the tail of the user's audio is stepped, not dropped.
+        if self._pending.size:
+            pad = self._frame_size - self._pending.shape[0]
+            frame = np.concatenate([self._pending, np.zeros(pad, dtype=np.float32)])
+            self._pending = np.zeros(0, dtype=np.float32)
+            offer_realtime(self._inbox, frame)
+        offer_realtime(self._inbox, _CLOSE)
 
     async def on_barge_in(self, session: DuplexSession) -> None:
         # No-op: Moshi-class models perceive the user continuously, so an interrupt
