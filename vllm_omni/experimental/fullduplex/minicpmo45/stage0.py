@@ -712,7 +712,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             return None
         try:
             processed = process_image(frames, max_slice_nums=1)
-        except Exception as exc:  # noqa: BLE001 - prefill fails with a reason
+        except Exception:  # noqa: BLE001 - prefill fails with a reason
             return None
         targets = (self.stage_model, self.thinker, getattr(self.stage_model, "model", None))
         for target in targets:
@@ -739,7 +739,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 tgt_sizes = torch.cat(flat_tgt, dim=0).to(device=device, dtype=torch.int64)
                 with torch.no_grad():
                     hidden = get_hidden({"pixel_values": flat_pixels, "tgt_sizes": tgt_sizes})
-            except Exception as exc:  # noqa: BLE001 - prefill fails with a reason
+            except Exception:  # noqa: BLE001 - prefill fails with a reason
                 return None
             expected = MiniCPMO45DuplexPolicy.VISION_EMBEDS_PER_FRAME
             out: list[Any] = []
