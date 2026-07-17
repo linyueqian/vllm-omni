@@ -196,6 +196,19 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         self.talker_mtp_output_key = ("codes", "audio")
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("hidden_states", "last")}
         self.talker_mtp_graph_safe = True
+        # Async omni output, mirroring the Qwen3-Omni talker (qwen3_omni.py) and
+        # the Qwen3-TTS talker after #4923. The SlowAR talker only ships codec
+        # codes (``codes.audio``) downstream to the stage-1 DAC decoder, so the
+        # per-step latent hidden-state D2H copy in the pooler payload is pure
+        # overhead. Keep the postprocess eager (the next step's ``talker_mtp``
+        # consumes the postprocessed ``hidden_states.last``, which
+        # ``gpu_resident_buffer_keys`` already keeps GPU-resident) and drop the
+        # hidden state from the CPU pooler payload. These flags only take effect
+        # when the deploy enables ``async_scheduling`` (+ ``async_chunk``);
+        # otherwise the runner keeps the synchronous output path.
+        self.use_async_omni_output = True
+        self.eager_omni_postprocess_before_async_output = True
+        self.omni_pooler_payload_include_hidden = False
 
         # Qwen3 transformer backbone.
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
