@@ -122,6 +122,7 @@ export class DuplexSession {
         this._lastSpeechStopTime = 0;
         this._firstDeltaOfResponse = true;
         this._responseCreateTimer = null;
+        this._responseActive = false;
 
         this.audioPlayer.onMetrics = (data) => {
             this.onMetrics({
@@ -165,6 +166,14 @@ export class DuplexSession {
         try {
             await new Promise((resolve, reject) => {
                 this.ws = new WebSocket(wsUrl);
+                // The omni page writes client_diagnostic events straight to
+                // session.ws; the realtime endpoint rejects unknown events,
+                // so drop them at the socket.
+                const rawSend = this.ws.send.bind(this.ws);
+                this.ws.send = (data) => {
+                    if (typeof data === 'string' && data.includes('"client_diagnostic"')) return;
+                    rawSend(data);
+                };
                 this.ws.onopen = () => resolve();
                 this.ws.onerror = () => reject(new Error('WebSocket connection failed'));
                 this.ws.onclose = () => {
@@ -281,6 +290,9 @@ export class DuplexSession {
                 this._responseCreateTimer = setTimeout(() => {
                     this._responseCreateTimer = null;
                     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.paused) return;
+                    // Mid-response (barge-in) commits are deferred server-side
+                    // and start automatically when the active response ends.
+                    if (this._responseActive) return;
                     this.ws.send(JSON.stringify({ type: 'response.create' }));
                 }, RESPONSE_CREATE_FALLBACK_MS);
             }
@@ -335,6 +347,7 @@ export class DuplexSession {
             clearTimeout(this._responseCreateTimer);
             this._responseCreateTimer = null;
         }
+        this._responseActive = false;
         this.audioPlayer.stop();
         if (this.ws) {
             this.ws.onclose = null;
@@ -379,6 +392,7 @@ export class DuplexSession {
         const now = performance.now();
         switch (evt.type) {
             case 'response.created':
+                this._responseActive = true;
                 if (this._responseCreateTimer) {
                     clearTimeout(this._responseCreateTimer);
                     this._responseCreateTimer = null;
@@ -437,6 +451,7 @@ export class DuplexSession {
             }
 
             case 'response.done': {
+                this._responseActive = false;
                 if (this.audioPlayer.turnActive) this.audioPlayer.endTurn();
                 if (this._speakHandle) this.onSpeakEnd();
                 this._speakHandle = null;
@@ -450,6 +465,7 @@ export class DuplexSession {
             case 'response.cancelled':
             case 'output_audio_buffer.clear':
             case 'output_audio_buffer.cleared':
+                this._responseActive = false;
                 this.audioPlayer.stopAll();
                 if (this.audioPlayer.turnActive) this.audioPlayer.endTurn();
                 this._speakHandle = null;
