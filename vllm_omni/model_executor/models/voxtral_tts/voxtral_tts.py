@@ -114,6 +114,13 @@ class VoxtralTTSForConditionalGeneration(
             self.requires_raw_input_tokens = True
             self.set_custom_preprocess(self.tts_preprocess)
             self.set_custom_postprocess(self.tts_postprocess)
+            # Async omni output (mirrors the Qwen3-Omni talker): the audio
+            # tokenizer stage consumes only codec ``codes.audio``, never the
+            # generator hidden, so skip the per-step hidden-state D2H. eager flag
+            # required because has_postprocess=True.
+            self.use_async_omni_output = True
+            self.eager_omni_postprocess_before_async_output = True
+            self.omni_pooler_payload_include_hidden = False
             self.audio_generation = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 hf_config=config,

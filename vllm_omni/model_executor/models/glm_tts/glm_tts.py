@@ -808,6 +808,14 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
+        # Async omni output (mirrors the Qwen3-Omni/Qwen3-TTS talker): the DiT
+        # stage consumes only speech_tokens + the voice-clone embed, never the
+        # talker hidden, so skip the per-step hidden-state D2H. eager flag
+        # required (has_postprocess=True); the model's own next-step buffer stays
+        # GPU-resident via gpu_resident_buffer_keys.
+        self.use_async_omni_output = True
+        self.eager_omni_postprocess_before_async_output = True
+        self.omni_pooler_payload_include_hidden = False
         # GLM-TTS async chunk transfer consumes speech_tokens plus voice-clone
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("last_hidden", "last")}
 

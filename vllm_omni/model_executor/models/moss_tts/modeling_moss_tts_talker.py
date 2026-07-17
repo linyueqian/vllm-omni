@@ -119,6 +119,13 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
     have_multimodal_outputs: bool = True
     has_preprocess: bool = True
     has_postprocess: bool = True
+    # Async omni output: talker ships only codec ``codes.audio`` to the Stage-1
+    # codec decoder (stage_input_processors/moss_tts.py), so skip the per-step
+    # hidden-state D2H. eager flag required (has_postprocess=True); the next
+    # step's mtp_hidden stays GPU-resident via gpu_resident_buffer_keys.
+    use_async_omni_output: bool = True
+    eager_omni_postprocess_before_async_output: bool = True
+    omni_pooler_payload_include_hidden: bool = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -795,6 +802,13 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
     have_multimodal_outputs: bool = True
     has_preprocess: bool = True
     has_postprocess: bool = True
+    # Async omni output: talker ships only codec ``codes.audio`` to the Stage-1
+    # codec decoder (stage_input_processors/moss_tts.py), so skip the per-step
+    # hidden-state D2H. eager flag required (has_postprocess=True); the next
+    # step's mtp_hidden stays GPU-resident via gpu_resident_buffer_keys.
+    use_async_omni_output: bool = True
+    eager_omni_postprocess_before_async_output: bool = True
+    omni_pooler_payload_include_hidden: bool = False
 
     AUDIO_BOS = 1025
     AUDIO_EOS = 1026
@@ -1267,6 +1281,13 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     have_multimodal_outputs: bool = True
     has_preprocess: bool = True
     has_postprocess: bool = True
+    # Async omni output: talker ships only codec ``codes.audio`` (+ ``codes.ref``)
+    # to the Stage-1 codec decoder (stage_input_processors/moss_tts.py), so skip
+    # the per-step hidden-state D2H. eager flag required (has_postprocess=True);
+    # the next step's mtp_hidden stays GPU-resident via gpu_resident_buffer_keys.
+    use_async_omni_output: bool = True
+    eager_omni_postprocess_before_async_output: bool = True
+    omni_pooler_payload_include_hidden: bool = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()

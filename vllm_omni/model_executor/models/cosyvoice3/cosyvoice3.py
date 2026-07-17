@@ -470,6 +470,12 @@ class CosyVoice3Model(
             # KV cache is now managed externally by vLLM's PagedAttention
             # No need for self.llm_cache
             self.model = self.talker
+            # Async omni output (mirrors the Qwen3-Omni talker): code2wav
+            # consumes only speech tokens + the voice-clone embed, never the
+            # talker text_hidden_states, so skip the per-step hidden-state D2H.
+            # No has_postprocess => no eager flag needed.
+            self.use_async_omni_output = True
+            self.omni_pooler_payload_include_hidden = False
         elif self.model_stage == "cosyvoice3_code2wav":
             # Initialize code2wav stage (flow matching + vocoder)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav

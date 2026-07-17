@@ -556,6 +556,12 @@ class MiMoAudioForConditionalGeneration(
         if self.model_stage == "fused_thinker_talker":
             self.has_preprocess = True
             self.set_custom_preprocess(self.fused_thinker_talker_preprocess)
+            # Async omni output (mirrors the Qwen3-Omni talker): code2wav
+            # consumes only codec ``codes.audio``, never the talker hidden, so
+            # skip the per-step hidden-state D2H. No has_postprocess => no eager
+            # flag (the gate skips the postprocess coupling when it is unset).
+            self.use_async_omni_output = True
+            self.omni_pooler_payload_include_hidden = False
             # Initialize fused_thinker_talker llm model (multimodal processing)
             self.fused_thinker_talker = init_vllm_registered_model(
                 vllm_config=vllm_config,
