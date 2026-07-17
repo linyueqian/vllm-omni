@@ -88,7 +88,7 @@
   /**
    * Arm the post-commit fallback: the runtime auto-responds to the first
    * input_audio_buffer.commit but not to later ones (post-response commits
-   * are mis-deferred as barge-in of an already-finished response). If the
+   * are wrongly deferred as barge-in of an already-finished response). If the
    * assistant is mid-response the commit was deferred server-side and starts
    * on its own, so re-check instead of firing — unless deltas stalled, which
    * means the response was truncated without a terminal event.
