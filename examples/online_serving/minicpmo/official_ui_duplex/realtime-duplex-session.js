@@ -20,6 +20,9 @@ const CHUNK_MS_EST = 1000;
 // If the server has not started a response this long after a commit,
 // send response.create (the auto-response only fires on the first turn).
 const RESPONSE_CREATE_FALLBACK_MS = 900;
+// A "still active" response with no deltas for this long is considered
+// dead (e.g. truncated by barge-in without a terminal lifecycle event).
+const RESPONSE_STALL_MS = 2000;
 
 // ---- base64 <-> typed array helpers -------------------------------------
 
@@ -123,6 +126,7 @@ export class DuplexSession {
         this._firstDeltaOfResponse = true;
         this._responseCreateTimer = null;
         this._responseActive = false;
+        this._lastDeltaTime = 0;
 
         this.audioPlayer.onMetrics = (data) => {
             this.onMetrics({
@@ -286,17 +290,30 @@ export class DuplexSession {
                 // barge-in of an already-finished response). If no response
                 // starts shortly, request one explicitly — the runtime then
                 // replays the committed audio.
-                if (this._responseCreateTimer) clearTimeout(this._responseCreateTimer);
-                this._responseCreateTimer = setTimeout(() => {
-                    this._responseCreateTimer = null;
-                    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.paused) return;
-                    // Mid-response (barge-in) commits are deferred server-side
-                    // and start automatically when the active response ends.
-                    if (this._responseActive) return;
-                    this.ws.send(JSON.stringify({ type: 'response.create' }));
-                }, RESPONSE_CREATE_FALLBACK_MS);
+                this._armResponseCreateFallback();
             }
         }
+    }
+
+    /**
+     * Arm the post-commit fallback. If the assistant is mid-response the
+     * commit was deferred server-side (barge-in) and starts on its own, so
+     * re-check instead of firing — unless deltas stalled, which means the
+     * response was truncated without a terminal event and needs the nudge.
+     */
+    _armResponseCreateFallback() {
+        if (this._responseCreateTimer) clearTimeout(this._responseCreateTimer);
+        this._responseCreateTimer = setTimeout(() => {
+            this._responseCreateTimer = null;
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.paused) return;
+            const streaming = this._responseActive
+                && (performance.now() - this._lastDeltaTime) < RESPONSE_STALL_MS;
+            if (streaming) {
+                this._armResponseCreateFallback();
+                return;
+            }
+            this.ws.send(JSON.stringify({ type: 'response.create' }));
+        }, RESPONSE_CREATE_FALLBACK_MS);
     }
 
     /** Client-side pause: stop feeding audio (no server pause in realtime). */
@@ -401,6 +418,7 @@ export class DuplexSession {
 
             case 'response.audio.delta':
             case 'response.output_audio.delta': {
+                this._lastDeltaTime = now;
                 const f32 = deltaToF32(evt, this.config.outputSampleRate);
                 if (f32 && f32.length) {
                     if (!this.audioPlayer.turnActive) this.audioPlayer.beginTurn();
@@ -419,6 +437,7 @@ export class DuplexSession {
             // Transcript deltas are the only response-text channel.
             case 'response.audio_transcript.delta':
             case 'response.output_audio_transcript.delta': {
+                this._lastDeltaTime = now;
                 const delta = evt.delta;
                 if (typeof delta === 'string' && delta) {
                     this.currentSpeakText += delta;
@@ -475,6 +494,13 @@ export class DuplexSession {
                 break;
 
             case 'error': {
+                const code = evt.code || (evt.error && evt.error.code);
+                if (code === 'response_already_active') {
+                    // The fallback raced a response that is still winding
+                    // down; retry quietly until the deferred turn starts.
+                    this._armResponseCreateFallback();
+                    break;
+                }
                 const detail = evt.error ? JSON.stringify(evt.error) : JSON.stringify(evt);
                 this.onSystemLog(`Error: ${detail}`);
                 break;
