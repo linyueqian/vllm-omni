@@ -17,6 +17,9 @@ const INPUT_RATE = 16000;
 const SILENCE_COMMIT_MS = 500;
 const SPEECH_RMS = 0.015;
 const CHUNK_MS_EST = 1000;
+// If the server has not started a response this long after a commit,
+// send response.create (the auto-response only fires on the first turn).
+const RESPONSE_CREATE_FALLBACK_MS = 900;
 
 // ---- base64 <-> typed array helpers -------------------------------------
 
@@ -118,6 +121,7 @@ export class DuplexSession {
         this._started = false;
         this._lastSpeechStopTime = 0;
         this._firstDeltaOfResponse = true;
+        this._responseCreateTimer = null;
 
         this.audioPlayer.onMetrics = (data) => {
             this.onMetrics({
@@ -268,6 +272,17 @@ export class DuplexSession {
                 this._hadSpeech = false;
                 this._silenceMs = 0;
                 this.ws.send(JSON.stringify({ type: 'input_audio_buffer.commit', final: true }));
+                // The runtime auto-responds to the first commit but not to
+                // later ones (post-response commits are mis-deferred as
+                // barge-in of an already-finished response). If no response
+                // starts shortly, request one explicitly — the runtime then
+                // replays the committed audio.
+                if (this._responseCreateTimer) clearTimeout(this._responseCreateTimer);
+                this._responseCreateTimer = setTimeout(() => {
+                    this._responseCreateTimer = null;
+                    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.paused) return;
+                    this.ws.send(JSON.stringify({ type: 'response.create' }));
+                }, RESPONSE_CREATE_FALLBACK_MS);
             }
         }
     }
@@ -316,6 +331,10 @@ export class DuplexSession {
 
     cleanup() {
         this.onCleanup();
+        if (this._responseCreateTimer) {
+            clearTimeout(this._responseCreateTimer);
+            this._responseCreateTimer = null;
+        }
         this.audioPlayer.stop();
         if (this.ws) {
             this.ws.onclose = null;
@@ -359,6 +378,13 @@ export class DuplexSession {
     _handleEvent(evt) {
         const now = performance.now();
         switch (evt.type) {
+            case 'response.created':
+                if (this._responseCreateTimer) {
+                    clearTimeout(this._responseCreateTimer);
+                    this._responseCreateTimer = null;
+                }
+                break;
+
             case 'response.audio.delta':
             case 'response.output_audio.delta': {
                 const f32 = deltaToF32(evt, this.config.outputSampleRate);
