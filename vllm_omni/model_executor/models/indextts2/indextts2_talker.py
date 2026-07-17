@@ -98,6 +98,14 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
+        # Async omni output (mirrors the Qwen3-Omni talker): the S2Mel decoder
+        # reads the latent from the multimodal payload, never the raw talker
+        # hidden, so skip the per-step hidden-state D2H. eager flag required
+        # (has_postprocess=True). INERT until top-level async_chunk:true in
+        # indextts2.yaml (stage-0 async_scheduling is already on).
+        self.use_async_omni_output = True
+        self.eager_omni_postprocess_before_async_output = True
+        self.omni_pooler_payload_include_hidden = False
         self.requires_raw_input_tokens = True
         self.enable_update_additional_information = True
         # S2Mel consumes the complete code sequence only at request end, but

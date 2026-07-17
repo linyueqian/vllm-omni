@@ -615,6 +615,13 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.have_multimodal_outputs = True
+        # Async omni output (mirrors the Qwen3-Omni talker): Token2Wav consumes
+        # audio token IDs from the AR sample stream, not thinker hidden, so skip
+        # the per-step hidden-state D2H. No has_postprocess => no eager flag.
+        # INERT until the deploy runs the async scheduler (step_audio_2_async_chunk.yaml
+        # currently uses the sync OmniARScheduler).
+        self.use_async_omni_output = True
+        self.omni_pooler_payload_include_hidden = False
 
         config = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config

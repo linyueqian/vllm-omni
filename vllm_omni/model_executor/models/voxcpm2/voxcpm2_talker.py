@@ -837,6 +837,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
+        # Async omni output (mirrors the Qwen3-Omni talker): single-stage
+        # terminal audio model with no downstream stage that reads hidden, so
+        # skip the per-step hidden-state D2H. eager flag required
+        # (has_postprocess=True; postprocess is a no-op). INERT until top-level
+        # async_chunk:true in voxcpm2.yaml (stage-0 async_scheduling is on).
+        self.use_async_omni_output = True
+        self.eager_omni_postprocess_before_async_output = True
+        self.omni_pooler_payload_include_hidden = False
 
         self.model = MiniCPM4PagedForVoxCPM2(
             vllm_config=vllm_config,

@@ -330,6 +330,16 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         # vLLM's logits processor wires sampling metadata into the lm_head.
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
+        # Async omni output (mirrors the Qwen3-Omni talker): code2wav consumes
+        # only codec codes (text_hidden_states=None), never the talker hidden,
+        # so skip the per-step hidden-state D2H. eager flag required because
+        # has_postprocess=True. INERT under the shipped deploy (async_chunk +
+        # async_scheduling are off in higgs_audio_v2.yaml); a deploy that turns
+        # both on activates it (prefix caching is already off).
+        self.use_async_omni_output = True
+        self.eager_omni_postprocess_before_async_output = True
+        self.omni_pooler_payload_include_hidden = False
+
     # ----------------------------------------------------------------- masks
     @torch.inference_mode()
     def audio_token_mask(self, input_ids: torch.Tensor) -> torch.Tensor:

@@ -124,6 +124,14 @@ class MingFlashOmniForConditionalGeneration(
             )
             self.model = self.thinker
             self.make_empty_intermediate_tensors = self.thinker.make_empty_intermediate_tensors
+            # Async omni output (mirrors the Qwen3-Omni talker): the thinker ships
+            # detokenized text to the talker (thinker2talker_token_only), which
+            # retokenizes and never reads thinker hidden, so skip the per-step
+            # hidden-state D2H. No has_postprocess => no eager flag. INERT: the
+            # thinker->talker edge has no async-chunk producer yet, so activation
+            # (async_chunk:true in ming_flash_omni.yaml) is deferred.
+            self.use_async_omni_output = True
+            self.omni_pooler_payload_include_hidden = False
 
         elif self.model_stage == "imagegen":
             # Image generation is a separate diffusion stage; it does not run

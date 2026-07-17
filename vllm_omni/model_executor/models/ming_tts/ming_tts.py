@@ -71,6 +71,16 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
             self.has_postprocess = True
             self.set_custom_preprocess(self.preprocess)
             self.set_custom_postprocess(self.postprocess)
+            # Async omni output (mirrors the Qwen3-Omni talker): audio_vae reads
+            # ``ming_latent_patch`` from multimodal_outputs (and does
+            # ``del hidden_states``); the AR loop is fed by the eager postprocess,
+            # so the talker hidden is unused downstream -> skip the per-step
+            # hidden-state D2H. eager flag required (has_postprocess=True). INERT
+            # until stage-0 async_scheduling:true in ming_tts{,_moe}.yaml
+            # (async_chunk is already on).
+            self.use_async_omni_output = True
+            self.eager_omni_postprocess_before_async_output = True
+            self.omni_pooler_payload_include_hidden = False
         elif self.model_stage == "audio_vae":
             self.model = init_vllm_registered_model(vllm_config=vllm_config, architectures=["MingAudioVAEModel"])
             self.requires_raw_input_tokens = True
