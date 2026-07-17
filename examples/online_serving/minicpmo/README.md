@@ -135,12 +135,31 @@ page and proxies the same-origin Realtime WebSocket to the backend:
 ```bash
 python -m vllm_omni.experimental.fullduplex.web \
     --port 7862 \
-    --ws-backend ws://127.0.0.1:8099
+    --ws-backend ws://127.0.0.1:8099 \
+    --ref-audio /path/to/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav
 ```
 
 Open `http://<host>:7862/`. When using a reverse proxy, open the proxy URL that
 maps to port `7862`. The browser derives its WebSocket endpoint relative to
 that URL, preserving any proxy path prefix.
+
+Client behavior and options:
+
+- **Prompt presets**: the system prompt defaults to the official
+  MiniCPM-o-Demo presets — `Streaming Omni Conversation.` (omni preset, for
+  camera + voice) with the audio-call personas (中文通话 / English Call)
+  selectable, or fully custom text.
+- **Reference voice**: `--ref-audio` points at a wav whose voice the TTS
+  clones (the official demo defaults to its signature voice at
+  `assets/ref_audio/ref_minicpm_signature.wav`). Without it the model's
+  built-in timbre is used.
+- **Camera**: the **Camera** button streams ~1 fps JPEG frames riding the
+  audio appends (`video_frames` on `input_audio_buffer.append`, the official
+  omni contract) so the model sees while it listens.
+- **Auto-commit (client VAD)**: on by default; commits the turn after ~0.5 s
+  of post-speech silence. If the runtime does not start a response after a
+  commit (its auto-response currently only fires on the first turn), the
+  client requests one with `response.create` after a short fallback window.
 
 ## Notes
 

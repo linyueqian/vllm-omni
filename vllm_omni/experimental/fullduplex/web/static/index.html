@@ -28,6 +28,18 @@
           </label>
           <video id="cameraPreview" muted playsinline style="display:none;width:96px;height:72px;border-radius:8px;object-fit:cover;background:#000"></video>
         </div>
+        <div style="display:flex;gap:8px;align-items:flex-start;margin-top:8px;width:100%">
+          <label style="display:inline-flex;flex-direction:column;gap:4px;font-size:13px;opacity:.85;white-space:nowrap">
+            Prompt preset
+            <select id="promptPreset" style="font-size:13px;padding:4px 6px;border-radius:6px">
+              <option value="omni" selected>Omni (official omni preset)</option>
+              <option value="chinese_call">中文通话 (official audio preset)</option>
+              <option value="english_call">English Call (official audio preset)</option>
+              <option value="custom">Custom</option>
+            </select>
+          </label>
+          <textarea id="systemPrompt" rows="2" placeholder="System prompt" style="flex:1;font-size:13px;padding:6px 8px;border-radius:6px;resize:vertical">Streaming Omni Conversation.</textarea>
+        </div>
         <div class="meter" aria-label="Microphone level">
           <span>Mic</span>
           <div class="meter-track"><div id="meterFill" class="meter-fill"></div></div>

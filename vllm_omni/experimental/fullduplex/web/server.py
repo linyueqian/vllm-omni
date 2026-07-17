@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -65,14 +66,23 @@ def build_app(
     *,
     ws_backend: str = "ws://127.0.0.1:8099",
     model: str = "openbmb/MiniCPM-o-4_5",
+    ref_audio: str | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Experimental Full-Duplex Web Demo")
     index_path = STATIC_DIR / "index.html"
 
+    ref_audio_uri: str | None = None
+    if ref_audio:
+        ref_path = Path(ref_audio)
+        if not ref_path.is_file():
+            raise SystemExit(f"--ref-audio not found: {ref_audio}")
+        encoded = base64.b64encode(ref_path.read_bytes()).decode("ascii")
+        ref_audio_uri = f"data:audio/wav;base64,{encoded}"
+
     @app.get("/", response_class=HTMLResponse)
     def index() -> HTMLResponse:
         config = json.dumps(
-            {"model": model, "realtimePath": "v1/realtime"},
+            {"model": model, "realtimePath": "v1/realtime", "refAudio": ref_audio_uri},
             ensure_ascii=True,
         )
         html = index_path.read_text(encoding="utf-8").replace(
@@ -127,11 +137,19 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=7862)
     parser.add_argument("--ws-backend", default="ws://127.0.0.1:8099")
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
+    parser.add_argument(
+        "--ref-audio",
+        default=None,
+        help=(
+            "Optional reference voice wav for TTS voice cloning, e.g. the "
+            "official MiniCPM-o-Demo assets/ref_audio/ref_minicpm_signature.wav"
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
     uvicorn.run(
-        build_app(ws_backend=args.ws_backend, model=args.model),
+        build_app(ws_backend=args.ws_backend, model=args.model, ref_audio=args.ref_audio),
         host=args.host,
         port=args.port,
         log_level="info",

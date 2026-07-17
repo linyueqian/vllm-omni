@@ -7,6 +7,8 @@
   const cameraButton = document.getElementById('cameraButton');
   const cameraPreview = document.getElementById('cameraPreview');
   const autoCommitToggle = document.getElementById('autoCommitToggle');
+  const promptPreset = document.getElementById('promptPreset');
+  const systemPromptInput = document.getElementById('systemPrompt');
   const connectionState = document.getElementById('connectionState');
   const modelState = document.getElementById('modelState');
   const playbackState = document.getElementById('playbackState');
@@ -23,6 +25,25 @@
   const OUTPUT_RATE = 24000;
   const SEND_INTERVAL_MS = 200;
   const ECHO_GUARD_MS = 300;
+  // If the server has not started a response this long after a commit,
+  // send response.create (the auto-response only fires on the first turn).
+  const RESPONSE_CREATE_FALLBACK_MS = 900;
+  // A "still active" response with no deltas for this long is considered
+  // dead (e.g. truncated by barge-in without a terminal lifecycle event).
+  const RESPONSE_STALL_MS = 2000;
+
+  // Default prompts mirroring the official MiniCPM-o-Demo presets
+  // (assets/presets/{omni,audio_duplex}/*.yaml).
+  const PROMPT_PRESETS = {
+    omni: 'Streaming Omni Conversation.',
+    chinese_call: '扮演一个具有以上声音特征的助手。请认真、高质量地回复用户的问题。'
+      + '请用高自然度的方式和用户聊天。你处于双工模式，可以一边听、一边说。'
+      + '你是由面壁智能开发的人工智能助手：面壁小钢炮。',
+    english_call: 'Replicate the tone and style from the input audio. Your task is to be '
+      + 'a helpful assistant using this voice pattern. Please answer the user\'s questions '
+      + 'seriously and in a high quality. Please chat with the user in a high naturalness '
+      + 'style. You are in duplex mode, where you can listen and speak at the same time.',
+  };
 
   let socket = null;
   let mediaStream = null;
@@ -50,6 +71,50 @@
   let logCount = 0;
   let liveUserTurn = null;
   let liveAssistantTurn = null;
+  let responseCreateTimer = null;
+  let responseActiveNow = false;
+  let lastResponseDeltaAt = 0;
+
+  if (promptPreset && systemPromptInput) {
+    promptPreset.addEventListener('change', () => {
+      const preset = PROMPT_PRESETS[promptPreset.value];
+      if (preset !== undefined) systemPromptInput.value = preset;
+    });
+    systemPromptInput.addEventListener('input', () => {
+      promptPreset.value = 'custom';
+    });
+  }
+
+  /**
+   * Arm the post-commit fallback: the runtime auto-responds to the first
+   * input_audio_buffer.commit but not to later ones (post-response commits
+   * are mis-deferred as barge-in of an already-finished response). If the
+   * assistant is mid-response the commit was deferred server-side and starts
+   * on its own, so re-check instead of firing — unless deltas stalled, which
+   * means the response was truncated without a terminal event.
+   */
+  function armResponseCreateFallback() {
+    if (responseCreateTimer) clearTimeout(responseCreateTimer);
+    responseCreateTimer = setTimeout(() => {
+      responseCreateTimer = null;
+      if (!socket || socket.readyState !== WebSocket.OPEN || !running) return;
+      const streaming = responseActiveNow
+        && (performance.now() - lastResponseDeltaAt) < RESPONSE_STALL_MS;
+      if (streaming) {
+        armResponseCreateFallback();
+        return;
+      }
+      socket.send(JSON.stringify({ type: 'response.create' }));
+      appendLog('response.create fallback sent (auto-response missing)');
+    }, RESPONSE_CREATE_FALLBACK_MS);
+  }
+
+  function disarmResponseCreateFallback() {
+    if (responseCreateTimer) {
+      clearTimeout(responseCreateTimer);
+      responseCreateTimer = null;
+    }
+  }
 
   function realtimeUrl() {
     const url = new URL(config.realtimePath, window.location.href);
@@ -275,6 +340,7 @@
       uploadSilenceMs = 0;
       socket.send(JSON.stringify({ type: 'input_audio_buffer.commit', final: true }));
       appendLog('turn committed (end of utterance)');
+      armResponseCreateFallback();
     }
   }
 
@@ -340,10 +406,15 @@
         setModel('Listening');
         break;
       case 'response.created':
+        responseActiveNow = true;
+        disarmResponseCreateFallback();
+        beginAssistant(responseId);
+        break;
       case 'response.speak':
         beginAssistant(responseId);
         break;
       case 'response.audio.delta':
+        lastResponseDeltaAt = performance.now();
         currentResponseId = responseId || currentResponseId;
         assistantActive = true;
         setModel('Speaking');
@@ -355,6 +426,7 @@
         requestPlaybackDrain(responseId);
         break;
       case 'response.audio_transcript.delta':
+        lastResponseDeltaAt = performance.now();
         addTranscript('assistant', event.delta || '');
         break;
       case 'response.audio_transcript.done':
@@ -367,6 +439,7 @@
         finishTranscript('user', event.transcript || '');
         break;
       case 'response.done':
+        responseActiveNow = false;
         finishTranscript('assistant');
         if (!responseHasAudio) requestPlaybackDrain(responseId);
         break;
@@ -376,10 +449,18 @@
           runtimeDetail.textContent = `Playback committed ${acknowledgement.committed_ms || 0} ms`;
         }
         break;
-      case 'error':
+      case 'error': {
+        const errorCode = event.code || (event.error && event.error.code);
+        if (errorCode === 'response_already_active') {
+          // The fallback raced a response that is still winding down;
+          // retry quietly until the deferred turn starts.
+          armResponseCreateFallback();
+          break;
+        }
         setConnection('Error', 'error');
         runtimeDetail.textContent = String(event.error || event.code || 'Server error');
         break;
+      }
       default:
         break;
     }
@@ -436,17 +517,21 @@
       let settled = false;
       socket.onopen = () => {
         settled = true;
-        socket.send(JSON.stringify({
-          type: 'session.update',
-          session: {
-            modalities: ['audio', 'text'],
-            voice: 'default',
-            extra_body: {
-              auto_response: true,
-              minicpmo45_native_duplex: true,
-            },
-          },
-        }));
+        const extraBody = {
+          auto_response: true,
+          minicpmo45_native_duplex: true,
+        };
+        // Reference voice for TTS cloning, provided by the server via
+        // --ref-audio (mirrors the official demo's default ref audio).
+        if (config.refAudio) extraBody.ref_audio = config.refAudio;
+        const session = {
+          modalities: ['audio', 'text'],
+          voice: 'default',
+          extra_body: extraBody,
+        };
+        const instructions = systemPromptInput ? systemPromptInput.value.trim() : '';
+        if (instructions) session.instructions = instructions;
+        socket.send(JSON.stringify({ type: 'session.update', session }));
         runtimeDetail.textContent = `${captureRate} Hz capture / ${playbackRate} Hz playback`;
         appendLog(`websocket open  ${url}`);
         resolve();
@@ -566,6 +651,8 @@
   async function stopSession() {
     running = false;
     assistantActive = false;
+    responseActiveNow = false;
+    disarmResponseCreateFallback();
     pendingCapture = [];
     if (sendTimer !== null) clearInterval(sendTimer);
     if (clockTimer !== null) clearInterval(clockTimer);
