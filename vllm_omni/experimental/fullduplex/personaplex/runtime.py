@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import os
 import tarfile
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -72,6 +73,11 @@ class NativePersonaPlexEngine:
         self.config = config or PersonaPlexConfig()
         self.sample_rate = self.config.sample_rate
         self.frame_size = self.config.frame_size
+        # Serializes the single-session FrameStepper surface (open_session/step)
+        # across worker threads: a cancelled asyncio task cannot stop a running
+        # engine call, so a racing open() must wait for the in-flight step.
+        # The batched surface is serialized by BatchedSessionManager instead.
+        self._fs_lock = threading.Lock()
         self._loaded = False
         self._opened = False
         self._tokenizer = None
@@ -436,20 +442,22 @@ class NativePersonaPlexEngine:
     # -- single-session FrameStepper surface -------------------------------------
 
     def open_session(self, voice_prompt: str | None = None, persona: str | None = None) -> None:
-        if not self._loaded:
-            self.load()
-        # Always resolve a voice: falling back to the configured default here
-        # keeps a previous session's custom voice from leaking into this one.
-        self._load_voice(voice_prompt or self.config.voice_prompt)
-        self._reset_all_streaming()
-        self._boot_prefill(persona)
-        self._opened = True
+        with self._fs_lock:
+            if not self._loaded:
+                self.load()
+            # Always resolve a voice: falling back to the configured default here
+            # keeps a previous session's custom voice from leaking into this one.
+            self._load_voice(voice_prompt or self.config.voice_prompt)
+            self._reset_all_streaming()
+            self._boot_prefill(persona)
+            self._opened = True
 
     def step(self, user_pcm: NDArray[np.float32]):
-        pcm = np.ascontiguousarray(user_pcm, dtype=np.float32).reshape(-1)
-        if pcm.shape[0] != self.frame_size:
-            raise ValueError(f"expected {self.frame_size} samples per frame, got {pcm.shape[0]}")
-        outs = self.step_batch(pcm.reshape(1, -1))
+        with self._fs_lock:
+            pcm = np.ascontiguousarray(user_pcm, dtype=np.float32).reshape(-1)
+            if pcm.shape[0] != self.frame_size:
+                raise ValueError(f"expected {self.frame_size} samples per frame, got {pcm.shape[0]}")
+            outs = self.step_batch(pcm.reshape(1, -1))
         from vllm_omni.experimental.fullduplex.personaplex.engine import FrameOutput
 
         return outs[0] if outs[0] is not None else FrameOutput(audio=None, text=None)

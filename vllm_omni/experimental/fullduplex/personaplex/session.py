@@ -57,6 +57,11 @@ class PersonaPlexServingSessionState:
     closed: bool = False
     slot: Any = None  # batched mode: the claimed serving/batched.py Slot
     epoch: int = 0  # batched mode: slot epoch at claim time (stale-guard)
+    # Single-session mode: completion event of the engine call currently running
+    # on a worker thread. Task cancellation cannot stop that thread (and marks
+    # the asyncio future cancelled while the thread runs on), so the server
+    # waits on this event before releasing its lease (DuplexServer._engine_call).
+    inflight: Any = None
 
 
 class PersonaPlexSession:

@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import tarfile
@@ -119,6 +120,39 @@ class DuplexServer:
         self._active = True
         return True
 
+    async def _engine_call(self, state: PersonaPlexServingSessionState, fn, *args, **kwargs):
+        """Run one synchronous engine call on a worker thread, tracked for drain.
+
+        Cancelling the awaiting task does NOT stop the worker thread, and it
+        marks the asyncio wrapper future cancelled (``done()``) even while the
+        thread keeps running, so the future itself cannot signal completion.
+        The worker instead sets a plain ``threading.Event`` when the call truly
+        finishes; :meth:`_drain_inflight` waits on that event before the lease
+        is released. Without this, a fast reconnect could acquire the lease and
+        call ``open()`` while the previous connection's final ``step()`` is
+        still mutating the shared engine on its thread.
+        """
+        call = functools.partial(fn, *args, **kwargs)
+        finished = threading.Event()
+
+        def run_and_signal():
+            try:
+                return call()
+            finally:
+                finished.set()
+
+        state.inflight = finished
+        result = await asyncio.get_running_loop().run_in_executor(None, run_and_signal)
+        state.inflight = None  # on cancellation, the event stays referenced for drain
+        return result
+
+    @staticmethod
+    async def _drain_inflight(state: PersonaPlexServingSessionState, timeout: float = 5.0) -> None:
+        """Wait out any engine call still running on a worker thread."""
+        finished = state.inflight
+        if finished is not None and not finished.is_set():
+            await asyncio.to_thread(finished.wait, timeout)
+
     # ---- official Moshi protocol (Opus over aiohttp WS) ---------------------
 
     async def handle_chat(self, request: web.Request) -> web.WebSocketResponse:
@@ -126,17 +160,17 @@ class DuplexServer:
         await ws.prepare(request)
         if not await self._lease(ws):
             return ws
+        state = PersonaPlexServingSessionState()
         try:
             persona = (request.query.get("text_prompt") or "").strip() or None
             voice = (request.query.get("voice_prompt") or "").strip() or None
             sr = self.engine.sample_rate
             session = PersonaPlexSession(self.engine, self.config)
             # System-prompt prefill is seconds of GPU work; keep it off the loop.
-            await asyncio.to_thread(session.open, voice_prompt=voice, persona=persona)
+            await self._engine_call(state, session.open, voice_prompt=voice, persona=persona)
 
             reader = sphn.OpusStreamReader(sr)
             writer = sphn.OpusStreamWriter(sr)
-            state = PersonaPlexServingSessionState()
             await ws.send_bytes(b"\x00")  # ready handshake
 
             async def recv_loop() -> None:
@@ -161,7 +195,7 @@ class DuplexServer:
                         pcm = await asyncio.wait_for(state.pcm_queue.get(), timeout=0.25)
                     except asyncio.TimeoutError:
                         continue
-                    for frame_out in await asyncio.to_thread(session.feed, pcm):
+                    for frame_out in await self._engine_call(state, session.feed, pcm):
                         if frame_out.audio is not None:
                             opus = _opus_encode(writer, frame_out.audio)
                             if opus:
@@ -180,6 +214,10 @@ class DuplexServer:
                 with contextlib.suppress(Exception):
                     await ws.close()
         finally:
+            # A cancelled feed/open may still be running on its worker thread;
+            # wait it out BEFORE freeing the lease, or a fast reconnect races
+            # the shared engine (CUDA illegal access / cross-session bleed).
+            await self._drain_inflight(state)
             self._active = False
         return ws
 
@@ -191,29 +229,35 @@ class DuplexServer:
         if not await self._lease(ws):
             return ws
         session = PersonaPlexSession(self.engine, self.config)
+        state = PersonaPlexServingSessionState()
         opened = False
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
                     req = json.loads(msg.data)
                     if req.get("type") == "open":
-                        await asyncio.to_thread(session.open, voice_prompt=req.get("voice"), persona=req.get("persona"))
+                        await self._engine_call(
+                            state, session.open, voice_prompt=req.get("voice"), persona=req.get("persona")
+                        )
                         opened = True
                         await ws.send_json({"type": "ready"})
                     elif req.get("type") == "close":
                         if opened:
-                            await self._emit(ws, await asyncio.to_thread(session.flush))
+                            await self._emit(ws, await self._engine_call(state, session.flush))
                         await ws.send_json({"type": "done"})
                         break
                 elif msg.type == WSMsgType.BINARY:
                     if not opened:
-                        await asyncio.to_thread(session.open)
+                        await self._engine_call(state, session.open)
                         opened = True
                     pcm = np.frombuffer(msg.data, dtype=np.float32)
-                    await self._emit(ws, await asyncio.to_thread(session.feed, pcm))
+                    await self._emit(ws, await self._engine_call(state, session.feed, pcm))
                 elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
                     break
         finally:
+            # Same as handle_chat: wait out any worker-thread engine call
+            # before freeing the lease (see _engine_call).
+            await self._drain_inflight(state)
             self._active = False
             with contextlib.suppress(Exception):
                 await ws.close()
