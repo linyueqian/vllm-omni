@@ -18,12 +18,6 @@ class DuplexCapability:
 
     proactive: bool = False
 
-    # EXTENSION (ours, pending upstream discussion on PR #3907): declares a
-    # lockstep / frame-clocked model (Moshi-class): one eternal response driven by
-    # the input cadence (see DuplexSessionConfig.continuous). The serving layer
-    # mirrors this onto the session config so the runtime picks the lifecycle.
-    continuous: bool = False
-
 
 @dataclass
 class OutputChunk:
@@ -47,9 +41,3 @@ class DuplexAdapter(ABC):
     async def on_barge_in(self, session: DuplexSession) -> None: ...
 
     async def on_playback_ack(self, session: DuplexSession, cursor: int) -> None: ...
-
-    # EXTENSION (ours, pending upstream discussion on PR #3907): continuous-mode
-    # drain signal; the runtime calls this on close so a lockstep respond()
-    # generator can stop awaiting input and return cleanly. No-op for turn-based
-    # adapters.
-    async def on_close(self, session: DuplexSession) -> None: ...
