@@ -33,7 +33,7 @@ if not torch.cuda.is_available():  # noqa: E402
 
 from vllm_omni.experimental.fullduplex.personaplex.config import PersonaPlexConfig  # noqa: E402
 from vllm_omni.experimental.fullduplex.personaplex.runtime import (  # noqa: E402
-    NativePersonaPlexEngine,
+    PersonaPlexEngine,
 )
 
 B = 4
@@ -41,13 +41,13 @@ LIVE_TICKS = 40  # live frames compared per claim
 RECYCLE_AT = 10
 
 
-def _make_engine() -> NativePersonaPlexEngine:
+def _make_engine() -> PersonaPlexEngine:
     cfg = PersonaPlexConfig(batch_size=B)  # native stepper is greedy-only
-    return NativePersonaPlexEngine(cfg).load()
+    return PersonaPlexEngine(cfg).load()
 
 
 @pytest.fixture(scope="module")
-def engine() -> NativePersonaPlexEngine:
+def engine() -> PersonaPlexEngine:
     return _make_engine()
 
 
@@ -205,7 +205,7 @@ def _bench(batch_sizes: list[int]) -> None:
 
     for bs in batch_sizes:
         cfg = PersonaPlexConfig(batch_size=max(bs, 2))
-        eng = NativePersonaPlexEngine(cfg).load()
+        eng = PersonaPlexEngine(cfg).load()
         eng.open_batch()
         frame = eng.frame_size
         pcm = np.zeros((cfg.batch_size, frame), dtype=np.float32)

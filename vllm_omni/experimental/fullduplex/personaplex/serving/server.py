@@ -45,7 +45,6 @@ from huggingface_hub import hf_hub_download
 
 from vllm_omni.experimental.fullduplex.personaplex.config import PersonaPlexConfig
 from vllm_omni.experimental.fullduplex.personaplex.engine import PersonaPlexEngine
-from vllm_omni.experimental.fullduplex.personaplex.runtime import NativePersonaPlexEngine
 from vllm_omni.experimental.fullduplex.personaplex.serving.batched import BatchedSessionManager
 from vllm_omni.experimental.fullduplex.personaplex.session import (
     PersonaPlexServingSessionState,
@@ -286,7 +285,7 @@ class BatchedDuplexServer:
 
     def __init__(self, config: PersonaPlexConfig) -> None:
         self.config = config
-        self.engine = NativePersonaPlexEngine(config)
+        self.engine = PersonaPlexEngine(config)
         self.manager: BatchedSessionManager | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None

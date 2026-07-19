@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Slot manager + lockstep tick loop for batched PersonaPlex serving.
 
-Pure-python orchestration over a :class:`NativePersonaPlexEngine`-shaped object
+Pure-python orchestration over a :class:`PersonaPlexEngine`-shaped object
 (injected, so tests run GPU-free with a stub): a fixed table of B conversation
 slots, one shared wall-clock 80 ms tick that advances every non-idle slot, and
 per-slot recycle prefill for new callers.

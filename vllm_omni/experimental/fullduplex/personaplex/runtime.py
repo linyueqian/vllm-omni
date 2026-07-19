@@ -60,7 +60,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class NativePersonaPlexEngine:
+class PersonaPlexEngine:
     """Frame-lockstep PersonaPlex on native components only (no moshi).
 
     One class serves both surfaces: the single-session ``FrameStepper`` protocol
@@ -98,7 +98,7 @@ class NativePersonaPlexEngine:
 
     # -- loading --------------------------------------------------------------
 
-    def load(self) -> NativePersonaPlexEngine:
+    def load(self) -> PersonaPlexEngine:
         if self._loaded:
             return self
         import sentencepiece
@@ -382,7 +382,12 @@ class NativePersonaPlexEngine:
         return self._step_from_codes(codes, prefill)
 
     def step_codes(self, user_codes, prefill: dict[int, PrefillStep] | None = None):
-        """Test hook: drive the lockstep loop from precomputed user codes."""
+        """Drive the lockstep loop from precomputed user codes (golden replays).
+
+        Kept public deliberately: bit-exact golden-replay verification must
+        bypass the Mimi encoder, whose streaming conv state makes encoded
+        codes run-order dependent (valid but not reproducible token-for-token).
+        """
         return self._step_from_codes(user_codes.to(self.config.device).long(), prefill)
 
     def _step_from_codes(self, codes, prefill):

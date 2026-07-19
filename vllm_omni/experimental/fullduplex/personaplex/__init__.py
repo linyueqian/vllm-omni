@@ -7,13 +7,12 @@ speech-to-speech model. This package plugs it into the model-agnostic
 ``fullduplex/core`` seam without touching the engine:
 
 - :class:`PersonaPlexConfig`   immutable session config (voice / persona / sampling)
-- :class:`PersonaPlexEngine`   real Moshi/Mimi backend (``FrameStepper``)
+- :class:`PersonaPlexEngine`   the moshi-free lockstep engine (``FrameStepper``;
+  single session and B concurrent slots with elastic per-slot recycle)
 - :class:`PersonaPlexSession`  lockstep driver (the runnable serving primitive)
 - :class:`PersonaPlexDuplexAdapter`  the ``core.DuplexAdapter`` for lockstep audio
 - :class:`PersonaPlexDuplexRuntime`  the model-owned lockstep lifecycle
   (start-once / drain-on-close; ``core`` stays verbatim upstream)
-- :class:`NativePersonaPlexEngine`  the moshi-free lockstep engine (single
-  session and B concurrent slots with elastic per-slot recycle)
 """
 
 from vllm_omni.experimental.fullduplex.personaplex.adapter import (
@@ -26,14 +25,10 @@ from vllm_omni.experimental.fullduplex.personaplex.engine import (
     FrameStepper,
     PersonaPlexEngine,
 )
-from vllm_omni.experimental.fullduplex.personaplex.runtime import (
-    NativePersonaPlexEngine,
-    PrefillStep,
-)
+from vllm_omni.experimental.fullduplex.personaplex.runtime import PrefillStep
 from vllm_omni.experimental.fullduplex.personaplex.session import PersonaPlexSession
 
 __all__ = [
-    "NativePersonaPlexEngine",
     "FrameOutput",
     "FrameStepper",
     "PersonaPlexConfig",

@@ -62,17 +62,13 @@ class FrameStepper(Protocol):
 
 
 from vllm_omni.experimental.fullduplex.personaplex.runtime import (  # noqa: E402
-    NativePersonaPlexEngine,
+    PersonaPlexEngine,
     PrefillStep,
 )
-
-# The moshi-free native engine is the one and only implementation.
-PersonaPlexEngine = NativePersonaPlexEngine
 
 __all__ = [
     "FrameOutput",
     "FrameStepper",
-    "NativePersonaPlexEngine",
     "PersonaPlexEngine",
     "PrefillStep",
 ]
