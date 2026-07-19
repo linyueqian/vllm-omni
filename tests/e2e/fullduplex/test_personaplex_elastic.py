@@ -26,6 +26,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+
 if not torch.cuda.is_available():  # noqa: E402
     pytest.skip("needs CUDA", allow_module_level=True)
 
