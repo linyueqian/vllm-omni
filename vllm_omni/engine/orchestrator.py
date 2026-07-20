@@ -12,6 +12,7 @@ handled by :class:`MembershipController`, which is injected optionally.
 from __future__ import annotations
 
 import asyncio
+import os
 import time as _time
 from dataclasses import dataclass, field
 from typing import Any
@@ -52,6 +53,22 @@ from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+# VLLM_OMNI_EVENT_DRIVEN_ORCH=1 switches the orchestration loop (and the
+# serving-side final-output drain in entrypoints/async_omni.py) from the legacy
+# 1 ms poll cadence to event-driven wakeups: one reader task per live LLM stage
+# replica awaits `client.get_output_async()` directly — the same pattern vLLM's
+# own AsyncLLM output handler uses — and feeds a single serial dispatch queue.
+# Default off; the legacy poll loop remains the fallback.
+_EVENT_DRIVEN_ORCH_ENV = "VLLM_OMNI_EVENT_DRIVEN_ORCH"
+
+# How often the event-driven loop reconciles its reader-task set against
+# `live_replica_ids()` (elastic membership, dead-replica eviction) while idle.
+_ORCH_READER_RECONCILE_INTERVAL_S = 0.5
+
+
+def _event_driven_orch_enabled() -> bool:
+    return os.environ.get(_EVENT_DRIVEN_ORCH_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _build_terminal_empty_output(
@@ -258,6 +275,7 @@ class Orchestrator:
         self._stages_shutdown = False
         self._fatal_error: str | None = None
         self._fatal_error_stage_id: int | None = None
+        self._event_driven_orch = _event_driven_orch_enabled()
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
@@ -651,10 +669,84 @@ class Orchestrator:
     async def _orchestration_output_handler(self) -> None:
         """Poll all stages, handle transfers, send final outputs to main."""
         try:
-            await self._orchestration_loop()
+            if self._event_driven_orch:
+                await self._orchestration_loop_event_driven()
+            else:
+                await self._orchestration_loop()
         except asyncio.CancelledError:
             logger.debug("[Orchestrator] _orchestration_output_handler cancelled")
             return
+
+    async def _process_llm_stage_outputs(self, stage_id: int, replica_id: int, raw_outputs: Any) -> list[Any]:
+        """Process one raw LLM poll result; returns processed request outputs.
+
+        Shared by the legacy poll loop and the event-driven dispatcher so both
+        run the exact same per-output handling.
+        """
+        pool = self.stage_pools[stage_id]
+        await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+        for eco in raw_outputs.outputs:
+            req_state = self.request_states.get(getattr(eco, "request_id", None))
+            if req_state is None or not req_state.streaming.enabled:
+                continue
+            req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
+            req_state.streaming.new_prompt_len_snapshot = getattr(
+                eco,
+                "new_prompt_len_snapshot",
+                None,
+            )
+            if req_state.streaming.enabled:
+                await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
+        # OmniSchedulerMixin.make_stats() already throttles
+        # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
+        # being non-None means this replica passed its own gate.
+        # A second global throttle here would drop stats for
+        # other (stage, replica) pairs in the same 1s window.
+        record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
+        iteration_stats = IterationStats() if record_stats else None
+        raw_output = await pool.process_llm_raw_outputs(
+            replica_id,
+            raw_outputs,
+            iteration_stats=iteration_stats,
+        )
+        if record_stats:
+            self._stat_logger.record(
+                raw_outputs.scheduler_stats,
+                iteration_stats,
+                engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
+            )
+        return raw_output
+
+    async def _fatal_engine_dead(self, stage_id: int, e: BaseException) -> None:
+        """Promote a dead stage replica to an engine-wide fatal shutdown."""
+        logger.error(
+            "[Orchestrator] Stage-%s is dead: %s",
+            stage_id,
+            e,
+        )
+        # TODO: Fault handling is intentionally fail-stop at
+        # the orchestrator level today. If one replica in a
+        # logical stage dies, we promote it to `_fatal_error`,
+        # notify requests already admitted to that stage, and
+        # re-raise so `run()` shuts down all stages. This is
+        # conservative but means a single unhealthy replica in
+        # a multi-replica deployment can take down otherwise
+        # healthy replicas in other stages. Revisit this when
+        # adding per-replica fault isolation / eviction.
+        self._fatal_error = str(e)
+        self._fatal_error_stage_id = stage_id
+        for req_id, req_state in list(self.request_states.items()):
+            if stage_id in req_state.stage_submit_ts:
+                await self.output_async_queue.put(
+                    ErrorMessage(
+                        error=str(e),
+                        fatal=True,
+                        request_id=req_id,
+                        stage_id=stage_id,
+                    )
+                )
+                self.request_states.pop(req_id, None)
+        self._shutdown_event.set()
 
     async def _orchestration_loop(self) -> None:
         """Poll stage pools and route logical outputs."""
@@ -680,68 +772,11 @@ class Orchestrator:
                             if raw_outputs is None:
                                 continue
 
-                            await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
-                            for eco in raw_outputs.outputs:
-                                req_state = self.request_states.get(getattr(eco, "request_id", None))
-                                if req_state is None or not req_state.streaming.enabled:
-                                    continue
-                                req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
-                                req_state.streaming.new_prompt_len_snapshot = getattr(
-                                    eco,
-                                    "new_prompt_len_snapshot",
-                                    None,
-                                )
-                                if req_state.streaming.enabled:
-                                    await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
-                            # OmniSchedulerMixin.make_stats() already throttles
-                            # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
-                            # being non-None means this replica passed its own gate.
-                            # A second global throttle here would drop stats for
-                            # other (stage, replica) pairs in the same 1s window.
-                            record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
-                            iteration_stats = IterationStats() if record_stats else None
-                            raw_output = await pool.process_llm_raw_outputs(
-                                replica_id,
-                                raw_outputs,
-                                iteration_stats=iteration_stats,
-                            )
-                            if record_stats:
-                                self._stat_logger.record(
-                                    raw_outputs.scheduler_stats,
-                                    iteration_stats,
-                                    engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
-                                )
+                            raw_output = await self._process_llm_stage_outputs(stage_id, replica_id, raw_outputs)
                         except asyncio.CancelledError:
                             raise
                         except EngineDeadError as e:
-                            logger.error(
-                                "[Orchestrator] Stage-%s is dead: %s",
-                                stage_id,
-                                e,
-                            )
-                            # TODO: Fault handling is intentionally fail-stop at
-                            # the orchestrator level today. If one replica in a
-                            # logical stage dies, we promote it to `_fatal_error`,
-                            # notify requests already admitted to that stage, and
-                            # re-raise so `run()` shuts down all stages. This is
-                            # conservative but means a single unhealthy replica in
-                            # a multi-replica deployment can take down otherwise
-                            # healthy replicas in other stages. Revisit this when
-                            # adding per-replica fault isolation / eviction.
-                            self._fatal_error = str(e)
-                            self._fatal_error_stage_id = stage_id
-                            for req_id, req_state in list(self.request_states.items()):
-                                if stage_id in req_state.stage_submit_ts:
-                                    await self.output_async_queue.put(
-                                        ErrorMessage(
-                                            error=str(e),
-                                            fatal=True,
-                                            request_id=req_id,
-                                            stage_id=stage_id,
-                                        )
-                                    )
-                                    self.request_states.pop(req_id, None)
-                            self._shutdown_event.set()
+                            await self._fatal_engine_dead(stage_id, e)
                             raise
                         except Exception:
                             if self._shutdown_event.is_set():
@@ -761,6 +796,177 @@ class Orchestrator:
                 await asyncio.sleep(0.001)
             else:
                 await asyncio.sleep(0)
+
+    async def _orchestration_loop_event_driven(self) -> None:
+        """Event-driven variant of ``_orchestration_loop``.
+
+        Selected by ``VLLM_OMNI_EVENT_DRIVEN_ORCH=1``. One reader task per live
+        LLM stage replica awaits ``client.get_output_async()`` directly — the
+        same pattern vLLM's own ``AsyncLLM`` output handler uses — and feeds a
+        single dispatch queue. This coroutine consumes that queue serially, so
+        routing/handling semantics are identical to the legacy loop; only the
+        1 ms poll cadence (and its per-tick ``asyncio.wait_for`` task churn) is
+        removed. Diffusion stages keep their nowait-poll contract via a
+        per-pool poller task feeding the same queue.
+        """
+        ready_q: asyncio.Queue[tuple[str, int, int, Any]] = asyncio.Queue()
+        readers: dict[tuple[int, int], tuple[asyncio.Task, Any]] = {}
+        pollers: list[asyncio.Task] = []
+
+        async def _llm_replica_reader(stage_id: int, replica_id: int, client: Any) -> None:
+            try:
+                while not self._shutdown_event.is_set():
+                    raw_outputs = await client.get_output_async()
+                    if not raw_outputs.outputs:
+                        # Matches _poll_stage_raw: drop empty batches. A
+                        # poll-style client returns an empty batch instead of
+                        # blocking, so keep the legacy 1 ms cadence for those;
+                        # a blocking client only lands here on stats-only
+                        # ticks, where 1 ms of extra latency is irrelevant.
+                        await asyncio.sleep(0.001)
+                        continue
+                    await ready_q.put(("llm", stage_id, replica_id, raw_outputs))
+            except asyncio.CancelledError:
+                raise
+            except BaseException as e:  # noqa: BLE001 - routed to the dispatcher
+                await ready_q.put(("error", stage_id, replica_id, e))
+
+        async def _diffusion_poller(stage_id: int, pool: StagePool) -> None:
+            try:
+                while not self._shutdown_event.is_set():
+                    got = False
+                    for replica_id in pool.live_replica_ids():
+                        output = pool.poll_diffusion_output(replica_id)
+                        if output is None:
+                            continue
+                        await ready_q.put(("diffusion", stage_id, replica_id, output))
+                        got = True
+                    await asyncio.sleep(0 if got else 0.001)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as e:  # noqa: BLE001 - routed to the dispatcher
+                await ready_q.put(("error", stage_id, -1, e))
+
+        def _reconcile_readers() -> None:
+            """Spawn/reap LLM readers to track live replicas and client swaps."""
+            live: set[tuple[int, int]] = set()
+            for stage_id in range(self.num_stages):
+                pool = self.stage_pools[stage_id]
+                if pool.stage_type == "diffusion":
+                    continue
+                for replica_id in pool.live_replica_ids():
+                    client = pool.clients[replica_id]
+                    if client is None:
+                        continue
+                    key = (stage_id, replica_id)
+                    live.add(key)
+                    existing = readers.get(key)
+                    if existing is not None and not existing[0].done() and existing[1] is client:
+                        continue
+                    if existing is not None and not existing[0].done():
+                        existing[0].cancel()
+                    readers[key] = (
+                        asyncio.create_task(
+                            _llm_replica_reader(stage_id, replica_id, client),
+                            name=f"orch-reader-s{stage_id}r{replica_id}",
+                        ),
+                        client,
+                    )
+            for key in list(readers):
+                if key not in live:
+                    task, _ = readers.pop(key)
+                    task.cancel()
+
+        for stage_id in range(self.num_stages):
+            pool = self.stage_pools[stage_id]
+            if pool.stage_type == "diffusion":
+                pollers.append(
+                    asyncio.create_task(
+                        _diffusion_poller(stage_id, pool),
+                        name=f"orch-diffusion-poller-s{stage_id}",
+                    )
+                )
+        _reconcile_readers()
+        logger.info(
+            "[Orchestrator] Event-driven orchestration loop enabled (%s): %d LLM replica readers, %d diffusion pollers",
+            _EVENT_DRIVEN_ORCH_ENV,
+            len(readers),
+            len(pollers),
+        )
+
+        shutdown_task = asyncio.create_task(self._shutdown_event.wait(), name="orch-shutdown-wait")
+        pending_get: asyncio.Task | None = None
+        try:
+            while not self._shutdown_event.is_set():
+                if pending_get is None:
+                    pending_get = asyncio.create_task(ready_q.get(), name="orch-dispatch-get")
+                done, _ = await asyncio.wait(
+                    {pending_get, shutdown_task},
+                    timeout=_ORCH_READER_RECONCILE_INTERVAL_S,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if shutdown_task in done:
+                    return
+                if not done:
+                    # Idle reconcile tick (elastic membership, replaced clients).
+                    self._orch_monitor.note_loop(idle=True)
+                    _reconcile_readers()
+                    continue
+                kind, stage_id, replica_id, payload = pending_get.result()
+                pending_get = None
+                self._orch_monitor.note_loop(idle=False)
+
+                if kind == "diffusion":
+                    pool = self.stage_pools[stage_id]
+                    pool.record_output_timestamps([payload])
+                    await self._handle_processed_outputs(stage_id, replica_id, [payload])
+                    continue
+
+                if kind == "error":
+                    if isinstance(payload, EngineDeadError):
+                        await self._fatal_engine_dead(stage_id, payload)
+                        raise payload
+                    if self._shutdown_event.is_set():
+                        return
+                    logger.error(
+                        "[Orchestrator] Stage-%s replica-%s reader failed: %r",
+                        stage_id,
+                        replica_id,
+                        payload,
+                    )
+                    raise payload
+
+                try:
+                    raw_output = await self._process_llm_stage_outputs(stage_id, replica_id, payload)
+                except asyncio.CancelledError:
+                    raise
+                except EngineDeadError as e:
+                    await self._fatal_engine_dead(stage_id, e)
+                    raise
+                except Exception:
+                    if self._shutdown_event.is_set():
+                        return
+                    logger.exception(
+                        "[Orchestrator] Stage-%s replica-%s processing failed",
+                        stage_id,
+                        replica_id,
+                    )
+                    raise
+
+                await self._handle_processed_outputs(stage_id, replica_id, raw_output)
+        finally:
+            shutdown_task.cancel()
+            if pending_get is not None:
+                pending_get.cancel()
+            reader_tasks = [task for task, _ in readers.values()]
+            for task in reader_tasks:
+                task.cancel()
+            for task in pollers:
+                task.cancel()
+            cleanup = [shutdown_task, *reader_tasks, *pollers]
+            if pending_get is not None:
+                cleanup.append(pending_get)
+            await asyncio.gather(*cleanup, return_exceptions=True)
 
     async def _handle_processed_outputs(self, stage_id: int, replica_id: int, outputs: list[Any]) -> None:
         """Route processed stage outputs produced by one stage poll."""
