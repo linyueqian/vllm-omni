@@ -19,13 +19,13 @@ from vllm_omni.experimental.fullduplex.core.adapter import (
     DuplexCapability,
     OutputChunk,
 )
-from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.core.runtime import DuplexRuntime
 from vllm_omni.experimental.fullduplex.core.session import (
     DuplexSession,
     DuplexSessionConfig,
     DuplexState,
 )
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
