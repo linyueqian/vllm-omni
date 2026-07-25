@@ -26,7 +26,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+# slow + H100 + omni routes this module into the weekly Buildkite E2E group
+# ("Omni · H100" in .buildkite/cuda/test-weekly.yml: -m "slow and H100 and
+# omni" --run-level full_model); the ready/merge CPU sweeps exclude it by mark.
+pytestmark = [pytest.mark.full_model, pytest.mark.omni, pytest.mark.slow, pytest.mark.H100]
 
 if not torch.cuda.is_available():  # noqa: E402
     pytest.skip("needs CUDA", allow_module_level=True)
@@ -43,7 +46,13 @@ RECYCLE_AT = 10
 
 def _make_engine() -> PersonaPlexEngine:
     cfg = PersonaPlexConfig(batch_size=B)  # native stepper is greedy-only
-    return PersonaPlexEngine(cfg).load()
+    try:
+        return PersonaPlexEngine(cfg).load()
+    except Exception as exc:  # gated-repo access is environment-dependent
+        name = type(exc).__name__
+        if "Gated" in name or "401" in str(exc) or "403" in str(exc):
+            pytest.skip(f"no access to the gated nvidia/personaplex-7b-v1 repo: {name}")
+        raise
 
 
 @pytest.fixture(scope="module")
