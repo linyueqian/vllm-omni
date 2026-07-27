@@ -30,6 +30,20 @@ from .batched_token2wav import (
 logger = init_logger(__name__)
 
 
+def _resolve_model_dir(model_ref: str, revision: str | None = None) -> str:
+    """Resolve ``model_ref`` to a local directory containing the repo assets.
+
+    ``model_config.model`` is a filesystem path in local deployments but a
+    Hugging Face repo id in hub/CI deployments; the prompt-audio and
+    token2wav asset lookups need a real directory either way.
+    """
+    if Path(model_ref).is_dir():
+        return model_ref
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(model_ref, revision=revision, allow_patterns=["assets/*"])
+
+
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
     payload = {"reason": reason, **details}
     return RuntimeError(f"MiniCPMO45Code2WavBatchError {json.dumps(payload, sort_keys=True)}")
@@ -117,7 +131,10 @@ class MiniCPMO45Code2Wav(nn.Module):
         super().__init__()
         del prefix
         self.vllm_config = vllm_config
-        self.model_path = str(vllm_config.model_config.model)
+        self.model_path = _resolve_model_dir(
+            str(vllm_config.model_config.model),
+            revision=vllm_config.model_config.revision,
+        )
         self.backend: BatchedToken2Wav | None = None
         self._states: dict[str, _RequestState] = {}
         self._owned_prompt_wavs: dict[str, tuple[str, str]] = {}
