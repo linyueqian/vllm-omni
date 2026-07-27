@@ -1,27 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for ``minicpmo_4_5_code2wav._resolve_model_dir``.
+"""Unit tests for MiniCPM-o 4.5 code2wav model-dir resolution (#5442).
 
-Covers the hub/CI deployment path where ``model_config.model`` is a repo id
-rather than a local directory (issue #5442): asset lookups must resolve to
-the downloaded snapshot instead of treating the repo id as a relative path.
+In hub/CI deployments ``model_config.model`` is a repo id rather than a local
+directory, so asset lookups must resolve to the downloaded snapshot. The
+resolution must stay lazy: constructing the model with a fake path (as the
+CPU unit tests do) must not touch the hub.
 """
 
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import huggingface_hub
 import pytest
 
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
+    MiniCPMO45Code2Wav,
     _resolve_model_dir,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-def test_local_directory_is_returned_unchanged(tmp_path, monkeypatch):
+
+def _no_hub(monkeypatch):
     def _fail(*args, **kwargs):  # pragma: no cover - must not be reached
-        raise AssertionError("snapshot_download must not be called for local dirs")
+        raise AssertionError("snapshot_download must not be called here")
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _fail)
+
+
+def test_local_directory_is_returned_unchanged(tmp_path, monkeypatch):
+    _no_hub(monkeypatch)
     assert _resolve_model_dir(str(tmp_path)) == str(tmp_path)
 
 
@@ -49,3 +59,30 @@ def test_snapshot_download_failure_propagates(monkeypatch):
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _raise)
     with pytest.raises(FileNotFoundError):
         _resolve_model_dir("openbmb/MiniCPM-o-4_5")
+
+
+def test_init_with_fake_path_does_not_resolve(monkeypatch):
+    """Mirrors the CPU-test construction: fake model path, no ``revision``."""
+    _no_hub(monkeypatch)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="/fake/model",
+            stage_connector_config=None,
+        )
+    )
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+    assert model.model_path == "/fake/model"
+    assert model._default_prompt_wav == "/fake/model/assets/HT_ref_audio.wav"
+
+
+def test_default_prompt_wav_follows_resolved_model_path(monkeypatch):
+    _no_hub(monkeypatch)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="openbmb/MiniCPM-o-4_5",
+            stage_connector_config=None,
+        )
+    )
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+    model.model_path = "/resolved/snapshot"
+    assert model._default_prompt_wav == "/resolved/snapshot/assets/HT_ref_audio.wav"
