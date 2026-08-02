@@ -13,10 +13,10 @@ Greedy decoding makes every cross-slot leak observable as a bit difference:
 
 Run (moshi-free native stack; ~30 GB GPU + HF access to the gated repo; set
 PPLEX_QUESTION_WAV to a spoken-question wav to enable the coherence test):
-    pytest tests/e2e/fullduplex/test_personaplex_elastic.py -v -s
+    pytest tests/e2e/features/fullduplex/test_personaplex_elastic.py -v -s
 
 Bench (B sweep, ms/tick vs the 80 ms budget):
-    python tests/e2e/fullduplex/test_personaplex_elastic.py --bench 2 4 8 16
+    python tests/e2e/features/fullduplex/test_personaplex_elastic.py --bench 2 4 8 16
 """
 
 from __future__ import annotations

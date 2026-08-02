@@ -29,6 +29,34 @@ HF_TOKEN=... CUDA_VISIBLE_DEVICES=0 python -m \
   python duplex_client.py --url ws://localhost:8124/api/chat --input user.wav --out reply.wav
   ```
 
+## Unified Realtime API
+
+The default `vllm_omni/deploy/personaplex.yaml` also enables main's engine-owned
+full-duplex control plane:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main serve \
+  /path/to/personaplex-7b-v1 \
+  --omni \
+  --stage-configs-path vllm_omni/deploy/personaplex.yaml
+```
+
+Validate the actual `/v1/realtime?duplex=1` scheduler path with paced 24 kHz
+PCM, two concurrent sessions, overflow admission, per-session slot recycling,
+and non-silent output:
+
+```bash
+python tests/e2e/online_serving/personaplex_realtime_duplex.py \
+  --model /path/to/personaplex-7b-v1 \
+  --input-wav /path/to/speech.wav \
+  --output-dir /tmp/personaplex-realtime-duplex
+```
+
+This is distinct from the standalone `/api/chat` compatibility server above.
+The unified endpoint advertises `supports_barge_in=false`: overlapping speech
+is native model behavior, but destructive output interruption and model-state
+rewind have not been validated for PersonaPlex.
+
 ## Protocol (`/api/chat`)
 
 Binary WebSocket messages, first byte is a tag (identical to `moshi.server`):

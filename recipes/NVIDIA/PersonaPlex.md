@@ -143,13 +143,13 @@ python examples/offline_inference/personaplex/personaplex_offline.py \
 
 ```bash
 # GPU-free contract tests (stubbed FrameStepper)
-pytest tests/fullduplex/test_personaplex_adapter.py \
-       tests/fullduplex/test_personaplex_session.py \
-       tests/fullduplex/test_personaplex_batched.py -q
+pytest tests/e2e/features/fullduplex/test_personaplex_adapter.py \
+       tests/e2e/features/fullduplex/test_personaplex_session.py \
+       tests/e2e/features/fullduplex/test_personaplex_batched.py -q
 
 # GPU e2e: batched isolation + slot recycle (coherence check needs a real
 # question WAV via PPLEX_QUESTION_WAV)
-pytest tests/e2e/fullduplex/test_personaplex_elastic.py -q
+pytest tests/e2e/features/fullduplex/test_personaplex_elastic.py -q
 ```
 
 A green offline run producing a coherent spoken reply (and inner-monologue text

@@ -5,7 +5,8 @@
 Covers the DuplexFence identity value, the session identity rules (epoch only
 advances on barge-in, response_index once per begin_response), stale-output
 dropping in the turn lifecycle. The lockstep (single-eternal-response)
-lifecycle is model-owned (see tests/fullduplex/test_personaplex_adapter.py).
+lifecycle is model-owned (see
+tests/e2e/features/fullduplex/test_personaplex_adapter.py).
 """
 
 import asyncio
