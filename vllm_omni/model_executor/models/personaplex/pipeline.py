@@ -30,6 +30,14 @@ PERSONAPLEX_PIPELINE = PipelineConfig(
     model_type="personaplex",
     # Pipeline-level default; the code2wav stage overrides per-stage below.
     model_arch="PersonaPlexTalkerForConditionalGeneration",
+    default_deploy_config_name="personaplex.yaml",
+    duplex_runtime_extension=(
+        "vllm_omni.experimental.fullduplex.personaplex.runtime_extension.PersonaPlexDuplexRuntimeExtension"
+    ),
+    duplex_serving_adapter=(
+        "vllm_omni.experimental.fullduplex.personaplex.serving_adapter.PersonaPlexServingRuntimeAdapter"
+    ),
+    duplex_control_enabled=True,
     stages=(
         StagePipelineConfig(
             stage_id=0,
