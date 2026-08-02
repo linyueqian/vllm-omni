@@ -107,6 +107,7 @@ class DuplexServer:
         self.config = config
         self.engine = PersonaPlexEngine(config)
         self._active = False  # capacity-one session lease (event-loop confined)
+        self._lease_release_tasks: set[asyncio.Task] = set()
 
     def load(self) -> None:
         self.engine.load()
@@ -146,11 +147,38 @@ class DuplexServer:
         return result
 
     @staticmethod
-    async def _drain_inflight(state: PersonaPlexServingSessionState, timeout: float = 5.0) -> None:
+    async def _drain_inflight(state: PersonaPlexServingSessionState, timeout: float = 5.0) -> bool:
         """Wait out any engine call still running on a worker thread."""
         finished = state.inflight
+        if finished is None or finished.is_set():
+            return True
+        return bool(await asyncio.to_thread(finished.wait, timeout))
+
+    async def _release_lease_when_finished(self, state: PersonaPlexServingSessionState) -> None:
+        finished = state.inflight
         if finished is not None and not finished.is_set():
-            await asyncio.to_thread(finished.wait, timeout)
+            await asyncio.to_thread(finished.wait)
+        self._active = False
+
+    async def _release_lease_after_drain(
+        self,
+        state: PersonaPlexServingSessionState,
+        *,
+        timeout: float = 5.0,
+    ) -> bool:
+        """Release now when drained, otherwise retain the lease until completion."""
+        if await self._drain_inflight(state, timeout):
+            self._active = False
+            return True
+
+        logger.error(
+            "PersonaPlex engine cleanup exceeded %.1fs; retaining the session lease until the worker thread finishes",
+            timeout,
+        )
+        task = asyncio.create_task(self._release_lease_when_finished(state))
+        self._lease_release_tasks.add(task)
+        task.add_done_callback(self._lease_release_tasks.discard)
+        return False
 
     # ---- official Moshi protocol (Opus over aiohttp WS) ---------------------
 
@@ -216,8 +244,7 @@ class DuplexServer:
             # A cancelled feed/open may still be running on its worker thread;
             # wait it out BEFORE freeing the lease, or a fast reconnect races
             # the shared engine (CUDA illegal access / cross-session bleed).
-            await self._drain_inflight(state)
-            self._active = False
+            await self._release_lease_after_drain(state)
         return ws
 
     # ---- simple raw-PCM protocol (no Opus, for tests) ----------------------
@@ -256,8 +283,7 @@ class DuplexServer:
         finally:
             # Same as handle_chat: wait out any worker-thread engine call
             # before freeing the lease (see _engine_call).
-            await self._drain_inflight(state)
-            self._active = False
+            await self._release_lease_after_drain(state)
             with contextlib.suppress(Exception):
                 await ws.close()
         return ws

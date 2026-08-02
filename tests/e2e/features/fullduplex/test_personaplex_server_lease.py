@@ -12,11 +12,18 @@ connection's final ``step()`` is still mutating it.
 
 import asyncio
 import contextlib
+import sys
 import threading
+import types
 
 import pytest
 
-pytest.importorskip("sphn")  # serving-only dependency; skip where absent
+try:
+    import sphn  # noqa: F401
+except ImportError:
+    # These lease tests never encode/decode Opus. Keep the optional serving
+    # dependency from hiding dependency-free teardown regressions.
+    sys.modules["sphn"] = types.ModuleType("sphn")
 
 from vllm_omni.experimental.fullduplex.personaplex.config import PersonaPlexConfig
 from vllm_omni.experimental.fullduplex.personaplex.serving.server import DuplexServer
@@ -72,3 +79,23 @@ async def test_completed_engine_call_clears_inflight():
     assert result == "ok"
     assert state.inflight is None
     await server._drain_inflight(state)  # no-op on a clean state
+
+
+@pytest.mark.asyncio
+async def test_drain_timeout_keeps_lease_until_worker_finishes():
+    server = DuplexServer(PersonaPlexConfig())
+    server._active = True
+    state = PersonaPlexServingSessionState()
+    state.inflight = threading.Event()
+
+    drained = await server._release_lease_after_drain(state, timeout=0.01)
+
+    assert drained is False
+    assert server._active is True
+
+    state.inflight.set()
+    for _ in range(100):
+        if not server._active:
+            break
+        await asyncio.sleep(0.01)
+    assert server._active is False

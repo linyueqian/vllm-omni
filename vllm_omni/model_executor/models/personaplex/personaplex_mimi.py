@@ -43,6 +43,51 @@ FRAME_SIZE = 1920
 CODEBOOKS = 8
 
 
+def _map_moshi_codec_weights(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Map bundled Moshi codec keys to ``transformers.MimiModel`` keys."""
+
+    mapped: dict[str, torch.Tensor] = {}
+    transformer_prefixes = ("encoder_transformer.", "decoder_transformer.")
+    for name, tensor in state_dict.items():
+        if name.startswith(transformer_prefixes):
+            continue
+
+        if name.startswith("encoder.model."):
+            target = name.replace("encoder.model.", "encoder.layers.", 1)
+            target = target.replace(".conv.conv.", ".conv.")
+        elif name.startswith("decoder.model."):
+            target = name.replace("decoder.model.", "decoder.layers.", 1)
+            target = target.replace(".convtr.convtr.", ".conv.")
+            target = target.replace(".conv.conv.", ".conv.")
+        elif name.startswith("downsample.conv.conv.conv."):
+            target = name.replace("downsample.conv.conv.conv.", "downsample.conv.", 1)
+        elif name.startswith("upsample.convtr.convtr.convtr."):
+            target = name.replace("upsample.convtr.convtr.convtr.", "upsample.conv.", 1)
+        elif name.startswith("quantizer.rvq_first."):
+            target = name.replace(
+                "quantizer.rvq_first.",
+                "quantizer.semantic_residual_vector_quantizer.",
+                1,
+            )
+        elif name.startswith("quantizer.rvq_rest."):
+            target = name.replace(
+                "quantizer.rvq_rest.",
+                "quantizer.acoustic_residual_vector_quantizer.",
+                1,
+            )
+        else:
+            raise KeyError(f"unrecognized PersonaPlex Mimi checkpoint key: {name}")
+
+        target = target.replace(".vq.layers.", ".layers.")
+        target = target.replace("._codebook._initialized", ".codebook.initialized")
+        target = target.replace("._codebook.cluster_usage", ".codebook.cluster_usage")
+        target = target.replace("._codebook.embedding_sum", ".codebook.embed_sum")
+        mapped[target] = tensor
+    return mapped
+
+
 class _StreamConv1d:
     """Moshi ``RawStreamingConv1d``: causal left-context carry per call.
 
@@ -238,24 +283,44 @@ def _walk_seanet(layers) -> list[tuple[str, object]]:
     return stages
 
 
-class PersonaPlexMimiCodec:
+class PersonaPlexMimiCodec(nn.Module):
     """Streaming Mimi encode/decode at one 80 ms frame per call (moshi-free)."""
 
     def __init__(self, hf_repo: str = DEFAULT_HF_REPO, checkpoint: str | None = None, device: str = "cuda") -> None:
+        super().__init__()
         from huggingface_hub import hf_hub_download
         from safetensors.torch import load_file
-        from transformers import MimiModel
+        from transformers import MimiConfig, MimiModel
 
         self.device = torch.device(device)
-        self.model = MimiModel.from_pretrained(hf_repo).to(self.device).eval()
-        self.dtype = next(self.model.parameters()).dtype
 
         # The PersonaPlex repo ships the reference mimi checkpoint in the moshi
-        # fused layout; the transformers are loaded from it directly so the
-        # deployed weights (not just the HF conversion) are the source of truth.
+        # fused layout. Build the matching Transformers graph locally, then load
+        # every codec tensor from that bundled checkpoint. Only the two HF
+        # transformer stacks remain absent because the streaming implementations
+        # below replace them with the checkpoint's fused QKV layout.
         if checkpoint is None:
-            checkpoint = hf_hub_download("nvidia/personaplex-7b-v1", "tokenizer-e351c8d8-checkpoint125.safetensors")
+            checkpoint = hf_hub_download(
+                "nvidia/personaplex-7b-v1",
+                "tokenizer-e351c8d8-checkpoint125.safetensors",
+            )
         sd = load_file(checkpoint, device=str(self.device))
+        self.model = MimiModel(MimiConfig())
+        codec_state = _map_moshi_codec_weights(sd)
+        incompatible = self.model.load_state_dict(codec_state, strict=False)
+        expected_missing = {
+            name
+            for name in self.model.state_dict()
+            if name.startswith(("encoder_transformer.", "decoder_transformer."))
+        }
+        if set(incompatible.missing_keys) != expected_missing or incompatible.unexpected_keys:
+            raise RuntimeError(
+                "PersonaPlex Mimi checkpoint did not exactly cover the local codec graph: "
+                f"missing={sorted(set(incompatible.missing_keys) - expected_missing)}, "
+                f"unexpected={sorted(incompatible.unexpected_keys)}"
+            )
+        self.model = self.model.to(self.device).eval()
+        self.dtype = next(self.model.parameters()).dtype
         self.encoder_transformer = _MimiStreamingTransformer().to(self.device, self.dtype)
         self.decoder_transformer = _MimiStreamingTransformer().to(self.device, self.dtype)
         n_enc = self.encoder_transformer.load_weights(sd, "encoder_transformer")

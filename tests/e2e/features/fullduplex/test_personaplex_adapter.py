@@ -13,7 +13,11 @@ import numpy as np
 import pytest
 
 from vllm_omni.experimental.fullduplex.core import protocol as ev
-from vllm_omni.experimental.fullduplex.core.session import DuplexSession, DuplexSessionConfig
+from vllm_omni.experimental.fullduplex.core.session import (
+    DuplexSession,
+    DuplexSessionConfig,
+    DuplexState,
+)
 from vllm_omni.experimental.fullduplex.personaplex.adapter import (
     PersonaPlexDuplexAdapter,
     PersonaPlexDuplexRuntime,
@@ -48,6 +52,16 @@ class StubStepper:
         )
 
 
+class RecordingAdapter(PersonaPlexDuplexAdapter):
+    def __init__(self, stepper: StubStepper) -> None:
+        super().__init__(stepper)
+        self.closed = False
+
+    async def on_close(self, session: DuplexSession) -> None:
+        self.closed = True
+        await super().on_close(session)
+
+
 def _collector():
     out: list[dict] = []
 
@@ -60,6 +74,21 @@ def _collector():
 async def _feed(events):
     for e in events:
         yield e
+
+
+async def _raising_feed(frame):
+    yield {"type": ev.INPUT_APPEND, "modality": "audio", "data": frame}
+    await asyncio.sleep(0)
+    raise RuntimeError("input failed")
+
+
+def _respond_tasks() -> list[asyncio.Task]:
+    current = asyncio.current_task()
+    return [
+        task
+        for task in asyncio.all_tasks()
+        if task is not current and "_respond_once" in getattr(task.get_coro(), "__qualname__", "")
+    ]
 
 
 def _session():
@@ -140,6 +169,28 @@ async def test_iterator_eof_without_close_drains_and_stops():
     types = [e["type"] for e in out]
     assert types.count(ev.RESPONSE_DONE) == 1
     assert stub.steps == 1
+
+
+@pytest.mark.asyncio
+async def test_input_exception_closes_response_and_runtime() -> None:
+    stub = StubStepper()
+    adapter = RecordingAdapter(stub)
+    rt = PersonaPlexDuplexRuntime(_session(), adapter)
+    out, emit = _collector()
+    frame = np.zeros(FRAME_SIZE, dtype=np.float32)
+
+    with pytest.raises(RuntimeError, match="input failed"):
+        await rt.run(_raising_feed(frame), emit)
+
+    leaked = _respond_tasks()
+    for task in leaked:
+        task.cancel()
+    if leaked:
+        await asyncio.gather(*leaked, return_exceptions=True)
+
+    assert adapter.closed is True
+    assert rt.session.state is DuplexState.CLOSED
+    assert not leaked
 
 
 @pytest.mark.asyncio

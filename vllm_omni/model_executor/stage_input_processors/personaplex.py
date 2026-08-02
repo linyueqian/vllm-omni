@@ -103,29 +103,40 @@ def talker2code2wav_token_only(
 
 def talker2code2wav_full_payload(
     transfer_manager: Any = None,
-    multimodal_output: Any = None,
+    pooling_output: Any = None,
     request: Any = None,
     is_finished: bool = False,
-    **_: Any,
+    **kwargs: Any,
 ) -> OmniPayloadStruct:
     """Producer: collect the talker's accumulated agent codes -> Code2Wav input.
 
-    Called by the connector with (transfer_manager, multimodal_output, request,
-    is_finished). The codes live in the request's additional_information under
-    ("codes","audio") (talker_mtp_output_key), NOT in multimodal_output (which is
-    the engine "latent" output); read them from the request.
+    Called by the connector with (transfer_manager, pooling_output, request,
+    is_finished). Prefer the request's additional_information payload under
+    ("codes","audio") (talker_mtp_output_key), while accepting pooling_output
+    and the legacy multimodal_output keyword as compatibility fallbacks.
     """
     del transfer_manager, is_finished
-    info = getattr(request, "additional_information", None)
-    audio = None
-    if isinstance(info, dict):
-        nested = info.get("codes")
+
+    def _codes_from(src: Any) -> torch.Tensor | None:
+        if not isinstance(src, dict):
+            return None
+        nested = src.get("codes")
         audio = nested.get("audio") if isinstance(nested, dict) else None
-        if audio is None:
-            audio = info.get("codes.audio")
-    if audio is None and isinstance(multimodal_output, dict):
-        nested = multimodal_output.get("codes")
-        audio = nested.get("audio") if isinstance(nested, dict) else multimodal_output.get("codes.audio")
+        return audio if audio is not None else src.get("codes.audio")
+
+    audio = None
+    for source in (
+        getattr(request, "additional_information", None),
+        getattr(request, "additional_information_cpu", None),
+        pooling_output,
+        # Temporary compatibility shim for the two producer call contracts.
+        # Remove after https://github.com/vllm-project/vllm-omni/issues/4872
+        # provides validated full-payload and async-chunk processor protocols.
+        kwargs.get("multimodal_output"),
+    ):
+        audio = _codes_from(source)
+        if audio is not None:
+            break
     if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
         return _empty_finished_payload()
     flat = _agent_codes_to_codebook_major(audio)
@@ -150,12 +161,17 @@ def talker2code2wav_async_chunk(
     chunk's worth is ready (or the request finishes), then flushed.
     """
     request_id = getattr(request, "external_req_id", getattr(request, "request_id", "?"))
-    finished = bool(is_finished or (hasattr(request, "is_finished") and request.is_finished()))
-    buf = getattr(transfer_manager, "_pplex_frames", None)
-    if buf is None:
-        buf = {}
-        transfer_manager._pplex_frames = buf
-    frames = buf.setdefault(request_id, [])
+    # The adapter passes ``is_finished=True`` for both a resumable segment
+    # boundary and the terminal request boundary. PersonaPlex must preserve the
+    # delayed cb1..7 tail across the former; only a non-resumable stop flushes
+    # the stream.
+    finished = bool(is_finished and not getattr(request, "resumable", False))
+    request_payload = getattr(transfer_manager, "request_payload", None)
+    if not isinstance(request_payload, dict):
+        request_payload = {}
+        transfer_manager.request_payload = request_payload
+    state = request_payload.setdefault(request_id, {})
+    frames = state.setdefault("personaplex_frames", [])
 
     # Codes live in the server-side request's additional_information under
     # ("codes","audio") (talker_mtp_output_key), not in multimodal_output (latent).
@@ -179,18 +195,46 @@ def talker2code2wav_async_chunk(
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk = int(cfg.get("codec_chunk_frames", 25))
+    initial_chunk = int(cfg.get("initial_codec_chunk_frames") or 0)
+    if chunk <= 0 or initial_chunk < 0:
+        raise ValueError(
+            "PersonaPlex codec chunk sizes must be positive/non-negative: "
+            f"codec_chunk_frames={chunk}, initial_codec_chunk_frames={initial_chunk}"
+        )
+    target_frames = initial_chunk if not state.get("personaplex_emitted") and initial_chunk > 0 else chunk
 
-    if len(frames) < chunk and not finished:
+    # De-delay needs one successor raw frame: N output acoustic frames require
+    # N + 1 raw depformer rows.
+    available_frames = max(0, len(frames) - 1)
+    if available_frames < target_frames and not finished:
+        # Each full-duplex input frame is a resumable stage-0 segment. Returning
+        # None would make the generic chunk adapter synthesize a
+        # segment-finished marker, wake Code2Wav with its one-token placeholder,
+        # and discard the buffered de-delay tail. Explicitly keep this transport
+        # chunk non-terminal until enough successor frames exist.
+        pending = torch.tensor(False, dtype=torch.bool)
+        return OmniPayloadStruct(
+            meta=MetaStruct(
+                finished=pending,
+                is_segment_finished=pending,
+            )
+        )
+    emit_frames = available_frames if finished else target_frames
+    if emit_frames <= 0:
+        if finished:
+            request_payload.pop(request_id, None)
+            return _empty_finished_payload()
         return None
-    if not frames:
-        return _empty_finished_payload() if finished else None
 
-    stacked = torch.stack(frames, dim=0)  # [F, dep_q]
+    stacked = torch.stack(frames[: emit_frames + 1], dim=0)  # [F+1, dep_q]
     flat = _agent_codes_to_codebook_major(stacked)
-    # De-delay drops the last frame (its cb1..7 come from the NEXT frame), so it
-    # must seed the next chunk or one acoustic frame is lost per chunk boundary.
-    # On finish there is no successor, so the tail is legitimately dropped.
-    buf[request_id] = [] if finished else [frames[-1]]
+    if finished:
+        request_payload.pop(request_id, None)
+    else:
+        # Row ``emit_frames`` is the successor used by the last emitted frame
+        # and the cb0 source for the next frame.
+        state["personaplex_frames"] = frames[emit_frames:]
+        state["personaplex_emitted"] = True
     return OmniPayloadStruct(
         codes=CodesStruct(audio=flat),
         meta=MetaStruct(finished=torch.tensor(bool(finished), dtype=torch.bool)),

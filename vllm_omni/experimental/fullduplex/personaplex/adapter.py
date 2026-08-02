@@ -120,34 +120,38 @@ class PersonaPlexDuplexRuntime(DuplexRuntime):
 
     async def run(self, inputs: AsyncIterator[dict], emit: Emit) -> None:
         task: asyncio.Task | None = None
-        async for event in inputs:
-            etype = event.get("type")
-            if etype == ev.INPUT_APPEND:
-                modality = event.get("modality", "")
-                if modality not in self._capabilities.input_modalities:
-                    await emit(ev.error(f"unsupported input modality: {modality}"))
-                    continue
-                await self.adapter.on_input(self.session, modality, event.get("data"))
-                self.session.state = DuplexState.LISTENING
-                task = self._ensure_started(task, emit)
-            elif etype in (ev.INPUT_COMMIT, ev.RESPONSE_CREATE):
-                task = self._ensure_started(task, emit)
-            elif etype == ev.RESPONSE_CANCEL:
-                # Barge-in is native for lockstep models: bump the epoch for the
-                # playback cursor but keep the single response streaming.
-                await self._barge_in()
-                await emit(ev.cancelled(self.session.response_index))
-            elif etype == ev.PLAYBACK_ACK:
-                await self.adapter.on_playback_ack(self.session, int(event.get("cursor", 0)))
-            elif etype == ev.CLOSE:
-                break
-        # Drain on EVERY exit path: an input iterator that ends without an
-        # explicit CLOSE (transport drop) must not leave the eternal response
-        # blocked on its inbox forever.
-        if task is not None and not task.done():
-            await self.adapter.on_close(self.session)
-            await task
-        self.session.state = DuplexState.CLOSED
+        try:
+            async for event in inputs:
+                etype = event.get("type")
+                if etype == ev.INPUT_APPEND:
+                    modality = event.get("modality", "")
+                    if modality not in self._capabilities.input_modalities:
+                        await emit(ev.error(f"unsupported input modality: {modality}"))
+                        continue
+                    await self.adapter.on_input(self.session, modality, event.get("data"))
+                    self.session.state = DuplexState.LISTENING
+                    task = self._ensure_started(task, emit)
+                elif etype in (ev.INPUT_COMMIT, ev.RESPONSE_CREATE):
+                    task = self._ensure_started(task, emit)
+                elif etype == ev.RESPONSE_CANCEL:
+                    # Barge-in is native for lockstep models: bump the epoch for the
+                    # playback cursor but keep the single response streaming.
+                    await self._barge_in()
+                    await emit(ev.cancelled(self.session.response_index))
+                elif etype == ev.PLAYBACK_ACK:
+                    await self.adapter.on_playback_ack(self.session, int(event.get("cursor", 0)))
+                elif etype == ev.CLOSE:
+                    break
+        finally:
+            # Drain on EVERY exit path: CLOSE, iterator EOF, transport errors,
+            # and cancellation must not leave the eternal response blocked on
+            # its inbox or the session outside CLOSED.
+            try:
+                if task is not None and not task.done():
+                    await self.adapter.on_close(self.session)
+                    await task
+            finally:
+                self.session.state = DuplexState.CLOSED
 
     def _ensure_started(self, task: asyncio.Task | None, emit: Emit) -> asyncio.Task:
         # Start the single eternal response exactly once; never supersede it.
