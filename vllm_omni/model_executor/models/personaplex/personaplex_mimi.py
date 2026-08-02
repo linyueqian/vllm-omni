@@ -319,6 +319,10 @@ class PersonaPlexMimiCodec(nn.Module):
                 f"missing={sorted(set(incompatible.missing_keys) - expected_missing)}, "
                 f"unexpected={sorted(incompatible.unexpected_keys)}"
             )
+        # The fused streaming transformers below replace these unloaded HF
+        # stacks. Drop their randomly initialized weights before moving Mimi to
+        # the target device.
+        del self.model.encoder_transformer, self.model.decoder_transformer
         self.model = self.model.to(self.device).eval()
         self.dtype = next(self.model.parameters()).dtype
         self.encoder_transformer = _MimiStreamingTransformer().to(self.device, self.dtype)
@@ -355,7 +359,10 @@ class PersonaPlexMimiCodec(nn.Module):
         self.decoder_transformer.streaming_init(batch_size)
 
     def reset_streaming(self) -> None:
-        self.streaming_init(self._batch_size)
+        assert self._batch_size is not None
+        for state in self._conv_states():
+            for b in range(self._batch_size):
+                state.reset_slot(b)
         self.encoder_transformer.reset_streaming()
         self.decoder_transformer.reset_streaming()
 
@@ -391,6 +398,15 @@ class PersonaPlexMimiCodec(nn.Module):
     def decode_frame(self, codes: torch.Tensor) -> torch.Tensor:
         """``[B, 8]`` codes -> ``[B, frame_size]`` float PCM."""
         emb = self.model.quantizer.decode(codes.to(self.device).view(-1, CODEBOOKS, 1))
+        emb = self._upsample(emb)
+        emb = self.decoder_transformer.step(emb.transpose(1, 2)).transpose(1, 2)
+        x = self._run_stages(emb, self._dec_stages)
+        return x[:, 0, :]
+
+    @torch.no_grad()
+    def decode_frames(self, codes: torch.Tensor) -> torch.Tensor:
+        """``[B, 8, F]`` codes -> ``[B, F * frame_size]`` float PCM."""
+        emb = self.model.quantizer.decode(codes.to(self.device))
         emb = self._upsample(emb)
         emb = self.decoder_transformer.step(emb.transpose(1, 2)).transpose(1, 2)
         x = self._run_stages(emb, self._dec_stages)

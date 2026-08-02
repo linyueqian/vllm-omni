@@ -173,6 +173,9 @@ class OmniEngineArgs(EngineArgs):
     # Must be declared here so engine_args dict propagation does not silently
     # drop the value when constructing OmniEngineArgs from kwargs.
     active_stream_window: int = 0
+    # Engine admission is the single source of truth for per-stage pools of
+    # model-owned streaming state (codec, decoder, and similar resources).
+    duplex_max_sessions: int = 1
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
@@ -353,6 +356,7 @@ class OmniEngineArgs(EngineArgs):
             async_chunk=self.async_chunk,
             retains_state_across_chunks=self.retains_state_across_chunks,
             active_stream_window=self.active_stream_window,
+            duplex_max_sessions=self.duplex_max_sessions,
             model_stage=self.model_stage,
             model_arch=self.model_arch,
             worker_type=self.worker_type,

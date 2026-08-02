@@ -42,6 +42,8 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
 
+_MIMI_DECODE_BATCH_FRAMES = 5
+
 
 def _codec_ids_from_payload_or_input(
     input_ids: torch.Tensor,
@@ -92,13 +94,15 @@ class PersonaPlexCode2Wav(nn.Module):
         self._output_sample_rate = int(getattr(mimi_cfg, "sample_rate", 24000))
         self._samples_per_frame = int(getattr(mimi_cfg, "samples_per_frame", 1920))
         self._mimi_name = getattr(mimi_cfg, "mimi_name", None) or getattr(self.config, "mimi_name", None)
+        self._max_codec_sessions = int(getattr(vllm_config.model_config, "duplex_max_sessions", 1))
 
         # The Mimi module is constructed in load_weights() (it owns its own
         # weight format) and assigned here so vLLM's memory profiler can see it.
         self.mimi: nn.Module | None = None
+        self._additional_mimi = nn.ModuleList()
         self._mimi_device: torch.device | None = None
         self._request_codes: dict[str, torch.Tensor] = {}
-        self._codec_owner: str | None = None
+        self._request_codec_slots: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Runner-facing no-op / placeholder hooks (mirror Qwen3TTSCode2Wav).
@@ -278,37 +282,67 @@ class PersonaPlexCode2Wav(nn.Module):
         return incoming
 
     def _decode_streaming_frames(self, request_id: str | None, codes_kf: torch.Tensor) -> torch.Tensor:
-        assert self.mimi is not None
-        if not hasattr(self.mimi, "decode_frame"):
+        codec, ephemeral = self._codec_for_request(request_id)
+        if not hasattr(codec, "decode_frame"):
             raise RuntimeError("PersonaPlex Code2Wav requires a streaming Mimi decoder")
 
-        if request_id is None:
-            self.mimi.streaming_init(1)
-        elif self._codec_owner is None:
-            self.mimi.streaming_init(1)
-            self._codec_owner = request_id
-        elif self._codec_owner != request_id:
-            raise RuntimeError(
-                "PersonaPlex Code2Wav supports a single live streaming request: "
-                f"active={self._codec_owner!r}, requested={request_id!r}"
-            )
-
-        chunks = [
-            self._flatten_wav(self.mimi.decode_frame(codes_kf[:, frame].unsqueeze(0)))
-            for frame in range(codes_kf.shape[1])
-        ]
+        decode_frames = getattr(codec, "decode_frames", None)
+        chunks: list[torch.Tensor] = []
+        for start in range(0, codes_kf.shape[1], _MIMI_DECODE_BATCH_FRAMES):
+            frame_batch = codes_kf[:, start : start + _MIMI_DECODE_BATCH_FRAMES]
+            if frame_batch.shape[1] > 1 and callable(decode_frames):
+                chunks.append(self._flatten_wav(decode_frames(frame_batch.unsqueeze(0))))
+            else:
+                chunks.extend(
+                    self._flatten_wav(codec.decode_frame(frame_batch[:, frame].unsqueeze(0)))
+                    for frame in range(frame_batch.shape[1])
+                )
         wav = torch.cat(chunks, dim=0) if chunks else codes_kf.new_empty(0, dtype=torch.float32)
-        if request_id is None:
-            self.mimi.reset_streaming()
+        if ephemeral:
+            codec.reset_streaming()
         return wav
+
+    def _set_mimi_codecs(self, codecs: list[nn.Module]) -> None:
+        if not codecs:
+            raise ValueError("PersonaPlex Code2Wav requires at least one Mimi decoder")
+        self.mimi = codecs[0]
+        self._additional_mimi = nn.ModuleList(codecs[1:])
+        self._request_codec_slots.clear()
+
+    def _mimi_codecs(self) -> list[nn.Module]:
+        if self.mimi is None:
+            return []
+        return [self.mimi, *self._additional_mimi]
+
+    def _codec_for_request(self, request_id: str | None) -> tuple[nn.Module, bool]:
+        codecs = self._mimi_codecs()
+        if not codecs:
+            raise RuntimeError("PersonaPlexCode2Wav.forward called before Mimi was loaded in load_weights().")
+        occupied = set(self._request_codec_slots.values())
+        if request_id is not None:
+            slot = self._request_codec_slots.get(request_id)
+            if slot is None:
+                slot = next((index for index in range(len(codecs)) if index not in occupied), None)
+                if slot is None:
+                    raise RuntimeError(f"PersonaPlex Code2Wav decoder capacity {len(codecs)} is exhausted")
+                codecs[slot].streaming_init(1)
+                self._request_codec_slots[request_id] = slot
+            return codecs[slot], False
+
+        slot = next((index for index in range(len(codecs)) if index not in occupied), None)
+        if slot is None:
+            raise RuntimeError(f"PersonaPlex Code2Wav decoder capacity {len(codecs)} is exhausted")
+        codecs[slot].streaming_init(1)
+        return codecs[slot], True
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for request_id in finished_req_ids:
             state_id = str(request_id)
             self._request_codes.pop(state_id, None)
-            if self._codec_owner == state_id and self.mimi is not None:
-                self.mimi.reset_streaming()
-                self._codec_owner = None
+            slot = self._request_codec_slots.pop(state_id, None)
+            codecs = self._mimi_codecs()
+            if slot is not None and slot < len(codecs):
+                codecs[slot].reset_streaming()
 
     @staticmethod
     def _flatten_wav(wav: torch.Tensor) -> torch.Tensor:
@@ -365,18 +399,35 @@ class PersonaPlexCode2Wav(nn.Module):
         )
 
         checkpoint = Path(self.model_path) / (self._mimi_name or "tokenizer-e351c8d8-checkpoint125.safetensors")
-        self.mimi = PersonaPlexMimiCodec(
-            checkpoint=str(checkpoint) if checkpoint.is_file() else None,
-            device=str(device),
-        ).eval()
+        codecs = [
+            PersonaPlexMimiCodec(
+                checkpoint=str(checkpoint) if checkpoint.is_file() else None,
+                device=str(device),
+            ).eval()
+            for _ in range(self._max_codec_sessions)
+        ]
+        self._set_mimi_codecs(codecs)
         self._mimi_device = torch.device(str(device))
-        reported_sr = getattr(self.mimi.model.config, "sampling_rate", None)
+        reported_sr = getattr(codecs[0].model.config, "sampling_rate", None)
         if reported_sr is not None:
             self._output_sample_rate = int(reported_sr)
+        bytes_per_mib = 1024**2
+        per_slot_weight_mib = (
+            sum(parameter.numel() * parameter.element_size() for parameter in codecs[0].parameters()) / bytes_per_mib
+        )
+        total_weight_mib = (
+            sum(parameter.numel() * parameter.element_size() for codec in codecs for parameter in codec.parameters())
+            / bytes_per_mib
+        )
         logger.info(
-            "PersonaPlex Code2Wav loaded Mimi (transformers): num_codebooks=%d sample_rate=%d samples_per_frame=%d",
+            "PersonaPlex Code2Wav loaded %d Mimi stream(s): "
+            "per_slot_weight_mib=%.2f total_weight_mib=%.2f "
+            "num_codebooks=%d sample_rate=%d samples_per_frame=%d",
+            len(codecs),
+            per_slot_weight_mib,
+            total_weight_mib,
             self._num_codebooks,
             self._output_sample_rate,
             self._samples_per_frame,
         )
-        return {f"mimi.{name}" for name, _ in self.mimi.named_parameters()}
+        return {name for name, _ in self.named_parameters() if name.startswith(("mimi.", "_additional_mimi."))}

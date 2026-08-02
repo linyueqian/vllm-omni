@@ -10,8 +10,13 @@
 #     first-chunk latency (not correctness).
 #   * Stage 1 (code2wav) wraps the external Mimi codec. Each codec frame is
 #     8 active codebooks (cb 0..7) -> 1920 PCM samples @ 24 kHz / 12.5 Hz.
-#   * Stage 0 runs cudagraph by default; Stage 1 (Mimi) defaults to eager-off
-#     so the external decoder can use its own kernels.
+#   * Stage 0 runs cudagraph by default; Stage 1 (Mimi) is eager because the
+#     external decoder performs host-to-device copies that cannot be captured.
+pipeline: personaplex
+session_mode: duplex
+duplex_session:
+  max_sessions: 2
+
 async_chunk: true
 
 connectors:
@@ -34,7 +39,10 @@ stages:
     max_num_seqs: 10
     gpu_memory_utilization: 0.4
     trust_remote_code: true
-    enable_prefix_caching: true
+    skip_tokenizer_init: true
+    # Prompt IDs are placeholders; voice/persona/audio semantics live in
+    # request-specific embeddings, so token-ID prefix caching is invalid.
+    enable_prefix_caching: false
     async_scheduling: true
     max_num_batched_tokens: 512
     # Temporal transformer sliding_window is 3000 frames; keep model len within.
@@ -56,8 +64,9 @@ stages:
   - stage_id: 1
     max_num_seqs: 10
     gpu_memory_utilization: 0.3
-    enforce_eager: false
+    enforce_eager: true
     trust_remote_code: true
+    skip_tokenizer_init: true
     enable_prefix_caching: false
     async_scheduling: true
     # Codec prefill length is num_codebooks * num_frames; keep ample headroom.
