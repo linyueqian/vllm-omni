@@ -17,16 +17,18 @@ logger = init_logger(__name__)
 
 _STATS_INTERVAL_S = 1.0
 
-# Upper bound on how long a request may sit in full-payload-input wait
-# (the state ``OmniSchedulingCoordinator`` records via ``_waiting_since``)
-# before the scheduler force-fails it.  Defends against stuck consumer-side
-# requests when the producer drops a full-payload, send fails, or recv
-# never arrives.  Override per-deployment via
-# VLLM_OMNI_INPUT_WAIT_TIMEOUT_S; set <=0 to disable the safety net.
+# Upper bound on how long a request may wait for stage input before the
+# scheduler force-fails it.  Defends against stuck consumer-side requests when
+# the producer drops a payload, send fails, or recv never arrives.  Override
+# per-deployment via VLLM_OMNI_INPUT_WAIT_TIMEOUT_S; set <=0 to disable the
+# safety net.
 #
-# Scope: this constant only covers the full-payload coordinator path
-# (``input_coordinator``).  The async-chunk path uses
-# ``chunk_transfer_adapter`` and is not affected by this constant.
+# Scope: both transports.  The full-payload path measures time parked in
+# WAITING_FOR_INPUT (``OmniSchedulingCoordinator._waiting_since``); the
+# async-chunk path measures time stalled in WAITING_FOR_CHUNK
+# (``OmniChunkTransferAdapter._waiting_since``, reset on each chunk arrival).
+# One knob, because the question it answers -- "how long may a request wait for
+# stage input?" -- does not depend on which transport carries it.
 _INPUT_WAIT_TIMEOUT_RAW = os.environ.get("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", "600")
 try:
     DEFAULT_INPUT_WAIT_TIMEOUT_S: float = float(_INPUT_WAIT_TIMEOUT_RAW)
@@ -117,9 +119,9 @@ class OmniSchedulerMixin:
         Disabled when ``DEFAULT_INPUT_WAIT_TIMEOUT_S`` is <= 0.
 
         Scope: only covers ``input_coordinator`` (full-payload path).
-        Async-chunk requests park in ``chunk_transfer_adapter`` instead
-        and are not handled here -- if a similar safety net is needed
-        for the chunk path, it belongs in the chunk adapter.
+        Async-chunk requests park in ``chunk_transfer_adapter`` instead and
+        are handled by ``_process_pending_chunk_timeouts`` below, which shares
+        this timeout.
         """
         if DEFAULT_INPUT_WAIT_TIMEOUT_S <= 0:
             return
@@ -134,6 +136,43 @@ class OmniSchedulerMixin:
             return
         logger.warning(
             "Marking %d request(s) as FINISHED_ERROR after waiting > %.0fs for connector input: %s",
+            len(present_ids),
+            DEFAULT_INPUT_WAIT_TIMEOUT_S,
+            sorted(present_ids),
+        )
+        self.finish_requests(present_ids, RequestStatus.FINISHED_ERROR)
+
+    def _process_pending_chunk_timeouts(self) -> None:
+        """Force-fail requests stalled in ``WAITING_FOR_CHUNK`` too long.
+
+        The async-chunk counterpart of ``_process_pending_input_timeouts``,
+        called right after ``chunk_transfer_adapter.process_pending_chunks``.
+        Until now the chunk path had no safety net at all: the scheduler-side
+        comment on the full-payload net said a similar guard "belongs in the
+        chunk adapter", while the worker mixin assumed the full-payload net
+        already covered it.  Only the first was true, so a dropped terminal
+        chunk or a producer that exhausted its send retries parked the request
+        forever (vllm-project/vllm-omni#3833).  Since ``async_chunk: true`` is
+        the default for the flagship TTS pipelines, that was the default
+        streaming path.
+
+        Shares ``VLLM_OMNI_INPUT_WAIT_TIMEOUT_S`` with the full-payload net:
+        one knob for "how long may a request wait for stage input", regardless
+        of which transport carries it.  Disabled when the value is <= 0.
+        """
+        if DEFAULT_INPUT_WAIT_TIMEOUT_S <= 0:
+            return
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is None or not getattr(adapter, "receives_chunks", False):
+            return
+        timed_out_ids = adapter.collect_timed_out_request_ids(timeout_s=DEFAULT_INPUT_WAIT_TIMEOUT_S)
+        if not timed_out_ids:
+            return
+        present_ids = {req_id for req_id in timed_out_ids if req_id in self.requests}
+        if not present_ids:
+            return
+        logger.warning(
+            "Marking %d request(s) as FINISHED_ERROR after stalling > %.0fs waiting for a chunk: %s",
             len(present_ids),
             DEFAULT_INPUT_WAIT_TIMEOUT_S,
             sorted(present_ids),

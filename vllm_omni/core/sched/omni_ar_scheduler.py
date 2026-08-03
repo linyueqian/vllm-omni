@@ -258,6 +258,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.chunk_transfer_adapter.process_pending_chunks(
                 self.waiting, self.running, scheduler_requests=self.requests
             )
+            self._process_pending_chunk_timeouts()
 
         original_waiting = None
         if self._should_defer_waiting_admission():
