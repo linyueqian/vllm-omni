@@ -1,0 +1,46 @@
+== Extrapolation ceiling ==
+  blocked train max D*: 35.0s  cal max: 29.4s  test max: 79.2s
+  gbm-q0.9 max prediction anywhere: 38.0s
+
+== Knife test run r2.4_t3_s1: raw prediction vs truth (blocked model) ==
+  actual  p50 0.98 p90 1.30 max 1.74
+  rawpred p50 2.36 p90 7.41 max 15.15
+
+== Clean test runs, actual D* q0.9 (tax context, blocked) ==
+  r2.0_t3_s0: actual q0.9 = 0.452s  bound_mean would-be tax vs actual need
+  r2.2_t0_s0: actual q0.9 = 0.457s  bound_mean would-be tax vs actual need
+  r2.2_t3_s0: actual q0.9 = 0.563s  bound_mean would-be tax vs actual need
+
+== Deep-collapse test run r3.3_t3_s1: where coverage dies (blocked) ==
+  time-quarter (0, 0.25): actual p50    8.3s  bound p50    5.6s  cov 0.419
+  time-quarter (0.25, 0.5): actual p50   27.5s  bound p50   24.7s  cov 0.282
+  time-quarter (0.5, 0.75): actual p50   44.0s  bound p50   24.4s  cov 0.000
+  time-quarter (0.75, 1.0): actual p50   62.5s  bound p50   24.4s  cov 0.000
+
+== LOLO-knife: per-run coverage on the 4 knife test runs ==
+  Qc = 16.45s; cal runs: ['r2.0_t3_s0', 'r2.2_t0_s0', 'r2.2_t3_s0', 'r3.0_t0_s1', 'r3.0_t3_s1', 'r3.3_t0_s1', 'r3.3_t3_s1']
+  r2.4_t0_s0: actual p50/p90  1.76/ 5.84  rawpred p50  1.69  rawcov 0.552  cov 1.000  bound_mean 19.57
+  r2.4_t3_s0: actual p50/p90  1.24/ 2.30  rawpred p50  1.53  rawcov 0.814  cov 1.000  bound_mean 18.77
+  r2.4_t0_s1: actual p50/p90  0.45/ 0.74  rawpred p50  0.58  rawcov 0.874  cov 1.000  bound_mean 17.42
+  r2.4_t3_s1: actual p50/p90  0.98/ 1.30  rawpred p50  1.41  rawcov 0.934  cov 1.000  bound_mean 18.99
+
+== LOLO-cc: per-clean-run coverage (train knife only) ==
+  Qc = -0.09s
+  r1.6_t0_s0  : actual q0.9  0.46  cov 0.684  bound_mean  0.39
+  r1.6_t3_s0  : actual q0.9  0.72  cov 0.625  bound_mean  0.38
+  r1.6_t0_s1  : actual q0.9  0.27  cov 0.776  bound_mean  0.27
+  r1.6_t3_s1  : actual q0.9  0.32  cov 0.786  bound_mean  0.30
+  r1.8_t0_s0  : actual q0.9  0.30  cov 0.825  bound_mean  0.30
+  r1.8_t3_s0  : actual q0.9  0.36  cov 0.768  bound_mean  0.34
+  r2.0_t0_s0  : actual q0.9  0.37  cov 0.777  bound_mean  0.36
+  r2.0_t3_s0  : actual q0.9  0.45  cov 0.717  bound_mean  0.40
+  r2.2_t0_s0  : actual q0.9  0.46  cov 0.733  bound_mean  0.45
+  r2.2_t3_s0  : actual q0.9  0.56  cov 0.657  bound_mean  0.47
+
+== Effective run-level heterogeneity in cal (blocked): residual q0.9 per cal run ==
+  r2.4_t0_s1   knife     residual q0.9 =   -0.04s
+  r2.8_t0_s1   collapse  residual q0.9 =   -0.06s
+  r2.8_t3_s1   collapse  residual q0.9 =    6.59s
+  r3.0_t0_s1   collapse  residual q0.9 =    6.40s
+  r1.8_t3_s0   clean     residual q0.9 =   -0.02s
+  r2.0_t0_s0   clean     residual q0.9 =   -0.02s

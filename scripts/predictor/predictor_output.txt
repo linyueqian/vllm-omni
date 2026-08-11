@@ -1,0 +1,89 @@
+== Run allocation (blocked split) ==
+  r1.6_t0_s0     clean     -> train
+  r1.6_t3_s0     clean     -> train
+  r2.4_t0_s0     knife     -> train
+  r2.4_t3_s0     knife     -> train
+  r2.8_t0_s0     collapse  -> train
+  r2.8_t3_s0     collapse  -> train
+  r3.0_t0_s0     collapse  -> train
+  r3.0_t3_s0     collapse  -> train
+  r3.3_t0_s0     collapse  -> train
+  r3.3_t3_s0     collapse  -> train
+  r1.6_t0_s1     clean     -> train
+  r1.6_t3_s1     clean     -> train
+  r2.4_t0_s1     knife     -> cal
+  r2.4_t3_s1     knife     -> test
+  r2.8_t0_s1     collapse  -> cal
+  r2.8_t3_s1     collapse  -> cal
+  r3.0_t0_s1     collapse  -> cal
+  r3.0_t3_s1     collapse  -> test
+  r3.3_t0_s1     collapse  -> test
+  r3.3_t3_s1     collapse  -> test
+  r1.8_t0_s0     clean     -> train
+  r1.8_t3_s0     clean     -> cal
+  r2.0_t0_s0     clean     -> cal
+  r2.0_t3_s0     clean     -> test
+  r2.2_t0_s0     clean     -> test
+  r2.2_t3_s0     clean     -> test
+
+gbm target space chosen on blocked CAL: raw=0.6373 log=0.6285 -> log_target=True
+
+split                              method             pinball  cov@90  rawcov      Qc  taxMean  taxP95 taxSrc
+-------------------------------------------------------------------------------------------------------------
+blocked                            global-q0.9         6.8795   0.620   0.676   -4.72     7.43    7.43   test
+blocked                            load-bucket-q0.9    3.9724   0.695   0.713   -0.04     0.81    1.14   test
+blocked                            gbm-q0.9            4.1945   0.708   0.677    0.13     0.67    1.05   test
+blocked                            gbm-mean            5.0747   0.676   0.455    1.00     1.36    1.55   test
+lolo-knife (train clean+collapse)  global-q0.9         1.0498   1.000   1.000   27.49    39.31   39.31   cal*
+lolo-knife (train clean+collapse)  load-bucket-q0.9    0.3191   1.000   0.824   17.38    17.85   18.05   cal*
+lolo-knife (train clean+collapse)  gbm-q0.9            0.3409   1.000   0.796   16.45    16.93   17.34   cal*
+lolo-knife (train clean+collapse)  gbm-mean            0.3677   1.000   0.550   22.06    22.41   22.62   cal*
+lolo-cc (train knife only)         global-q0.9         4.3897   0.520   0.695   -2.67     1.30    1.30   test
+lolo-cc (train knife only)         load-bucket-q0.9    4.6407   0.332   0.657   -0.42     0.17    0.84   test
+lolo-cc (train knife only)         gbm-q0.9            4.5223   0.519   0.621   -0.09     0.37    0.71   test
+lolo-cc (train knife only)         gbm-mean            4.7353   0.555   0.444    0.06     0.37    0.63   test
+
+== Per-regime test breakdown (gbm-q0.9 rows plus baselines) ==
+  blocked                            global-q0.9       clean     n= 1110 pinball=  1.1800 cov=1.000 bound_mean=   7.43 bound_p95=   7.43
+  blocked                            global-q0.9       knife     n=  437 pinball=  1.1273 cov=1.000 bound_mean=   7.43 bound_p95=   7.43
+  blocked                            global-q0.9       collapse  n= 1729 pinball= 11.9924 cov=0.280 bound_mean=   7.43 bound_p95=   7.43
+  blocked                            load-bucket-q0.9  clean     n= 1110 pinball=  0.0508 cov=0.957 bound_mean=   0.81 bound_p95=   1.14
+  blocked                            load-bucket-q0.9  knife     n=  437 pinball=  0.3083 cov=0.989 bound_mean=   3.91 bound_p95=   6.30
+  blocked                            load-bucket-q0.9  collapse  n= 1729 pinball=  7.4162 cov=0.453 bound_mean=  16.99 bound_p95=  25.65
+  blocked                            gbm-q0.9          clean     n= 1110 pinball=  0.0210 cov=0.998 bound_mean=   0.67 bound_p95=   1.05
+  blocked                            gbm-q0.9          knife     n=  437 pinball=  0.2473 cov=0.995 bound_mean=   3.46 bound_p95=   9.28
+  blocked                            gbm-q0.9          collapse  n= 1729 pinball=  7.8714 cov=0.448 bound_mean=  15.96 bound_p95=  26.85
+  blocked                            gbm-mean          clean     n= 1110 pinball=  0.0252 cov=1.000 bound_mean=   1.36 bound_p95=   1.55
+  blocked                            gbm-mean          knife     n=  437 pinball=  0.0851 cov=1.000 bound_mean=   2.52 bound_p95=   4.44
+  blocked                            gbm-mean          collapse  n= 1729 pinball=  9.5776 cov=0.387 bound_mean=  13.68 bound_p95=  24.23
+  lolo-knife (train clean+collapse)  global-q0.9       knife     n= 1704 pinball=  1.0498 cov=1.000 bound_mean=  39.31 bound_p95=  39.31
+  lolo-knife (train clean+collapse)  load-bucket-q0.9  knife     n= 1704 pinball=  0.3191 cov=1.000 bound_mean=  19.27 bound_p95=  23.68
+  lolo-knife (train clean+collapse)  gbm-q0.9          knife     n= 1704 pinball=  0.3409 cov=1.000 bound_mean=  18.67 bound_p95=  24.26
+  lolo-knife (train clean+collapse)  gbm-mean          knife     n= 1704 pinball=  0.3677 cov=1.000 bound_mean=  23.31 bound_p95=  25.38
+  lolo-cc (train knife only)         global-q0.9       clean     n= 3214 pinball=  0.3688 cov=1.000 bound_mean=   1.30 bound_p95=   1.30
+  lolo-cc (train knife only)         global-q0.9       collapse  n= 6446 pinball=  6.3946 cov=0.281 bound_mean=   1.30 bound_p95=   1.30
+  lolo-cc (train knife only)         load-bucket-q0.9  clean     n= 3214 pinball=  0.0325 cov=0.251 bound_mean=   0.17 bound_p95=   0.84
+  lolo-cc (train knife only)         load-bucket-q0.9  collapse  n= 6446 pinball=  6.9383 cov=0.372 bound_mean=   2.32 bound_p95=   6.17
+  lolo-cc (train knife only)         gbm-q0.9          clean     n= 3214 pinball=  0.0213 cov=0.735 bound_mean=   0.37 bound_p95=   0.71
+  lolo-cc (train knife only)         gbm-q0.9          collapse  n= 6446 pinball=  6.7666 cov=0.411 bound_mean=   2.33 bound_p95=   4.29
+  lolo-cc (train knife only)         gbm-mean          clean     n= 3214 pinball=  0.0247 cov=0.867 bound_mean=   0.37 bound_p95=   0.63
+  lolo-cc (train knife only)         gbm-mean          collapse  n= 6446 pinball=  7.0840 cov=0.399 bound_mean=   1.91 bound_p95=   3.34
+
+== Permutation importance (gbm-q0.9, blocked split, test block, pinball) ==
+  s0_running             dPinball   3.6255 +- 0.0418
+  client_inflight        dPinball   2.0675 +- 0.0255
+  s1_running             dPinball   0.5184 +- 0.0176
+  s1_waiting             dPinball   0.3282 +- 0.0078
+  s1_qtime_sum_delta     dPinball   0.0716 +- 0.0086
+  s0_waiting             dPinball   0.0544 +- 0.0016
+  s1_qtime_count_delta   dPinball   0.0101 +- 0.0089
+  s0_kv_usage            dPinball  -0.7817 +- 0.0266
+
+== Per-test-run coverage, gbm-q0.9 conformalized (blocked split) ==
+  r2.4_t3_s1     knife     n= 437 cov=0.995 bound_mean=  3.46
+  r3.0_t3_s1     collapse  n= 539 cov=0.755 bound_mean=  9.17
+  r3.3_t0_s1     collapse  n= 595 cov=0.444 bound_mean= 17.93
+  r3.3_t3_s1     collapse  n= 595 cov=0.175 bound_mean= 20.14
+  r2.0_t3_s0     clean     n= 346 cov=1.000 bound_mean=  0.61
+  r2.2_t0_s0     clean     n= 382 cov=1.000 bound_mean=  0.71
+  r2.2_t3_s0     clean     n= 382 cov=0.995 bound_mean=  0.67
