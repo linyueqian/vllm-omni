@@ -24,6 +24,7 @@ from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.legato_laxity import LegatoLaxityTracker
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
@@ -55,6 +56,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 stage_id=getattr(model_config, "stage_id", 0),
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
+        # Legato v2: laxity-ordered admission/allocation for async-chunk
+        # consumer stages.  None unless VLLM_OMNI_LEGATO_LAXITY is truthy.
+        self.legato_laxity = LegatoLaxityTracker.maybe_create(model_config, self.chunk_transfer_adapter)
 
     @staticmethod
     def _record_prefill_stats(request: Request) -> None:
@@ -123,6 +127,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.chunk_transfer_adapter.process_pending_chunks(
                 self.waiting, self.running, scheduler_requests=self.requests
             )
+
+        if self.legato_laxity is not None:
+            # Legato v2: lowest laxity first, for both step-batch allocation
+            # (self.running scan order under token_budget below) and
+            # admission (self.waiting pop order under max_num_running_reqs).
+            self.legato_laxity.order_queues(self.running, self.waiting)
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled
@@ -244,6 +254,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Return skipped waiting requests
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
+
+        if self.legato_laxity is not None and num_scheduled_tokens:
+            # Credit the chunk frames dispatched this step (per-stream
+            # cumulative decode progress for the laxity computation).
+            self.legato_laxity.note_scheduled(num_scheduled_tokens.keys(), self.requests)
 
         # If fast path scheduled none, fall back to the original scheduling
         if not num_scheduled_tokens:
@@ -389,6 +404,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 )
             if self.input_coordinator:
                 self.input_coordinator.restore_queues(self.waiting)
+            if self.legato_laxity is not None:
+                # Keep self.running laxity-ascending after restore_queues
+                # appended chunk-waiting returners, so the adapter's
+                # over-cap tail preemption (process_pending_chunks, next
+                # cycle) evicts the highest-laxity stream, not FCFS tail.
+                self.legato_laxity.order_queues(self.running)
 
         return self._wrap_omni_scheduler_output(scheduler_output)
 
@@ -433,13 +454,13 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        if self.input_coordinator is None:
-            return super()._free_request(request, delay_free_blocks)
-
         try:
             return super()._free_request(request, delay_free_blocks)
         finally:
-            self._free_input_coordinator_request(request.request_id)
+            if self.input_coordinator is not None:
+                self._free_input_coordinator_request(request.request_id)
+            if self.legato_laxity is not None:
+                self.legato_laxity.free(request.request_id)
 
     def update_from_output(
         self,
