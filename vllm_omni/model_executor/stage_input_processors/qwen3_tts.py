@@ -16,7 +16,10 @@ from vllm_omni.data_entry_keys import (
 )
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     AdaptiveCadenceState,
+    SystemPressureTracker,
     compute_adaptive_emit,
+    compute_coordinated_emit,
+    parse_chunk_coordinated,
     compute_dynamic_initial_chunk_size,
     compute_ramp_emit,
     max_ic_for_chunk_size,
@@ -120,6 +123,14 @@ def talker2code2wav_async_chunk(
     if adaptive is not None:
         ramp = None
 
+    # Coordinated cadence (Legato controller v1): supersedes adaptive and ramp.
+    if not hasattr(transfer_manager, "_coordinated_parsed"):
+        transfer_manager._coordinated_parsed = parse_chunk_coordinated(cfg)
+    coordinated = transfer_manager._coordinated_parsed
+    if coordinated is not None:
+        adaptive = None
+        ramp = None
+
     # Per-request override takes priority over dynamic IC.
     fixed_initial_chunk_size = configured_initial_chunk_size > 0
     initial_chunk_size = configured_initial_chunk_size
@@ -180,7 +191,34 @@ def talker2code2wav_async_chunk(
             )
         return None
 
-    if adaptive is not None:
+    if coordinated is not None:
+        coord_states = getattr(transfer_manager, "_adaptive_states", None)
+        if coord_states is None:
+            coord_states = {}
+            transfer_manager._adaptive_states = coord_states
+        if request_id not in coord_states:
+            coord_states[request_id] = AdaptiveCadenceState()
+        tracker = getattr(transfer_manager, "_pressure_tracker", None)
+        if tracker is None:
+            tracker = SystemPressureTracker()
+            transfer_manager._pressure_tracker = tracker
+        emit, context_length = compute_coordinated_emit(
+            length,
+            request_id,
+            coord_states,
+            tracker,
+            coordinated,
+            finished,
+            time.time(),
+        )
+        if not emit:
+            return None
+        if context_length == 0:
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+            )
+    elif adaptive is not None:
         adaptive_states = getattr(transfer_manager, "_adaptive_states", None)
         if adaptive_states is None:
             adaptive_states = {}
