@@ -16,6 +16,7 @@ this file only asserts the wiring from the mixin to that API.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -201,3 +202,55 @@ def test_process_pending_chunk_timeouts_disabled_when_timeout_zero(monkeypatch):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# --- R1.4: VLLM_OMNI_INPUT_WAIT_TIMEOUT_S is parsed at import time, so each of
+# these reloads the module under a different environment. One knob now gates the
+# deadline on both transports, which is why a silent 0 matters more than it did
+# when only the full-payload path used it.
+
+def _reload_with(monkeypatch, raw):
+    import importlib
+
+    import vllm_omni.core.sched.omni_scheduler_mixin as mod
+
+    if raw is None:
+        monkeypatch.delenv("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", raw)
+    return importlib.reload(mod)
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (None, 600.0),
+        ("30", 30.0),
+        ("0.5", 0.5),
+        ("0", 0.0),  # explicit opt-out is still honoured
+    ],
+)
+def test_timeout_accepts_valid_values(monkeypatch, raw, expected):
+    mod = _reload_with(monkeypatch, raw)
+    assert mod.DEFAULT_INPUT_WAIT_TIMEOUT_S == expected
+
+
+@pytest.mark.parametrize("raw", ["-1", "-600", "-0.5"])
+def test_negative_timeout_falls_back_instead_of_disabling(monkeypatch, raw):
+    """A negative value is a typo, not an opt-out; -600 must not mean "off"."""
+    mod = _reload_with(monkeypatch, raw)
+    assert mod.DEFAULT_INPUT_WAIT_TIMEOUT_S == 600.0
+
+
+def test_zero_warns_and_names_both_transports(monkeypatch, caplog):
+    with caplog.at_level(logging.WARNING):
+        mod = _reload_with(monkeypatch, "0")
+    assert mod.DEFAULT_INPUT_WAIT_TIMEOUT_S == 0.0
+    text = caplog.text
+    assert "DISABLED" in text
+    assert "WAITING_FOR_INPUT" in text and "WAITING_FOR_CHUNK" in text
+
+
+def test_unparseable_timeout_falls_back(monkeypatch):
+    mod = _reload_with(monkeypatch, "not-a-number")
+    assert mod.DEFAULT_INPUT_WAIT_TIMEOUT_S == 600.0

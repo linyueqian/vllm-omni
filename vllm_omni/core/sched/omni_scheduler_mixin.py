@@ -52,15 +52,38 @@ _STATS_INTERVAL_S = 1.0
 # (``OmniChunkTransferAdapter._waiting_since``, reset on each chunk arrival).
 # One knob, because the question it answers -- "how long may a request wait for
 # stage input?" -- does not depend on which transport carries it.
+_INPUT_WAIT_TIMEOUT_DEFAULT = 600.0
 _INPUT_WAIT_TIMEOUT_RAW = os.environ.get("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", "600")
 try:
     DEFAULT_INPUT_WAIT_TIMEOUT_S: float = float(_INPUT_WAIT_TIMEOUT_RAW)
 except ValueError:
     logger.warning(
-        "Invalid VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=%r; falling back to 600 seconds.",
+        "Invalid VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=%r; falling back to %s seconds.",
         _INPUT_WAIT_TIMEOUT_RAW,
+        _INPUT_WAIT_TIMEOUT_DEFAULT,
     )
-    DEFAULT_INPUT_WAIT_TIMEOUT_S = 600.0
+    DEFAULT_INPUT_WAIT_TIMEOUT_S = _INPUT_WAIT_TIMEOUT_DEFAULT
+
+if DEFAULT_INPUT_WAIT_TIMEOUT_S < 0:
+    # A negative deadline has no meaning. Reading it as "disabled" would let a
+    # typo (-600 for 600) turn off both nets while looking like a real value.
+    logger.warning(
+        "VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=%r is negative; using %s seconds. "
+        "Set it to exactly 0 if you mean to disable the stage-input deadline.",
+        _INPUT_WAIT_TIMEOUT_RAW,
+        _INPUT_WAIT_TIMEOUT_DEFAULT,
+    )
+    DEFAULT_INPUT_WAIT_TIMEOUT_S = _INPUT_WAIT_TIMEOUT_DEFAULT
+elif DEFAULT_INPUT_WAIT_TIMEOUT_S == 0:
+    # Zero stays a supported opt-out, but it is no longer silent: it disables
+    # the deadline on BOTH transports, so a request whose stage input never
+    # arrives waits forever. Say which nets just went away.
+    logger.warning(
+        "VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=0: stage-input deadlines are DISABLED for "
+        "both the full-payload path (WAITING_FOR_INPUT) and the async-chunk path "
+        "(WAITING_FOR_CHUNK). A request whose input never arrives will wait "
+        "indefinitely instead of failing."
+    )
 
 
 class OmniSchedulerMixin:
