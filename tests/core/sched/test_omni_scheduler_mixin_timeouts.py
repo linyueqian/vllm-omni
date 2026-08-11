@@ -200,14 +200,11 @@ def test_process_pending_chunk_timeouts_disabled_when_timeout_zero(monkeypatch):
     assert scheduler.finish_calls == []
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
 # --- R1.4: VLLM_OMNI_INPUT_WAIT_TIMEOUT_S is parsed at import time, so each of
 # these reloads the module under a different environment. One knob now gates the
 # deadline on both transports, which is why a silent 0 matters more than it did
 # when only the full-payload path used it.
+
 
 def _reload_with(monkeypatch, raw):
     import importlib
@@ -251,6 +248,10 @@ def test_zero_warns_and_names_both_transports(monkeypatch, caplog):
     assert "WAITING_FOR_INPUT" in text and "WAITING_FOR_CHUNK" in text
 
 
-def test_unparseable_timeout_falls_back(monkeypatch):
+def test_unparsable_timeout_falls_back(monkeypatch):
     mod = _reload_with(monkeypatch, "not-a-number")
     assert mod.DEFAULT_INPUT_WAIT_TIMEOUT_S == 600.0
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
