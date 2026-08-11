@@ -390,6 +390,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # has been sent successfully. This avoids cleanup->save races.
             if is_payload_finished:
                 self.cleanup(request.request_id, external_req_id)
+        else:
+            # R1.2 of #4855. connector.put returning False is a silent drop: no
+            # exception, no retry, and the caller's `if success:` block simply
+            # does not run. /dev/shm exhaustion in SharedMemoryConnector.put is
+            # one way to get here. Record it so the request fails now rather
+            # than parking in WAITING_FOR_CHUNK until the deadline.
+            logger.error(
+                "Chunk send failed for %s (stage %s -> %s); giving up on this chunk",
+                external_req_id,
+                stage_id,
+                next_stage_id,
+            )
+            self.record_send_failure(external_req_id, "connector.put reported failure")
 
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)

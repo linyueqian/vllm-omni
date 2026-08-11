@@ -174,6 +174,7 @@ class OmniSchedulerMixin:
                 scheduler_requests=self.requests,
             )
             self._process_pending_chunk_timeouts()
+            self._process_failed_chunk_sends()
 
     def _restore_omni_wait_queues(self) -> None:
         """Restore requests temporarily parked by Omni input gates."""
@@ -223,6 +224,30 @@ class OmniSchedulerMixin:
             sorted(present_ids),
         )
         self.finish_requests(present_ids, RequestStatus.FINISHED_ERROR)
+
+    def _process_failed_chunk_sends(self) -> None:
+        """Fail requests whose outgoing chunk was dropped (R1.2 of #4855).
+
+        ``save_loop`` pops a task and does not re-queue it, and
+        ``connector.put`` can report failure without raising, so a dropped
+        chunk is a give-up rather than a retry. The consumer would otherwise
+        sit in WAITING_FOR_CHUNK until the R1.1 deadline; this fails it as
+        soon as the sender knows, on the producer side where the failure
+        actually happened.
+        """
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is None:
+            return
+        failures = adapter.collect_failed_send_request_ids()
+        if not failures:
+            return
+        for request_id, reason in failures.items():
+            logger.error(
+                "[OmniScheduler] req=%s: chunk send gave up (%s); failing the request",
+                request_id,
+                reason,
+            )
+        self.finish_requests(list(failures), RequestStatus.FINISHED_ERROR)
 
     def _process_pending_chunk_timeouts(self) -> None:
         """Force-fail requests stalled in ``WAITING_FOR_CHUNK`` too long.

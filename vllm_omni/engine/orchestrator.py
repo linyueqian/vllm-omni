@@ -2216,9 +2216,30 @@ class Orchestrator:
 
         prompt_token_ids = getattr(stage0_request, "prompt_token_ids", None)
         if prompt_token_ids is None:
-            logger.warning(
-                "[Orchestrator] async_chunk prewarm skipped for req=%s: stage0 prompt_token_ids missing",
+            # R1.3 of #4855. Skipping the prewarm leaves every downstream stage
+            # unsubmitted, so the request produces no output and no error -- it
+            # just stops. An embeds-only prompt in async-chunk mode is a config
+            # mistake, and the client should hear about it now rather than wait
+            # for the stage-input deadline to notice nothing ever arrived.
+            logger.error(
+                "[Orchestrator] req=%s: async_chunk prewarm needs stage0 prompt_token_ids "
+                "and none were provided; failing the request",
                 request_id,
+            )
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    error=(
+                        "async_chunk requires prompt_token_ids on the stage-0 request; "
+                        "an embeds-only prompt cannot prewarm downstream stages"
+                    ),
+                    fatal=True,
+                    request_id=request_id,
+                    stage_id=0,
+                )
+            )
+            await self._cleanup_request_ids(
+                [request_id, *self._cfg_tracker.cleanup_parent(request_id)],
+                abort=True,
             )
             return
 
