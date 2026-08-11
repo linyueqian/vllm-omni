@@ -1,0 +1,177 @@
+
+#### Replay: blocked-test  (Qc=0.13s, 7 test runs, n=3276) ####
+
+-- blocked-test :: pooled (n=3276) --
+  policy                 accept stallInc stallMean stallP95  ttaP50  ttaP95  gapMean  gapP95
+  no-pacing               1.000    0.532      6.04    22.42    0.94   50.19    -3.38    0.00
+  oracle                  1.000    0.000      0.00     0.00    1.40   53.53     0.00    0.00
+  two-regime th=1         0.413    0.013      1.93     4.08    0.92    1.22     0.24    0.52
+  two-regime th=2         0.475    0.032      5.49    12.71    0.98    1.84     0.13    0.76
+  two-regime th=4         0.523    0.051      6.78    23.08    1.01    3.32     0.07    1.61
+  two-regime th=8         0.612    0.102      8.04    25.65    1.07    6.59    -0.13    3.68
+  paced (no reject)       1.000    0.285      5.67    18.53    3.39   50.19    -0.10    9.40
+ certificate (fractions of all offered):
+  policy                 ok(accept,nostall)  rejected  stalled
+  no-pacing                           0.468     0.000    0.532
+  oracle                              1.000     0.000    0.000
+  two-regime th=1                     0.407     0.587    0.005
+  two-regime th=2                     0.460     0.525    0.015
+  two-regime th=4                     0.497     0.477    0.027
+  two-regime th=8                     0.550     0.388    0.063
+  paced (no reject)                   0.715     0.000    0.285
+
+-- blocked-test :: clean (n=1110) --
+  policy                 accept stallInc stallMean stallP95  ttaP50  ttaP95  gapMean  gapP95
+  no-pacing               1.000    0.000      0.00     0.00    0.64    0.85    -0.00    0.00
+  oracle                  1.000    0.000      0.00     0.00    0.64    0.86     0.00    0.00
+  two-regime th=1         0.941    0.000      0.00     0.00    0.90    1.20     0.28    0.51
+  two-regime th=2         0.995    0.000      0.00     0.00    0.93    1.32     0.31    0.62
+  two-regime th=4         0.999    0.000      0.00     0.00    0.94    1.35     0.32    0.63
+  two-regime th=8         1.000    0.000      0.00     0.00    0.94    1.35     0.32    0.64
+  paced (no reject)       1.000    0.000      0.00     0.00    0.94    1.35     0.32    0.64
+ certificate (fractions of all offered):
+  policy                 ok(accept,nostall)  rejected  stalled
+  no-pacing                           1.000     0.000    0.000
+  oracle                              1.000     0.000    0.000
+  two-regime th=1                     0.941     0.059    0.000
+  two-regime th=2                     0.995     0.005    0.000
+  two-regime th=4                     0.999     0.001    0.000
+  two-regime th=8                     1.000     0.000    0.000
+  paced (no reject)                   1.000     0.000    0.000
+
+-- blocked-test :: knife (n=437) --
+  policy                 accept stallInc stallMean stallP95  ttaP50  ttaP95  gapMean  gapP95
+  no-pacing               1.000    0.533      0.17     0.41    0.89    1.20    -0.29    0.00
+  oracle                  1.000    0.000      0.00     0.00    1.28    1.76     0.00    0.00
+  two-regime th=1         0.295    0.000      0.00     0.00    0.98    1.25     0.30    0.59
+  two-regime th=2         0.439    0.000      0.00     0.00    1.09    2.25     0.40    0.93
+  two-regime th=4         0.645    0.000      0.00     0.00    1.67    4.05     0.91    2.60
+  two-regime th=8         0.936    0.000      0.00     0.00    2.65    7.47     2.03    6.02
+  paced (no reject)       1.000    0.000      0.00     0.00    2.79    9.58     2.59    8.20
+ certificate (fractions of all offered):
+  policy                 ok(accept,nostall)  rejected  stalled
+  no-pacing                           0.467     0.000    0.533
+  oracle                              1.000     0.000    0.000
+  two-regime th=1                     0.295     0.705    0.000
+  two-regime th=2                     0.439     0.561    0.000
+  two-regime th=4                     0.645     0.355    0.000
+  two-regime th=8                     0.936     0.064    0.000
+  paced (no reject)                   1.000     0.000    0.000
+
+-- blocked-test :: collapse (n=1729) --
+  policy                 accept stallInc stallMean stallP95  ttaP50  ttaP95  gapMean  gapP95
+  no-pacing               1.000    0.874      6.95    23.54    7.13   55.42    -6.34    0.00
+  oracle                  1.000    0.000      0.00     0.00   16.92   61.74     0.00    0.00
+  two-regime th=1         0.103    0.101      1.93     4.08    0.96    1.25    -0.00    0.45
+  two-regime th=2         0.151    0.192      5.49    12.71    1.11    1.88    -0.83    0.87
+  two-regime th=4         0.187    0.269      6.78    23.08    1.22    3.66    -1.55    1.76
+  two-regime th=8         0.282    0.421      8.04    25.65    1.87    7.87    -2.96    3.38
+  paced (no reject)       1.000    0.540      5.67    18.53   20.85   55.42    -1.06   11.21
+ certificate (fractions of all offered):
+  policy                 ok(accept,nostall)  rejected  stalled
+  no-pacing                           0.126     0.000    0.874
+  oracle                              1.000     0.000    0.000
+  two-regime th=1                     0.093     0.897    0.010
+  two-regime th=2                     0.122     0.849    0.029
+  two-regime th=4                     0.136     0.813    0.050
+  two-regime th=8                     0.163     0.718    0.119
+  paced (no reject)                   0.460     0.000    0.540
+
+#### Replay: lolo-knife  (Qc=16.45s, 4 test runs, n=1704) ####
+
+-- lolo-knife :: pooled (n=1704) --
+  policy                 accept stallInc stallMean stallP95  ttaP50  ttaP95  gapMean  gapP95
+  no-pacing               1.000    0.512      0.98     4.49    0.90    1.48    -0.68    0.00
+  oracle                  1.000    0.000      0.00     0.00    1.26    5.09     0.00    0.00
+  two-regime th=1         0.000      nan      0.00     0.00     nan     nan      nan     nan
+  two-regime th=2         0.000      nan      0.00     0.00     nan     nan      nan     nan
+  two-regime th=4         0.000      nan      0.00     0.00     nan     nan      nan     nan
+  two-regime th=8         0.000      nan      0.00     0.00     nan     nan      nan     nan
+  paced (no reject)       1.000    0.000      0.00     0.00   18.08   24.56    17.35   22.29
+ certificate (fractions of all offered):
+  policy                 ok(accept,nostall)  rejected  stalled
+  no-pacing                           0.488     0.000    0.512
+  oracle                              1.000     0.000    0.000
+  two-regime th=1                     0.000     1.000    0.000
+  two-regime th=2                     0.000     1.000    0.000
+  two-regime th=4                     0.000     1.000    0.000
+  two-regime th=8                     0.000     1.000    0.000
+  paced (no reject)                   1.000     0.000    0.000
+
+-- lolo-knife :: knife (n=1704) --
+  policy                 accept stallInc stallMean stallP95  ttaP50  ttaP95  gapMean  gapP95
+  no-pacing               1.000    0.512      0.98     4.49    0.90    1.48    -0.68    0.00
+  oracle                  1.000    0.000      0.00     0.00    1.26    5.09     0.00    0.00
+  two-regime th=1         0.000      nan      0.00     0.00     nan     nan      nan     nan
+  two-regime th=2         0.000      nan      0.00     0.00     nan     nan      nan     nan
+  two-regime th=4         0.000      nan      0.00     0.00     nan     nan      nan     nan
+  two-regime th=8         0.000      nan      0.00     0.00     nan     nan      nan     nan
+  paced (no reject)       1.000    0.000      0.00     0.00   18.08   24.56    17.35   22.29
+ certificate (fractions of all offered):
+  policy                 ok(accept,nostall)  rejected  stalled
+  no-pacing                           0.488     0.000    0.512
+  oracle                              1.000     0.000    0.000
+  two-regime th=1                     0.000     1.000    0.000
+  two-regime th=2                     0.000     1.000    0.000
+  two-regime th=4                     0.000     1.000    0.000
+  two-regime th=8                     0.000     1.000    0.000
+  paced (no reject)                   1.000     0.000    0.000
+
+#### Replay: lolo-cc  (Qc=-0.09s, 22 test runs, n=9660) ####
+
+-- lolo-cc :: pooled (n=9660) --
+  policy                 accept stallInc stallMean stallP95  ttaP50  ttaP95  gapMean  gapP95
+  no-pacing               1.000    0.520      3.95    17.32    0.95   25.45    -2.22    0.00
+  oracle                  1.000    0.000      0.00     0.00    1.45   31.93     0.00    0.00
+  two-regime th=1         0.447    0.010      1.61     4.03    0.68    1.08     0.08    0.33
+  two-regime th=2         0.555    0.036      5.13    11.96    0.73    2.12    -0.06    0.59
+  two-regime th=4         0.956    0.339      5.30    18.42    1.67   26.15    -1.72    0.96
+  two-regime th=8         1.000    0.332      5.50    19.00    1.94   25.45    -1.63    2.09
+  paced (no reject)       1.000    0.332      5.50    19.00    1.94   25.45    -1.63    2.09
+ certificate (fractions of all offered):
+  policy                 ok(accept,nostall)  rejected  stalled
+  no-pacing                           0.480     0.000    0.520
+  oracle                              1.000     0.000    0.000
+  two-regime th=1                     0.442     0.553    0.004
+  two-regime th=2                     0.535     0.445    0.020
+  two-regime th=4                     0.631     0.044    0.324
+  two-regime th=8                     0.668     0.000    0.332
+  paced (no reject)                   0.668     0.000    0.332
+
+-- lolo-cc :: clean (n=3214) --
+  policy                 accept stallInc stallMean stallP95  ttaP50  ttaP95  gapMean  gapP95
+  no-pacing               1.000    0.004      0.12     0.31    0.56    0.81    -0.00    0.00
+  oracle                  1.000    0.000      0.00     0.00    0.56    0.82     0.00    0.00
+  two-regime th=1         0.984    0.002      0.13     0.30    0.66    0.95     0.09    0.29
+  two-regime th=2         1.000    0.002      0.13     0.30    0.67    1.02     0.10    0.32
+  two-regime th=4         1.000    0.002      0.13     0.30    0.67    1.02     0.10    0.32
+  two-regime th=8         1.000    0.002      0.13     0.30    0.67    1.02     0.10    0.32
+  paced (no reject)       1.000    0.002      0.13     0.30    0.67    1.02     0.10    0.32
+ certificate (fractions of all offered):
+  policy                 ok(accept,nostall)  rejected  stalled
+  no-pacing                           0.996     0.000    0.004
+  oracle                              1.000     0.000    0.000
+  two-regime th=1                     0.983     0.016    0.002
+  two-regime th=2                     0.998     0.000    0.002
+  two-regime th=4                     0.998     0.000    0.002
+  two-regime th=8                     0.998     0.000    0.002
+  paced (no reject)                   0.998     0.000    0.002
+
+-- lolo-cc :: collapse (n=6446) --
+  policy                 accept stallInc stallMean stallP95  ttaP50  ttaP95  gapMean  gapP95
+  no-pacing               1.000    0.777      3.96    17.39    1.54   35.52    -3.32    0.00
+  oracle                  1.000    0.000      0.00     0.00    2.84   40.56     0.00    0.00
+  two-regime th=1         0.179    0.031      1.81     4.26    0.78    1.18     0.04    0.42
+  two-regime th=2         0.333    0.087      5.26    12.32    1.16    2.23    -0.31    0.81
+  two-regime th=4         0.934    0.520      5.31    18.45    2.99   37.70    -2.70    1.40
+  two-regime th=8         1.000    0.496      5.51    19.00    3.04   35.52    -2.49    2.65
+  paced (no reject)       1.000    0.496      5.51    19.00    3.04   35.52    -2.49    2.65
+ certificate (fractions of all offered):
+  policy                 ok(accept,nostall)  rejected  stalled
+  no-pacing                           0.223     0.000    0.777
+  oracle                              1.000     0.000    0.000
+  two-regime th=1                     0.173     0.821    0.006
+  two-regime th=2                     0.304     0.667    0.029
+  two-regime th=4                     0.448     0.066    0.485
+  two-regime th=8                     0.504     0.000    0.496
+  paced (no reject)                   0.504     0.000    0.496
