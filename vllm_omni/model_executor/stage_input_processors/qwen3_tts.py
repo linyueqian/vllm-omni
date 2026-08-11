@@ -1,5 +1,6 @@
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -14,9 +15,12 @@ from vllm_omni.data_entry_keys import (
     to_dict,
 )
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
+    AdaptiveCadenceState,
+    compute_adaptive_emit,
     compute_dynamic_initial_chunk_size,
     compute_ramp_emit,
     max_ic_for_chunk_size,
+    parse_chunk_adaptive,
     parse_chunk_ramp,
 )
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
@@ -108,6 +112,14 @@ def talker2code2wav_async_chunk(
         transfer_manager._ramp_parsed = parse_chunk_ramp(cfg, steady=chunk_size)
     ramp = transfer_manager._ramp_parsed
 
+    # Adaptive cadence (Legato controller v0): closed-loop chunk sizing from
+    # banked buffer lead. Supersedes the static ramp when configured.
+    if not hasattr(transfer_manager, "_adaptive_parsed"):
+        transfer_manager._adaptive_parsed = parse_chunk_adaptive(cfg)
+    adaptive = transfer_manager._adaptive_parsed
+    if adaptive is not None:
+        ramp = None
+
     # Per-request override takes priority over dynamic IC.
     fixed_initial_chunk_size = configured_initial_chunk_size > 0
     initial_chunk_size = configured_initial_chunk_size
@@ -168,7 +180,30 @@ def talker2code2wav_async_chunk(
             )
         return None
 
-    if ramp is not None:
+    if adaptive is not None:
+        adaptive_states = getattr(transfer_manager, "_adaptive_states", None)
+        if adaptive_states is None:
+            adaptive_states = {}
+            transfer_manager._adaptive_states = adaptive_states
+        if request_id not in adaptive_states:
+            adaptive_states[request_id] = AdaptiveCadenceState()
+        emit, context_length = compute_adaptive_emit(
+            length,
+            adaptive_states[request_id],
+            adaptive["ladder"],
+            adaptive["lead_low"],
+            adaptive["lead_high"],
+            finished,
+            time.time(),
+        )
+        if not emit:
+            return None
+        if context_length == 0:
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+            )
+    elif ramp is not None:
         chunk_index = transfer_manager.ramp_chunk_count.get(request_id, 0)
         emit, context_length = compute_ramp_emit(length, chunk_index, ramp, chunk_size, finished)
         if not emit:

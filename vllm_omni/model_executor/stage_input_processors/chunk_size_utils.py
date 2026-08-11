@@ -127,3 +127,86 @@ def compute_ramp_emit(
         return True, 0
 
     return True, length - prev_threshold
+
+
+FRAME_SECONDS = 0.08  # 12.5 Hz codec
+
+
+def parse_chunk_adaptive(cfg: dict) -> dict | None:
+    """Parse ``codec_chunk_adaptive`` from connector extra config.
+
+    Expects a mapping with optional keys: ``ladder`` (ascending positive
+    ints) and ``lead_low`` / ``lead_high`` (seconds, hysteresis band).
+    Returns ``None`` when absent or invalid (adaptive cadence disabled).
+    """
+    raw = cfg.get("codec_chunk_adaptive")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        logger.warning("codec_chunk_adaptive must be a mapping; disabling.")
+        return None
+    try:
+        ladder = [int(x) for x in (raw.get("ladder") or [4, 8, 16, 25])]
+        lead_low = float(raw.get("lead_low", 0.6))
+        lead_high = float(raw.get("lead_high", 1.5))
+    except (TypeError, ValueError):
+        logger.warning("codec_chunk_adaptive parse error for %r; disabling.", raw)
+        return None
+    if len(ladder) < 2 or any(x <= 0 for x in ladder) or sorted(ladder) != ladder:
+        logger.warning(
+            "codec_chunk_adaptive ladder must be >= 2 ascending positive ints; disabling."
+        )
+        return None
+    if not 0.0 <= lead_low < lead_high:
+        logger.warning("codec_chunk_adaptive needs 0 <= lead_low < lead_high; disabling.")
+        return None
+    return {"ladder": ladder, "lead_low": lead_low, "lead_high": lead_high}
+
+
+class AdaptiveCadenceState:
+    """Per-request state for closed-loop cadence control."""
+
+    __slots__ = ("tier", "frames_emitted", "t_first_emit")
+
+    def __init__(self) -> None:
+        self.tier = 0
+        self.frames_emitted = 0
+        self.t_first_emit: float | None = None
+
+
+def compute_adaptive_emit(
+    length: int,
+    state: AdaptiveCadenceState,
+    ladder: list[int],
+    lead_low: float,
+    lead_high: float,
+    finished: bool,
+    now: float,
+) -> tuple[bool, int]:
+    """Closed-loop emission decision: chunk size follows banked buffer lead.
+
+    Lead is conservative: playback is assumed to start at the first emission,
+    so the real client lead is at least ``lead + client_buffer``. The tier
+    moves at most one step per emitted chunk (hysteresis band
+    ``[lead_low, lead_high]``), per the stability requirements.
+
+    Returns ``(emit, context_length)`` with the same contract as
+    ``compute_ramp_emit``.
+    """
+    pending = length - state.frames_emitted
+    if pending <= 0:
+        return (True, 0) if finished else (False, 0)
+    target = ladder[state.tier]
+    if not finished and pending < target:
+        return False, 0
+    emit_frames = pending if finished else target
+    if state.t_first_emit is None:
+        state.t_first_emit = now
+    else:
+        lead = state.frames_emitted * FRAME_SECONDS - (now - state.t_first_emit)
+        if lead > lead_high and state.tier < len(ladder) - 1:
+            state.tier += 1
+        elif lead < lead_low and state.tier > 0:
+            state.tier -= 1
+    state.frames_emitted += emit_frames
+    return True, emit_frames
