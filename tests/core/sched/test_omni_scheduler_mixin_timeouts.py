@@ -233,10 +233,19 @@ def test_timeout_accepts_valid_values(monkeypatch, raw, expected):
 
 
 @pytest.mark.parametrize("raw", ["-1", "-600", "-0.5"])
-def test_negative_timeout_falls_back_instead_of_disabling(monkeypatch, raw):
-    """A negative value is a typo, not an opt-out; -600 must not mean "off"."""
-    mod = _reload_with(monkeypatch, raw)
-    assert mod.DEFAULT_INPUT_WAIT_TIMEOUT_S == 600.0
+def test_negative_timeout_is_rejected(monkeypatch, raw):
+    """`-1` is a common "no limit" idiom; substituting 600 would give an operator
+    who meant "never time out" mysterious failures ten minutes in. Fail loudly."""
+    with pytest.raises(ValueError, match="negative"):
+        _reload_with(monkeypatch, raw)
+
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "1e999"])
+def test_non_finite_timeout_is_rejected(monkeypatch, raw):
+    """nan compares false against every deadline check and inf is unreachable;
+    both disable the net while looking like a number."""
+    with pytest.raises(ValueError, match="not finite"):
+        _reload_with(monkeypatch, raw)
 
 
 def test_zero_warns_and_names_both_transports(monkeypatch, caplog):

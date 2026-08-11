@@ -114,8 +114,14 @@ class OmniTransferAdapterBase:
                     # so this is a give-up, not a retry: the consumer will wait for a
                     # chunk that is never coming. Record it so the scheduler can fail
                     # the request now instead of leaving it to the wait deadline.
-                    logger.error("Send gave up for %s: %s", task.get("request_id"), e)
-                    self.record_send_failure(task.get("request_id"), f"{type(e).__name__}: {e}")
+                    # The task dict carries the Request object, not a bare id --
+                    # `task.get("request_id")` is always None (it was that way in the
+                    # original warning too, which logged "None" for every failure).
+                    # Use the scheduler-side id: that is what `self.requests` is keyed
+                    # by, and what `finish_requests` expects.
+                    failed = getattr(task.get("request"), "request_id", None)
+                    logger.error("Send gave up for %s: %s", failed, e)
+                    self.record_send_failure(failed, f"{type(e).__name__}: {e}")
 
             with self._save_cond:
                 if not self._pending_save_reqs and not self.stop_event.is_set():

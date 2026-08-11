@@ -402,7 +402,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 stage_id,
                 next_stage_id,
             )
-            self.record_send_failure(external_req_id, "connector.put reported failure")
+            # Key on the scheduler-side id. `external_req_id` is the user-facing id
+            # (InputProcessor renames request_id to an internal UUID and keeps the
+            # original in external_req_id, see async_omni_engine.py), while
+            # `self.requests` -- and therefore `finish_requests` -- is keyed by the
+            # internal one.
+            self.record_send_failure(request.request_id, "connector.put reported failure")
 
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)

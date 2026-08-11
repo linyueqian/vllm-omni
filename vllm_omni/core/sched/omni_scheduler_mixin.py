@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import time
 from collections.abc import Iterable
@@ -43,8 +44,8 @@ _STATS_INTERVAL_S = 1.0
 # Upper bound on how long a request may wait for stage input before the
 # scheduler force-fails it.  Defends against stuck consumer-side requests when
 # the producer drops a payload, send fails, or recv never arrives.  Override
-# per-deployment via VLLM_OMNI_INPUT_WAIT_TIMEOUT_S; set <=0 to disable the
-# safety net.
+# per-deployment via VLLM_OMNI_INPUT_WAIT_TIMEOUT_S; set exactly 0 to disable
+# the safety net. Negative and non-finite values are rejected at startup.
 #
 # Scope: both transports.  The full-payload path measures time parked in
 # WAITING_FOR_INPUT (``OmniSchedulingCoordinator._waiting_since``); the
@@ -64,16 +65,22 @@ except ValueError:
     )
     DEFAULT_INPUT_WAIT_TIMEOUT_S = _INPUT_WAIT_TIMEOUT_DEFAULT
 
-if DEFAULT_INPUT_WAIT_TIMEOUT_S < 0:
-    # A negative deadline has no meaning. Reading it as "disabled" would let a
-    # typo (-600 for 600) turn off both nets while looking like a real value.
-    logger.warning(
-        "VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=%r is negative; using %s seconds. "
-        "Set it to exactly 0 if you mean to disable the stage-input deadline.",
-        _INPUT_WAIT_TIMEOUT_RAW,
-        _INPUT_WAIT_TIMEOUT_DEFAULT,
+if not math.isfinite(DEFAULT_INPUT_WAIT_TIMEOUT_S):
+    # nan compares false against everything, so every deadline check silently
+    # passes; inf makes the deadline unreachable. Both disable the net while
+    # looking like a number, which is the failure this item exists to stop.
+    raise ValueError(
+        f"VLLM_OMNI_INPUT_WAIT_TIMEOUT_S={_INPUT_WAIT_TIMEOUT_RAW!r} is not finite. "
+        "Use a positive number of seconds, or exactly 0 to disable the deadline."
     )
-    DEFAULT_INPUT_WAIT_TIMEOUT_S = _INPUT_WAIT_TIMEOUT_DEFAULT
+if DEFAULT_INPUT_WAIT_TIMEOUT_S < 0:
+    # Fail at startup rather than substituting a default. `-1` is a common idiom
+    # for "no limit", so silently turning it into 600 would give an operator who
+    # meant "never time out" mysterious failures ten minutes in.
+    raise ValueError(
+        f"VLLM_OMNI_INPUT_WAIT_TIMEOUT_S={_INPUT_WAIT_TIMEOUT_RAW!r} is negative. "
+        "Use a positive number of seconds, or exactly 0 to disable the deadline."
+    )
 elif DEFAULT_INPUT_WAIT_TIMEOUT_S == 0:
     # Zero stays a supported opt-out, but it is no longer silent: it disables
     # the deadline on BOTH transports, so a request whose stage input never
@@ -174,7 +181,7 @@ class OmniSchedulerMixin:
                 scheduler_requests=self.requests,
             )
             self._process_pending_chunk_timeouts()
-            self._process_failed_chunk_sends()
+            self._log_failed_chunk_sends()
 
     def _restore_omni_wait_queues(self) -> None:
         """Restore requests temporarily parked by Omni input gates."""
@@ -225,29 +232,35 @@ class OmniSchedulerMixin:
         )
         self.finish_requests(present_ids, RequestStatus.FINISHED_ERROR)
 
-    def _process_failed_chunk_sends(self) -> None:
-        """Fail requests whose outgoing chunk was dropped (R1.2 of #4855).
+    def _log_failed_chunk_sends(self) -> None:
+        """Surface chunks the sender gave up on (R1.2 of #4855).
 
-        ``save_loop`` pops a task and does not re-queue it, and
-        ``connector.put`` can report failure without raising, so a dropped
-        chunk is a give-up rather than a retry. The consumer would otherwise
-        sit in WAITING_FOR_CHUNK until the R1.1 deadline; this fails it as
-        soon as the sender knows, on the producer side where the failure
-        actually happened.
+        ``save_loop`` pops a task with ``popleft()`` and never re-queues it, and
+        ``connector.put`` can report failure without raising, so a dropped chunk
+        is a give-up rather than a retry. Until this change the only trace was a
+        warning that printed ``None`` for the request id, because the task dict
+        has no ``request_id`` key.
+
+        This only reports. Failing the request from here does not work: the
+        producer is not the ``final_output`` stage, so an abort synthesized by
+        ``finish_requests`` is not turned into a client-visible termination by
+        ``Orchestrator._route_output`` (see the ``final_output`` guards there).
+        Making a producer-side drop client-visible needs an orchestrator-side
+        path like ``_fail_request_dead_stage``; the consumer's R1.1 deadline is
+        what actually ends the request today.
         """
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is None:
             return
         failures = adapter.collect_failed_send_request_ids()
-        if not failures:
-            return
         for request_id, reason in failures.items():
-            logger.error(
-                "[OmniScheduler] req=%s: chunk send gave up (%s); failing the request",
-                request_id,
-                reason,
-            )
-        self.finish_requests(list(failures), RequestStatus.FINISHED_ERROR)
+            if request_id in self.requests:
+                logger.error(
+                    "[OmniScheduler] req=%s: chunk send gave up (%s); the consumer will "
+                    "fail on the stage-input deadline",
+                    request_id,
+                    reason,
+                )
 
     def _process_pending_chunk_timeouts(self) -> None:
         """Force-fail requests stalled in ``WAITING_FOR_CHUNK`` too long.
