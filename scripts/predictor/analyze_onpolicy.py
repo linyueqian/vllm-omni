@@ -126,6 +126,52 @@ def replay_on_off_trace(rows: List[dict], metrics_path: str, model_payload: dict
     }
 
 
+def pooled_summary(seeds: List[int]) -> None:
+    """Multi-seed matched-pair summary: mean across seeds with min-max range.
+    Flags any theta=2 seed whose stall incidence among accepted exceeds 5%."""
+    pairs = [("2.4", "0"), ("2.4", "3"), ("3.0", "0"), ("3.0", "3")]
+    print(f"\n== Pooled {len(seeds)}-seed matched-pair summary "
+          f"(seeds {seeds}; mean [min..max] across seeds) ==")
+    hdr = (f"{'pair':<9} {'arm':<4} {'sds':>3} {'acceptance':>19} "
+           f"{'stallInc(acc)':>19} {'meanConc':>21} {'D*p50(acc)':>19} {'ttaP50':>19}")
+    print(hdr)
+    failures: List[str] = []
+    for rate, ti in pairs:
+        for arm, paced in [("off", False), ("th2", True)]:
+            per_seed: List[dict] = []
+            used: List[int] = []
+            for sd in seeds:
+                tag = f"r{rate}_t{ti}_s{sd}_{arm}"
+                path = os.path.join(RUN_DIR, f"{tag}.ndjson")
+                if not os.path.exists(path):
+                    continue
+                st = arm_stats(load_rows(tag), paced)
+                per_seed.append(st)
+                used.append(sd)
+                if paced and st["stall_inc"] > 0.05:
+                    failures.append(
+                        f"{tag}: stall incidence among accepted = "
+                        f"{st['stall_inc']:.3f} (> 0.05)")
+            if not per_seed:
+                continue
+
+            def agg(key: str) -> str:
+                vals = [s[key] for s in per_seed]
+                mean = sum(vals) / len(vals)
+                return f"{mean:7.3f} [{min(vals):5.3f}..{max(vals):5.3f}]"
+
+            print(f"r{rate}_t{ti:<4} {arm:<4} {len(used):>3} "
+                  f"{agg('acceptance'):>19} {agg('stall_inc'):>19} "
+                  f"{agg('mean_conc'):>21} {agg('d_p50'):>19} {agg('tta_p50'):>19}")
+    if failures:
+        print("\n*** STALL-CONTROL FAILURES (incidence > 5% among accepted) ***")
+        for f in failures:
+            print(f"  {f}")
+    else:
+        print("\nNo stall-control failures: every paced seed kept stall "
+              "incidence among accepted <= 5%.")
+
+
 def main() -> None:
     payload = joblib.load(MODEL)
     pairs = []
@@ -180,6 +226,8 @@ def main() -> None:
                   f"{onp['acceptance']:>8.3f} {rep['stall_inc']:>12.3f} "
                   f"{onp['stall_inc']:>12.3f} {all_stats[off_tag]['d_p50']:>9.2f} "
                   f"{onp['d_p50']:>9.2f}")
+
+    pooled_summary([7, 8, 9])
 
 
 if __name__ == "__main__":
