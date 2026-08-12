@@ -41,6 +41,108 @@ METRIC_LINE = re.compile(
 )
 METRIC_KEEP = re.compile(r"running|waiting|usage|rtf|stage|queue|preempt|tokens")
 
+PACER_BUFFER_S = 0.3
+
+
+class Pacer:
+    """Live risk-controlled pacing/admission from the exported D* predictor.
+
+    Per arrival: one /metrics scrape, features built with the SAME semantics as
+    extract_dstar.py (stage-labeled counters; qtime counter deltas against a
+    rolling previous-scrape cache; client_inflight = accepted requests in
+    flight, excluding the deciding request). bound = quantile prediction + Qc
+    (split-CQR offset). bound > theta => REJECT (request is never sent);
+    otherwise the request is sent unmodified and the bound is recorded so the
+    paced playback start s = max(ttfa, bound) + 0.3 is computed in the summary.
+    """
+
+    def __init__(self, model_path: str, theta: float) -> None:
+        import joblib  # deferred: only pacer runs need sklearn in the venv
+
+        payload = joblib.load(model_path)
+        self.model = payload["model"]
+        self.qc = float(payload["Qc"])
+        self.features: list[str] = list(payload["features"])
+        self.log_target = bool(payload.get("log_target", True))
+        self.theta = theta
+        self.prev: dict[str, Any] | None = None
+        self.inflight = 0
+        logger.info(
+            "pacer: model=%s Qc=%.4f theta=%s features=%s",
+            model_path, self.qc, theta, self.features,
+        )
+
+    @staticmethod
+    def _get(m: dict[str, float], name: str, stage: str,
+             extra: str | None = None) -> float | None:
+        prefix = name + "{"
+        for k, v in m.items():
+            if k.startswith(prefix) and f'stage="{stage}"' in k:
+                if extra is None or extra in k:
+                    return v
+        return None
+
+    async def _scrape(
+        self, session: aiohttp.ClientSession, url: str
+    ) -> dict[str, Any] | None:
+        try:
+            async with session.get(f"{url.rstrip('/')}/metrics") as resp:
+                body = await resp.text()
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            logger.warning("pacer scrape failed: %s", exc)
+            return None
+        m: dict[str, float] = {}
+        for line in body.splitlines():
+            if line.startswith("#") or not METRIC_KEEP.search(line):
+                continue
+            mt = METRIC_LINE.match(line)
+            if mt:
+                m[mt.group(1)] = float(mt.group(2))
+        return {
+            "ts": time.time(),
+            "s0_running": self._get(m, "vllm:num_requests_running", "0"),
+            "s1_running": self._get(m, "vllm:num_requests_running", "1"),
+            "s0_waiting": self._get(m, "vllm:num_requests_waiting", "0"),
+            "s1_waiting": self._get(m, "vllm:num_requests_waiting", "1"),
+            "s0_kv_usage": self._get(m, "vllm:kv_cache_usage_perc", "0"),
+            "s1_qtime_count": self._get(
+                m, "vllm:request_queue_time_seconds_count", "1"),
+            "s1_qtime_sum": self._get(m, "vllm:request_queue_time_seconds_sum", "1"),
+        }
+
+    async def decide(self, session: aiohttp.ClientSession, url: str) -> dict[str, Any]:
+        cur = await self._scrape(session, url)
+        scrape_ok = cur is not None
+        if cur is None:
+            cur = self.prev  # stale fallback; None on the very first arrival
+        feats: dict[str, float] = {"client_inflight": float(self.inflight)}
+        for k in ("s0_running", "s0_waiting", "s1_running", "s1_waiting",
+                  "s0_kv_usage"):
+            v = cur.get(k) if cur else None
+            feats[k] = float(v) if v is not None else 0.0
+        # qtime counter deltas vs rolling previous-scrape cache (0.0 when no
+        # previous sample -- same imputation as model training).
+        feats["s1_qtime_count_delta"] = 0.0
+        feats["s1_qtime_sum_delta"] = 0.0
+        dt = None
+        if scrape_ok and self.prev is not None:
+            dt = cur["ts"] - self.prev["ts"]
+            for key, out in (("s1_qtime_count", "s1_qtime_count_delta"),
+                             ("s1_qtime_sum", "s1_qtime_sum_delta")):
+                if cur.get(key) is not None and self.prev.get(key) is not None:
+                    feats[out] = float(cur[key] - self.prev[key])
+        vec = [[feats[k] for k in self.features]]
+        import math as _math
+
+        pred = float(self.model.predict(vec)[0])
+        if self.log_target:
+            pred = _math.exp(pred)
+        bound = max(0.0, pred + self.qc)
+        if scrape_ok:
+            self.prev = cur
+        return {"bound": bound, "features": feats, "scrape_ok": scrape_ok,
+                "scrape_dt_s": round(dt, 3) if dt is not None else None}
+
 
 async def stream_once(
     session: aiohttp.ClientSession, url: str, text: str, voice: str
@@ -121,6 +223,34 @@ def base_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return agg
 
 
+def paced_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Acceptance and paced-playback stall summary (s = max(ttfa, bound) + 0.3),
+    exactly the replay convention: stall time = [dstar - s]+."""
+    from extract_dstar import deficits
+
+    rejected = [r for r in rows if r.get("status") == "rejected"]
+    acc = [r for r in rows if r.get("status") == "ok" and "pacer_bound" in r]
+    out: dict[str, Any] = {
+        "n_rejected": len(rejected),
+        "n_accepted": len(acc),
+        "acceptance": round(len(acc) / max(len(acc) + len(rejected), 1), 3),
+    }
+    stall_times: list[float] = []
+    n_lbl = 0
+    for r in acc:
+        d = deficits(r)
+        if d is None:
+            continue
+        n_lbl += 1
+        s = max(r["ttfa_s"], r["pacer_bound"]) + PACER_BUFFER_S
+        st = max(0.0, d[0] - s)
+        if st > 1e-9:
+            stall_times.append(st)
+    out["paced_stalled_frac_b300"] = round(len(stall_times) / max(n_lbl, 1), 3)
+    out["paced_stall_total_s"] = round(sum(stall_times), 2)
+    return out
+
+
 def concurrency_stats(
     rows: list[dict[str, Any]], duration_s: float | None
 ) -> dict[str, Any]:
@@ -166,7 +296,8 @@ async def run_closed_loop(
 
 
 async def run_open_loop(
-    session: aiohttp.ClientSession, args: argparse.Namespace
+    session: aiohttp.ClientSession, args: argparse.Namespace,
+    pacer: "Pacer | None" = None,
 ) -> list[dict[str, Any]]:
     rng = random.Random(args.seed)
     arrivals: list[float] = []
@@ -181,12 +312,30 @@ async def run_open_loop(
 
     async def one(i: int, sched_at: float) -> dict[str, Any]:
         t0_epoch = time.time()
+        prow: dict[str, Any] = {}
+        if pacer is not None:
+            dec = await pacer.decide(session, args.url)
+            prow = {
+                "pacer_bound": round(dec["bound"], 4),
+                "pacer_scrape_ok": dec["scrape_ok"],
+                "pacer_scrape_dt_s": dec["scrape_dt_s"],
+                "pacer_features": dec["features"],
+            }
+            if dec["bound"] > pacer.theta:
+                return {"status": "rejected", "req": i,
+                        "sched_arrival_s": round(sched_at, 4),
+                        "t0_epoch": time.time(), **prow}
+            pacer.inflight += 1
         try:
             res = await stream_once(session, args.url, args.text, args.voice)
             row = summarize(res)
             row["t0_epoch"] = res["t0_epoch"]
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
             row = {"status": "error", "error": repr(exc), "t0_epoch": t0_epoch}
+        finally:
+            if pacer is not None:
+                pacer.inflight -= 1
+        row.update(prow)
         row["req"] = i
         row["sched_arrival_s"] = round(sched_at, 4)
         return row
@@ -205,6 +354,11 @@ async def run_open_loop(
 
 async def run(args: argparse.Namespace) -> None:
     open_loop = args.arrival_rate is not None
+    pacer = None
+    if args.pacer_model:
+        if not open_loop:
+            raise SystemExit("--pacer-model requires open-loop mode (--arrival-rate)")
+        pacer = Pacer(args.pacer_model, args.pacer_theta)
     timeout = aiohttp.ClientTimeout(total=args.timeout, sock_read=args.timeout)
     # Open loop must never queue connections client-side (that would re-couple
     # arrivals to completions); closed loop keeps the bounded connector.
@@ -224,7 +378,7 @@ async def run(args: argparse.Namespace) -> None:
             )
 
         if open_loop:
-            rows = await run_open_loop(session, args)
+            rows = await run_open_loop(session, args, pacer)
         else:
             rows = await run_closed_loop(session, args)
         stop.set()
@@ -244,6 +398,9 @@ async def run(args: argparse.Namespace) -> None:
         agg["n_arrivals"] = len(rows)
         agg["offered_rate"] = round(len(rows) / args.duration_s, 4)
         agg.update(concurrency_stats(rows, args.duration_s))
+        if pacer is not None:
+            agg["pacer_theta"] = args.pacer_theta
+            agg.update(paced_aggregate(rows))
     else:
         agg["mode"] = "closed-loop"
         agg["concurrency"] = args.concurrency
@@ -277,6 +434,15 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     parser.add_argument("--metrics-out", default=None)
     parser.add_argument("--metrics-interval", type=float, default=1.0)
+    parser.add_argument(
+        "--pacer-model", default=None,
+        help="joblib payload from export_pacer.py; enables live pacing/admission",
+    )
+    parser.add_argument(
+        "--pacer-theta", type=float, default=float("inf"),
+        help="reject arrivals whose conformalized bound exceeds theta seconds "
+        "(default inf = pace-only, never reject)",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     asyncio.run(run(args))
