@@ -261,6 +261,17 @@ class OmniSchedulerMixin:
                     request_id,
                     reason,
                 )
+            else:
+                # Drained but no longer scheduled here: the request finished or
+                # was aborted between the failed send and this sweep. Still say
+                # so -- collect_* empties the map, so staying quiet would make
+                # this the one drop path in a change whose point is visibility.
+                logger.warning(
+                    "[OmniScheduler] req=%s: chunk send gave up (%s) after the request "
+                    "left this scheduler (finished or aborted)",
+                    request_id,
+                    reason,
+                )
 
     def _process_pending_chunk_timeouts(self) -> None:
         """Force-fail requests stalled in ``WAITING_FOR_CHUNK`` too long.

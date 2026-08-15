@@ -15,6 +15,7 @@ import asyncio
 import time as _time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
 import janus
@@ -51,6 +52,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
+from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
@@ -221,7 +223,7 @@ class _OrchestratorDuplexStagePort:
         async_chunk: bool,
         prewarm_async_chunk_stages: Callable[
             [str, Any, OrchestratorRequestState],
-            Awaitable[None],
+            Awaitable[bool],
         ],
     ) -> None:
         self._stage_pools = stage_pools
@@ -307,11 +309,23 @@ class _OrchestratorDuplexStagePort:
         else:
             replica_id = await pool.submit_initial(context.request_id, request_state, request, prompt_text=None)
             if self._async_chunk and context.stage_id == 0:
-                await self._prewarm_async_chunk_stages(
+                prewarmed = await self._prewarm_async_chunk_stages(
                     context.request_id,
                     request,
                     request_state,
                 )
+                if not prewarmed:
+                    # The prewarm already failed the request, aborted it, and
+                    # popped its state. Falling through would write fences and
+                    # a submit timestamp onto that orphaned object and
+                    # re-increment the running counter the cleanup just
+                    # released, then hand the control plane a success result
+                    # for a request that no longer exists. Raise instead:
+                    # ``DuplexControlPlane.handle_append`` turns this into an
+                    # error result for the append.
+                    raise RuntimeError(
+                        f"async-chunk prewarm failed for duplex request {context.request_id}; the request was aborted"
+                    )
         request_state.duplex_stage_fences[context.stage_id] = context.fence
         request_state.stage_submit_ts[context.stage_id] = _time.time()
         if not request_state.running_counter_registered and self._running_counter is not None:
@@ -2209,10 +2223,15 @@ class Orchestrator:
         request_id: str,
         stage0_request: Any,
         req_state: OrchestratorRequestState,
-    ) -> None:
-        """Pre-submit downstream stages for async-chunk mode."""
+    ) -> bool:
+        """Pre-submit downstream stages for async-chunk mode.
+
+        Returns False when the request was failed and cleaned up in here, so a
+        caller still holding ``req_state`` stops instead of recording state on
+        an object the cleanup already popped from ``request_states``.
+        """
         if req_state.final_stage_id <= 0:
-            return
+            return True
 
         prompt_token_ids = getattr(stage0_request, "prompt_token_ids", None)
         if prompt_token_ids is None:
@@ -2221,6 +2240,14 @@ class Orchestrator:
             # just stops. An embeds-only prompt in async-chunk mode is a config
             # mistake, and the client should hear about it now rather than wait
             # for the stage-input deadline to notice nothing ever arrived.
+            #
+            # Non-fatal, with a 4xx: `fatal=True` means "the engine is dead", and
+            # the entrypoints act on it -- `OmniBase._handle_output_message`
+            # raises `OmniEngineDeadError` out of `OmniLLM.generate`'s batch loop,
+            # failing every other request in that batch, and the serving layer
+            # calls `terminate_if_errored`. One client's bad prompt must not do
+            # either. This is the same shape `_handle_stage_error` uses for a
+            # request-scoped client error.
             logger.error(
                 "[Orchestrator] req=%s: async_chunk prewarm needs stage0 prompt_token_ids "
                 "and none were provided; failing the request",
@@ -2232,7 +2259,8 @@ class Orchestrator:
                         "async_chunk requires prompt_token_ids on the stage-0 request; "
                         "an embeds-only prompt cannot prewarm downstream stages"
                     ),
-                    fatal=True,
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    error_type=DEFAULT_CLIENT_ERROR_TYPE,
                     request_id=request_id,
                     stage_id=0,
                 )
@@ -2240,8 +2268,9 @@ class Orchestrator:
             await self._cleanup_request_ids(
                 [request_id, *self._cfg_tracker.cleanup_parent(request_id)],
                 abort=True,
+                close_duplex_sessions=True,
             )
-            return
+            return False
 
         for next_stage_id in range(1, req_state.final_stage_id + 1):
             next_pool = self.stage_pools[next_stage_id]
@@ -2316,7 +2345,7 @@ class Orchestrator:
             # Attribute the failure to the stage that failed, not stage 0; the
             # request is already cleaned up, so stop prewarming.
             if not submitted:
-                return
+                return False
 
             # The guard swallows submit_initial's return value; the pool binding
             # it recorded carries the same replica.
@@ -2341,6 +2370,8 @@ class Orchestrator:
                 request_id=request_id,
                 tx_ms=_tx_ms,
             )
+
+        return True
 
     def _build_kv_sender_info(
         self,

@@ -16,7 +16,10 @@ this file only asserts the wiring from the mixin to that API.
 
 from __future__ import annotations
 
+import importlib
 import logging
+import math
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -200,22 +203,87 @@ def test_process_pending_chunk_timeouts_disabled_when_timeout_zero(monkeypatch):
     assert scheduler.finish_calls == []
 
 
+class _FakeSendFailureAdapter:
+    """Stands in for the adapter's drained send-failure map (R1.2)."""
+
+    def __init__(self, failures):
+        self._failures = dict(failures)
+        self.collect_calls = 0
+
+    def collect_failed_send_request_ids(self):
+        self.collect_calls += 1
+        failures, self._failures = self._failures, {}
+        return failures
+
+
+class _FakeSendFailureScheduler(OmniSchedulerMixin):
+    def __init__(self, requests, adapter):
+        self.requests = requests
+        self.chunk_transfer_adapter = adapter
+
+
+def test_log_failed_chunk_sends_reports_a_live_request(caplog):
+    adapter = _FakeSendFailureAdapter({"req-live": "OSError: No space left on device"})
+    scheduler = _FakeSendFailureScheduler({"req-live": SimpleNamespace(request_id="req-live")}, adapter)
+
+    with caplog.at_level(logging.ERROR):
+        scheduler._log_failed_chunk_sends()
+
+    assert "req-live" in caplog.text
+    assert "No space left on device" in caplog.text
+
+
+def test_log_failed_chunk_sends_still_reports_a_departed_request(caplog):
+    """``collect_*`` drains the map, so a failure for a request that already left
+    this scheduler is the one place a drop could still go unrecorded."""
+    adapter = _FakeSendFailureAdapter({"req-gone": "OSError: No space left on device"})
+    scheduler = _FakeSendFailureScheduler({}, adapter)
+
+    with caplog.at_level(logging.WARNING):
+        scheduler._log_failed_chunk_sends()
+
+    assert adapter.collect_calls == 1
+    assert "req-gone" in caplog.text
+    assert "No space left on device" in caplog.text
+    assert "finished or aborted" in caplog.text
+
+
+def test_log_failed_chunk_sends_noop_without_adapter():
+    scheduler = _FakeSendFailureScheduler({}, None)
+    scheduler._log_failed_chunk_sends()
+
+
 # --- R1.4: VLLM_OMNI_INPUT_WAIT_TIMEOUT_S is parsed at import time, so each of
 # these reloads the module under a different environment. One knob now gates the
 # deadline on both transports, which is why a silent 0 matters more than it did
 # when only the full-payload path used it.
 
 
-def _reload_with(monkeypatch, raw):
-    import importlib
+@pytest.fixture
+def reload_with(monkeypatch):
+    """Reload the mixin module under a given env value, then put it back.
 
+    ``importlib.reload`` re-executes into the live module dict, so whatever the
+    last test parsed is what every later test in the session sees -- ``-k
+    zero_warns`` alone would leave ``DEFAULT_INPUT_WAIT_TIMEOUT_S = 0.0`` and
+    silently disable both deadlines. The rejection cases are worse: the
+    ValueError fires *after* the rebind, so ``nan`` lingers in the module.
+    ``monkeypatch`` restores the environment but not the module, so reload once
+    more on the way out.
+    """
     import vllm_omni.core.sched.omni_scheduler_mixin as mod
 
-    if raw is None:
-        monkeypatch.delenv("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", raw)
-    return importlib.reload(mod)
+    def _reload(raw):
+        if raw is None:
+            monkeypatch.delenv("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", raw)
+        return importlib.reload(mod)
+
+    yield _reload
+
+    monkeypatch.undo()
+    importlib.reload(mod)
 
 
 @pytest.mark.parametrize(
@@ -227,39 +295,62 @@ def _reload_with(monkeypatch, raw):
         ("0", 0.0),  # explicit opt-out is still honoured
     ],
 )
-def test_timeout_accepts_valid_values(monkeypatch, raw, expected):
-    mod = _reload_with(monkeypatch, raw)
+def test_timeout_accepts_valid_values(reload_with, raw, expected):
+    mod = reload_with(raw)
     assert mod.DEFAULT_INPUT_WAIT_TIMEOUT_S == expected
 
 
 @pytest.mark.parametrize("raw", ["-1", "-600", "-0.5"])
-def test_negative_timeout_is_rejected(monkeypatch, raw):
+def test_negative_timeout_is_rejected(reload_with, raw):
     """`-1` is a common "no limit" idiom; substituting 600 would give an operator
     who meant "never time out" mysterious failures ten minutes in. Fail loudly."""
     with pytest.raises(ValueError, match="negative"):
-        _reload_with(monkeypatch, raw)
+        reload_with(raw)
 
 
 @pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "1e999"])
-def test_non_finite_timeout_is_rejected(monkeypatch, raw):
+def test_non_finite_timeout_is_rejected(reload_with, raw):
     """nan compares false against every deadline check and inf is unreachable;
     both disable the net while looking like a number."""
     with pytest.raises(ValueError, match="not finite"):
-        _reload_with(monkeypatch, raw)
+        reload_with(raw)
 
 
-def test_zero_warns_and_names_both_transports(monkeypatch, caplog):
+def test_zero_warns_and_names_both_transports(reload_with, caplog):
     with caplog.at_level(logging.WARNING):
-        mod = _reload_with(monkeypatch, "0")
+        mod = reload_with("0")
     assert mod.DEFAULT_INPUT_WAIT_TIMEOUT_S == 0.0
     text = caplog.text
     assert "DISABLED" in text
     assert "WAITING_FOR_INPUT" in text and "WAITING_FOR_CHUNK" in text
 
 
-def test_unparsable_timeout_falls_back(monkeypatch):
-    mod = _reload_with(monkeypatch, "not-a-number")
+def test_unparsable_timeout_falls_back(reload_with):
+    mod = reload_with("not-a-number")
     assert mod.DEFAULT_INPUT_WAIT_TIMEOUT_S == 600.0
+
+
+def test_a_rejected_value_does_not_outlive_its_test(monkeypatch):
+    """The reason ``reload_with`` reloads on the way out, done here by hand.
+
+    ``nan`` is bound before the ValueError fires, so the reload that rejects it
+    still leaves it in the module -- and nan compares false against every
+    deadline check, which is exactly the silent-disable this item exists to
+    stop. Restoring the environment is not enough; the module has to be reloaded
+    too.
+    """
+    import vllm_omni.core.sched.omni_scheduler_mixin as mod
+
+    ambient = float(os.environ.get("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", "600"))
+
+    monkeypatch.setenv("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", "nan")
+    with pytest.raises(ValueError, match="not finite"):
+        importlib.reload(mod)
+    assert math.isnan(mod.DEFAULT_INPUT_WAIT_TIMEOUT_S)
+
+    monkeypatch.undo()
+    importlib.reload(mod)
+    assert mod.DEFAULT_INPUT_WAIT_TIMEOUT_S == ambient
 
 
 if __name__ == "__main__":
