@@ -67,7 +67,7 @@ rows, not requests.
 #### Command
 
 ```bash
-vllm-omni serve MiniMaxAI/MiniMax-Music3 \
+vllm serve MiniMaxAI/MiniMax-Music3 \
     --host 0.0.0.0 --port 8000 \
     --trust-remote-code --omni
 ```
@@ -116,7 +116,7 @@ response shorter than the cap is the model finishing rather than a truncation.
 Use `minimax_music3_2gpu.yaml` to put the acoustic stage on the second device:
 
 ```bash
-vllm-omni serve MiniMaxAI/MiniMax-Music3 \
+vllm serve MiniMaxAI/MiniMax-Music3 \
     --host 0.0.0.0 --port 8000 \
     --trust-remote-code --omni \
     --deploy-config minimax_music3_2gpu.yaml
