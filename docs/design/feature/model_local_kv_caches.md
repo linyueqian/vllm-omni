@@ -1,83 +1,56 @@
 # Model-local KV caches
 
-Several vLLM-Omni model implementations keep their own attention KV state instead of
-using the engine's paged KV manager. This page inventories them, because the
-question "which caches exist and what do they cost" currently has no written answer,
-and three separate RFCs ([#4366](https://github.com/vllm-project/vllm-omni/issues/4366),
-[#5244](https://github.com/vllm-project/vllm-omni/issues/5244),
-[#4855](https://github.com/vllm-project/vllm-omni/issues/4855) K3) each assume a
-different one.
+Some models keep their attention KV as HuggingFace `transformers` cache objects
+instead of using the engine's paged KV manager. That memory is allocated after
+the profiling run that sizes the KV pool, so no per-stage footprint includes it.
 
-Line numbers are against `dbc0dd6d8`.
+Measured against `596c16a55`. Every figure is derived from the checkpoint config
+plus the code that bounds the cache.
 
-## What is actually there
+| Model | Cache | Bounded by | Per instance |
+|---|---|---|---|
+| Qwen3-TTS codec decoder (stage 1) | sliding `DynamicCache` | `sliding_window - 1 = 71` | 4.44 MiB |
+| MiMo-Audio local transformer | `DynamicCache` | `group_size + max(delay_pattern) = 11` | 704 KiB |
+| MiMo-Audio graph pool | same, captured | 261 retained batch rows | 179.44 MiB [^1] |
+| MiniCPM-o 4.5 Whisper encoder | `EncoderDecoderCache` | 1500 encoder frames | 140.62 MiB |
+| ming_flash_omni talker | `StaticCache`, preallocated | hardcoded `max_cache_len = 2048` | not statically determinable |
 
-They are not ad-hoc lists. Every one of them is a HuggingFace `transformers`
-cache object, held in model code, allocated per call:
+Three things this table makes obvious, none of which were before.
 
-| Model | Type | Allocated | Scope |
-|-------|------|-----------|-------|
-| `mimo_audio` | `DynamicCache` | `mimo_audio_llm.py:827` | local, re-bound each step from `output.past_key_values` |
-| `ming_flash_omni` talker | `StaticCache` | `talker_module.py:843` via `_init_kv_cache` | local to the generate call |
-| `minicpmo_4_5` | `EncoderDecoderCache(DynamicCache(), DynamicCache())` | `minicpmo_4_5_omni_llm.py:2765` | local, 5 allocation sites |
-| `nemotron_voicechat` | HF cache held in a session dict | `nemotron_voicechat_talker.py:343` | per session, lives across turns |
+**No cache is bounded by `max_model_len`.** Each has its own mechanism: a
+sliding window, a decode-loop trip count, an encoder frame limit, a constant.
+Sizing any of them by sequence length overstates them by orders of magnitude --
+Qwen3-TTS at stage 1's `max_model_len` would read 256 MiB/request instead of
+4.44 MiB.
 
-`DynamicCache` grows a `list[Tensor]` per layer as tokens are appended;
-`StaticCache` preallocates the full extent up front. Both are ordinary torch
-allocations on the same device as the model.
+**Lifetime and multiplicity are independent.** MiMo's per-call cache is 704 KiB,
+but it is captured once per bucket in `MIMO_CUDAGRAPH_BATCH_SIZES`, so 261 batch
+rows stay resident for the process. Peak memory needs both numbers.
 
-## The problem is accounting, not lifetime
+**ming's geometry does not exist in this repo.** `self._llm_config` is a
+`Qwen2Config` from the checkpoint, so layers, kv-heads, head-dim and dtype are
+only knowable after load. Any static table has a hole here; a post-load query
+does not.
 
-The obvious worry is leaks. That is mostly not the issue — `_init_kv_cache`
-returns a local, and the `DynamicCache` sites are re-bound or dropped when the
-call returns, so refcounting frees them. `nemotron_voicechat` is the exception
-worth watching, since its cache hangs off a session that outlives a single
-request.
+## Declaring instead of tabulating
 
-The real problems are that this memory is invisible and arbitrarily sized:
+`vllm_omni/model_executor/models/model_local_kv.py` defines
+`ModelLocalKVSpec` + `HasModelLocalKV`: a model declares what it holds, the
+engine sums it. It describes and never allocates -- allocation for the diffusion
+path is owned by RFC #5244 / PR #6094 and this must not become a second
+allocator.
 
-**Invisible.** None of these allocations pass through
-`determine_available_memory()` or any per-stage budget. A stage's reported
-footprint is weights plus graphs plus vLLM's own KV pool; these caches are on
-top of that, allocated after the profiling run that decided how much KV memory
-the engine could claim. That is the cross-stage OOM class that
-[#4855](https://github.com/vllm-project/vllm-omni/issues/4855) K2 and
-[#6071](https://github.com/vllm-project/vllm-omni/pull/6071) are about, arriving
-from a direction neither of them currently covers.
+A table like the one above is stale the moment someone changes `sliding_window`.
+A declaration is not.
 
-**Arbitrarily sized.** `ming_flash_omni` hardcodes `max_cache_len = 2048` with
-`max_batch_size=1` (`talker_module.py:840-848`). The constant has no relation to
-the request's actual length or to `max_model_len`; a `StaticCache` at that extent
-is preallocated in full whether the request needs 50 tokens or 2000. Each model
-picks its own number this way.
+## Adding a model
 
-**Per-model, so per-model bugs.** Four models, four cache disciplines, no shared
-test surface. A fix for one does not carry.
+Return one entry per distinct *lifetime*, not per cache object: a retained
+per-request cache and a short-lived working copy of the same geometry are two
+entries. `capacity_source` is diagnostic text -- never branch on it.
 
-## What this does not propose
-
-Deliberately no design here. Unifying these onto a paged manager is
-[#4855](https://github.com/vllm-project/vllm-omni/issues/4855) K3, and it should
-be scoped with the owners of
-[#5244](https://github.com/vllm-project/vllm-omni/issues/5244) rather than
-decided TTS-side, especially now that
-[#6094](https://github.com/vllm-project/vllm-omni/pull/6094) has landed a
-scheduler-managed block allocator for the diffusion path. The useful next step is
-agreeing which of the three RFCs owns this surface; that argument is easier with
-the inventory written down than without it.
-
-Two things that are worth doing regardless of how that lands, in rough order of
-cost:
-
-1. Report these allocations per stage, so the footprint numbers stop being wrong.
-   [#5180](https://github.com/vllm-project/vllm-omni/pull/5180) is adding
-   per-stage memory observability and is the natural place.
-2. Derive `max_cache_len` from the stage's `max_model_len` instead of a
-   per-model constant, so the preallocation is at least proportionate.
-
-## Adding to this page
-
-If you add a model that keeps its own KV state, add a row. The check that
-produced the table is a `git grep` for
-`DynamicCache|StaticCache|EncoderDecoderCache|SlidingWindowCache|HybridCache`
-under `vllm_omni/model_executor/models/`.
+[^1]: MiMo captures every bucket in `MIMO_CUDAGRAPH_BATCH_SIZES` gated only on
+`torch.cuda.is_available()` (`mimo_audio_llm.py:670`), so these stay resident
+even when the deploy config sets `enforce_eager: true`. Not fixed here --
+gating it is a one-line change but verifying it needs a model boot, and an
+unverified startup-behaviour change is not worth bundling into this PR.

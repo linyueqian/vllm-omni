@@ -2559,11 +2559,17 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
             attention_mask=attention_mask,
             layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,
-            past_key_value=past_key_values,
+            past_key_values=past_key_values,
         )
         hidden_states = attn_out[0]
         attn_weights = attn_out[1] if len(attn_out) > 1 else None
-        past_key_values = attn_out[2] if len(attn_out) > 2 else None
+        # Do NOT re-read the cache from the return value. transformers 4.x
+        # returned it as a third element; v5's WhisperAttention.forward returns
+        # only (attn_output, attn_weights), so `attn_out[2]` was unreachable and
+        # this silently rebound past_key_values to None -- the streaming encoder
+        # then re-encoded its whole prefix every chunk. v5 Cache objects are
+        # mutated in place by `.update()`, so the object passed in above is
+        # already current; just keep it.
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
 
