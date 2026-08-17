@@ -199,7 +199,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         much KV the engine may claim, so no existing per-stage number accounts
         for them. Logging is deliberately all this does: the measurement that
         would justify subtracting them from the engine's budget has not been
-        made, and guessing here would mis-size the paged pool.
+        made, and guessing here would size the paged pool wrongly.
         """
         specs = collect_model_local_kv_specs(getattr(self, "model", None))
         if not specs:
