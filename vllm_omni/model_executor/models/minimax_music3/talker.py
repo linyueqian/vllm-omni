@@ -934,11 +934,15 @@ class MiniMaxMusic3TalkerForConditionalGeneration(nn.Module):
         # The span's start frame and terminal flag ride along with it: without
         # them the acoustic stage cannot tell which window it is looking at,
         # and therefore cannot crop it correctly.
-        merged: dict[str, Any] = {}
-        for meta in metas:
-            merged.update(meta)
-        if merged:
-            payload["meta"] = merged
+        #
+        # Every field is a list with one entry per batch row, in the same order
+        # as ``latent``. The payload is partitioned per request by indexing
+        # list values, so a scalar here would be broadcast to the whole batch
+        # and every request would decode with the last request's seed, window
+        # offset and terminal flag.
+        meta_keys = {key for meta in metas for key in meta}
+        if meta_keys:
+            payload["meta"] = {key: [meta.get(key) for meta in metas] for key in sorted(meta_keys)}
         return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs=payload)
 
     def on_requests_finished(self, finished_req_ids: Iterable[str]) -> None:
