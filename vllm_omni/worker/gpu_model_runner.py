@@ -33,6 +33,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
+from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -189,6 +190,44 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._maybe_enable_output_token_ids_for_model_sampler()
         self._init_talker_mtp()
         self._prewarm_attention_capture_workspaces()
+        self._report_model_local_kv()
+
+    def _report_model_local_kv(self) -> None:
+        """Log attention KV this model holds outside the paged manager.
+
+        These caches are allocated after the profiling run that decides how
+        much KV the engine may claim, so no existing per-stage number accounts
+        for them. Logging is deliberately all this does: the measurement that
+        would justify subtracting them from the engine's budget has not been
+        made, and guessing here would mis-size the paged pool.
+        """
+        specs = collect_model_local_kv_specs(getattr(self, "model", None))
+        if not specs:
+            return
+        concurrency = max(1, int(self.scheduler_config.max_num_seqs))
+        fixed = sum(s.max_live_bytes for _, s in specs if not s.scales_with_concurrency)
+        peak = sum(s.peak_bytes(concurrency) for _, s in specs)
+        logger.info(
+            "Model-local KV (outside the paged manager): %.2f MiB resident + "
+            "%.2f MiB at max_num_seqs=%d, across %d declaration(s)",
+            fixed / (1 << 20),
+            (peak - fixed) / (1 << 20),
+            concurrency,
+            len(specs),
+        )
+        for path, spec in specs:
+            logger.info(
+                "  %s.%s: %.2f MiB (%d x %.2f MiB, scope=%s%s, %d positions from %s)",
+                path or type(self.model).__name__,
+                spec.name,
+                spec.peak_bytes(concurrency) / (1 << 20),
+                spec.max_live_instances * (concurrency if spec.scales_with_concurrency else 1),
+                spec.bytes_per_instance / (1 << 20),
+                spec.scope.value,
+                " x max_num_seqs" if spec.scales_with_concurrency else " resident",
+                spec.physical_capacity_positions,
+                spec.capacity_source,
+            )
 
     def _maybe_enable_output_token_ids_for_model_sampler(self) -> None:
         if getattr(self.model, "logitsprocs_need_output_token_ids", False):

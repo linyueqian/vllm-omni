@@ -55,6 +55,11 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema
 
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import MiMoAudioConfig
+from vllm_omni.model_executor.models.model_local_kv import (
+    ModelLocalKVScope,
+    ModelLocalKVSpec,
+    spec_from_hf_config,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
@@ -745,6 +750,58 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
     def get_language_model(self) -> torch.nn.Module:
         return self.model
+
+    def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
+        """Declare the local transformer's decode cache and its graph copies.
+
+        The cache is created per call inside ``base_local_forward`` and is
+        bounded by the decode loop, not by sequence length: the loop runs
+        ``group_size + max(delay_pattern)`` steps regardless of how long the
+        utterance is.
+
+        The second entry is the one that matters. ``base_local_forward`` runs
+        inside ``torch.cuda.graph`` during capture, so each captured bucket
+        leaves a cache's worth of tensors pinned in the graph pool for the
+        process lifetime. There is no Python object left to inspect -- the
+        cache is a local in the captured frame -- so the count comes from the
+        buckets that captured successfully, which is why it reads
+        ``local_forward_cg_by_bs`` rather than MIMO_CUDAGRAPH_BATCH_SIZES: a
+        bucket whose capture raised is logged and skipped.
+        """
+        delay_iters = self.group_size + max(self.delay_pattern)
+        dtype = next(self.local_transformer.parameters()).dtype
+        specs = [
+            spec_from_hf_config(
+                self.local_config,
+                name="local_transformer",
+                dtype=dtype,
+                physical_capacity_positions=delay_iters,
+                capacity_source=f"group_size({self.group_size}) + max(delay_pattern)({max(self.delay_pattern)})",
+                scope=ModelLocalKVScope.INVOCATION,
+                batch_capacity=1,
+                max_live_instances=1,
+            )
+        ]
+        captured_rows = sum(self.local_forward_cg_by_bs)
+        if captured_rows:
+            specs.append(
+                spec_from_hf_config(
+                    self.local_config,
+                    name="local_transformer_graph_pool",
+                    dtype=dtype,
+                    physical_capacity_positions=delay_iters,
+                    capacity_source=f"group_size({self.group_size}) + max(delay_pattern)({max(self.delay_pattern)})",
+                    scope=ModelLocalKVScope.MODEL,
+                    batch_capacity=1,
+                    max_live_instances=captured_rows,
+                    allocation_note=(
+                        f"pinned in the CUDA graph pool by {len(self.local_forward_cg_by_bs)} captured buckets "
+                        f"{sorted(self.local_forward_cg_by_bs)}; capture is gated only on cuda.is_available(), "
+                        "so this stays resident under enforce_eager too"
+                    ),
+                )
+            )
+        return specs
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         if kwargs.get("modality_preprocess") is None:

@@ -854,6 +854,19 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self._cudagraph_enabled = False
         self._cudagraph_wrapper = None
 
+    def model_local_kv_specs(self):
+        """Declare the KV the CUDA-graph wrapper holds on this decoder's behalf.
+
+        The wrapper is a plain object, not a submodule, so the module-tree walk
+        in ``collect_model_local_kv_specs`` cannot reach it. This is the hop it
+        needs. Nothing is declared before ``enable_cudagraph``: without the
+        wrapper the decoder allocates its cache per call and retains none.
+        """
+        wrapper = getattr(self, "_cudagraph_wrapper", None)
+        if wrapper is None:
+            return []
+        return wrapper.model_local_kv_specs()
+
     def precompute_snake_caches(self):
         """Precompute exp(alpha) and 1/(exp(beta)+eps) for all SnakeBeta modules."""
         count = 0

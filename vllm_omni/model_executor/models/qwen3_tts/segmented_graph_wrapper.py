@@ -17,6 +17,12 @@ from transformers.cache_utils import DynamicCache
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
+from vllm_omni.model_executor.models.model_local_kv import (
+    ModelLocalKVScope,
+    ModelLocalKVSpec,
+    spec_from_hf_config,
+)
+
 logger = init_logger(__name__)
 
 
@@ -165,6 +171,93 @@ class CUDAGraphDecoderWrapper:
     def _maybe_log_stats(self) -> None:
         if self._stats_log_every > 0 and self._stats_total_requests % self._stats_log_every == 0:
             self.log_decode_stats()
+
+    @staticmethod
+    def _retained_kv_caches(states: dict) -> list[tuple[int, DynamicCache]]:
+        """Find the KV caches a capture kept alive, with their batch rows.
+
+        Walks the stored ``cache`` payload instead of assuming which capture
+        path populates it: ``_decode_icl_first_chunk`` fills its dict on the
+        decoder side, so the only reliable count is the one taken from the
+        objects themselves after warmup.
+        """
+        found: list[tuple[int, DynamicCache]] = []
+        for state in states.values():
+            payload = state.get("cache")
+            if not isinstance(payload, dict):
+                continue
+            for value in payload.values():
+                if not isinstance(value, DynamicCache):
+                    continue
+                layers = getattr(value, "layers", None)
+                keys = getattr(layers[0], "keys", None) if layers else None
+                if keys is None:
+                    continue
+                found.append((int(keys.shape[0]), value))
+        return found
+
+    def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
+        """Declare the codec decoder KV this wrapper holds.
+
+        Two entries, because the retained graph copies dominate and have a
+        different lifetime from the live one. Every captured shape keeps its
+        dummy ``DynamicCache`` alive for replay (``combined_states``,
+        ``icl_prefix_states``, ``xvec_prefix_states`` all store ``cache``), so
+        the graph-resident total is the per-instance cost times the number of
+        captures -- not one instance.
+
+        Counts come from the state dicts rather than from the configured
+        capture lists: a capture that raised is logged and skipped, so the
+        configured shape count would over-report.
+        """
+        config = self.decoder.config
+        try:
+            dtype = next(self.decoder.parameters()).dtype
+        except StopIteration:  # parameterless stub, only reachable in tests
+            return []
+
+        # Physical, not logical: the sliding window truncates on every write,
+        # so a stream of thousands of frames never occupies more than this.
+        physical = self.prefix_length - 1
+        retained = [
+            *self._retained_kv_caches(self.combined_states),
+            *self._retained_kv_caches(self.icl_prefix_states),
+            *self._retained_kv_caches(self.xvec_prefix_states),
+        ]
+        batched_captures = sum(rows for rows, _ in retained)
+
+        specs = [
+            spec_from_hf_config(
+                config,
+                name="codec_decoder_suffix",
+                dtype=dtype,
+                physical_capacity_positions=physical,
+                capacity_source=f"sliding_window({self.prefix_length}) - 1",
+                scope=ModelLocalKVScope.REQUEST,
+                batch_capacity=1,
+                max_live_instances=1,
+                allocation_note="grows to the window then truncates in place",
+            )
+        ]
+        if batched_captures:
+            specs.append(
+                spec_from_hf_config(
+                    config,
+                    name="codec_decoder_graph_pool",
+                    dtype=dtype,
+                    physical_capacity_positions=physical,
+                    capacity_source=f"sliding_window({self.prefix_length}) - 1",
+                    scope=ModelLocalKVScope.MODEL,
+                    batch_capacity=1,
+                    max_live_instances=batched_captures,
+                    allocation_note=(
+                        f"{len(retained)} retained caches across "
+                        f"{len(self.combined_states)} suffix / {len(self.icl_prefix_states)} icl-prefix / "
+                        f"{len(self.xvec_prefix_states)} xvec-prefix captures, summed over batch rows"
+                    ),
+                )
+            )
+        return specs
 
     def log_decode_stats(self) -> None:
         if not getattr(self, "_stats_enabled", False) or self._stats_total_requests == 0:

@@ -136,6 +136,12 @@ def _encode_tokens(tokenizer: Any, prompt: str) -> list[int]:
 
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
+from vllm_omni.model_executor.models.model_local_kv import (
+    ModelLocalKVScope,
+    ModelLocalKVSpec,
+    spec_from_hf_config,
+)
+
 logger = init_logger(__name__)
 hf_logger = logging.get_logger(__name__)
 
@@ -2605,6 +2611,36 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
         self.layers = nn.ModuleList(
             [MiniCPMWhisperEncoderLayer(config, layer_idx=i) for i in range(config.encoder_layers)]
         )
+
+    def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
+        """Declare the streaming encoder's self-attention cache.
+
+        Bounded by learned position embeddings, not by ``max_model_len``: the
+        cache cannot outgrow ``embed_positions``, and past that point the
+        forward pass repeats the last position rather than extending (see the
+        "audio is longer than 30s" branch below).
+
+        Whisper is encoder-only self-attention here, so kv-heads equal
+        attention heads. Layer count is read off the built ``self.layers``
+        rather than the config, so a partially built encoder reports what it
+        actually has.
+        """
+        return [
+            spec_from_hf_config(
+                self.config,
+                name="whisper_encoder_self_attn",
+                dtype=self.conv1.weight.dtype,
+                layers=len(self.layers),
+                kv_heads=self.config.encoder_attention_heads,
+                head_dim=self.config.d_model // self.config.encoder_attention_heads,
+                physical_capacity_positions=int(self.embed_positions.weight.shape[0]),
+                capacity_source="embed_positions rows (max_source_positions)",
+                scope=ModelLocalKVScope.SESSION,
+                batch_capacity=1,
+                max_live_instances=1,
+                allocation_note="only allocated on the streaming path, when use_cache is set",
+            )
+        ]
 
     def forward(
         self,
