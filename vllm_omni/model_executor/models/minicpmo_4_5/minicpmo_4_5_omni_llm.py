@@ -137,6 +137,7 @@ def _encode_tokens(tokenizer: Any, prompt: str) -> list[int]:
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from vllm_omni.model_executor.models.model_local_kv import (
+    DuplexMaxSessions,
     ModelLocalKVScope,
     ModelLocalKVSpec,
     spec_from_hf_config,
@@ -2624,6 +2625,14 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
         attention heads. Layer count is read off the built ``self.layers``
         rather than the config, so a partially built encoder reports what it
         actually has.
+
+        Width is driven by duplex sessions, not by ``max_num_seqs``. Each
+        duplex session state owns its own ``audio_past_key_values``
+        (``experimental/fullduplex/minicpmo45/stage0.py``), so the number of
+        concurrent caches is ``duplex_max_sessions``. Those are different
+        settings with different defaults, and scaling this by the scheduler's
+        sequence count -- which an earlier revision did -- answers a question
+        nobody asked.
         """
         return [
             spec_from_hf_config(
@@ -2636,8 +2645,8 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
                 physical_capacity_positions=int(self.embed_positions.weight.shape[0]),
                 capacity_source="embed_positions rows (max_source_positions)",
                 scope=ModelLocalKVScope.SESSION,
-                batch_capacity=1,
-                max_live_instances=1,
+                rows=DuplexMaxSessions(),
+                allocations=1,
                 allocation_note="only allocated on the streaming path, when use_cache is set",
             )
         ]

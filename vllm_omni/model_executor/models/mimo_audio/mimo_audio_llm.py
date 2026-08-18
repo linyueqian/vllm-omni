@@ -56,6 +56,8 @@ from vllm.utils.tensor_schema import TensorSchema
 
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import MiMoAudioConfig
 from vllm_omni.model_executor.models.model_local_kv import (
+    Fixed,
+    MaxNumSeqs,
     ModelLocalKVScope,
     ModelLocalKVSpec,
     spec_from_hf_config,
@@ -763,23 +765,33 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         inside ``torch.cuda.graph`` during capture, so each captured bucket
         leaves a cache's worth of tensors pinned in the graph pool for the
         process lifetime. There is no Python object left to inspect -- the
-        cache is a local in the captured frame -- so the count comes from the
+        cache is a local in the captured frame -- so the width comes from the
         buckets that captured successfully, which is why it reads
         ``local_forward_cg_by_bs`` rather than MIMO_CUDAGRAPH_BATCH_SIZES: a
         bucket whose capture raised is logged and skipped.
+
+        Both entries are declared, and summing them over-states a single step:
+        a given call either replays a captured bucket or runs eagerly, never
+        both. The graph pool is resident regardless, so the sum is the right
+        ceiling for the process and the wrong number for one request.
         """
         delay_iters = self.group_size + max(self.delay_pattern)
         dtype = next(self.local_transformer.parameters()).dtype
+        bound = f"group_size({self.group_size}) + max(delay_pattern)({max(self.delay_pattern)})"
         specs = [
             spec_from_hf_config(
                 self.local_config,
                 name="local_transformer",
                 dtype=dtype,
                 physical_capacity_positions=delay_iters,
-                capacity_source=f"group_size({self.group_size}) + max(delay_pattern)({max(self.delay_pattern)})",
+                capacity_source=bound,
                 scope=ModelLocalKVScope.INVOCATION,
-                batch_capacity=1,
-                max_live_instances=1,
+                # One cache, B rows wide -- not B caches. base_local_forward
+                # builds a single DynamicCache whose batch dimension is the
+                # number of requests in the group.
+                rows=MaxNumSeqs(),
+                allocations=1,
+                allocation_note="one batched allocation per eager call; graph replay uses the pool entry instead",
             )
         ]
         captured_rows = sum(self.local_forward_cg_by_bs)
@@ -790,13 +802,15 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                     name="local_transformer_graph_pool",
                     dtype=dtype,
                     physical_capacity_positions=delay_iters,
-                    capacity_source=f"group_size({self.group_size}) + max(delay_pattern)({max(self.delay_pattern)})",
+                    capacity_source=bound,
                     scope=ModelLocalKVScope.MODEL,
-                    batch_capacity=1,
-                    max_live_instances=captured_rows,
+                    rows=Fixed(
+                        captured_rows,
+                        because=f"sum of captured buckets {sorted(self.local_forward_cg_by_bs)}",
+                    ),
+                    allocations=1,
                     allocation_note=(
-                        f"pinned in the CUDA graph pool by {len(self.local_forward_cg_by_bs)} captured buckets "
-                        f"{sorted(self.local_forward_cg_by_bs)}; capture is gated only on cuda.is_available(), "
+                        "pinned in the CUDA graph pool; capture is gated only on cuda.is_available(), "
                         "so this stays resident under enforce_eager too"
                     ),
                 )

@@ -37,6 +37,7 @@ from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE
 from vllm_omni.model_executor.models.common.ming.dit import CondEmbedder, DiTBlock, FinalLayer, get_epss_timesteps
 from vllm_omni.model_executor.models.common.ming.fm import apply_sway_sampling, integrate_cfm_steps
 from vllm_omni.model_executor.models.model_local_kv import (
+    Fixed,
     ModelLocalKVScope,
     ModelLocalKVSpec,
     spec_from_hf_config,
@@ -682,9 +683,19 @@ class MingAudioGenerator:
         stays under. transformers v5 initializes ``StaticLayer`` lazily, but
         the first write to a layer allocates all ``max_cache_len`` positions at
         once rather than growing, so a prefill brings the full extent into
-        existence on step 0 of every generation. It is rebuilt per
-        ``generate_latents`` call and calls are sequential, hence one live
-        instance.
+        existence on step 0 of every generation.
+
+        Width is fixed at one row, not ``max_num_seqs``. ``forward`` takes only
+        ``runtime_additional_information[0]`` and runs the whole AR loop inline
+        before returning, so one worker holds one cache no matter how many
+        sequences the scheduler admits. Declaring this per-sequence -- which an
+        earlier revision did, by deriving the multiplier from scope -- reported
+        ``max_num_seqs`` times the real figure.
+
+        The caveat is that nothing enforces the serialization. ``StaticCache``
+        is built outside ``_sampler_pool``'s lock, so overlapping calls to
+        ``generate_latents`` would coexist. If this model ever gains a
+        concurrent entry point, this row count is the line to revisit.
         """
         return [
             spec_from_hf_config(
@@ -694,8 +705,8 @@ class MingAudioGenerator:
                 physical_capacity_positions=self._STATIC_CACHE_LEN,
                 capacity_source=f"hardcoded max_cache_len={self._STATIC_CACHE_LEN} in _init_kv_cache",
                 scope=ModelLocalKVScope.INVOCATION,
-                batch_capacity=1,
-                max_live_instances=1,
+                rows=Fixed(1, because="forward() handles one request and runs the AR loop inline"),
+                allocations=1,
                 allocation_note="full extent on first write per layer, not grown; rebuilt per text segment",
             )
         ]

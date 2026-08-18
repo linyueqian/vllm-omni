@@ -18,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 from vllm_omni.model_executor.models.model_local_kv import (
+    Fixed,
     ModelLocalKVScope,
     ModelLocalKVSpec,
     spec_from_hf_config,
@@ -197,18 +198,19 @@ class CUDAGraphDecoderWrapper:
         return found
 
     def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
-        """Declare the codec decoder KV this wrapper holds.
+        """Declare only the graph-resident copies this wrapper retains.
 
-        Two entries, because the retained graph copies dominate and have a
-        different lifetime from the live one. Every captured shape keeps its
-        dummy ``DynamicCache`` alive for replay (``combined_states``,
-        ``icl_prefix_states``, ``xvec_prefix_states`` all store ``cache``), so
-        the graph-resident total is the per-instance cost times the number of
-        captures -- not one instance.
+        The per-decode cache is declared by the decoder itself, because it
+        exists whether or not graphs were captured. What is specific to this
+        wrapper is that every captured shape keeps its dummy ``DynamicCache``
+        alive for replay (``combined_states``, ``icl_prefix_states`` and
+        ``xvec_prefix_states`` all store ``cache``), for the process lifetime.
 
-        Counts come from the state dicts rather than from the configured
-        capture lists: a capture that raised is logged and skipped, so the
-        configured shape count would over-report.
+        Rows come from the state dicts rather than the configured capture
+        lists: a capture that raised is logged and skipped, so the configured
+        shape count would over-report. The trade is that a capture whose
+        tensors transformers has not yet materialized contributes nothing, so
+        this is a floor rather than a contract.
         """
         config = self.decoder.config
         try:
@@ -226,38 +228,31 @@ class CUDAGraphDecoderWrapper:
         ]
         batched_captures = sum(rows for rows, _ in retained)
 
-        specs = [
+        if not batched_captures:
+            return []
+        return [
             spec_from_hf_config(
                 config,
-                name="codec_decoder_suffix",
+                name="codec_decoder_graph_pool",
                 dtype=dtype,
                 physical_capacity_positions=physical,
                 capacity_source=f"sliding_window({self.prefix_length}) - 1",
-                scope=ModelLocalKVScope.REQUEST,
-                batch_capacity=1,
-                max_live_instances=1,
-                allocation_note="grows to the window then truncates in place",
+                scope=ModelLocalKVScope.MODEL,
+                rows=Fixed(
+                    batched_captures,
+                    because=(
+                        f"rows across {len(retained)} retained caches in "
+                        f"{len(self.combined_states)} suffix / {len(self.icl_prefix_states)} icl-prefix / "
+                        f"{len(self.xvec_prefix_states)} xvec-prefix captures"
+                    ),
+                ),
+                allocations=1,
+                allocation_note=(
+                    "counted from caches transformers has materialized; captures whose tensors are still "
+                    "unallocated report nothing, so this is a floor for the xvec path"
+                ),
             )
         ]
-        if batched_captures:
-            specs.append(
-                spec_from_hf_config(
-                    config,
-                    name="codec_decoder_graph_pool",
-                    dtype=dtype,
-                    physical_capacity_positions=physical,
-                    capacity_source=f"sliding_window({self.prefix_length}) - 1",
-                    scope=ModelLocalKVScope.MODEL,
-                    batch_capacity=1,
-                    max_live_instances=batched_captures,
-                    allocation_note=(
-                        f"{len(retained)} retained caches across "
-                        f"{len(self.combined_states)} suffix / {len(self.icl_prefix_states)} icl-prefix / "
-                        f"{len(self.xvec_prefix_states)} xvec-prefix captures, summed over batch rows"
-                    ),
-                )
-            )
-        return specs
 
     def log_decode_stats(self) -> None:
         if not getattr(self, "_stats_enabled", False) or self._stats_total_requests == 0:

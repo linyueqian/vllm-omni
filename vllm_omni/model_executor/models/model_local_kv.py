@@ -37,9 +37,14 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 __all__ = [
+    "DuplexMaxSessions",
+    "EngineCapacity",
+    "Fixed",
+    "HasModelLocalKV",
+    "MaxNumSeqs",
+    "ModelLocalKVRows",
     "ModelLocalKVScope",
     "ModelLocalKVSpec",
-    "HasModelLocalKV",
     "collect_model_local_kv_specs",
     "spec_from_hf_config",
     "total_declared_bytes",
@@ -47,12 +52,12 @@ __all__ = [
 
 
 class ModelLocalKVScope(str, Enum):
-    """How long one cache instance lives.
+    """How long one allocation lives.
 
-    Separate from multiplicity: ``scope`` says how long an instance survives,
-    ``max_live_instances`` says how many can exist at once. Peak memory needs
-    both, and collapsing them into a single "preallocated vs grows" flag cannot
-    express a cache that is short-lived but replicated per CUDA-graph bucket.
+    Diagnostic only. Lifetime and size are independent: a per-call cache can be
+    the widest thing a model owns, and a process-lifetime one can be a single
+    row. ``ModelLocalKVSpec.rows`` and ``allocations`` carry the size; this
+    carries only the reader's mental model of when the memory appears and goes.
     """
 
     INVOCATION = "invocation"
@@ -66,6 +71,99 @@ class ModelLocalKVScope(str, Enum):
 
     MODEL = "model"
     """Lives as long as the model (e.g. captured into a CUDA-graph pool)."""
+
+
+@dataclass(frozen=True)
+class EngineCapacity:
+    """The engine-side numbers a declaration may be widened by.
+
+    Passed in by the consumer. A model must never read these itself: it does
+    not know them at declaration time, and guessing is how the previous
+    revision came to multiply a serialized cache by ``max_num_seqs``.
+    """
+
+    max_num_seqs: int = 1
+
+    duplex_max_sessions: int | None = None
+    """``None`` when the consumer could not resolve the duplex session cap.
+
+    Kept distinct from 1 on purpose. ``duplex_max_sessions`` is currently only
+    passed through as an engine-args key and is not readable as an attribute at
+    report time, so a silent default of 1 would understate a duplex deployment
+    without anyone noticing. Unresolved is a state the report should say out
+    loud, not paper over.
+    """
+
+
+class ModelLocalKVRows:
+    """What sets the batch extent of an allocation."""
+
+    def resolve(self, engine: EngineCapacity) -> int:
+        raise NotImplementedError
+
+    def resolved(self, engine: EngineCapacity) -> bool:
+        """Whether the driver's value was actually known.
+
+        A driver that falls back reports ``False`` so the consumer can say the
+        figure is a floor rather than presenting a guess as a measurement.
+        """
+        del engine
+        return True
+
+    @property
+    def label(self) -> str:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class Fixed(ModelLocalKVRows):
+    """A width the model itself controls."""
+
+    count: int
+    because: str
+    """Why it is this number: a bucket sum, a serialized call path, a constant.
+
+    Required, because a bare integer cannot be reviewed. ``Fixed(1)`` for a
+    cache that looks per-request is exactly the claim a reader must be able to
+    check.
+    """
+
+    def resolve(self, engine: EngineCapacity) -> int:
+        del engine
+        return self.count
+
+    @property
+    def label(self) -> str:
+        return f"fixed({self.count}; {self.because})"
+
+
+@dataclass(frozen=True)
+class MaxNumSeqs(ModelLocalKVRows):
+    """One row per in-flight sequence."""
+
+    def resolve(self, engine: EngineCapacity) -> int:
+        return max(1, engine.max_num_seqs)
+
+    @property
+    def label(self) -> str:
+        return "max_num_seqs"
+
+
+@dataclass(frozen=True)
+class DuplexMaxSessions(ModelLocalKVRows):
+    """One row per concurrent duplex session, which is not max_num_seqs."""
+
+    def resolve(self, engine: EngineCapacity) -> int:
+        if engine.duplex_max_sessions is None:
+            return 1
+        return max(1, engine.duplex_max_sessions)
+
+    def resolved(self, engine: EngineCapacity) -> bool:
+        return engine.duplex_max_sessions is not None
+
+    @property
+    def label(self) -> str:
+        return "duplex_max_sessions"
 
 
 @dataclass(frozen=True)
@@ -100,66 +198,58 @@ class ModelLocalKVSpec:
     """
 
     scope: ModelLocalKVScope
-    batch_capacity: int
-    """Rows the tensor is sized for. Required: defaulting it to 1 silently
-    under-reports every batched cache."""
+    """How long one allocation lives. Diagnostic only.
 
-    max_live_instances: int
-    """Instances the *model* retains, at a concurrency of one.
+    Deliberately not the multiplier. An earlier revision derived scaling from
+    scope, which made every non-``MODEL`` cache multiply by ``max_num_seqs``.
+    That over-reported ming by that factor (its calls are serialized) and used
+    the wrong driver entirely for MiniCPM-o (duplex sessions, not sequences).
+    Lifetime does not imply replication topology; ``rows`` says what does.
+    """
 
-    This is model-side replication only: 261 for a cache copied into every
-    captured CUDA-graph bucket, 1 for almost everything else. A model cannot
-    know how many requests are in flight, so it must not try to account for
-    them here -- see ``scales_with_concurrency``.
+    rows: ModelLocalKVRows
+    """What sets the batch extent of this allocation.
+
+    ``FIXED(n)`` for an extent the model controls, ``MAX_NUM_SEQS`` or
+    ``DUPLEX_MAX_SESSIONS`` for one the engine controls. Required, because
+    defaulting it silently understates every cache whose width is not 1.
+    """
+
+    allocations: int = 1
+    """Simultaneous live allocations of this shape.
+
+    Almost always 1. Higher only when genuinely distinct allocations coexist,
+    e.g. one retained per captured CUDA-graph bucket. This is a count of
+    objects, not of rows: a cache that widens with the batch has ``rows``
+    greater than one and ``allocations`` still 1.
     """
 
     allocation_note: str | None = None
     """Optional detail such as "rebuilt per text segment". Diagnostic only."""
 
     @property
-    def bytes_per_instance(self) -> int:
+    def bytes_per_row(self) -> int:
+        """Bytes for a single batch row of this cache."""
         return (
             2  # K and V
             * self.layers
             * self.kv_heads
             * self.head_dim
             * self.physical_capacity_positions
-            * self.batch_capacity
             * torch.empty((), dtype=self.dtype).element_size()
         )
 
-    @property
-    def max_live_bytes(self) -> int:
-        """Model-side peak, at a concurrency of one.
+    def row_count(self, engine: EngineCapacity) -> int:
+        return self.rows.resolve(engine)
 
-        Use ``peak_bytes(concurrency)`` for the number an engine should
-        actually budget against.
+    def peak_bytes(self, engine: EngineCapacity | None = None) -> int:
+        """Peak bytes once the engine's capacity is known.
+
+        The model supplies geometry and says which engine number sets the
+        width; only the engine knows that number's value.
         """
-        return self.bytes_per_instance * self.max_live_instances
-
-    @property
-    def scales_with_concurrency(self) -> bool:
-        """Whether more in-flight requests mean more copies of this cache.
-
-        Splitting the two multiplicities is the whole reason ``scope`` is not
-        cosmetic. A ``MODEL``-scoped cache is captured once and shared, so it
-        costs the same at concurrency 64 as at 1. Everything else is per
-        request, session, or call, so the engine multiplies it -- and only the
-        engine knows by how much.
-
-        A batched cache that widens rather than replicating (one tensor with a
-        larger batch dimension) belongs in ``batch_capacity`` instead, which is
-        why that field has no default.
-        """
-        return self.scope is not ModelLocalKVScope.MODEL
-
-    def peak_bytes(self, concurrency: int = 1) -> int:
-        """Peak bytes at a given number of in-flight requests."""
-        if concurrency < 1:
-            raise ValueError(f"concurrency must be >= 1, got {concurrency}")
-        if not self.scales_with_concurrency:
-            return self.max_live_bytes
-        return self.max_live_bytes * concurrency
+        engine = engine or EngineCapacity()
+        return self.bytes_per_row * self.row_count(engine) * self.allocations
 
 
 def _resolve(config: object, candidates: Sequence[str], what: str) -> int:
@@ -181,8 +271,8 @@ def spec_from_hf_config(
     capacity_source: str,
     scope: ModelLocalKVScope,
     dtype: torch.dtype,
-    batch_capacity: int = 1,
-    max_live_instances: int = 1,
+    rows: ModelLocalKVRows,
+    allocations: int = 1,
     allocation_note: str | None = None,
     layers: int | None = None,
     kv_heads: int | None = None,
@@ -198,7 +288,10 @@ def spec_from_hf_config(
 
     Raises rather than guessing when an attribute is absent: a silently wrong
     geometry would under-report, which is the failure this protocol exists to
-    prevent.
+    prevent. ``rows`` is keyword-required for the same reason -- an earlier
+    revision defaulted the batch extent to 1 here while documenting it as
+    required on the dataclass, so every declarer that used this helper got the
+    default and the guarantee was decorative.
     """
     if layers is None:
         layers = _resolve(config, ("num_hidden_layers", "encoder_layers", "num_layers"), "layer count")
@@ -226,8 +319,8 @@ def spec_from_hf_config(
         physical_capacity_positions=physical_capacity_positions,
         capacity_source=capacity_source,
         scope=scope,
-        batch_capacity=batch_capacity,
-        max_live_instances=max_live_instances,
+        rows=rows,
+        allocations=allocations,
         allocation_note=allocation_note,
     )
 
@@ -246,20 +339,33 @@ class HasModelLocalKV(Protocol):
 
 
 def _unwrap_to_module(model: object) -> object:
-    """Follow runnable-style wrappers down to something with a module tree.
+    """Unwrap runner-side wrappers down to the real module tree.
 
-    By the time the runner holds it, the model may be wrapped for CUDA-graph
-    dispatch. ``vllm.compilation.cuda_graph.CUDAGraphWrapper`` is a plain
-    callable holding ``.runnable``, not an ``nn.Module``, so walking it
-    directly finds nothing and every declaration silently reports zero.
+    ``vllm.compilation.cuda_graph.CUDAGraphWrapper`` is a plain callable, not
+    an ``nn.Module``, but its ``__getattr__`` forwards anything the runnable
+    has -- including ``named_modules``. So a check for ``named_modules`` does
+    not detect the wrapper, and the wrapper and its runnable both answer to the
+    same attributes. That matters twice over: it means walking the wrapper
+    happens to work, and it means a naive walk can enter the tree as both the
+    wrapper and the root module and count a root-level declarer twice.
+
+    Prefer the supported ``unwrap()`` accessor, which returns the runnable
+    directly.
     """
     seen: set[int] = set()
     current = model
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if callable(getattr(current, "named_modules", None)):
+        unwrap = getattr(current, "unwrap", None)
+        if not callable(unwrap):
             return current
-        current = getattr(current, "runnable", None)
+        try:
+            nxt = unwrap()
+        except Exception:
+            return current
+        if nxt is None or nxt is current:
+            return current
+        current = nxt
     return model
 
 
@@ -275,14 +381,11 @@ def collect_model_local_kv_specs(model: object) -> list[tuple[str, ModelLocalKVS
     A raising declaration is logged and skipped rather than propagated:
     reporting memory must not be able to break model load.
     """
+    root = _unwrap_to_module(model)
+
     owners: list[tuple[str, object]] = []
     seen_ids: set[int] = set()
-    if isinstance(model, HasModelLocalKV):
-        owners.append(("", model))
-        seen_ids.add(id(model))
-
-    root = _unwrap_to_module(model)
-    if root is not model and isinstance(root, HasModelLocalKV) and id(root) not in seen_ids:
+    if isinstance(root, HasModelLocalKV):
         owners.append(("", root))
         seen_ids.add(id(root))
 
@@ -309,12 +412,12 @@ def collect_model_local_kv_specs(model: object) -> list[tuple[str, ModelLocalKVS
     return collected
 
 
-def total_declared_bytes(model: object, concurrency: int = 1) -> int:
+def total_declared_bytes(model: object, engine: EngineCapacity | None = None) -> int:
     """Sum declared peak bytes, or 0 for a model that declares nothing.
 
-    Pass ``concurrency`` (the engine's ``max_num_seqs``) to include the
-    per-request multiplicity the model cannot know. Returning 0 rather than
-    raising keeps this usable as an additive term in memory reporting before
-    every model has been migrated.
+    Pass the engine's capacity so each declaration is widened by the driver it
+    named. Returning 0 rather than raising keeps this usable as an additive
+    term in reporting before every model has been migrated.
     """
-    return sum(spec.peak_bytes(concurrency) for _, spec in collect_model_local_kv_specs(model))
+    engine = engine or EngineCapacity()
+    return sum(spec.peak_bytes(engine) for _, spec in collect_model_local_kv_specs(model))

@@ -855,17 +855,52 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self._cudagraph_wrapper = None
 
     def model_local_kv_specs(self):
-        """Declare the KV the CUDA-graph wrapper holds on this decoder's behalf.
+        """Declare this decoder's attention KV.
 
-        The wrapper is a plain object, not a submodule, so the module-tree walk
-        in ``collect_model_local_kv_specs`` cannot reach it. This is the hop it
-        needs. Nothing is declared before ``enable_cudagraph``: without the
-        wrapper the decoder allocates its cache per call and retains none.
+        Two sources. The decode path allocates a sliding-window cache per call
+        whether or not CUDA graphs are on -- ``_decode_icl_first_chunk`` fills
+        a fresh dict on every batched eager call -- so that entry is
+        unconditional. An earlier revision declared nothing at all when
+        ``_cudagraph_wrapper`` was absent, which reported zero for exactly the
+        deployments that set ``enforce_eager``.
+
+        The wrapper, when present, adds the graph-resident copies. It is a
+        plain object rather than a submodule, so the module-tree walk cannot
+        reach it; this is the hop it needs.
         """
-        wrapper = getattr(self, "_cudagraph_wrapper", None)
-        if wrapper is None:
+        from vllm_omni.model_executor.models.model_local_kv import (
+            MaxNumSeqs,
+            ModelLocalKVScope,
+            spec_from_hf_config,
+        )
+
+        config = self.config
+        try:
+            dtype = next(self.parameters()).dtype
+        except StopIteration:  # parameterless stub, only reachable in tests
             return []
-        return wrapper.model_local_kv_specs()
+
+        window = int(getattr(config, "sliding_window", 0) or 0)
+        if window <= 1:
+            return []
+
+        specs = [
+            spec_from_hf_config(
+                config,
+                name="codec_decoder_decode",
+                dtype=dtype,
+                physical_capacity_positions=window - 1,
+                capacity_source=f"sliding_window({window}) - 1",
+                scope=ModelLocalKVScope.REQUEST,
+                rows=MaxNumSeqs(),
+                allocations=1,
+                allocation_note="allocated per decode call, eager or graph-replayed",
+            )
+        ]
+        wrapper = getattr(self, "_cudagraph_wrapper", None)
+        if wrapper is not None:
+            specs.extend(wrapper.model_local_kv_specs())
+        return specs
 
     def precompute_snake_caches(self):
         """Precompute exp(alpha) and 1/(exp(beta)+eps) for all SnakeBeta modules."""

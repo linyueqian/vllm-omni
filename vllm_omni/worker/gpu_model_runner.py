@@ -33,7 +33,10 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
-from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
+from vllm_omni.model_executor.models.model_local_kv import (
+    EngineCapacity,
+    collect_model_local_kv_specs,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -195,39 +198,74 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _report_model_local_kv(self) -> None:
         """Log attention KV this model holds outside the paged manager.
 
-        These caches are allocated after the profiling run that decides how
-        much KV the engine may claim, so no existing per-stage number accounts
-        for them. Logging is deliberately all this does: the measurement that
-        would justify subtracting them from the engine's budget has not been
-        made, and guessing here would size the paged pool wrongly.
+        Reporting only. Two of these caches are captured into CUDA graphs
+        during ``load_model``, so NVML already charges them to the process
+        before ``determine_available_memory()`` samples it; subtracting the
+        declared total from the KV budget would double-count them. What is not
+        charged is the per-request half, which appears after profiling and
+        scales with ``max_num_seqs``.
+
+        Wrapped whole: a memory report has no business breaking model load,
+        and this runs on platforms these declarations have never been
+        exercised on.
         """
+        try:
+            self._log_model_local_kv()
+        except Exception:
+            logger.warning("Model-local KV reporting failed; continuing", exc_info=True)
+
+    def _log_model_local_kv(self) -> None:
         specs = collect_model_local_kv_specs(getattr(self, "model", None))
         if not specs:
             return
-        concurrency = max(1, int(self.scheduler_config.max_num_seqs))
-        fixed = sum(s.max_live_bytes for _, s in specs if not s.scales_with_concurrency)
-        peak = sum(s.peak_bytes(concurrency) for _, s in specs)
+        engine = EngineCapacity(
+            max_num_seqs=max(1, int(self.scheduler_config.max_num_seqs)),
+            duplex_max_sessions=self._resolve_duplex_max_sessions(),
+        )
+        total = sum(spec.peak_bytes(engine) for _, spec in specs)
         logger.info(
-            "Model-local KV (outside the paged manager): %.2f MiB resident + "
-            "%.2f MiB at max_num_seqs=%d, across %d declaration(s)",
-            fixed / (1 << 20),
-            (peak - fixed) / (1 << 20),
-            concurrency,
+            "Model-local KV (outside the paged manager): %.2f MiB across %d declaration(s) "
+            "at max_num_seqs=%d, duplex_max_sessions=%s",
+            total / (1 << 20),
             len(specs),
+            engine.max_num_seqs,
+            engine.duplex_max_sessions if engine.duplex_max_sessions is not None else "unresolved",
         )
         for path, spec in specs:
             logger.info(
-                "  %s.%s: %.2f MiB (%d x %.2f MiB, scope=%s%s, %d positions from %s)",
+                "  %s.%s: %.2f MiB (%d rows from %s%s x %.2f MiB/row, %d allocation(s), "
+                "scope=%s, %d positions from %s)",
                 path or type(self.model).__name__,
                 spec.name,
-                spec.peak_bytes(concurrency) / (1 << 20),
-                spec.max_live_instances * (concurrency if spec.scales_with_concurrency else 1),
-                spec.bytes_per_instance / (1 << 20),
+                spec.peak_bytes(engine) / (1 << 20),
+                spec.row_count(engine),
+                spec.rows.label,
+                "" if spec.rows.resolved(engine) else " [unresolved, floor]",
+                spec.bytes_per_row / (1 << 20),
+                spec.allocations,
                 spec.scope.value,
-                " x max_num_seqs" if spec.scales_with_concurrency else " resident",
                 spec.physical_capacity_positions,
                 spec.capacity_source,
             )
+
+    def _resolve_duplex_max_sessions(self) -> int | None:
+        """Find the duplex session cap, or return None rather than guess.
+
+        It is threaded through as an engine-args key rather than exposed as a
+        stable attribute, so this probes the objects that might carry it and
+        gives up honestly. Returning 1 on failure would silently understate a
+        duplex deployment's session-scoped caches.
+        """
+        for holder in (
+            getattr(self, "model_config", None),
+            getattr(self, "scheduler_config", None),
+            getattr(self, "cache_config", None),
+            getattr(self, "vllm_config", None),
+        ):
+            value = getattr(holder, "duplex_max_sessions", None) if holder is not None else None
+            if value:
+                return max(1, int(value))
+        return None
 
     def _maybe_enable_output_token_ids_for_model_sampler(self) -> None:
         if getattr(self.model, "logitsprocs_need_output_token_ids", False):

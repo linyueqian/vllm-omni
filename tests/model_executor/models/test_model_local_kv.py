@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A declaration must match the cache that actually gets allocated.
 
-These tests build the real `transformers` cache objects the models build and
-compare their allocated bytes against what the spec claims, so a wrong
-declaration fails here rather than being believed. An earlier version of this
-file asserted hand-typed constants against each other, which could not fail no
-matter what any model declared.
+Two earlier versions of this file could not fail. The first asserted hand-typed
+constants against each other. The second built real `transformers` caches but
+compared them to specs written in the test, so no production declaration was
+ever executed. What matters here is that a real declarer is called and its
+numbers are checked against a real cache built the way the model builds it.
 """
 
 import ast
@@ -14,11 +14,15 @@ import pathlib
 
 import pytest
 import torch
-from transformers import Qwen2Config, WhisperConfig
+from transformers import Qwen2Config
 from transformers.cache_utils import DynamicCache, StaticCache
 
 from vllm_omni.model_executor.models.model_local_kv import (
+    DuplexMaxSessions,
+    EngineCapacity,
+    Fixed,
     HasModelLocalKV,
+    MaxNumSeqs,
     ModelLocalKVScope,
     ModelLocalKVSpec,
     collect_model_local_kv_specs,
@@ -32,7 +36,6 @@ MODELS_DIR = pathlib.Path(__file__).resolve().parents[3] / "vllm_omni" / "model_
 
 
 def _cache_bytes(cache) -> int:
-    """Sum the real allocated bytes of a transformers cache."""
     total = 0
     for layer in cache.layers:
         for tensor in (layer.keys, layer.values):
@@ -41,68 +44,75 @@ def _cache_bytes(cache) -> int:
     return total
 
 
-def test_declaration_matches_a_real_static_cache():
-    """ming's talker: one decode step costs the whole declared extent.
-
-    Built with the same arguments as `MingAudioGenerator._init_kv_cache`.
-    transformers v5 initializes `StaticLayer` lazily -- `keys` is None until a
-    layer is first written -- but that first write allocates all
-    `max_cache_len` positions at once rather than growing. A prefill touches
-    every layer, so the declared number is reached on the first step of any
-    generation regardless of how short the utterance is.
-    """
-    layers, kv_heads, head_dim = 4, 2, 32
-    config = Qwen2Config(
+def _qwen2_config(layers=4, kv_heads=2, heads=8, hidden=256) -> Qwen2Config:
+    return Qwen2Config(
         num_hidden_layers=layers,
-        num_attention_heads=8,
+        num_attention_heads=heads,
         num_key_value_heads=kv_heads,
-        hidden_size=256,
-        intermediate_size=512,
+        hidden_size=hidden,
+        intermediate_size=hidden * 2,
         vocab_size=1000,
     )
-    spec = spec_from_hf_config(
-        config,
-        name="talker_llm_static_cache",
-        dtype=torch.float16,
-        physical_capacity_positions=2048,
-        capacity_source="hardcoded max_cache_len=2048",
-        scope=ModelLocalKVScope.INVOCATION,
-        batch_capacity=1,
-        max_live_instances=1,
-    )
+
+
+# --------------------------------------------------------------------------
+# A real declarer, called, checked against a real cache.
+# --------------------------------------------------------------------------
+
+
+def test_ming_declaration_matches_the_cache_it_describes():
+    """Calls MingAudioGenerator.model_local_kv_specs and checks the bytes.
+
+    Builds the declarer without its weights -- only `_llm_config` and `_model`
+    are read -- then builds the `StaticCache` that `_init_kv_cache` builds from
+    the same config and compares. A wrong layer count, kv-head count, dtype or
+    capacity in the production declaration fails here.
+    """
+    from vllm_omni.model_executor.models.ming_flash_omni.talker_module import MingAudioGenerator
+
+    config = _qwen2_config()
+    generator = object.__new__(MingAudioGenerator)
+    generator._llm_config = config
+    generator._model = torch.nn.Linear(1, 1).to(torch.float16)
+
+    (spec,) = generator.model_local_kv_specs()
+
     cache = StaticCache(
         config=config,
         max_batch_size=1,
-        max_cache_len=2048,
+        max_cache_len=MingAudioGenerator._STATIC_CACHE_LEN,
         device="cpu",
         dtype=torch.float16,
     )
-    assert _cache_bytes(cache) == 0, "expected v5 lazy init; a preallocating build changes the claim below"
-
-    # A single one-position write per layer, i.e. the cheapest possible step.
-    for layer_idx in range(layers):
-        keys = torch.zeros(1, kv_heads, 1, head_dim, dtype=torch.float16)
+    head_dim = config.hidden_size // config.num_attention_heads
+    for layer_idx in range(config.num_hidden_layers):
+        keys = torch.zeros(1, config.num_key_value_heads, 1, head_dim, dtype=torch.float16)
         cache.update(keys, keys.clone(), layer_idx)
 
-    assert spec.bytes_per_instance == _cache_bytes(cache)
+    assert spec.peak_bytes(EngineCapacity(max_num_seqs=1)) == _cache_bytes(cache)
 
 
-def test_declaration_matches_a_real_dynamic_cache_at_capacity():
-    """The growing caches: declared bytes are the ceiling they reach when full.
+def test_ming_does_not_scale_with_max_num_seqs():
+    """forward() takes runtime_additional_information[0] and loops inline.
 
-    Fills a DynamicCache to the declared position count and compares. This is
-    what makes `physical_capacity_positions` meaningful -- if the field were
-    read as a logical sequence position rather than tensor extent, this fails.
+    One worker holds one of these no matter how many sequences the scheduler
+    admits. A previous revision derived the multiplier from scope and reported
+    `max_num_seqs` times the real figure.
     """
+    from vllm_omni.model_executor.models.ming_flash_omni.talker_module import MingAudioGenerator
+
+    generator = object.__new__(MingAudioGenerator)
+    generator._llm_config = _qwen2_config()
+    generator._model = torch.nn.Linear(1, 1).to(torch.float16)
+
+    (spec,) = generator.model_local_kv_specs()
+    assert spec.peak_bytes(EngineCapacity(max_num_seqs=64)) == spec.peak_bytes(EngineCapacity(max_num_seqs=1))
+
+
+def test_growing_cache_declaration_matches_a_real_dynamic_cache():
+    """The declared positions are the extent the tensor reaches when full."""
     layers, kv_heads, head_dim, positions = 4, 2, 32, 11
-    config = Qwen2Config(
-        num_hidden_layers=layers,
-        num_attention_heads=kv_heads,
-        num_key_value_heads=kv_heads,
-        hidden_size=kv_heads * head_dim,
-        intermediate_size=128,
-        vocab_size=1000,
-    )
+    config = _qwen2_config(layers=layers, kv_heads=kv_heads, heads=kv_heads, hidden=kv_heads * head_dim)
     spec = spec_from_hf_config(
         config,
         name="local_transformer",
@@ -110,8 +120,7 @@ def test_declaration_matches_a_real_dynamic_cache_at_capacity():
         physical_capacity_positions=positions,
         capacity_source="group_size + max(delay_pattern)",
         scope=ModelLocalKVScope.INVOCATION,
-        batch_capacity=1,
-        max_live_instances=1,
+        rows=Fixed(1, because="test"),
     )
 
     cache = DynamicCache()
@@ -119,66 +128,83 @@ def test_declaration_matches_a_real_dynamic_cache_at_capacity():
         keys = torch.zeros(1, kv_heads, positions, head_dim, dtype=torch.bfloat16)
         cache.update(keys, torch.zeros_like(keys), layer_idx)
 
-    assert spec.bytes_per_instance == _cache_bytes(cache)
+    assert spec.peak_bytes() == _cache_bytes(cache)
 
 
-def test_multiplicity_is_what_graph_capture_costs():
-    """Retained copies dominate, and only max_live_instances can say so.
+def test_a_batched_cache_is_rows_not_allocations():
+    """One allocation B rows wide costs the same as B one-row allocations.
 
-    Both Qwen3-TTS and MiMo keep one cache per captured graph bucket alive for
-    the process lifetime. A single preallocated/grows flag cannot express a
-    cache that is per-invocation but replicated 261 times.
+    The bytes coincide, which is why the previous model went unnoticed. The
+    distinction still matters: `allocations` is what the log reports, and
+    saying "64 caches" when there is one is simply false.
     """
-    config = Qwen2Config(
-        num_hidden_layers=4,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        hidden_size=64,
-        intermediate_size=128,
-        vocab_size=1000,
-    )
-    kwargs = dict(
+    config = _qwen2_config(layers=4, kv_heads=2, heads=2, hidden=64)
+    common = dict(
         config=config,
-        name="graph_pool",
+        name="c",
         dtype=torch.bfloat16,
         physical_capacity_positions=11,
         capacity_source="test",
-        scope=ModelLocalKVScope.MODEL,
-        batch_capacity=1,
+        scope=ModelLocalKVScope.INVOCATION,
     )
-    one = spec_from_hf_config(max_live_instances=1, **kwargs)
-    captured = spec_from_hf_config(max_live_instances=261, **kwargs)
+    batched = spec_from_hf_config(rows=MaxNumSeqs(), allocations=1, **common)
+    engine = EngineCapacity(max_num_seqs=64)
 
-    assert captured.bytes_per_instance == one.bytes_per_instance
-    assert captured.max_live_bytes == 261 * one.max_live_bytes
+    assert batched.row_count(engine) == 64
+    assert batched.allocations == 1
+    assert batched.peak_bytes(engine) == batched.bytes_per_row * 64
 
 
-def test_whisper_geometry_needs_encoder_naming():
-    """Encoder-decoder configs do not use the Qwen attribute names.
-
-    MiniCPM-o passes its geometry explicitly for this reason. Guarding it here
-    so a later "simplification" to pure config sniffing fails loudly.
-    """
-    config = WhisperConfig(encoder_layers=4, encoder_attention_heads=8, d_model=256)
+def test_duplex_cache_uses_sessions_not_sequences():
+    config = _qwen2_config()
     spec = spec_from_hf_config(
         config,
         name="whisper_encoder_self_attn",
         dtype=torch.bfloat16,
-        layers=config.encoder_layers,
-        kv_heads=config.encoder_attention_heads,
-        head_dim=config.d_model // config.encoder_attention_heads,
         physical_capacity_positions=1500,
         capacity_source="embed_positions rows",
         scope=ModelLocalKVScope.SESSION,
-        batch_capacity=1,
-        max_live_instances=1,
+        rows=DuplexMaxSessions(),
     )
-    assert (spec.layers, spec.kv_heads, spec.head_dim) == (4, 8, 32)
+    engine = EngineCapacity(max_num_seqs=64, duplex_max_sessions=3)
+    assert spec.row_count(engine) == 3
+
+
+def test_unresolved_duplex_capacity_is_reported_not_guessed():
+    """An unknown session cap must be visible, not silently 1."""
+    rows = DuplexMaxSessions()
+    unknown = EngineCapacity(max_num_seqs=64)
+    known = EngineCapacity(max_num_seqs=64, duplex_max_sessions=4)
+
+    assert rows.resolve(unknown) == 1
+    assert rows.resolved(unknown) is False
+    assert rows.resolved(known) is True
+
+
+def test_rows_is_required():
+    """Defaulting the batch extent is how the previous guarantee died.
+
+    The dataclass declared it required while the helper every declarer uses
+    defaulted it to 1, so nothing enforced it where it mattered.
+    """
+    with pytest.raises(TypeError):
+        spec_from_hf_config(  # type: ignore[call-arg]
+            _qwen2_config(),
+            name="x",
+            dtype=torch.float16,
+            physical_capacity_positions=1,
+            capacity_source="",
+            scope=ModelLocalKVScope.REQUEST,
+        )
+
+
+def test_fixed_rows_must_say_why():
+    """`Fixed(1)` on a per-request-looking cache is a claim needing evidence."""
+    with pytest.raises(TypeError):
+        Fixed(1)  # type: ignore[call-arg]
 
 
 def test_spec_from_hf_config_raises_rather_than_guessing():
-    """A missing attribute must not silently become a wrong number."""
-
     class Empty:
         pass
 
@@ -190,7 +216,13 @@ def test_spec_from_hf_config_raises_rather_than_guessing():
             physical_capacity_positions=1,
             capacity_source="",
             scope=ModelLocalKVScope.REQUEST,
+            rows=Fixed(1, because="test"),
         )
+
+
+# --------------------------------------------------------------------------
+# Collection
+# --------------------------------------------------------------------------
 
 
 def _spec(**overrides) -> ModelLocalKVSpec:
@@ -203,8 +235,7 @@ def _spec(**overrides) -> ModelLocalKVSpec:
         physical_capacity_positions=8,
         capacity_source="test",
         scope=ModelLocalKVScope.REQUEST,
-        batch_capacity=1,
-        max_live_instances=1,
+        rows=Fixed(1, because="test"),
     )
     kwargs.update(overrides)
     return ModelLocalKVSpec(**kwargs)
@@ -215,9 +246,25 @@ class _Owner(torch.nn.Module):
         return [_spec()]
 
 
-def test_collector_finds_owners_nested_in_the_module_tree():
-    """The cache owner is never the registered model, so the walk is the point."""
+class _CUDAGraphWrapperLike:
+    """Mirrors vllm.compilation.cuda_graph.CUDAGraphWrapper.
 
+    Not an nn.Module, and its __getattr__ forwards everything the runnable
+    has. That forwarding is why a previous revision's "unwrap fix" was
+    unnecessary, and why a walk that does not unwrap can enter the tree twice.
+    """
+
+    def __init__(self, runnable):
+        self.runnable = runnable
+
+    def unwrap(self):
+        return self.runnable
+
+    def __getattr__(self, key):
+        return getattr(self.runnable, key)
+
+
+def test_collector_finds_owners_nested_in_the_module_tree():
     class Mid(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -229,49 +276,35 @@ def test_collector_finds_owners_nested_in_the_module_tree():
             self.mid = Mid()
 
     model = Top()
-    collected = collect_model_local_kv_specs(model)
-    assert [path for path, _ in collected] == ["mid.inner"]
-    # 2 layers * 2 kv * 4 hd * 8 pos * 1 batch * 2 bytes * 2 (K and V) = 512
+    assert [path for path, _ in collect_model_local_kv_specs(model)] == ["mid.inner"]
+    # 2 layers * 2 kv * 4 head_dim * 8 positions * 2 bytes * 2 (K and V) = 512
     assert total_declared_bytes(model) == 512
 
 
-def test_collector_sees_through_a_non_module_wrapper():
-    """The runner's `self.model` is not always the model.
+def test_a_root_declarer_behind_a_wrapper_is_counted_once():
+    """The wrapper forwards attributes, so a naive walk sees it twice."""
 
-    `vllm.compilation.cuda_graph.CUDAGraphWrapper` is a plain callable holding
-    `.runnable`, not an nn.Module, so a collector that goes straight to
-    `named_modules()` finds nothing and every declaration silently reports
-    zero. Caught on a real Qwen3-TTS boot, where the runner logged
-    `model=CUDAGraphWrapper specs=0`.
-    """
+    class Root(_Owner):
+        pass
 
-    class Wrapper:  # mirrors CUDAGraphWrapper's shape, not an nn.Module
-        def __init__(self, runnable):
-            self.runnable = runnable
+    wrapped = _CUDAGraphWrapperLike(Root())
+    collected = collect_model_local_kv_specs(wrapped)
 
+    assert len(collected) == 1, collected
+    assert total_declared_bytes(wrapped) == 512
+
+
+def test_collector_reaches_owners_through_a_wrapper():
     class Top(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.owner = _Owner()
 
-    wrapped = Wrapper(Top())
-    assert not hasattr(wrapped, "named_modules")
+    wrapped = _CUDAGraphWrapperLike(Top())
     assert [path for path, _ in collect_model_local_kv_specs(wrapped)] == ["owner"]
-    assert total_declared_bytes(wrapped) == 512
-
-
-def test_collector_tolerates_a_wrapper_chain_that_never_terminates():
-    class SelfWrapper:
-        pass
-
-    node = SelfWrapper()
-    node.runnable = node  # cycle
-    assert collect_model_local_kv_specs(node) == []
 
 
 def test_collector_survives_an_owner_that_raises():
-    """Reporting memory must never be able to break model load."""
-
     class Broken(torch.nn.Module):
         def model_local_kv_specs(self):
             raise RuntimeError("checkpoint field missing")
@@ -285,60 +318,9 @@ def test_collector_survives_an_owner_that_raises():
     assert total_declared_bytes(Top()) == 512
 
 
-def test_concurrency_multiplies_per_request_caches_but_not_resident_ones():
-    """The model declares one unit; only the engine knows how many are live.
-
-    A per-request cache at max_num_seqs=64 costs 64x. A cache captured into the
-    CUDA-graph pool is shared across all of them and costs the same at 64 as at
-    1. Collapsing these into one number is wrong in one direction or the other
-    depending on which cache you pick.
-    """
-    per_request = _spec(scope=ModelLocalKVScope.REQUEST)
-    resident = _spec(scope=ModelLocalKVScope.MODEL, max_live_instances=261)
-
-    assert per_request.scales_with_concurrency
-    assert not resident.scales_with_concurrency
-
-    assert per_request.peak_bytes(1) == per_request.max_live_bytes
-    assert per_request.peak_bytes(64) == 64 * per_request.max_live_bytes
-    assert resident.peak_bytes(64) == resident.max_live_bytes
-
-
-def test_peak_bytes_rejects_a_meaningless_concurrency():
-    with pytest.raises(ValueError, match="concurrency"):
-        _spec().peak_bytes(0)
-
-
-def test_total_declared_bytes_takes_concurrency():
-    class Top(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.owner = _Owner()
-
-    model = Top()
-    assert total_declared_bytes(model) == 512
-    assert total_declared_bytes(model, concurrency=8) == 8 * 512
-
-
 def test_undeclared_models_report_zero_not_an_error():
-    """Additive before every model is migrated."""
     assert total_declared_bytes(object()) == 0
     assert total_declared_bytes(torch.nn.Linear(2, 2)) == 0
-
-
-def test_batch_capacity_has_no_default():
-    """Defaulting it to 1 would silently under-report every batched cache."""
-    with pytest.raises(TypeError):
-        ModelLocalKVSpec(  # type: ignore[call-arg]
-            name="x",
-            layers=1,
-            kv_heads=1,
-            head_dim=1,
-            dtype=torch.float16,
-            physical_capacity_positions=1,
-            capacity_source="",
-            scope=ModelLocalKVScope.REQUEST,
-        )
 
 
 def test_protocol_is_structural():
@@ -360,8 +342,8 @@ def test_protocol_is_structural():
 def test_known_cache_owners_still_declare(relative_path: str, owner: str):
     """Parsed rather than imported: these modules need CUDA and real weights.
 
-    Catches the declaration being dropped in a refactor, which would silently
-    take the model back to reporting zero.
+    Weak by construction -- it only proves the method exists. The ming tests
+    above are the ones that check a declaration's contents.
     """
     tree = ast.parse((MODELS_DIR / relative_path).read_text())
     classes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == owner]
