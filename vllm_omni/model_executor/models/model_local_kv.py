@@ -56,8 +56,8 @@ class ModelLocalKVScope(str, Enum):
 
     Diagnostic only. Lifetime and size are independent: a per-call cache can be
     the widest thing a model owns, and a process-lifetime one can be a single
-    row. ``ModelLocalKVSpec.rows`` and ``allocations`` carry the size; this
-    carries only the reader's mental model of when the memory appears and goes.
+    row. ``ModelLocalKVSpec.rows`` carries the size; this carries only the
+    reader's mental model of when the memory appears and goes.
     """
 
     INVOCATION = "invocation"
@@ -84,14 +84,14 @@ class EngineCapacity:
 
     max_num_seqs: int = 1
 
-    duplex_max_sessions: int | None = None
-    """``None`` when the consumer could not resolve the duplex session cap.
+    duplex_max_sessions: int = 1
+    """Concurrent duplex sessions, from ``OmniModelConfig.duplex_max_sessions``.
 
-    Kept distinct from 1 on purpose. ``duplex_max_sessions`` is currently only
-    passed through as an engine-args key and is not readable as an attribute at
-    report time, so a silent default of 1 would understate a duplex deployment
-    without anyone noticing. Unresolved is a state the report should say out
-    loud, not paper over.
+    Note this cannot distinguish "duplex with one session" from "duplex off":
+    ``omni_config`` collapses both to 1 and does not propagate ``session_mode``
+    to the model config. A session-scoped declaration therefore reports its
+    cost at one session even when the path is never taken, which is what
+    ``ModelLocalKVSpec.only_when`` exists to say out loud.
     """
 
 
@@ -100,15 +100,6 @@ class ModelLocalKVRows:
 
     def resolve(self, engine: EngineCapacity) -> int:
         raise NotImplementedError
-
-    def resolved(self, engine: EngineCapacity) -> bool:
-        """Whether the driver's value was actually known.
-
-        A driver that falls back reports ``False`` so the consumer can say the
-        figure is a floor rather than presenting a guess as a measurement.
-        """
-        del engine
-        return True
 
     @property
     def label(self) -> str:
@@ -127,6 +118,12 @@ class Fixed(ModelLocalKVRows):
     cache that looks per-request is exactly the claim a reader must be able to
     check.
     """
+
+    def __post_init__(self) -> None:
+        if self.count < 1:
+            raise ValueError(f"Fixed count must be >= 1, got {self.count}")
+        if not self.because.strip():
+            raise ValueError("Fixed requires a non-empty reason; an unexplained constant cannot be reviewed")
 
     def resolve(self, engine: EngineCapacity) -> int:
         del engine
@@ -154,12 +151,7 @@ class DuplexMaxSessions(ModelLocalKVRows):
     """One row per concurrent duplex session, which is not max_num_seqs."""
 
     def resolve(self, engine: EngineCapacity) -> int:
-        if engine.duplex_max_sessions is None:
-            return 1
         return max(1, engine.duplex_max_sessions)
-
-    def resolved(self, engine: EngineCapacity) -> bool:
-        return engine.duplex_max_sessions is not None
 
     @property
     def label(self) -> str:
@@ -208,20 +200,29 @@ class ModelLocalKVSpec:
     """
 
     rows: ModelLocalKVRows
-    """What sets the batch extent of this allocation.
+    """How many rows of this shape are live at peak.
 
-    ``FIXED(n)`` for an extent the model controls, ``MAX_NUM_SEQS`` or
-    ``DUPLEX_MAX_SESSIONS`` for one the engine controls. Required, because
-    defaulting it silently understates every cache whose width is not 1.
+    A row is one batch entry's worth of the geometry above. Deliberately does
+    not distinguish "one allocation N rows wide" from "N allocations of one
+    row": those cost the same, and an earlier revision that tried to carry both
+    got the topology wrong in three of four declarers -- MiniCPM-o stores one
+    cache object per session while asserting batch size 1, and both graph pools
+    keep one distinct object per captured bucket. Bytes are what this protocol
+    reports; describe the object layout in ``allocation_note``.
+
+    Required, because defaulting it silently understates every cache whose
+    multiplicity is not 1.
     """
 
-    allocations: int = 1
-    """Simultaneous live allocations of this shape.
+    only_when: str | None = None
+    """The condition under which this memory is actually allocated.
 
-    Almost always 1. Higher only when genuinely distinct allocations coexist,
-    e.g. one retained per captured CUDA-graph bucket. This is a count of
-    objects, not of rows: a cache that widens with the batch has ``rows``
-    greater than one and ``allocations`` still 1.
+    Set it when a declaration is unconditional but the allocation is not, and
+    the model cannot see the deciding setting. A model that *can* see it should
+    return no spec at all rather than declare one and annotate it: Qwen3-TTS
+    knows whether it is in async-chunk mode, so its stateless path declares
+    nothing, while MiniCPM-o cannot tell duplex-off from one-session and has to
+    say so instead.
     """
 
     allocation_note: str | None = None
@@ -246,10 +247,10 @@ class ModelLocalKVSpec:
         """Peak bytes once the engine's capacity is known.
 
         The model supplies geometry and says which engine number sets the
-        width; only the engine knows that number's value.
+        multiplicity; only the engine knows that number's value.
         """
         engine = engine or EngineCapacity()
-        return self.bytes_per_row * self.row_count(engine) * self.allocations
+        return self.bytes_per_row * self.row_count(engine)
 
 
 def _resolve(config: object, candidates: Sequence[str], what: str) -> int:
@@ -272,7 +273,7 @@ def spec_from_hf_config(
     scope: ModelLocalKVScope,
     dtype: torch.dtype,
     rows: ModelLocalKVRows,
-    allocations: int = 1,
+    only_when: str | None = None,
     allocation_note: str | None = None,
     layers: int | None = None,
     kv_heads: int | None = None,
@@ -320,7 +321,7 @@ def spec_from_hf_config(
         capacity_source=capacity_source,
         scope=scope,
         rows=rows,
-        allocations=allocations,
+        only_when=only_when,
         allocation_note=allocation_note,
     )
 

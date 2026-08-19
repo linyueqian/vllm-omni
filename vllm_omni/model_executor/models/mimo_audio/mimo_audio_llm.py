@@ -790,7 +790,6 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 # builds a single DynamicCache whose batch dimension is the
                 # number of requests in the group.
                 rows=MaxNumSeqs(),
-                allocations=1,
                 allocation_note="one batched allocation per eager call; graph replay uses the pool entry instead",
             )
         ]
@@ -808,7 +807,6 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                         captured_rows,
                         because=f"sum of captured buckets {sorted(self.local_forward_cg_by_bs)}",
                     ),
-                    allocations=1,
                     allocation_note=(
                         "pinned in the CUDA graph pool; capture is gated only on cuda.is_available(), "
                         "so this stays resident under enforce_eager too"

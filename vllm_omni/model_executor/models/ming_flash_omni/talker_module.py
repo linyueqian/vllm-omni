@@ -706,7 +706,6 @@ class MingAudioGenerator:
                 capacity_source=f"hardcoded max_cache_len={self._STATIC_CACHE_LEN} in _init_kv_cache",
                 scope=ModelLocalKVScope.INVOCATION,
                 rows=Fixed(1, because="forward() handles one request and runs the AR loop inline"),
-                allocations=1,
                 allocation_note="full extent on first write per layer, not grown; rebuilt per text segment",
             )
         ]

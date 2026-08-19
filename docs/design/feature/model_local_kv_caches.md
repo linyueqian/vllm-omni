@@ -28,11 +28,11 @@ The consumer therefore reports and does not subtract.
 
 | Model | Cache | Bounded by | Per row | Rows |
 |---|---|---|---|---|
-| Qwen3-TTS codec decoder | sliding `DynamicCache` | `sliding_window - 1 = 71` | 4.44 MiB | `max_num_seqs` |
+| Qwen3-TTS codec decoder (async-chunk only) | sliding `DynamicCache` | `sliding_window - 1 = 71` | 4.44 MiB | `max_num_seqs`, x2 for the working copy |
 | Qwen3-TTS graph pool | retained captures | same | 4.44 MiB | fixed, from captured shapes |
 | MiMo-Audio local transformer | `DynamicCache` | `group_size + max(delay_pattern) = 11` | 704 KiB | `max_num_seqs` |
 | MiMo-Audio graph pool | captured | same | 704 KiB | fixed 261 (bucket sum) |
-| MiniCPM-o Whisper encoder | `EncoderDecoderCache` | `embed_positions` rows = 1500 | 140.62 MiB | `duplex_max_sessions` |
+| MiniCPM-o Whisper encoder (duplex only) | `EncoderDecoderCache` | `embed_positions` rows = 1500 | 140.62 MiB | `duplex_max_sessions` |
 | ming_flash_omni talker | `StaticCache` | hardcoded `max_cache_len = 2048` | 24.00 MiB | fixed 1 |
 
 **No cache is bounded by `max_model_len`.** Each has its own mechanism: a
@@ -63,14 +63,31 @@ So width is declared explicitly, by naming the driver:
 - `MaxNumSeqs()` -- one row per in-flight sequence.
 - `DuplexMaxSessions()` -- one row per duplex session.
 
-`allocations` stays separate and counts *objects*, not rows. A cache that widens
-with the batch has `rows` greater than one and `allocations` still 1. MiMo's
-eager cache is one allocation whose batch dimension is the group size, not N
-separate caches; the bytes coincide, the description does not.
+`rows` counts row-equivalents at peak and deliberately does not distinguish
+"one allocation N rows wide" from "N allocations of one row". Those cost the
+same, and a revision that tried to carry both got the object topology wrong in
+three of four declarers: MiniCPM-o keeps one cache object per session while
+asserting batch size 1, and both graph pools keep one distinct object per
+captured bucket. The layout belongs in `allocation_note`, where it cannot be
+mistaken for arithmetic.
 
-When a driver cannot be resolved -- `duplex_max_sessions` is currently only
-threaded through as an engine-args key -- the report says `unresolved` and marks
-the row a floor, rather than substituting 1 and looking confident.
+## Declaring nothing is a valid declaration
+
+A declaration must be inert when its path is. Qwen3-TTS holds KV only in
+async-chunk mode -- stateless decoding runs `_forward_exact`, which calls the
+transformer without `use_cache` -- so the stateless path declares nothing.
+Getting this wrong is easy in both directions, and both have happened here: one
+revision hung the declaration off the CUDA-graph wrapper and reported zero under
+`enforce_eager`, where the eager async-chunk path does allocate; the next
+declared unconditionally and invented roughly a gigabyte for stateless
+deployments.
+
+Where the model cannot see the deciding setting, it says so in `only_when`
+instead of guessing. MiniCPM-o's encoder cache exists only on the duplex
+streaming path, but `omni_config` collapses "duplex off" and "duplex with one
+session" both to `duplex_max_sessions=1` and does not propagate `session_mode`
+to the model config, so the model cannot tell them apart. It declares the cost
+and states the condition.
 
 ## Finding the declarers
 

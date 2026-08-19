@@ -857,12 +857,19 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
     def model_local_kv_specs(self):
         """Declare this decoder's attention KV.
 
-        Two sources. The decode path allocates a sliding-window cache per call
-        whether or not CUDA graphs are on -- ``_decode_icl_first_chunk`` fills
-        a fresh dict on every batched eager call -- so that entry is
-        unconditional. An earlier revision declared nothing at all when
-        ``_cudagraph_wrapper`` was absent, which reported zero for exactly the
-        deployments that set ``enforce_eager``.
+        Only the async-chunk path holds KV. In stateless mode the decoder runs
+        ``_forward_exact``, which calls ``pre_transformer`` without
+        ``use_cache`` and allocates no cache at all, so declaring a per-request
+        cache there invents memory that does not exist. The previous revision
+        did exactly that and reported over a gigabyte for stateless
+        deployments; the one before it hung the declaration off the CUDA-graph
+        wrapper and so reported zero under ``enforce_eager``, where the eager
+        async-chunk path does allocate. Both mistakes come from tying this to
+        the wrong condition.
+
+        Two entries when async-chunk is on: the retained per-request cache, and
+        the working copy ``_decode_icl_first_chunk`` deep-copies from it, which
+        is live at the same time.
 
         The wrapper, when present, adds the graph-resident copies. It is a
         plain object rather than a submodule, so the module-tree walk cannot
@@ -884,20 +891,34 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         if window <= 1:
             return []
 
-        specs = [
-            spec_from_hf_config(
-                config,
-                name="codec_decoder_decode",
+        specs = []
+        wrapper = getattr(self, "_cudagraph_wrapper", None)
+        # async_chunk is the wrapper's record of the mode; without a wrapper the
+        # decoder has not been told, and only the stateless path is reachable.
+        if wrapper is not None and getattr(wrapper, "async_chunk", False):
+            common = dict(
+                config=config,
                 dtype=dtype,
                 physical_capacity_positions=window - 1,
                 capacity_source=f"sliding_window({window}) - 1",
-                scope=ModelLocalKVScope.REQUEST,
                 rows=MaxNumSeqs(),
-                allocations=1,
-                allocation_note="allocated per decode call, eager or graph-replayed",
             )
-        ]
-        wrapper = getattr(self, "_cudagraph_wrapper", None)
+            specs.append(
+                spec_from_hf_config(
+                    name="codec_decoder_request",
+                    scope=ModelLocalKVScope.REQUEST,
+                    allocation_note="retained across chunks of one request",
+                    **common,
+                )
+            )
+            specs.append(
+                spec_from_hf_config(
+                    name="codec_decoder_working_copy",
+                    scope=ModelLocalKVScope.INVOCATION,
+                    allocation_note="deep-copied from the retained cache each chunk; live alongside it",
+                    **common,
+                )
+            )
         if wrapper is not None:
             specs.extend(wrapper.model_local_kv_specs())
         return specs

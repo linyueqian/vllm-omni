@@ -11,6 +11,7 @@ numbers are checked against a real cache built the way the model builds it.
 
 import ast
 import pathlib
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -131,12 +132,14 @@ def test_growing_cache_declaration_matches_a_real_dynamic_cache():
     assert spec.peak_bytes() == _cache_bytes(cache)
 
 
-def test_a_batched_cache_is_rows_not_allocations():
+def test_multiplicity_does_not_claim_an_object_layout():
     """One allocation B rows wide costs the same as B one-row allocations.
 
-    The bytes coincide, which is why the previous model went unnoticed. The
-    distinction still matters: `allocations` is what the log reports, and
-    saying "64 caches" when there is one is simply false.
+    The protocol reports bytes and deliberately does not distinguish the two.
+    An earlier revision carried a separate `allocations` count and got the
+    object topology wrong in three of four declarers, which is worse than not
+    claiming it: the layout belongs in `allocation_note`, where it cannot be
+    mistaken for arithmetic.
     """
     config = _qwen2_config(layers=4, kv_heads=2, heads=2, hidden=64)
     common = dict(
@@ -147,12 +150,12 @@ def test_a_batched_cache_is_rows_not_allocations():
         capacity_source="test",
         scope=ModelLocalKVScope.INVOCATION,
     )
-    batched = spec_from_hf_config(rows=MaxNumSeqs(), allocations=1, **common)
+    batched = spec_from_hf_config(rows=MaxNumSeqs(), **common)
     engine = EngineCapacity(max_num_seqs=64)
 
     assert batched.row_count(engine) == 64
-    assert batched.allocations == 1
     assert batched.peak_bytes(engine) == batched.bytes_per_row * 64
+    assert not hasattr(batched, "allocations"), "the object-count axis was removed on purpose"
 
 
 def test_duplex_cache_uses_sessions_not_sequences():
@@ -170,15 +173,54 @@ def test_duplex_cache_uses_sessions_not_sequences():
     assert spec.row_count(engine) == 3
 
 
-def test_unresolved_duplex_capacity_is_reported_not_guessed():
-    """An unknown session cap must be visible, not silently 1."""
-    rows = DuplexMaxSessions()
-    unknown = EngineCapacity(max_num_seqs=64)
-    known = EngineCapacity(max_num_seqs=64, duplex_max_sessions=4)
+def test_qwen3_tts_declares_nothing_on_the_stateless_path():
+    """Calls the real decoder declarer with no cache-holding mode configured.
 
-    assert rows.resolve(unknown) == 1
-    assert rows.resolved(unknown) is False
-    assert rows.resolved(known) is True
+    `_forward_exact` runs `pre_transformer` without `use_cache`, so stateless
+    decoding allocates no KV. A revision that declared a per-request cache
+    unconditionally invented over a gigabyte at max_num_seqs=256, and the
+    revision before it declared nothing at all under enforce_eager, where the
+    eager async-chunk path does allocate. Both are regressions this pins.
+    """
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz import (
+        modeling_qwen3_tts_tokenizer_v2 as mod,
+    )
+
+    decoder = object.__new__(mod.Qwen3TTSTokenizerV2Decoder)
+    # nn.Module.__setattr__ needs the machinery __init__ would have built, and
+    # this instance deliberately has none of it.
+    setattr_ = object.__setattr__
+    setattr_(
+        decoder,
+        "config",
+        SimpleNamespace(
+            sliding_window=72,
+            num_hidden_layers=8,
+            num_key_value_heads=16,
+            head_dim=64,
+            hidden_size=1024,
+            num_attention_heads=16,
+        ),
+    )
+    setattr_(decoder, "parameters", lambda: iter([torch.zeros(1, dtype=torch.float32)]))
+
+    setattr_(decoder, "_cudagraph_wrapper", None)
+    assert decoder.model_local_kv_specs() == []
+
+    setattr_(decoder, "_cudagraph_wrapper", SimpleNamespace(async_chunk=False, model_local_kv_specs=lambda: []))
+    assert decoder.model_local_kv_specs() == []
+
+    setattr_(decoder, "_cudagraph_wrapper", SimpleNamespace(async_chunk=True, model_local_kv_specs=lambda: []))
+    names = [s.name for s in decoder.model_local_kv_specs()]
+    assert names == ["codec_decoder_request", "codec_decoder_working_copy"], names
+
+
+def test_fixed_rejects_unreviewable_values():
+    """A bare or unexplained constant cannot be reviewed, so it is rejected."""
+    with pytest.raises(ValueError, match="non-empty reason"):
+        Fixed(1, because="   ")
+    with pytest.raises(ValueError, match=">= 1"):
+        Fixed(0, because="test")
 
 
 def test_rows_is_required():

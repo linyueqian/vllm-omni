@@ -218,54 +218,43 @@ class OmniGPUModelRunner(GPUModelRunner):
         specs = collect_model_local_kv_specs(getattr(self, "model", None))
         if not specs:
             return
-        engine = EngineCapacity(
-            max_num_seqs=max(1, int(self.scheduler_config.max_num_seqs)),
-            duplex_max_sessions=self._resolve_duplex_max_sessions(),
-        )
+        engine = self._engine_capacity()
         total = sum(spec.peak_bytes(engine) for _, spec in specs)
         logger.info(
             "Model-local KV (outside the paged manager): %.2f MiB across %d declaration(s) "
-            "at max_num_seqs=%d, duplex_max_sessions=%s",
+            "at max_num_seqs=%d, duplex_max_sessions=%d",
             total / (1 << 20),
             len(specs),
             engine.max_num_seqs,
-            engine.duplex_max_sessions if engine.duplex_max_sessions is not None else "unresolved",
+            engine.duplex_max_sessions,
         )
         for path, spec in specs:
             logger.info(
-                "  %s.%s: %.2f MiB (%d rows from %s%s x %.2f MiB/row, %d allocation(s), "
-                "scope=%s, %d positions from %s)",
+                "  %s.%s: %.2f MiB (%d rows from %s x %.2f MiB/row, scope=%s, %d positions from %s)%s",
                 path or type(self.model).__name__,
                 spec.name,
                 spec.peak_bytes(engine) / (1 << 20),
                 spec.row_count(engine),
                 spec.rows.label,
-                "" if spec.rows.resolved(engine) else " [unresolved, floor]",
                 spec.bytes_per_row / (1 << 20),
-                spec.allocations,
                 spec.scope.value,
                 spec.physical_capacity_positions,
                 spec.capacity_source,
+                f" -- only when {spec.only_when}" if spec.only_when else "",
             )
 
-    def _resolve_duplex_max_sessions(self) -> int | None:
-        """Find the duplex session cap, or return None rather than guess.
+    def _engine_capacity(self) -> EngineCapacity:
+        """Read the engine-side numbers a declaration may be widened by.
 
-        It is threaded through as an engine-args key rather than exposed as a
-        stable attribute, so this probes the objects that might carry it and
-        gives up honestly. Returning 1 on failure would silently understate a
-        duplex deployment's session-scoped caches.
+        ``duplex_max_sessions`` lives on ``OmniModelConfig`` and is read this
+        way elsewhere in the tree (``personaplex_talker.py``). An earlier
+        revision probed four holders and reported "unresolved" because the
+        attribute was looked up in a checkout that had lost the file.
         """
-        for holder in (
-            getattr(self, "model_config", None),
-            getattr(self, "scheduler_config", None),
-            getattr(self, "cache_config", None),
-            getattr(self, "vllm_config", None),
-        ):
-            value = getattr(holder, "duplex_max_sessions", None) if holder is not None else None
-            if value:
-                return max(1, int(value))
-        return None
+        return EngineCapacity(
+            max_num_seqs=max(1, int(self.scheduler_config.max_num_seqs)),
+            duplex_max_sessions=max(1, int(getattr(self.model_config, "duplex_max_sessions", 1) or 1)),
+        )
 
     def _maybe_enable_output_token_ids_for_model_sampler(self) -> None:
         if getattr(self.model, "logitsprocs_need_output_token_ids", False):

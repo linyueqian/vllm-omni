@@ -2645,9 +2645,14 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
                 physical_capacity_positions=int(self.embed_positions.weight.shape[0]),
                 capacity_source="embed_positions rows (max_source_positions)",
                 scope=ModelLocalKVScope.SESSION,
+                # One cache object per session state, each batch size 1, so the
+                # session count is the multiplicity.
                 rows=DuplexMaxSessions(),
-                allocations=1,
-                allocation_note="only allocated on the streaming path, when use_cache is set",
+                only_when=(
+                    "the duplex streaming path runs; ordinary audio encoding calls the encoder "
+                    "without use_cache, and duplex-off is indistinguishable from one session here"
+                ),
+                allocation_note="one EncoderDecoderCache per duplex session state",
             )
         ]
 

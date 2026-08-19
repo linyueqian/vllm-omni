@@ -246,7 +246,6 @@ class CUDAGraphDecoderWrapper:
                         f"{len(self.xvec_prefix_states)} xvec-prefix captures"
                     ),
                 ),
-                allocations=1,
                 allocation_note=(
                     "counted from caches transformers has materialized; captures whose tensors are still "
                     "unallocated report nothing, so this is a floor for the xvec path"
