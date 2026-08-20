@@ -33,6 +33,12 @@ class _Flow(nn.Module):
     def __init__(self, estimator: nn.Module):
         super().__init__()
         self.decoder = SimpleNamespace(estimator=estimator)
+        # BatchedToken2Wav.__init__ undecorates flow.encoder.forward_chunk
+        # (#6274). The real CosyVoice2 flow has an encoder; this stub did not,
+        # so constructing the adapter raised AttributeError before reaching the
+        # graph-replay assertions. _undecorate_dynamo returns early when the
+        # method is absent, so an empty namespace is enough.
+        self.encoder = SimpleNamespace()
 
 
 class _Token2Wav:
