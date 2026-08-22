@@ -1181,7 +1181,12 @@ class Orchestrator:
                 self._orch_monitor.note_loop(idle=False)
 
                 if kind == "error":
-                    if isinstance(payload, EngineDeadError):
+                    # replica_id < 0 means the failure was raised by a poller
+                    # task itself rather than attributed to one replica, so
+                    # there is nothing to evict -- and evict_replica() rejects
+                    # an out-of-range id, which would turn a survivable death
+                    # into a ValueError out of the dispatcher.
+                    if isinstance(payload, EngineDeadError) and replica_id >= 0:
                         # Same per-replica isolation as the legacy loop (#4285):
                         # evict and keep serving. Reconcile immediately so the
                         # dead replica's reader is reaped now rather than at the
