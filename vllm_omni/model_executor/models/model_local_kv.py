@@ -37,14 +37,10 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 __all__ = [
-    "DuplexMaxSessions",
-    "EngineCapacity",
-    "Fixed",
     "HasModelLocalKV",
-    "MaxNumSeqs",
-    "ModelLocalKVRows",
     "ModelLocalKVScope",
     "ModelLocalKVSpec",
+    "RowDriver",
     "collect_model_local_kv_specs",
     "spec_from_hf_config",
     "total_declared_bytes",
@@ -73,89 +69,20 @@ class ModelLocalKVScope(str, Enum):
     """Lives as long as the model (e.g. captured into a CUDA-graph pool)."""
 
 
-@dataclass(frozen=True)
-class EngineCapacity:
-    """The engine-side numbers a declaration may be widened by.
+class RowDriver(str, Enum):
+    """What sets how many rows of a cache are live at peak.
 
-    Passed in by the consumer. A model must never read these itself: it does
-    not know them at declaration time, and guessing is how the previous
-    revision came to multiply a serialized cache by ``max_num_seqs``.
+    Two values, because two are all the known caches need. A third belongs
+    here only when a model actually has a cache the engine widens by some
+    other number -- adding one speculatively costs a branch everywhere and
+    buys nothing.
     """
 
-    max_num_seqs: int = 1
+    FIXED = "fixed"
+    """A count the model controls: a captured-bucket sum, a serialized call path."""
 
-    duplex_max_sessions: int = 1
-    """Concurrent duplex sessions, from ``OmniModelConfig.duplex_max_sessions``.
-
-    Note this cannot distinguish "duplex with one session" from "duplex off":
-    ``omni_config`` collapses both to 1 and does not propagate ``session_mode``
-    to the model config. A session-scoped declaration therefore reports its
-    cost at one session even when the path is never taken, which is what
-    ``ModelLocalKVSpec.only_when`` exists to say out loud.
-    """
-
-
-class ModelLocalKVRows:
-    """What sets the batch extent of an allocation."""
-
-    def resolve(self, engine: EngineCapacity) -> int:
-        raise NotImplementedError
-
-    @property
-    def label(self) -> str:
-        raise NotImplementedError
-
-
-@dataclass(frozen=True)
-class Fixed(ModelLocalKVRows):
-    """A width the model itself controls."""
-
-    count: int
-    because: str
-    """Why it is this number: a bucket sum, a serialized call path, a constant.
-
-    Required, because a bare integer cannot be reviewed. ``Fixed(1)`` for a
-    cache that looks per-request is exactly the claim a reader must be able to
-    check.
-    """
-
-    def __post_init__(self) -> None:
-        if self.count < 1:
-            raise ValueError(f"Fixed count must be >= 1, got {self.count}")
-        if not self.because.strip():
-            raise ValueError("Fixed requires a non-empty reason; an unexplained constant cannot be reviewed")
-
-    def resolve(self, engine: EngineCapacity) -> int:
-        del engine
-        return self.count
-
-    @property
-    def label(self) -> str:
-        return f"fixed({self.count}; {self.because})"
-
-
-@dataclass(frozen=True)
-class MaxNumSeqs(ModelLocalKVRows):
-    """One row per in-flight sequence."""
-
-    def resolve(self, engine: EngineCapacity) -> int:
-        return max(1, engine.max_num_seqs)
-
-    @property
-    def label(self) -> str:
-        return "max_num_seqs"
-
-
-@dataclass(frozen=True)
-class DuplexMaxSessions(ModelLocalKVRows):
-    """One row per concurrent duplex session, which is not max_num_seqs."""
-
-    def resolve(self, engine: EngineCapacity) -> int:
-        return max(1, engine.duplex_max_sessions)
-
-    @property
-    def label(self) -> str:
-        return "duplex_max_sessions"
+    MAX_NUM_SEQS = "max_num_seqs"
+    """One row per in-flight sequence. Only the engine knows the value."""
 
 
 @dataclass(frozen=True)
@@ -199,34 +126,38 @@ class ModelLocalKVSpec:
     Lifetime does not imply replication topology; ``rows`` says what does.
     """
 
-    rows: ModelLocalKVRows
-    """How many rows of this shape are live at peak.
+    rows: RowDriver
+    """What sets how many rows of this shape are live at peak.
 
     A row is one batch entry's worth of the geometry above. Deliberately does
     not distinguish "one allocation N rows wide" from "N allocations of one
     row": those cost the same, and an earlier revision that tried to carry both
-    got the topology wrong in three of four declarers -- MiniCPM-o stores one
-    cache object per session while asserting batch size 1, and both graph pools
-    keep one distinct object per captured bucket. Bytes are what this protocol
-    reports; describe the object layout in ``allocation_note``.
+    got the object topology wrong in three of four declarers. Bytes are what
+    this protocol reports; describe the layout in ``allocation_note``.
 
     Required, because defaulting it silently understates every cache whose
     multiplicity is not 1.
     """
 
-    only_when: str | None = None
-    """The condition under which this memory is actually allocated.
+    rows_fixed: int = 1
+    """The count, when ``rows`` is ``FIXED``. Ignored otherwise."""
 
-    Set it when a declaration is unconditional but the allocation is not, and
-    the model cannot see the deciding setting. A model that *can* see it should
-    return no spec at all rather than declare one and annotate it: Qwen3-TTS
-    knows whether it is in async-chunk mode, so its stateless path declares
-    nothing, while MiniCPM-o cannot tell duplex-off from one-session and has to
-    say so instead.
+    rows_reason: str = ""
+    """Why ``rows_fixed`` is that number. Required when ``rows`` is ``FIXED``.
+
+    A bare constant cannot be reviewed. ``rows_fixed=1`` on a cache that looks
+    per-request is exactly the claim a reader has to be able to check.
     """
 
     allocation_note: str | None = None
     """Optional detail such as "rebuilt per text segment". Diagnostic only."""
+
+    def __post_init__(self) -> None:
+        if self.rows is RowDriver.FIXED:
+            if self.rows_fixed < 1:
+                raise ValueError(f"rows_fixed must be >= 1, got {self.rows_fixed}")
+            if not self.rows_reason.strip():
+                raise ValueError("a FIXED row count needs rows_reason; an unexplained constant cannot be reviewed")
 
     @property
     def bytes_per_row(self) -> int:
@@ -240,17 +171,19 @@ class ModelLocalKVSpec:
             * torch.empty((), dtype=self.dtype).element_size()
         )
 
-    def row_count(self, engine: EngineCapacity) -> int:
-        return self.rows.resolve(engine)
+    def row_count(self, max_num_seqs: int = 1) -> int:
+        """Rows live at peak, given the engine's concurrency."""
+        if self.rows is RowDriver.FIXED:
+            return self.rows_fixed
+        return max(1, max_num_seqs)
 
-    def peak_bytes(self, engine: EngineCapacity | None = None) -> int:
-        """Peak bytes once the engine's capacity is known.
+    def peak_bytes(self, max_num_seqs: int = 1) -> int:
+        """Peak bytes once the engine's concurrency is known.
 
-        The model supplies geometry and says which engine number sets the
-        multiplicity; only the engine knows that number's value.
+        The model supplies geometry and names the driver; only the engine knows
+        the number behind it.
         """
-        engine = engine or EngineCapacity()
-        return self.bytes_per_row * self.row_count(engine)
+        return self.bytes_per_row * self.row_count(max_num_seqs)
 
 
 def _resolve(config: object, candidates: Sequence[str], what: str) -> int:
@@ -272,8 +205,9 @@ def spec_from_hf_config(
     capacity_source: str,
     scope: ModelLocalKVScope,
     dtype: torch.dtype,
-    rows: ModelLocalKVRows,
-    only_when: str | None = None,
+    rows: RowDriver,
+    rows_fixed: int = 1,
+    rows_reason: str = "",
     allocation_note: str | None = None,
     layers: int | None = None,
     kv_heads: int | None = None,
@@ -321,7 +255,8 @@ def spec_from_hf_config(
         capacity_source=capacity_source,
         scope=scope,
         rows=rows,
-        only_when=only_when,
+        rows_fixed=rows_fixed,
+        rows_reason=rows_reason,
         allocation_note=allocation_note,
     )
 
@@ -413,12 +348,11 @@ def collect_model_local_kv_specs(model: object) -> list[tuple[str, ModelLocalKVS
     return collected
 
 
-def total_declared_bytes(model: object, engine: EngineCapacity | None = None) -> int:
+def total_declared_bytes(model: object, max_num_seqs: int = 1) -> int:
     """Sum declared peak bytes, or 0 for a model that declares nothing.
 
-    Pass the engine's capacity so each declaration is widened by the driver it
+    Pass ``max_num_seqs`` so each declaration is widened by the driver it
     named. Returning 0 rather than raising keeps this usable as an additive
     term in reporting before every model has been migrated.
     """
-    engine = engine or EngineCapacity()
-    return sum(spec.peak_bytes(engine) for _, spec in collect_model_local_kv_specs(model))
+    return sum(spec.peak_bytes(max_num_seqs) for _, spec in collect_model_local_kv_specs(model))

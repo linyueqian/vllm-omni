@@ -56,10 +56,9 @@ from vllm.utils.tensor_schema import TensorSchema
 
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import MiMoAudioConfig
 from vllm_omni.model_executor.models.model_local_kv import (
-    Fixed,
-    MaxNumSeqs,
     ModelLocalKVScope,
     ModelLocalKVSpec,
+    RowDriver,
     spec_from_hf_config,
 )
 from vllm_omni.platforms import current_omni_platform
@@ -789,7 +788,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 # One cache, B rows wide -- not B caches. base_local_forward
                 # builds a single DynamicCache whose batch dimension is the
                 # number of requests in the group.
-                rows=MaxNumSeqs(),
+                rows=RowDriver.MAX_NUM_SEQS,
                 allocation_note="one batched allocation per eager call; graph replay uses the pool entry instead",
             )
         ]
@@ -803,10 +802,9 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                     physical_capacity_positions=delay_iters,
                     capacity_source=bound,
                     scope=ModelLocalKVScope.MODEL,
-                    rows=Fixed(
-                        captured_rows,
-                        because=f"sum of captured buckets {sorted(self.local_forward_cg_by_bs)}",
-                    ),
+                    rows=RowDriver.FIXED,
+                    rows_fixed=captured_rows,
+                    rows_reason=f"sum of captured buckets {sorted(self.local_forward_cg_by_bs)}",
                     allocation_note=(
                         "pinned in the CUDA graph pool; capture is gated only on cuda.is_available(), "
                         "so this stays resident under enforce_eager too"

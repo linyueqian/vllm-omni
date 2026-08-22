@@ -42,9 +42,9 @@ from vllm_omni.model_executor.models.common.ming.cfm_solver import (
 )
 from vllm_omni.model_executor.models.common.ming.dit_blocks import CondEmbedder, DiTBlock, FinalLayer
 from vllm_omni.model_executor.models.model_local_kv import (
-    Fixed,
     ModelLocalKVScope,
     ModelLocalKVSpec,
+    RowDriver,
     spec_from_hf_config,
 )
 
@@ -658,7 +658,9 @@ class MingAudioGenerator:
                 physical_capacity_positions=self._STATIC_CACHE_LEN,
                 capacity_source=f"hardcoded max_cache_len={self._STATIC_CACHE_LEN} in _init_kv_cache",
                 scope=ModelLocalKVScope.INVOCATION,
-                rows=Fixed(1, because="forward() handles one request and runs the AR loop inline"),
+                rows=RowDriver.FIXED,
+                rows_fixed=1,
+                rows_reason="forward() handles one request and runs the AR loop inline",
                 allocation_note="full extent on first write per layer, not grown; rebuilt per text segment",
             )
         ]

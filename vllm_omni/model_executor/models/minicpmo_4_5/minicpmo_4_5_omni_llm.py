@@ -138,9 +138,9 @@ def _encode_tokens(tokenizer: Any, prompt: str) -> list[int]:
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from vllm_omni.model_executor.models.model_local_kv import (
-    DuplexMaxSessions,
     ModelLocalKVScope,
     ModelLocalKVSpec,
+    RowDriver,
     spec_from_hf_config,
 )
 
@@ -2637,10 +2637,17 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
         rather than the config, so a partially built encoder reports what it
         actually has.
 
-        Multiplicity is duplex sessions, not ``max_num_seqs``: each duplex
-        session state owns its own ``audio_past_key_values`` and the encoder
-        runs at batch size one. Those are different settings with different
-        defaults.
+        Declared per session, not per sequence. Each streaming session state
+        owns its own ``audio_past_key_values`` and the encoder runs at batch
+        size one, so ``max_num_seqs`` is the wrong number here.
+
+        One session is the unit rather than the configured cap, because the cap
+        is not visible from the model and the setting that carries it cannot
+        distinguish "duplex off" from "one session" -- so a cap-scaled figure
+        would report a cache that a non-duplex deployment never allocates. An
+        earlier revision grew a capacity driver and an engine-side field to
+        carry that number for this one declarer; the arithmetic is a
+        multiplication the reader can do when they need the ceiling.
         """
         return [
             spec_from_hf_config(
@@ -2653,12 +2660,13 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
                 physical_capacity_positions=int(self.embed_positions.weight.shape[0]),
                 capacity_source="embed_positions rows (max_source_positions)",
                 scope=ModelLocalKVScope.SESSION,
-                rows=DuplexMaxSessions(),
-                only_when=(
-                    "the duplex streaming path runs; ordinary audio encoding calls the encoder "
-                    "without use_cache, and duplex-off is indistinguishable from one session here"
+                rows=RowDriver.FIXED,
+                rows_fixed=1,
+                rows_reason="one EncoderDecoderCache per streaming session, encoder runs at batch size 1",
+                allocation_note=(
+                    "only allocated on the streaming path, where use_cache is set; scales with the "
+                    "configured duplex session cap"
                 ),
-                allocation_note="one EncoderDecoderCache per duplex session state",
             )
         ]
 

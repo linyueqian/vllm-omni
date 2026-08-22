@@ -876,8 +876,8 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         reach it; this is the hop it needs.
         """
         from vllm_omni.model_executor.models.model_local_kv import (
-            MaxNumSeqs,
             ModelLocalKVScope,
+            RowDriver,
             spec_from_hf_config,
         )
 
@@ -901,7 +901,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                 dtype=dtype,
                 physical_capacity_positions=window - 1,
                 capacity_source=f"sliding_window({window}) - 1",
-                rows=MaxNumSeqs(),
+                rows=RowDriver.MAX_NUM_SEQS,
             )
             specs.append(
                 spec_from_hf_config(

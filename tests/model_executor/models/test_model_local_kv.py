@@ -19,13 +19,10 @@ from transformers import Qwen2Config
 from transformers.cache_utils import DynamicCache, StaticCache
 
 from vllm_omni.model_executor.models.model_local_kv import (
-    DuplexMaxSessions,
-    EngineCapacity,
-    Fixed,
     HasModelLocalKV,
-    MaxNumSeqs,
     ModelLocalKVScope,
     ModelLocalKVSpec,
+    RowDriver,
     collect_model_local_kv_specs,
     spec_from_hf_config,
     total_declared_bytes,
@@ -90,7 +87,7 @@ def test_ming_declaration_matches_the_cache_it_describes():
         keys = torch.zeros(1, config.num_key_value_heads, 1, head_dim, dtype=torch.float16)
         cache.update(keys, keys.clone(), layer_idx)
 
-    assert spec.peak_bytes(EngineCapacity(max_num_seqs=1)) == _cache_bytes(cache)
+    assert spec.peak_bytes(1) == _cache_bytes(cache)
 
 
 def test_ming_does_not_scale_with_max_num_seqs():
@@ -107,7 +104,7 @@ def test_ming_does_not_scale_with_max_num_seqs():
     generator._model = torch.nn.Linear(1, 1).to(torch.float16)
 
     (spec,) = generator.model_local_kv_specs()
-    assert spec.peak_bytes(EngineCapacity(max_num_seqs=64)) == spec.peak_bytes(EngineCapacity(max_num_seqs=1))
+    assert spec.peak_bytes(64) == spec.peak_bytes(1)
 
 
 def test_growing_cache_declaration_matches_a_real_dynamic_cache():
@@ -121,7 +118,8 @@ def test_growing_cache_declaration_matches_a_real_dynamic_cache():
         physical_capacity_positions=positions,
         capacity_source="group_size + max(delay_pattern)",
         scope=ModelLocalKVScope.INVOCATION,
-        rows=Fixed(1, because="test"),
+        rows=RowDriver.FIXED,
+        rows_reason="test",
     )
 
     cache = DynamicCache()
@@ -150,27 +148,29 @@ def test_multiplicity_does_not_claim_an_object_layout():
         capacity_source="test",
         scope=ModelLocalKVScope.INVOCATION,
     )
-    batched = spec_from_hf_config(rows=MaxNumSeqs(), **common)
-    engine = EngineCapacity(max_num_seqs=64)
+    batched = spec_from_hf_config(rows=RowDriver.MAX_NUM_SEQS, **common)
 
-    assert batched.row_count(engine) == 64
-    assert batched.peak_bytes(engine) == batched.bytes_per_row * 64
+    assert batched.row_count(64) == 64
+    assert batched.peak_bytes(64) == batched.bytes_per_row * 64
     assert not hasattr(batched, "allocations"), "the object-count axis was removed on purpose"
 
 
-def test_duplex_cache_uses_sessions_not_sequences():
-    config = _qwen2_config()
+def test_a_fixed_driver_ignores_concurrency():
+    """A serialized or capture-pinned cache does not widen with max_num_seqs."""
     spec = spec_from_hf_config(
-        config,
-        name="whisper_encoder_self_attn",
+        _qwen2_config(),
+        name="graph_pool",
         dtype=torch.bfloat16,
-        physical_capacity_positions=1500,
-        capacity_source="embed_positions rows",
-        scope=ModelLocalKVScope.SESSION,
-        rows=DuplexMaxSessions(),
+        physical_capacity_positions=11,
+        capacity_source="test",
+        scope=ModelLocalKVScope.MODEL,
+        rows=RowDriver.FIXED,
+        rows_fixed=261,
+        rows_reason="sum of captured buckets",
     )
-    engine = EngineCapacity(max_num_seqs=64, duplex_max_sessions=3)
-    assert spec.row_count(engine) == 3
+    assert spec.row_count(1) == 261
+    assert spec.row_count(64) == 261
+    assert spec.peak_bytes(64) == spec.bytes_per_row * 261
 
 
 def test_qwen3_tts_declares_nothing_on_the_stateless_path():
@@ -217,10 +217,20 @@ def test_qwen3_tts_declares_nothing_on_the_stateless_path():
 
 def test_fixed_rejects_unreviewable_values():
     """A bare or unexplained constant cannot be reviewed, so it is rejected."""
-    with pytest.raises(ValueError, match="non-empty reason"):
-        Fixed(1, because="   ")
+    common = dict(
+        name="x",
+        layers=1,
+        kv_heads=1,
+        head_dim=1,
+        dtype=torch.float16,
+        physical_capacity_positions=1,
+        capacity_source="",
+        scope=ModelLocalKVScope.REQUEST,
+    )
+    with pytest.raises(ValueError, match="rows_reason"):
+        ModelLocalKVSpec(rows=RowDriver.FIXED, rows_fixed=1, rows_reason="   ", **common)
     with pytest.raises(ValueError, match=">= 1"):
-        Fixed(0, because="test")
+        ModelLocalKVSpec(rows=RowDriver.FIXED, rows_fixed=0, rows_reason="test", **common)
 
 
 def test_rows_is_required():
@@ -240,12 +250,6 @@ def test_rows_is_required():
         )
 
 
-def test_fixed_rows_must_say_why():
-    """`Fixed(1)` on a per-request-looking cache is a claim needing evidence."""
-    with pytest.raises(TypeError):
-        Fixed(1)  # type: ignore[call-arg]
-
-
 def test_spec_from_hf_config_raises_rather_than_guessing():
     class Empty:
         pass
@@ -258,7 +262,8 @@ def test_spec_from_hf_config_raises_rather_than_guessing():
             physical_capacity_positions=1,
             capacity_source="",
             scope=ModelLocalKVScope.REQUEST,
-            rows=Fixed(1, because="test"),
+            rows=RowDriver.FIXED,
+            rows_reason="test",
         )
 
 
@@ -277,7 +282,8 @@ def _spec(**overrides) -> ModelLocalKVSpec:
         physical_capacity_positions=8,
         capacity_source="test",
         scope=ModelLocalKVScope.REQUEST,
-        rows=Fixed(1, because="test"),
+        rows=RowDriver.FIXED,
+        rows_reason="test",
     )
     kwargs.update(overrides)
     return ModelLocalKVSpec(**kwargs)

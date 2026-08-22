@@ -18,9 +18,9 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 from vllm_omni.model_executor.models.model_local_kv import (
-    Fixed,
     ModelLocalKVScope,
     ModelLocalKVSpec,
+    RowDriver,
     spec_from_hf_config,
 )
 
@@ -238,13 +238,12 @@ class CUDAGraphDecoderWrapper:
                 physical_capacity_positions=physical,
                 capacity_source=f"sliding_window({self.prefix_length}) - 1",
                 scope=ModelLocalKVScope.MODEL,
-                rows=Fixed(
-                    batched_captures,
-                    because=(
-                        f"rows across {len(retained)} retained caches in "
-                        f"{len(self.combined_states)} suffix / {len(self.icl_prefix_states)} icl-prefix / "
-                        f"{len(self.xvec_prefix_states)} xvec-prefix captures"
-                    ),
+                rows=RowDriver.FIXED,
+                rows_fixed=batched_captures,
+                rows_reason=(
+                    f"rows across {len(retained)} retained caches in "
+                    f"{len(self.combined_states)} suffix / {len(self.icl_prefix_states)} icl-prefix / "
+                    f"{len(self.xvec_prefix_states)} xvec-prefix captures"
                 ),
                 allocation_note=(
                     "counted from caches transformers has materialized; captures whose tensors are still "

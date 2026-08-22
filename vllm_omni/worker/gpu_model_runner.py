@@ -33,10 +33,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
-from vllm_omni.model_executor.models.model_local_kv import (
-    EngineCapacity,
-    collect_model_local_kv_specs,
-)
+from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -218,43 +215,27 @@ class OmniGPUModelRunner(GPUModelRunner):
         specs = collect_model_local_kv_specs(getattr(self, "model", None))
         if not specs:
             return
-        engine = self._engine_capacity()
-        total = sum(spec.peak_bytes(engine) for _, spec in specs)
+        max_num_seqs = max(1, int(self.scheduler_config.max_num_seqs))
+        total = sum(spec.peak_bytes(max_num_seqs) for _, spec in specs)
         logger.info(
-            "Model-local KV (outside the paged manager): %.2f MiB across %d declaration(s) "
-            "at max_num_seqs=%d, duplex_max_sessions=%d",
+            "Model-local KV (outside the paged manager): %.2f MiB across %d declaration(s) at max_num_seqs=%d",
             total / (1 << 20),
             len(specs),
-            engine.max_num_seqs,
-            engine.duplex_max_sessions,
+            max_num_seqs,
         )
         for path, spec in specs:
             logger.info(
-                "  %s.%s: %.2f MiB (%d rows from %s x %.2f MiB/row, scope=%s, %d positions from %s)%s",
+                "  %s.%s: %.2f MiB (%d rows from %s x %.2f MiB/row, scope=%s, %d positions from %s)",
                 path or type(self.model).__name__,
                 spec.name,
-                spec.peak_bytes(engine) / (1 << 20),
-                spec.row_count(engine),
-                spec.rows.label,
+                spec.peak_bytes(max_num_seqs) / (1 << 20),
+                spec.row_count(max_num_seqs),
+                spec.rows.value if spec.rows.value != "fixed" else f"fixed({spec.rows_fixed}; {spec.rows_reason})",
                 spec.bytes_per_row / (1 << 20),
                 spec.scope.value,
                 spec.physical_capacity_positions,
                 spec.capacity_source,
-                f" -- only when {spec.only_when}" if spec.only_when else "",
             )
-
-    def _engine_capacity(self) -> EngineCapacity:
-        """Read the engine-side numbers a declaration may be widened by.
-
-        ``duplex_max_sessions`` lives on ``OmniModelConfig`` and is read this
-        way elsewhere in the tree (``personaplex_talker.py``). An earlier
-        revision probed four holders and reported "unresolved" because the
-        attribute was looked up in a checkout that had lost the file.
-        """
-        return EngineCapacity(
-            max_num_seqs=max(1, int(self.scheduler_config.max_num_seqs)),
-            duplex_max_sessions=max(1, int(getattr(self.model_config, "duplex_max_sessions", 1) or 1)),
-        )
 
     def _maybe_enable_output_token_ids_for_model_sampler(self) -> None:
         if getattr(self.model, "logitsprocs_need_output_token_ids", False):

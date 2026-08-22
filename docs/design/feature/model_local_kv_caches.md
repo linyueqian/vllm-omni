@@ -32,7 +32,7 @@ The consumer therefore reports and does not subtract.
 | Qwen3-TTS graph pool | retained captures | same | 4.44 MiB | fixed, from captured shapes |
 | MiMo-Audio local transformer | `DynamicCache` | `group_size + max(delay_pattern) = 11` | 704 KiB | `max_num_seqs` |
 | MiMo-Audio graph pool | captured | same | 704 KiB | fixed 261 (bucket sum) |
-| MiniCPM-o Whisper encoder (duplex only) | `EncoderDecoderCache` | `embed_positions` rows = 1500 | 140.62 MiB | `duplex_max_sessions` |
+| MiniCPM-o Whisper encoder (streaming only) | `EncoderDecoderCache` | `embed_positions` rows = 1500 | 140.62 MiB | fixed 1, per session |
 | ming_flash_omni talker | `StaticCache` | hardcoded `max_cache_len = 2048` | 24.00 MiB | fixed 1 |
 
 **No cache is bounded by `max_model_len`.** Each has its own mechanism: a
@@ -52,16 +52,22 @@ wrong in two different directions at once:
 - ming's talker is per-call but serialized -- `forward` takes
   `runtime_additional_information[0]` and runs the whole AR loop inline -- so
   scaling it by `max_num_seqs` over-reported it by that factor.
-- MiniCPM-o's encoder is per *session*, and sessions are capped by
-  `duplex_max_sessions`, a different setting entirely.
+- MiniCPM-o's encoder is per *session*, not per sequence, so `max_num_seqs` is
+  simply the wrong number for it.
 
-So width is declared explicitly, by naming the driver:
+So width is declared explicitly, by naming the driver. `RowDriver` has two
+values, because two are all the known caches need:
 
-- `Fixed(n, because=...)` -- a width the model controls. The reason is required,
-  because `Fixed(1)` on a cache that looks per-request is a claim a reviewer
-  must be able to check.
-- `MaxNumSeqs()` -- one row per in-flight sequence.
-- `DuplexMaxSessions()` -- one row per duplex session.
+- `FIXED` -- a count the model controls, with `rows_fixed` and a required
+  `rows_reason`. `rows_fixed=1` on a cache that looks per-request is a claim a
+  reviewer must be able to check.
+- `MAX_NUM_SEQS` -- one row per in-flight sequence; only the engine knows the
+  value.
+
+A third value belongs here when a model actually has a cache the engine widens
+by some other number. An earlier revision added one speculatively, for a single
+declarer, and paid for it with a class hierarchy, an engine-capacity object and
+a conditional-annotation field.
 
 `rows` counts row-equivalents at peak and deliberately does not distinguish
 "one allocation N rows wide" from "N allocations of one row". Those cost the
@@ -82,12 +88,11 @@ revision hung the declaration off the CUDA-graph wrapper and reported zero under
 declared unconditionally and invented roughly a gigabyte for stateless
 deployments.
 
-Where the model cannot see the deciding setting, it says so in `only_when`
-instead of guessing. MiniCPM-o's encoder cache exists only on the duplex
-streaming path, but `omni_config` collapses "duplex off" and "duplex with one
-session" both to `duplex_max_sessions=1` and does not propagate `session_mode`
-to the model config, so the model cannot tell them apart. It declares the cost
-and states the condition.
+Where the model cannot see the deciding setting, it declares the honest unit
+and says so in `allocation_note`. MiniCPM-o's encoder cache exists only on the
+streaming path and is one object per session; the session cap is not visible
+from the model, so it declares one session rather than scaling by a number it
+would have to guess at.
 
 ## Finding the declarers
 
