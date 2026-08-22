@@ -83,6 +83,14 @@ _PARITY_TESTS = [
     legacy.test_multi_replica_abort_broadcasts_to_all_replicas,
     legacy.test_multi_replica_shutdown_all_replicas,
     legacy.test_multi_replica_cfg_companion_inherits_parent_affinity,
+    # Stats plumbing. The scheduler-stats cases matter most here: a batch with
+    # no request outputs still carries SchedulerStats on throttled ticks, and a
+    # reader that drops every output-less batch silently stops reporting
+    # KV/queue gauges under the event-driven loop.
+    legacy.test_orchestrator_records_iteration_stats_without_scheduler_stats,
+    legacy.test_orchestrator_records_scheduler_stats_without_outputs,
+    legacy.test_orchestrator_does_not_build_iteration_stats_for_finished_only_batch,
+    legacy.test_orchestrator_does_not_build_iteration_stats_without_stat_logger,
     # Per-replica fault isolation (#4285): a dead replica must be evicted and
     # the server kept up, on both the LLM reader path and the diffusion poller.
     legacy_errors.test_engine_dead_error_evicts_replica_and_keeps_running,

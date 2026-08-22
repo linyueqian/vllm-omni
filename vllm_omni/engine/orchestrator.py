@@ -1066,18 +1066,25 @@ class Orchestrator:
         """
         ready_q: asyncio.Queue[tuple[str, int, int, Any]] = asyncio.Queue()
         readers: dict[tuple[int, int], tuple[asyncio.Task, Any]] = {}
-        pollers: list[asyncio.Task] = []
+        pollers: dict[int, asyncio.Task] = {}
+        reaped: list[asyncio.Task] = []
 
         async def _llm_replica_reader(stage_id: int, replica_id: int, client: Any) -> None:
             try:
                 while not self._shutdown_event.is_set():
                     raw_outputs = await client.get_output_async()
-                    if not raw_outputs.outputs:
-                        # Matches _poll_stage_raw: drop empty batches. A
-                        # poll-style client returns an empty batch instead of
-                        # blocking, so keep the legacy 1 ms cadence for those;
-                        # a blocking client only lands here on stats-only
-                        # ticks, where 1 ms of extra latency is irrelevant.
+                    # Same keep/drop rule as StagePool._poll_stage_raw: a batch
+                    # with no request outputs still carries SchedulerStats on
+                    # throttled ticks, and dropping it loses the KV/queue gauges
+                    # for that interval. Only a fully empty batch is dropped. A
+                    # poll-style client returns one instead of blocking, so keep
+                    # the legacy 1 ms cadence for those; a blocking client only
+                    # lands here rarely, where 1 ms is irrelevant.
+                    if (
+                        not raw_outputs.outputs
+                        and raw_outputs.scheduler_stats is None
+                        and not raw_outputs.finished_requests
+                    ):
                         await asyncio.sleep(0.001)
                         continue
                     await ready_q.put(("llm", stage_id, replica_id, raw_outputs))
@@ -1107,16 +1114,34 @@ class Orchestrator:
                 await ready_q.put(("error", stage_id, -1, e))
 
         def _reconcile_readers() -> None:
-            """Spawn/reap LLM readers to track available replicas and client swaps.
+            """Track available replicas: spawn/reap LLM readers and diffusion pollers.
 
             Walks ``available_replica_ids()`` for parity with the legacy loop,
             so a replica evicted by ``_handle_dead_replica`` (or marked
             unavailable by membership) stops being read here too.
+
+            Diffusion pollers are reconciled here rather than spawned once at
+            startup: a pool with no live replica yet reports ``stage_type is
+            None``, so a stage whose first replica registers at runtime would
+            otherwise never get a poller and its outputs would never drain.
             """
             live: set[tuple[int, int]] = set()
+            live_pools: set[int] = set()
             for stage_id in range(self.num_stages):
                 pool = self.stage_pools[stage_id]
-                if pool.stage_type == "diffusion":
+                stage_type = pool.stage_type
+                if stage_type is None:
+                    # No live replica yet; nothing to attach to. A later
+                    # reconcile picks the stage up once one registers.
+                    continue
+                if stage_type == "diffusion":
+                    live_pools.add(stage_id)
+                    existing_poller = pollers.get(stage_id)
+                    if existing_poller is None or existing_poller.done():
+                        pollers[stage_id] = asyncio.create_task(
+                            _diffusion_poller(stage_id, pool),
+                            name=f"orch-diffusion-poller-s{stage_id}",
+                        )
                     continue
                 for replica_id in pool.available_replica_ids():
                     client = pool.clients[replica_id]
@@ -1125,10 +1150,27 @@ class Orchestrator:
                     key = (stage_id, replica_id)
                     live.add(key)
                     existing = readers.get(key)
-                    if existing is not None and not existing[0].done() and existing[1] is client:
+                    if existing is None:
+                        readers[key] = (
+                            asyncio.create_task(
+                                _llm_replica_reader(stage_id, replica_id, client),
+                                name=f"orch-reader-s{stage_id}r{replica_id}",
+                            ),
+                            client,
+                        )
                         continue
-                    if existing is not None and not existing[0].done():
-                        existing[0].cancel()
+                    if existing[0].done():
+                        # The reader exited, which means it already queued its
+                        # failure. Leave the slot alone until the dispatcher
+                        # handles that error and evicts the replica; respawning
+                        # now just re-raises the same error against the same
+                        # dead client and queues a duplicate eviction.
+                        continue
+                    if existing[1] is client:
+                        continue
+                    # Client swapped underneath us: retire the old reader.
+                    existing[0].cancel()
+                    reaped.append(existing[0])
                     readers[key] = (
                         asyncio.create_task(
                             _llm_replica_reader(stage_id, replica_id, client),
@@ -1140,16 +1182,13 @@ class Orchestrator:
                 if key not in live:
                     task, _ = readers.pop(key)
                     task.cancel()
+                    reaped.append(task)
+            for stage_id in list(pollers):
+                if stage_id not in live_pools:
+                    task = pollers.pop(stage_id)
+                    task.cancel()
+                    reaped.append(task)
 
-        for stage_id in range(self.num_stages):
-            pool = self.stage_pools[stage_id]
-            if pool.stage_type == "diffusion":
-                pollers.append(
-                    asyncio.create_task(
-                        _diffusion_poller(stage_id, pool),
-                        name=f"orch-diffusion-poller-s{stage_id}",
-                    )
-                )
         _reconcile_readers()
         logger.info(
             "[Orchestrator] Event-driven orchestration loop enabled (%s): %d LLM replica readers, %d diffusion pollers",
@@ -1160,25 +1199,31 @@ class Orchestrator:
 
         shutdown_task = asyncio.create_task(self._shutdown_event.wait(), name="orch-shutdown-wait")
         pending_get: asyncio.Task | None = None
+        next_reconcile = _time.monotonic() + _ORCH_READER_RECONCILE_INTERVAL_S
         try:
             while not self._shutdown_event.is_set():
                 if pending_get is None:
                     pending_get = asyncio.create_task(ready_q.get(), name="orch-dispatch-get")
                 done, _ = await asyncio.wait(
                     {pending_get, shutdown_task},
-                    timeout=_ORCH_READER_RECONCILE_INTERVAL_S,
+                    timeout=max(0.0, next_reconcile - _time.monotonic()),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if shutdown_task in done:
                     return
-                if not done:
-                    # Idle reconcile tick (elastic membership, replaced clients).
-                    self._orch_monitor.note_loop(idle=True)
+                # Reconcile on a wall-clock schedule, not only when the queue
+                # goes idle: under continuous traffic `asyncio.wait` returns on
+                # every output and a timeout-only reconcile would never fire,
+                # so a replica that registers at runtime would never get a
+                # reader and its outputs would never drain.
+                if _time.monotonic() >= next_reconcile:
+                    next_reconcile = _time.monotonic() + _ORCH_READER_RECONCILE_INTERVAL_S
                     _reconcile_readers()
+                if not done:
+                    self._orch_monitor.note_loop(idle=True)
                     continue
                 kind, stage_id, replica_id, payload = pending_get.result()
                 pending_get = None
-                self._orch_monitor.note_loop(idle=False)
 
                 if kind == "error":
                     # replica_id < 0 means the failure was raised by a poller
@@ -1190,8 +1235,11 @@ class Orchestrator:
                         # Same per-replica isolation as the legacy loop (#4285):
                         # evict and keep serving. Reconcile immediately so the
                         # dead replica's reader is reaped now rather than at the
-                        # next idle tick.
-                        await self._handle_dead_replica(stage_id, replica_id, payload)
+                        # next scheduled tick. Skip a replica already evicted by
+                        # an earlier error from the same slot -- evict_replica()
+                        # would shut a None client down a second time.
+                        if replica_id in self.stage_pools[stage_id].live_replica_ids():
+                            await self._handle_dead_replica(stage_id, replica_id, payload)
                         _reconcile_readers()
                         continue
                     if self._shutdown_event.is_set():
@@ -1214,7 +1262,8 @@ class Orchestrator:
                 except asyncio.CancelledError:
                     raise
                 except EngineDeadError as e:
-                    await self._handle_dead_replica(stage_id, replica_id, e)
+                    if replica_id in self.stage_pools[stage_id].live_replica_ids():
+                        await self._handle_dead_replica(stage_id, replica_id, e)
                     _reconcile_readers()
                     continue
                 except Exception:
@@ -1228,16 +1277,22 @@ class Orchestrator:
                     raise
 
                 await self._handle_processed_outputs(stage_id, replica_id, processed)
+                # Mirrors the legacy loop, which sets idle=False only after a
+                # poll produced outputs that were routed -- an evicted replica
+                # `continue`s above without marking the tick active.
+                self._orch_monitor.note_loop(idle=False)
         finally:
             shutdown_task.cancel()
             if pending_get is not None:
                 pending_get.cancel()
             reader_tasks = [task for task, _ in readers.values()]
-            for task in reader_tasks:
+            poller_tasks = list(pollers.values())
+            for task in (*reader_tasks, *poller_tasks):
                 task.cancel()
-            for task in pollers:
-                task.cancel()
-            cleanup = [shutdown_task, *reader_tasks, *pollers]
+            # `reaped` holds readers/pollers retired mid-run (client swap,
+            # eviction, stage teardown). They were cancelled but never awaited,
+            # so gather them here too rather than leaving dangling tasks.
+            cleanup = [shutdown_task, *reader_tasks, *poller_tasks, *reaped]
             if pending_get is not None:
                 cleanup.append(pending_get)
             await asyncio.gather(*cleanup, return_exceptions=True)
