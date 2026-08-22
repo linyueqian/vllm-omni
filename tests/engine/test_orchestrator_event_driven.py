@@ -83,8 +83,13 @@ _PARITY_TESTS = [
     legacy.test_multi_replica_abort_broadcasts_to_all_replicas,
     legacy.test_multi_replica_shutdown_all_replicas,
     legacy.test_multi_replica_cfg_companion_inherits_parent_affinity,
-    legacy_errors.test_engine_dead_error_broadcasts_fatal_and_shuts_down,
-    legacy_errors.test_engine_dead_replica_evicted_while_survivor_keeps_serving,
+    # Per-replica fault isolation (#4285): a dead replica must be evicted and
+    # the server kept up, on both the LLM reader path and the diffusion poller.
+    legacy_errors.test_engine_dead_error_evicts_replica_and_keeps_running,
+    legacy_errors.test_engine_dead_error_fails_only_dead_replica_requests,
+    legacy_errors.test_forward_to_dead_downstream_stage_fails_request_not_server,
+    legacy_errors.test_add_request_to_dead_stage_fails_request_not_server,
+    legacy_errors.test_diffusion_replica_death_on_poll_keeps_server,
     legacy_errors.test_diffusion_error_output_routed_as_finished,
     legacy_errors.test_diffusion_client_error_output_propagates_status_code,
 ]

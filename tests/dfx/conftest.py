@@ -653,6 +653,7 @@ def run_benchmark(
     random_input_len: Any | None = None,
     random_output_len: Any | None = None,
     resource_label: str | None = None,
+    num_warmups: int = 2,
 ) -> dict[str, Any]:
     """Run one ``vllm bench serve --omni`` iteration and return parsed metrics.
 
@@ -677,7 +678,7 @@ def run_benchmark(
         + args
         + [
             "--num-warmups",
-            "2",
+            str(num_warmups),
             "--save-result",
             "--result-dir",
             os.environ.get("BENCHMARK_DIR", "tests"),
@@ -751,4 +752,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store",
         default=None,
         help=("Path to benchmark config JSON. Example: --test-config-file tests/dfx/perf/tests/test_tts.json"),
+    )
+    parser.addoption(
+        "--assert-baseline",
+        action="store_true",
+        default=False,
+        help=(
+            "When set, omni/diffusion perf runners compare metrics against the baseline block in the JSON config "
+            "(default: off)."
+        ),
     )

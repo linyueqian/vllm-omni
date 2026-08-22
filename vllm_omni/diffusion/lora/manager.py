@@ -4,11 +4,12 @@
 import math
 import time
 from collections import OrderedDict
+from enum import Enum
 from typing import get_args
 
 import torch
 import torch.nn as nn
-from vllm.config.lora import MaxLoRARanks
+from vllm.config.lora import LoRAConfig, MaxLoRARanks
 from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.lora.lora_model import LoRAModel
@@ -22,7 +23,6 @@ from vllm.lora.utils import (
 )
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 
-from vllm_omni.config.lora import LoRAConfig
 from vllm_omni.diffusion.lora.utils import (
     _expand_expected_modules_for_packed_layers,
     _match_target_modules,
@@ -31,6 +31,11 @@ from vllm_omni.diffusion.lora.utils import (
 from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
+
+
+class LoRABackend(str, Enum):
+    PEFT = "peft"
+    DISTILL = "distill"
 
 
 class DiffusionLoRAManager:
