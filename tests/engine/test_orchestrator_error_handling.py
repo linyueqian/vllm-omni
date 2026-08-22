@@ -81,6 +81,10 @@ class FakeDeadLLMStageClient(FakeStageClient):
     ``add_request_async`` has been called, then fail on the next poll.
     """
 
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.dead_poll_calls = 0
+
     async def get_output_async(self):
         if not self.add_request_calls:
             return SimpleNamespace(
@@ -88,6 +92,7 @@ class FakeDeadLLMStageClient(FakeStageClient):
                 scheduler_stats=None,
                 finished_requests=None,
             )
+        self.dead_poll_calls += 1
         raise EngineDeadError("Stage-0 engine core is dead")
 
 
@@ -126,6 +131,75 @@ async def test_engine_dead_error_broadcasts_fatal_and_shuts_down(orchestrator_fa
 
         # Request state should be cleaned up.
         assert "req-dead" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        if orchestrator_fixture.thread.is_alive():
+            orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+            orchestrator_fixture.thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_engine_dead_replica_evicted_while_survivor_keeps_serving(orchestrator_factory) -> None:
+    """One replica of a two-replica stage dies; the stage keeps serving.
+
+    The failure is survivable, so the orchestrator must report it as
+    ``fatal=False``, stay alive, drop the dead replica out of admission, and
+    admit the next request on the survivor.
+
+    Also pins that the dead replica is not re-polled after eviction. An
+    orchestration loop that tracks replicas by ``live_replica_ids()`` rather
+    than ``available_replica_ids()`` keeps the evicted replica in its walk --
+    ``mark_replica_unavailable()`` records the eviction without clearing
+    ``clients[replica_id]`` -- and re-raises the same EngineDeadError forever.
+    """
+    stage0_r0 = FakeDeadLLMStageClient(stage_type="llm", final_output=True)
+    stage0_r1 = FakeStageClient(stage_type="llm", final_output=True)
+
+    from .test_orchestrator import FakeOutputProcessor, _build_request_output, _build_stage_pools
+
+    proc0 = FakeOutputProcessor(request_outputs=[_build_request_output("req-live", token_ids=[3], finished=True)])
+    stage_pools = _build_stage_pools([[stage0_r0, stage0_r1]], output_processors=[proc0])
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+    pool = orchestrator_fixture.orchestrator.stage_pools[0]
+
+    try:
+        # Round-robin starts at replica 0, which dies once it holds a request.
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-dead",
+            prompt=SimpleNamespace(request_id="req-dead", prompt_token_ids=[1, 2]),
+            original_prompt={"prompt": "hello"},
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+        )
+        await _wait_for(lambda: len(stage0_r0.add_request_calls) == 1)
+
+        msg = await _get_any_output_message(orchestrator_fixture)
+        assert isinstance(msg, ErrorMessage)
+        assert msg.fatal is False, "a stage with a surviving replica must not report a fatal error"
+        assert msg.request_id == "req-dead"
+
+        # The dead replica is out of admission; the survivor remains.
+        await _wait_for(lambda: pool.available_replica_ids() == [1])
+        assert orchestrator_fixture.orchestrator._fatal_error is None
+        assert orchestrator_fixture.thread.is_alive()
+
+        # The evicted replica must stop being polled rather than being
+        # respawned into a hot EngineDeadError loop.
+        polls_after_eviction = stage0_r0.dead_poll_calls
+        await asyncio.sleep(0.2)
+        assert stage0_r0.dead_poll_calls == polls_after_eviction
+
+        # The stage still serves: the next request lands on the survivor.
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-live",
+            prompt=SimpleNamespace(request_id="req-live", prompt_token_ids=[4, 5]),
+            original_prompt={"prompt": "still here"},
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+        )
+        await _wait_for(lambda: len(stage0_r1.add_request_calls) == 1)
+        assert orchestrator_fixture.thread.is_alive()
     finally:
         if orchestrator_fixture.thread.is_alive():
             orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())

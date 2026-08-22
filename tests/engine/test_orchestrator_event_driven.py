@@ -84,6 +84,7 @@ _PARITY_TESTS = [
     legacy.test_multi_replica_shutdown_all_replicas,
     legacy.test_multi_replica_cfg_companion_inherits_parent_affinity,
     legacy_errors.test_engine_dead_error_broadcasts_fatal_and_shuts_down,
+    legacy_errors.test_engine_dead_replica_evicted_while_survivor_keeps_serving,
     legacy_errors.test_diffusion_error_output_routed_as_finished,
     legacy_errors.test_diffusion_client_error_output_propagates_status_code,
 ]
