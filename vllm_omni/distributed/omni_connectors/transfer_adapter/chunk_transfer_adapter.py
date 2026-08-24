@@ -425,6 +425,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
+            # Frames held on-device awaiting their batched emptiness check.
+            getattr(self, "pending_frames", {}).pop(external_req_id, None)
             self.requests_num_chunks_sent.pop(external_req_id, None)
             self.ramp_chunk_count.pop(external_req_id, None)
             cached_ic = getattr(self, "_cached_ic", None)
@@ -500,6 +502,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
+        getattr(self, "pending_frames", {}).pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
         self.ramp_chunk_count.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
@@ -945,5 +948,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         for req_id in request_ids:
             self.cleanup_receiver(req_id)
+            # A request finishing here is aborted, errored, or evicted, so no
+            # terminal chunk is coming and _send_single_request will never reach
+            # cleanup_sender. Release the accumulated codec frames, which are
+            # device tensors and would otherwise hold GPU memory for the
+            # adapter's lifetime. Only the frame stores are dropped -- the
+            # chunk counters stay on cleanup_sender's own lifecycle, since
+            # calling it before a terminal send is explicitly unsupported.
+            self.code_prompt_token_ids.pop(req_id, None)
+            getattr(self, "pending_frames", {}).pop(req_id, None)
 
         return []
