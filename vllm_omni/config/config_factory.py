@@ -69,14 +69,29 @@ def _materialize_object_storage_configs(model: str) -> str:
 
 
 def _name_match_candidate(model: str) -> str:
-    """Last path component of a model reference, used for name-based matching.
+    """Model-name component of a model reference, used for name-based matching.
 
     Object-storage URIs and HF repo ids carry non-model segments (bucket name,
     organization) that must not participate in substring matching; e.g. a
     bucket named ``qwen3-tts-models`` holding a ``Qwen3-Omni`` checkpoint must
-    not resolve to the ``qwen3_tts`` pipeline.
+    not resolve to the ``qwen3_tts`` pipeline. Usually that means the last
+    path component.
+
+    A resolved HF hub cache snapshot path is the exception: it ends in
+    ``models--<org>--<name>/snapshots/<revision>``, so its basename is a bare
+    revision hash with no model identity (models with an empty ``config.json``
+    such as CosyVoice3 then lose their only detection route). Recover ``name``
+    from the ``models--<org>--<name>`` segment; the organization still stays
+    out of the match.
     """
-    return model.rstrip("/").rsplit("/", 1)[-1]
+    parts = [part for part in str(model).rstrip("/").split("/") if part]
+    if not parts:
+        return ""
+    if len(parts) >= 3 and parts[-2] == "snapshots":
+        repo_dir = parts[-3].split("--", 2)
+        if len(repo_dir) == 3 and repo_dir[0] == "models":
+            return repo_dir[2]
+    return parts[-1]
 
 
 def with_trust_remote_code_override(

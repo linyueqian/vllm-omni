@@ -15,7 +15,11 @@ from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 
 from tests.helpers.stage_config import get_deploy_config_path, get_deploy_config_stage
 from vllm_omni.config import config_factory as config_factory_module
-from vllm_omni.config.config_factory import StageConfigFactory, _materialize_object_storage_configs
+from vllm_omni.config.config_factory import (
+    StageConfigFactory,
+    _materialize_object_storage_configs,
+    _name_match_candidate,
+)
 from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline, resolve_pipeline_config
@@ -2909,3 +2913,36 @@ class TestObjectStorageConfigResolution:
 
         matching = "s3://any-bucket/my-cosyvoice3-model"
         assert StageConfigFactory.try_infer_model_type(model=matching, trust_remote_code=False) == "cosyvoice3"
+
+
+class TestNameMatchCandidateSnapshotPaths:
+    """Name-based matching must survive resolved HF cache snapshot paths."""
+
+    _SNAPSHOT_REV = "29e01c4e8d000f4bcd70751be16fa94bf3d85a18"
+
+    def test_candidate_recovers_repo_name_from_hf_cache_layout(self):
+        path = f"/data/hub/models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512/snapshots/{self._SNAPSHOT_REV}"
+        assert _name_match_candidate(path) == "Fun-CosyVoice3-0.5B-2512"
+        assert _name_match_candidate(path + "/") == "Fun-CosyVoice3-0.5B-2512"
+
+    def test_candidate_keeps_basename_for_non_cache_paths(self):
+        assert _name_match_candidate("org/My-Model") == "My-Model"
+        assert _name_match_candidate("/data/snapshots-of/My-Model") == "My-Model"
+        # A ``snapshots`` parent without the ``models--<org>--<name>`` encoding
+        # falls back to the basename, same as before.
+        assert _name_match_candidate(f"/data/notcache/snapshots/{self._SNAPSHOT_REV}") == self._SNAPSHOT_REV
+
+    def test_candidate_preserves_double_dash_in_repo_name(self):
+        assert _name_match_candidate("/hub/models--org--weird--name/snapshots/abc123") == "weird--name"
+
+    def test_try_infer_model_type_matches_cosyvoice3_snapshot_dir(self, tmp_path):
+        """Regression for the HF-cache path shape: CosyVoice3 ships an empty
+        config.json and relies on name matching, but a resolved snapshot dir
+        basename is a bare revision hash, so basename-only matching (#5036)
+        misclassified it as a diffusion pipeline and stage init crashed with
+        "Diffusers pipeline index not found"."""
+        snapshot = tmp_path / "hub" / "models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512" / "snapshots" / self._SNAPSHOT_REV
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text("{}")
+
+        assert StageConfigFactory.try_infer_model_type(model=str(snapshot), trust_remote_code=False) == "cosyvoice3"
