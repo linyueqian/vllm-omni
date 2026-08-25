@@ -25,12 +25,16 @@ from vllm_omni.model_executor.models.model_local_kv import (
     RowDriver,
     collect_model_local_kv_specs,
     spec_from_hf_config,
-    total_declared_bytes,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 MODELS_DIR = pathlib.Path(__file__).resolve().parents[3] / "vllm_omni" / "model_executor" / "models"
+
+
+def _total_bytes(model: object, max_num_seqs: int = 1) -> int:
+    """Sum declared peak bytes across a model's declarations."""
+    return sum(spec.peak_bytes(max_num_seqs) for _, spec in collect_model_local_kv_specs(model))
 
 
 def _cache_bytes(cache) -> int:
@@ -326,7 +330,7 @@ def test_collector_finds_owners_nested_in_the_module_tree():
     model = Top()
     assert [path for path, _ in collect_model_local_kv_specs(model)] == ["mid.inner"]
     # 2 layers * 2 kv * 4 head_dim * 8 positions * 2 bytes * 2 (K and V) = 512
-    assert total_declared_bytes(model) == 512
+    assert _total_bytes(model) == 512
 
 
 def test_a_root_declarer_behind_a_wrapper_is_counted_once():
@@ -339,7 +343,7 @@ def test_a_root_declarer_behind_a_wrapper_is_counted_once():
     collected = collect_model_local_kv_specs(wrapped)
 
     assert len(collected) == 1, collected
-    assert total_declared_bytes(wrapped) == 512
+    assert _total_bytes(wrapped) == 512
 
 
 def test_collector_reaches_owners_through_a_wrapper():
@@ -363,12 +367,12 @@ def test_collector_survives_an_owner_that_raises():
             self.broken = Broken()
             self.ok = _Owner()
 
-    assert total_declared_bytes(Top()) == 512
+    assert _total_bytes(Top()) == 512
 
 
 def test_undeclared_models_report_zero_not_an_error():
-    assert total_declared_bytes(object()) == 0
-    assert total_declared_bytes(torch.nn.Linear(2, 2)) == 0
+    assert _total_bytes(object()) == 0
+    assert _total_bytes(torch.nn.Linear(2, 2)) == 0
 
 
 def test_protocol_is_structural():

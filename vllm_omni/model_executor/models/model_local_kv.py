@@ -43,7 +43,6 @@ __all__ = [
     "RowDriver",
     "collect_model_local_kv_specs",
     "spec_from_hf_config",
-    "total_declared_bytes",
 ]
 
 
@@ -346,13 +345,3 @@ def collect_model_local_kv_specs(model: object) -> list[tuple[str, ModelLocalKVS
             continue
         collected.extend((path, spec) for spec in specs)
     return collected
-
-
-def total_declared_bytes(model: object, max_num_seqs: int = 1) -> int:
-    """Sum declared peak bytes, or 0 for a model that declares nothing.
-
-    Pass ``max_num_seqs`` so each declaration is widened by the driver it
-    named. Returning 0 rather than raising keeps this usable as an additive
-    term in reporting before every model has been migrated.
-    """
-    return sum(spec.peak_bytes(max_num_seqs) for _, spec in collect_model_local_kv_specs(model))
