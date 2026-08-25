@@ -78,19 +78,21 @@ def _name_match_candidate(model: str) -> str:
     path component.
 
     A resolved HF hub cache snapshot path is the exception: it ends in
-    ``models--<org>--<name>/snapshots/<revision>``, so its basename is a bare
+    ``models--<org>--<name>/snapshots/<revision>`` (or ``models--<name>`` for
+    legacy un-namespaced repos such as ``gpt2``), so its basename is a bare
     revision hash with no model identity (models with an empty ``config.json``
     such as CosyVoice3 then lose their only detection route). Recover ``name``
-    from the ``models--<org>--<name>`` segment; the organization still stays
-    out of the match.
+    from the repo segment; the organization still stays out of the match. The
+    two forms are exhaustive because hub validation rejects ``--`` inside repo
+    ids; anything else keeps the plain basename.
     """
     parts = [part for part in str(model).rstrip("/").split("/") if part]
     if not parts:
         return ""
     if len(parts) >= 3 and parts[-2] == "snapshots":
-        repo_dir = parts[-3].split("--", 2)
-        if len(repo_dir) == 3 and repo_dir[0] == "models":
-            return repo_dir[2]
+        repo_dir = parts[-3].split("--")
+        if repo_dir[0] == "models" and len(repo_dir) in (2, 3) and all(repo_dir):
+            return repo_dir[-1]
     return parts[-1]
 
 

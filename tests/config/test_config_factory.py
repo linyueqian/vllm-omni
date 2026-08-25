@@ -2932,8 +2932,16 @@ class TestNameMatchCandidateSnapshotPaths:
         # falls back to the basename, same as before.
         assert _name_match_candidate(f"/data/notcache/snapshots/{self._SNAPSHOT_REV}") == self._SNAPSHOT_REV
 
-    def test_candidate_preserves_double_dash_in_repo_name(self):
-        assert _name_match_candidate("/hub/models--org--weird--name/snapshots/abc123") == "weird--name"
+    def test_candidate_recovers_bare_repo_name_from_hf_cache_layout(self):
+        # Legacy un-namespaced repos (e.g. ``gpt2``) cache as ``models--<name>``.
+        path = f"/data/hub/models--my-cosyvoice3-model/snapshots/{self._SNAPSHOT_REV}"
+        assert _name_match_candidate(path) == "my-cosyvoice3-model"
+
+    def test_candidate_ignores_malformed_cache_repo_dirs(self):
+        # Hub validation rejects ``--`` inside repo ids, so more than three
+        # ``--``-separated segments cannot be a real cache dir; keep basename.
+        assert _name_match_candidate("/hub/models--a--b--c/snapshots/abc123") == "abc123"
+        assert _name_match_candidate("/hub/models--/snapshots/abc123") == "abc123"
 
     def test_try_infer_model_type_matches_cosyvoice3_snapshot_dir(self, tmp_path):
         """Regression for the HF-cache path shape: CosyVoice3 ships an empty
