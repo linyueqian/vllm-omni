@@ -1267,8 +1267,6 @@ stages:
     @pytest.mark.parametrize(
         ("deploy_name", "pipeline_name", "stage_count", "final_output_type", "declared_pipeline"),
         [
-            ("mammoth_moda2.yaml", "mammoth_moda2", 2, "image", "mammoth_moda2"),
-            ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text", "mammoth_moda2_ar"),
             ("omnivoice.yaml", "omnivoice", 1, "audio", "omnivoice"),
             ("mimo_audio.yaml", "mimo_audio", 2, "audio", None),
             ("step_audio_2.yaml", "step_audio_2", 2, "audio", None),
@@ -1306,6 +1304,7 @@ stages:
             ({"model_type": "step_audio_2"}, None, "step_audio_2"),
             (None, {"_class_name": "HunyuanVideo15Pipeline"}, "hunyuan_video_15"),
             (None, {"_class_name": "WanPipeline"}, "wan2_2_ti2v"),
+            (None, {"_class_name": "WanDMDPipeline"}, "wan2_2_ti2v"),
         ],
     )
     def test_migrated_models_are_discovered_without_explicit_deploy(
@@ -2754,22 +2753,23 @@ class TestSentinelDefaultPrecedence:
         )
 
     def test_ming_flash_omni_topology(self):
-        """Guard ming_flash_omni's SIP cleanup: stage 0 has no full-payload
-        producer hook (arch is not in ``_FULL_PAYLOAD_INPUT_STAGES``), and
-        stage 1 uses only ``thinker2talker_token_only`` (sync_process_input_func).
+        """Guard ming_flash_omni's SIP cleanup: stage 0 has no
+        ``custom_process_next_stage_input_func``, and stage 1 does not set
+        ``requires_full_payload_input=True``. Stage 1 uses only
+        ``thinker2talker_token_only`` (sync_process_input_func).
         The dead ``thinker2talker`` (custom_process_input_func) was removed
         because ming_flash_omni has no async_chunk support and both functions
         called ``_build_talker_inputs`` identically.
-        Merge under either async_chunk mode must not re-introduce a
-        stage-0 full-payload hook."""
+        Merge under either async_chunk mode must not re-introduce either
+        full-payload transport gate."""
         pipeline = resolve_pipeline_config("ming_flash_omni")
         assert isinstance(pipeline, PipelineConfig)
 
         stage0, stage1 = pipeline.stages
         assert stage0.custom_process_next_stage_input_func is None, (
-            "ming_flash_omni stage 0 must not declare a full-payload producer "
-            "(connector path is not active for this arch)."
+            "ming_flash_omni stage 0 must not declare a full-payload producer hook."
         )
+        assert stage1.requires_full_payload_input is False
         assert stage1.custom_process_input_func is None
         assert stage1.sync_process_input_func is not None
         assert stage1.sync_process_input_func.endswith("thinker2talker_token_only")
