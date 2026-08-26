@@ -998,7 +998,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # adapter's lifetime. Only the frame stores are dropped -- the
             # chunk counters stay on cleanup_sender's own lifecycle, since
             # calling it before a terminal send is explicitly unsupported.
-            self.code_prompt_token_ids.pop(req_id, None)
-            getattr(self, "pending_frames", {}).pop(req_id, None)
+            # Both stores are keyed by the user-facing id, while `req_id` here
+            # is the scheduler's internal one (see the note in
+            # `_send_single_request`). Map before popping or this reclaims
+            # nothing.
+            external_req_id = self.request_ids_mapping.get(req_id, req_id)
+            self.code_prompt_token_ids.pop(external_req_id, None)
+            getattr(self, "pending_frames", {}).pop(external_req_id, None)
 
         return []

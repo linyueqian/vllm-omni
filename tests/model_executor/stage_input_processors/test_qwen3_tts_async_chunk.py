@@ -1163,10 +1163,16 @@ def test_abort_releases_accumulated_frames():
     adapter.pending_frames = {}
     adapter.cleanup_receiver = lambda _rid: None
 
-    adapter.code_prompt_token_ids["gone"] = [torch.tensor([1, 2, 3, 4])]
-    adapter.pending_frames["gone"] = [torch.tensor([5, 6, 7, 8])]
+    # The two id namespaces must differ here. `finish_requests` is called with
+    # the scheduler's internal id, while both frame stores are keyed by the
+    # user-facing one; a fixture that uses one string for both cannot tell a
+    # working cleanup from a no-op.
+    internal_id, external_id = "internal-uuid-1", "user-facing-1"
+    adapter.request_ids_mapping = {internal_id: external_id}
+    adapter.code_prompt_token_ids[external_id] = [torch.tensor([1, 2, 3, 4])]
+    adapter.pending_frames[external_id] = [torch.tensor([5, 6, 7, 8])]
 
-    adapter.finish_requests("gone", RequestStatus.FINISHED_ABORTED, requests={})
+    adapter.finish_requests(internal_id, RequestStatus.FINISHED_ABORTED, requests={})
 
-    assert "gone" not in adapter.code_prompt_token_ids
-    assert "gone" not in adapter.pending_frames
+    assert external_id not in adapter.code_prompt_token_ids
+    assert external_id not in adapter.pending_frames
