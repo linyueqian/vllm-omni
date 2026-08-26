@@ -37,6 +37,32 @@ VOCODER_DIR = "vocoder"
 
 _ROOT_MARKERS = (DEPTH_DECODER_DIR, TRANSFORMER_DIR, VOCODER_DIR)
 
+# The subset a stage reading the repo ROOT needs on disk. The AR backbone under
+# ``language_model/`` is pulled by vLLM's own loader, and the repo's top-level
+# ``.pth`` files and ``qwen_7B/`` folder belong to the reference implementation,
+# so neither is downloaded here.
+_COMPONENT_PATTERNS = (
+    "*.json",
+    f"{DEPTH_DECODER_DIR}/*",
+    f"{CONDITION_ENCODER_DIR}/*",
+    f"{TRANSFORMER_DIR}/*",
+    f"{VOCODER_DIR}/*",
+)
+
+
+def _download_component_snapshot(model: str) -> Path:
+    """Resolve an HF repo id to a snapshot holding the component folders.
+
+    Cache-first, so a warm cache needs no Hub round trip.
+    """
+    from huggingface_hub import snapshot_download
+
+    patterns = list(_COMPONENT_PATTERNS)
+    try:
+        return Path(snapshot_download(model, allow_patterns=patterns, local_files_only=True))
+    except Exception:
+        return Path(snapshot_download(model, allow_patterns=patterns))
+
 
 def resolve_repo_root(model_path: str | os.PathLike[str]) -> Path:
     """Find the multi-component repository root from a stage's model path.
@@ -44,6 +70,11 @@ def resolve_repo_root(model_path: str | os.PathLike[str]) -> Path:
     A stage that declares ``model_subdir`` sees the subfolder as its model
     path, so the root is usually the parent. Both are checked, and the search
     walks up a couple of levels for snapshot layouts.
+
+    The acoustic stage declares no ``model_subdir`` because it reads the root
+    itself, so on a hub-id deployment its model path is the repo id rather
+    than a directory. Resolve that to a local snapshot instead of treating it
+    as a relative path.
 
     Raises:
         FileNotFoundError: If no ancestor looks like the repository root.
@@ -53,6 +84,18 @@ def resolve_repo_root(model_path: str | os.PathLike[str]) -> Path:
     for candidate in candidates:
         if all((candidate / marker).is_dir() for marker in _ROOT_MARKERS):
             return candidate
+
+    if not path.exists():
+        try:
+            resolved = _download_component_snapshot(str(model_path))
+        except Exception as exc:
+            raise FileNotFoundError(
+                f"MiniMax Music 3 could not resolve {model_path!r} to a local repository root; "
+                f"expected folders {_ROOT_MARKERS}"
+            ) from exc
+        if all((resolved / marker).is_dir() for marker in _ROOT_MARKERS):
+            return resolved
+
     raise FileNotFoundError(
         f"MiniMax Music 3 could not locate the repository root from {path}; expected sibling folders {_ROOT_MARKERS}"
     )

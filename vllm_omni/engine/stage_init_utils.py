@@ -24,6 +24,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
@@ -79,22 +80,61 @@ class LogicalStageInitPlan:
     replicas: list[ReplicaInitPlan]
 
 
-def _resolve_model_to_local_path(model: str) -> str:
-    """Resolve an HF Hub model ID to a local cache path."""
+def _missing_stage_subdirs(base: str, subdirs: Sequence[str]) -> list[str]:
+    """Return the entries of ``subdirs`` that are not directories under ``base``."""
+    return [subdir for subdir in subdirs if not os.path.isdir(os.path.join(base, subdir))]
+
+
+def _resolve_model_to_local_path(model: str, required_subdirs: Sequence[str] = ()) -> str:
+    """Resolve an HF Hub model ID to a local path that holds ``required_subdirs``.
+
+    ``snapshot_download(local_files_only=True)`` returns the snapshot root as
+    soon as *any* file of the repo is cached, even when the subfolders this
+    stage needs were never materialized. Joining a stage subdir onto such a
+    root produces a path that exists nowhere, and upstream ``EngineArgs``
+    forwards a non-directory ``model`` to HuggingFace as a repo id, which fails
+    with an ``HFValidationError`` about the cache path. Verify the subfolders
+    here and pull just the missing ones, so the join always lands on a real
+    directory or raises an error that names what is missing.
+    """
     if os.path.isdir(model):
         return model
 
-    try:
-        from huggingface_hub import snapshot_download
+    from huggingface_hub import snapshot_download
 
-        # Keep init path resolution offline-friendly.
-        return snapshot_download(model, local_files_only=True)
+    # Keep the warm-cache path offline-friendly: no Hub round trip when the
+    # stage's subfolders are already there.
+    try:
+        cached_root: str | None = snapshot_download(model, local_files_only=True)
     except Exception:
-        logger.warning(
-            "[stage_init] Could not resolve %s to local snapshot; using as-is",
-            model,
+        cached_root = None
+    if cached_root is not None and not _missing_stage_subdirs(cached_root, required_subdirs):
+        return cached_root
+
+    # Cold cache, or a snapshot root whose stage subfolders were never
+    # downloaded: pull exactly the subfolders this stage asked for.
+    allow_patterns = [f"{subdir.strip('/')}/*" for subdir in required_subdirs] or None
+    try:
+        resolved = snapshot_download(model, allow_patterns=allow_patterns)
+    except Exception as exc:
+        raise RuntimeError(
+            f"[stage_init] Could not resolve {model!r} to a local snapshot containing "
+            f"{sorted(required_subdirs)}: the download failed and "
+            + (
+                f"the cached snapshot {cached_root!r} is missing "
+                f"{sorted(_missing_stage_subdirs(cached_root, required_subdirs))}."
+                if cached_root is not None
+                else "nothing is cached locally."
+            )
+        ) from exc
+
+    missing = _missing_stage_subdirs(resolved, required_subdirs)
+    if missing:
+        raise RuntimeError(
+            f"[stage_init] Snapshot {resolved!r} for {model!r} has no {sorted(missing)} "
+            "subfolder; the stage cannot be initialized from it."
         )
-        return model
+    return resolved
 
 
 def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> str:
@@ -104,7 +144,22 @@ def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> s
     if model_subdir is None and tokenizer_subdir is None:
         return model
 
-    resolved_base = _resolve_model_to_local_path(model)
+    required_subdirs = [subdir for subdir in (model_subdir, tokenizer_subdir) if subdir]
+    if is_runai_obj_uri(model):
+        # Object-storage URIs stay opaque until each stage builds its own
+        # ModelConfig, so the joins below are resolved by vLLM's streamer
+        # rather than by the local filesystem.
+        resolved_base = model
+    else:
+        resolved_base = _resolve_model_to_local_path(model, required_subdirs)
+        # Reachable for a local model directory; the Hub branch above has
+        # already failed closed on a missing subfolder.
+        missing = _missing_stage_subdirs(resolved_base, required_subdirs)
+        if missing:
+            raise RuntimeError(
+                f"[stage_init] Model directory {resolved_base!r} has no {sorted(missing)} "
+                "subfolder; the stage cannot be initialized from it."
+            )
 
     if model_subdir:
         model = os.path.join(resolved_base, model_subdir)
