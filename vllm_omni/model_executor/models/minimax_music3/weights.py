@@ -55,13 +55,13 @@ def _download_component_snapshot(model: str) -> Path:
 
     Cache-first, so a warm cache needs no Hub round trip.
     """
-    from huggingface_hub import snapshot_download
+    from vllm.transformers_utils.repo_utils import hf_api
 
     patterns = list(_COMPONENT_PATTERNS)
     try:
-        return Path(snapshot_download(model, allow_patterns=patterns, local_files_only=True))
+        return Path(hf_api().snapshot_download(model, allow_patterns=patterns, local_files_only=True))
     except Exception:
-        return Path(snapshot_download(model, allow_patterns=patterns))
+        return Path(hf_api().snapshot_download(model, allow_patterns=patterns))
 
 
 def resolve_repo_root(model_path: str | os.PathLike[str]) -> Path:

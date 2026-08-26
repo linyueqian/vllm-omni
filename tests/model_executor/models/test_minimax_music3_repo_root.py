@@ -39,16 +39,16 @@ def test_resolve_repo_root_walks_up_from_a_model_subdir(tmp_path):
 
 def test_resolve_repo_root_resolves_a_hub_id_to_a_local_snapshot(monkeypatch, tmp_path):
     """A hub id must resolve through the cache, not against the working directory."""
-    import huggingface_hub
+    from huggingface_hub import HfApi
 
     root = _make_root(tmp_path / "snapshots" / "deadbeef")
     seen = []
 
-    def fake_snapshot_download(repo_id, **kwargs):
+    def fake_snapshot_download(self, repo_id, **kwargs):
         seen.append(kwargs)
         return str(root)
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
 
     assert resolve_repo_root("MiniMaxAI/MiniMax-Music3") == root
     # Cache-first, and only the component folders.
@@ -58,30 +58,30 @@ def test_resolve_repo_root_resolves_a_hub_id_to_a_local_snapshot(monkeypatch, tm
 
 
 def test_resolve_repo_root_falls_back_to_the_hub_when_the_cache_is_incomplete(monkeypatch, tmp_path):
-    import huggingface_hub
+    from huggingface_hub import HfApi
 
     root = _make_root(tmp_path / "snapshots" / "deadbeef")
     calls = []
 
-    def fake_snapshot_download(repo_id, **kwargs):
+    def fake_snapshot_download(self, repo_id, **kwargs):
         calls.append(kwargs)
         if kwargs.get("local_files_only"):
             raise OSError("incomplete snapshot")
         return str(root)
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
 
     assert resolve_repo_root("MiniMaxAI/MiniMax-Music3") == root
     assert len(calls) == 2
 
 
 def test_resolve_repo_root_reports_the_original_reference_when_unresolvable(monkeypatch):
-    import huggingface_hub
+    from huggingface_hub import HfApi
 
-    def fake_snapshot_download(repo_id, **kwargs):
+    def fake_snapshot_download(self, repo_id, **kwargs):
         raise OSError("offline")
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
 
     with pytest.raises(FileNotFoundError, match="MiniMaxAI/MiniMax-Music3"):
         resolve_repo_root("MiniMaxAI/MiniMax-Music3")

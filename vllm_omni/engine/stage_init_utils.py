@@ -24,6 +24,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.transformers_utils.repo_utils import hf_api
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.input_processor import InputProcessor
@@ -100,12 +101,10 @@ def _resolve_model_to_local_path(model: str, required_subdirs: Sequence[str] = (
     if os.path.isdir(model):
         return model
 
-    from huggingface_hub import snapshot_download
-
     # Keep the warm-cache path offline-friendly: no Hub round trip when the
     # stage's subfolders are already there.
     try:
-        cached_root: str | None = snapshot_download(model, local_files_only=True)
+        cached_root: str | None = hf_api().snapshot_download(model, local_files_only=True)
     except Exception:
         cached_root = None
     if cached_root is not None and not _missing_stage_subdirs(cached_root, required_subdirs):
@@ -115,7 +114,7 @@ def _resolve_model_to_local_path(model: str, required_subdirs: Sequence[str] = (
     # downloaded: pull exactly the subfolders this stage asked for.
     allow_patterns = [f"{subdir.strip('/')}/*" for subdir in required_subdirs] or None
     try:
-        resolved = snapshot_download(model, allow_patterns=allow_patterns)
+        resolved = hf_api().snapshot_download(model, allow_patterns=allow_patterns)
     except Exception as exc:
         raise RuntimeError(
             f"[stage_init] Could not resolve {model!r} to a local snapshot containing "

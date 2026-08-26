@@ -1175,7 +1175,7 @@ def test_build_engine_args_pulls_stage_subdirs_missing_from_cached_snapshot(monk
     never materialized. Stage init must fetch exactly those subfolders instead
     of joining onto a path that exists nowhere.
     """
-    import huggingface_hub
+    from huggingface_hub import HfApi
 
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
@@ -1183,14 +1183,14 @@ def test_build_engine_args_pulls_stage_subdirs_missing_from_cached_snapshot(monk
     _make_snapshot(snapshot, ["tokenizer"])
     calls = []
 
-    def fake_snapshot_download(repo_id, **kwargs):
+    def fake_snapshot_download(self, repo_id, **kwargs):
         calls.append(kwargs)
         if kwargs.get("local_files_only"):
             return str(snapshot)
         _make_snapshot(snapshot, ["language_model"])
         return str(snapshot)
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1210,18 +1210,18 @@ def test_build_engine_args_pulls_stage_subdirs_missing_from_cached_snapshot(monk
 
 def test_build_engine_args_skips_hub_call_when_cached_snapshot_is_complete(monkeypatch, tmp_path):
     """A warm cache stays offline-friendly: no outgoing Hub request."""
-    import huggingface_hub
+    from huggingface_hub import HfApi
 
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
     snapshot = tmp_path / "snapshots" / "deadbeef"
     _make_snapshot(snapshot, ["language_model", "tokenizer"])
 
-    def fake_snapshot_download(repo_id, **kwargs):
+    def fake_snapshot_download(self, repo_id, **kwargs):
         assert kwargs.get("local_files_only"), "warm cache must not reach the Hub"
         return str(snapshot)
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1237,19 +1237,19 @@ def test_build_engine_args_skips_hub_call_when_cached_snapshot_is_complete(monke
 
 def test_build_engine_args_fails_closed_when_subdir_cannot_be_downloaded(monkeypatch, tmp_path):
     """An undownloadable subfolder raises here instead of reaching HuggingFace."""
-    import huggingface_hub
+    from huggingface_hub import HfApi
 
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
     snapshot = tmp_path / "snapshots" / "deadbeef"
     _make_snapshot(snapshot, ["tokenizer"])
 
-    def fake_snapshot_download(repo_id, **kwargs):
+    def fake_snapshot_download(self, repo_id, **kwargs):
         if kwargs.get("local_files_only"):
             return str(snapshot)
         raise OSError("offline")
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1264,14 +1264,14 @@ def test_build_engine_args_fails_closed_when_subdir_cannot_be_downloaded(monkeyp
 
 def test_build_engine_args_fails_closed_on_cold_cache_instead_of_joining_repo_id(monkeypatch):
     """With nothing cached, the stage must not join a subdir onto the repo id."""
-    import huggingface_hub
+    from huggingface_hub import HfApi
 
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
-    def fake_snapshot_download(repo_id, **kwargs):
+    def fake_snapshot_download(self, repo_id, **kwargs):
         raise OSError("offline")
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
