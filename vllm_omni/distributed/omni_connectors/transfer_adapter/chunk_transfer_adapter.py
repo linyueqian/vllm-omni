@@ -81,6 +81,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.segment_finished_requests: set[str] = set()
         self.request_payload = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
+        # Frames a stage-input processor holds on-device until it batches its
+        # next resolve. Declared here so every cleanup path can reclaim it;
+        # the entries are device tensors.
+        self.pending_frames: dict[str, list] = {}
         self.request_ids_mapping: dict[str, str] = {}
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
@@ -470,7 +474,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
             # Frames held on-device awaiting their batched emptiness check.
-            getattr(self, "pending_frames", {}).pop(external_req_id, None)
+            self.pending_frames.pop(external_req_id, None)
             self.ramp_chunk_count.pop(external_req_id, None)
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:
@@ -545,7 +549,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
-        getattr(self, "pending_frames", {}).pop(external_req_id, None)
+        self.pending_frames.pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
         self.ramp_chunk_count.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
@@ -1004,6 +1008,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # nothing.
             external_req_id = self.request_ids_mapping.get(req_id, req_id)
             self.code_prompt_token_ids.pop(external_req_id, None)
-            getattr(self, "pending_frames", {}).pop(external_req_id, None)
+            self.pending_frames.pop(external_req_id, None)
 
         return []
