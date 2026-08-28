@@ -14,8 +14,9 @@ import importlib
 import multiprocessing as mp
 import os
 import time
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
+from pathlib import Path
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal, cast
 
@@ -86,7 +87,51 @@ def _missing_stage_subdirs(base: str, subdirs: Sequence[str]) -> list[str]:
     return [subdir for subdir in subdirs if not os.path.isdir(os.path.join(base, subdir))]
 
 
-def _resolve_model_to_local_path(model: str, required_subdirs: Sequence[str] = ()) -> str:
+# Artifacts that make a snapshot subfolder trustworthy. A directory that
+# exists but holds none of these is an interrupted download, not a snapshot;
+# treating it as complete strips the Hub fallback vLLM would need later.
+_WEIGHT_ARTIFACT_PATTERNS = ("*.safetensors", "*.bin", "*.pt", "*.gguf", "*.index.json")
+
+
+def _subdir_is_populated(base: str, subdir: str, needs_weights: bool) -> bool:
+    folder = Path(base) / subdir
+    if not folder.is_dir():
+        return False
+    if needs_weights:
+        return any(next(folder.rglob(pattern), None) is not None for pattern in _WEIGHT_ARTIFACT_PATTERNS)
+    # Tokenizer-style folders carry no weights; any file beyond a bare
+    # config.json distinguishes them from an interrupted download.
+    return any(entry.is_file() and entry.name != "config.json" for entry in folder.iterdir())
+
+
+def _incomplete_stage_subdirs(
+    base: str,
+    subdirs: Sequence[str],
+    weight_subdirs: Collection[str] = (),
+) -> list[str]:
+    """Return the entries of ``subdirs`` without a POPULATED directory under ``base``.
+
+    Hub-snapshot paths use this stricter check: ``os.path.isdir`` alone accepts
+    a subfolder holding only config.json from an interrupted download, and the
+    warm-cache early return would then convert the Hub ID into a local path
+    vLLM cannot fetch missing weights for. ``weight_subdirs`` names the entries
+    that must contain a weight artifact, not merely any file.
+    """
+    return [
+        subdir
+        for subdir in subdirs
+        if not _subdir_is_populated(base, subdir, needs_weights=subdir in weight_subdirs)
+    ]
+
+
+def _resolve_model_to_local_path(
+    model: str,
+    required_subdirs: Sequence[str] = (),
+    weight_subdirs: Collection[str] = (),
+    *,
+    revision: str | None = None,
+    download_dir: str | None = None,
+) -> str:
     """Resolve an HF Hub model ID to a local path that holds ``required_subdirs``.
 
     ``snapshot_download(local_files_only=True)`` returns the snapshot root as
@@ -97,6 +142,10 @@ def _resolve_model_to_local_path(model: str, required_subdirs: Sequence[str] = (
     with an ``HFValidationError`` about the cache path. Verify the subfolders
     here and pull just the missing ones, so the join always lands on a real
     directory or raises an error that names what is missing.
+
+    ``revision`` and ``download_dir`` mirror the engine args of the same name:
+    once the repo ID is replaced by a local path, downstream ModelConfig can no
+    longer correct either, so they must shape the snapshot selection here.
     """
     if os.path.isdir(model):
         return model
@@ -104,33 +153,38 @@ def _resolve_model_to_local_path(model: str, required_subdirs: Sequence[str] = (
     # Keep the warm-cache path offline-friendly: no Hub round trip when the
     # stage's subfolders are already there.
     try:
-        cached_root: str | None = hf_api().snapshot_download(model, local_files_only=True)
+        cached_root: str | None = hf_api().snapshot_download(
+            model, local_files_only=True, revision=revision, cache_dir=download_dir
+        )
     except Exception:
         cached_root = None
-    if cached_root is not None and not _missing_stage_subdirs(cached_root, required_subdirs):
+    if cached_root is not None and not _incomplete_stage_subdirs(cached_root, required_subdirs, weight_subdirs):
         return cached_root
 
-    # Cold cache, or a snapshot root whose stage subfolders were never
-    # downloaded: pull exactly the subfolders this stage asked for.
+    # Cold cache, or a snapshot root whose stage subfolders were never (or
+    # only partially) downloaded: pull exactly the subfolders this stage asked
+    # for. snapshot_download resumes a partial subfolder for free.
     allow_patterns = [f"{subdir.strip('/')}/*" for subdir in required_subdirs] or None
     try:
-        resolved = hf_api().snapshot_download(model, allow_patterns=allow_patterns)
+        resolved = hf_api().snapshot_download(
+            model, allow_patterns=allow_patterns, revision=revision, cache_dir=download_dir
+        )
     except Exception as exc:
         raise RuntimeError(
             f"[stage_init] Could not resolve {model!r} to a local snapshot containing "
             f"{sorted(required_subdirs)}: the download failed and "
             + (
-                f"the cached snapshot {cached_root!r} is missing "
-                f"{sorted(_missing_stage_subdirs(cached_root, required_subdirs))}."
+                f"the cached snapshot {cached_root!r} is missing or incomplete for "
+                f"{sorted(_incomplete_stage_subdirs(cached_root, required_subdirs, weight_subdirs))}."
                 if cached_root is not None
                 else "nothing is cached locally."
             )
         ) from exc
 
-    missing = _missing_stage_subdirs(resolved, required_subdirs)
+    missing = _incomplete_stage_subdirs(resolved, required_subdirs, weight_subdirs)
     if missing:
         raise RuntimeError(
-            f"[stage_init] Snapshot {resolved!r} for {model!r} has no {sorted(missing)} "
+            f"[stage_init] Snapshot {resolved!r} for {model!r} has no populated {sorted(missing)} "
             "subfolder; the stage cannot be initialized from it."
         )
     return resolved
@@ -143,29 +197,53 @@ def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> s
     if model_subdir is None and tokenizer_subdir is None:
         return model
 
+    revision = engine_args.get("revision")
+    tokenizer_revision = engine_args.get("tokenizer_revision")
+    download_dir = engine_args.get("download_dir")
+    # A tokenizer pinned to a different revision cannot come from the model's
+    # snapshot; resolve it against its own.
+    split_tokenizer = bool(tokenizer_subdir) and tokenizer_revision is not None and tokenizer_revision != revision
+
     required_subdirs = [subdir for subdir in (model_subdir, tokenizer_subdir) if subdir]
+    model_required = [subdir for subdir in (model_subdir,) if subdir] if split_tokenizer else required_subdirs
+    weight_subdirs = frozenset(subdir for subdir in (model_subdir,) if subdir)
     if is_runai_obj_uri(model):
         # Object-storage URIs stay opaque until each stage builds its own
         # ModelConfig, so the joins below are resolved by vLLM's streamer
         # rather than by the local filesystem.
         resolved_base = model
+        tokenizer_base = model
     else:
-        resolved_base = _resolve_model_to_local_path(model, required_subdirs)
+        resolved_base = _resolve_model_to_local_path(
+            model, model_required, weight_subdirs, revision=revision, download_dir=download_dir
+        )
         # Reachable for a local model directory; the Hub branch above has
         # already failed closed on a missing subfolder.
-        missing = _missing_stage_subdirs(resolved_base, required_subdirs)
+        missing = _missing_stage_subdirs(resolved_base, model_required)
         if missing:
             raise RuntimeError(
                 f"[stage_init] Model directory {resolved_base!r} has no {sorted(missing)} "
                 "subfolder; the stage cannot be initialized from it."
             )
+        if split_tokenizer:
+            tokenizer_base = _resolve_model_to_local_path(
+                model, [tokenizer_subdir], revision=tokenizer_revision, download_dir=download_dir
+            )
+            missing = _missing_stage_subdirs(tokenizer_base, [tokenizer_subdir])
+            if missing:
+                raise RuntimeError(
+                    f"[stage_init] Tokenizer directory {tokenizer_base!r} has no {sorted(missing)} "
+                    "subfolder; the stage cannot be initialized from it."
+                )
+        else:
+            tokenizer_base = resolved_base
 
     if model_subdir:
         model = os.path.join(resolved_base, model_subdir)
         logger.info("[stage_init] Using model subdirectory: %s", model)
 
     if tokenizer_subdir is not None:
-        tokenizer_path = os.path.join(resolved_base, tokenizer_subdir) if tokenizer_subdir else resolved_base
+        tokenizer_path = os.path.join(tokenizer_base, tokenizer_subdir) if tokenizer_subdir else tokenizer_base
         engine_args["tokenizer"] = tokenizer_path
         logger.info("[stage_init] Using tokenizer from: %s", tokenizer_path)
     elif model_subdir and "tokenizer" not in engine_args:

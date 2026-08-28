@@ -64,6 +64,21 @@ def _download_component_snapshot(model: str) -> Path:
         return Path(hf_api().snapshot_download(model, allow_patterns=patterns))
 
 
+def _repo_id_from_cache_path(path: Path) -> str | None:
+    """Recover the Hub repo id when *path* lies inside an HF cache snapshot.
+
+    Stage init hands the talker the snapshot's ``language_model`` folder. On a
+    cold cache the sibling component folders were never downloaded, so the
+    marker walk fails even though the missing pieces are one snapshot_download
+    away; the repo id is recoverable from the cache layout
+    (``models--{org}--{name}/snapshots/{revision}/...``).
+    """
+    for part in path.parts:
+        if part.startswith("models--"):
+            return part.removeprefix("models--").replace("--", "/")
+    return None
+
+
 def resolve_repo_root(model_path: str | os.PathLike[str]) -> Path:
     """Find the multi-component repository root from a stage's model path.
 
@@ -76,6 +91,10 @@ def resolve_repo_root(model_path: str | os.PathLike[str]) -> Path:
     than a directory. Resolve that to a local snapshot instead of treating it
     as a relative path.
 
+    A cold cache is recoverable too: stage init pre-downloads only
+    ``language_model/`` and ``tokenizer/``, so the talker's model path exists
+    while the component folders do not. Fetch them here instead of failing.
+
     Raises:
         FileNotFoundError: If no ancestor looks like the repository root.
     """
@@ -85,9 +104,15 @@ def resolve_repo_root(model_path: str | os.PathLike[str]) -> Path:
         if all((candidate / marker).is_dir() for marker in _ROOT_MARKERS):
             return candidate
 
-    if not path.exists():
+    # No ancestor carries the markers. Two recoverable cases: the path is a
+    # Hub repo id (the acoustic stage passes the id through), or it is a
+    # cache-snapshot subfolder whose sibling component folders were never
+    # downloaded. ``_download_component_snapshot`` is cache-first, so a warm
+    # cache stays offline either way.
+    reference = str(model_path) if not path.exists() else _repo_id_from_cache_path(path)
+    if reference is not None:
         try:
-            resolved = _download_component_snapshot(str(model_path))
+            resolved = _download_component_snapshot(reference)
         except Exception as exc:
             raise FileNotFoundError(
                 f"MiniMax Music 3 could not resolve {model_path!r} to a local repository root; "

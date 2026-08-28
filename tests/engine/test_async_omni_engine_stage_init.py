@@ -1161,9 +1161,16 @@ def test_build_engine_args_rejects_missing_subdir_in_local_model_dir(tmp_path):
         build_engine_args_dict(stage_cfg, str(tmp_path))
 
 
+# A real snapshot subfolder always carries artifacts; empty directories would
+# assert the broken exists-means-complete predicate this suite regresses.
+_SUBDIR_ARTIFACT = {"language_model": "model.safetensors", "tokenizer": "tokenizer.json"}
+
+
 def _make_snapshot(root, subdirs):
     for subdir in subdirs:
-        (root / subdir).mkdir(parents=True, exist_ok=True)
+        folder = root / subdir
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / _SUBDIR_ARTIFACT.get(subdir, "data.bin")).write_text("x")
     return str(root)
 
 
@@ -1233,6 +1240,120 @@ def test_build_engine_args_skips_hub_call_when_cached_snapshot_is_complete(monke
     engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
 
     assert engine_args["model"] == os.path.join(str(snapshot), "language_model")
+
+
+def test_build_engine_args_redownloads_a_partial_subdir(monkeypatch, tmp_path):
+    """A subfolder holding only config.json is an interrupted download.
+
+    The warm-cache early return must not accept it: converting the Hub ID into
+    that local path leaves vLLM's loader without any fallback for the missing
+    weights.
+    """
+    from huggingface_hub import HfApi
+
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "deadbeef"
+    partial = snapshot / "language_model"
+    partial.mkdir(parents=True)
+    (partial / "config.json").write_text("{}")
+    _make_snapshot(snapshot, ["tokenizer"])
+    calls = []
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("local_files_only"):
+            return str(snapshot)
+        _make_snapshot(snapshot, ["language_model"])
+        return str(snapshot)
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert any(not call.get("local_files_only") for call in calls), "a partial subdir must fall through to the Hub"
+    assert engine_args["model"] == os.path.join(str(snapshot), "language_model")
+
+
+def test_build_engine_args_forwards_revision_and_download_dir(monkeypatch, tmp_path):
+    """revision/download_dir must shape snapshot selection (they cannot be
+    corrected downstream once the repo ID is a local path)."""
+    from huggingface_hub import HfApi
+
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "pinned"
+    _make_snapshot(snapshot, ["language_model", "tokenizer"])
+    seen = []
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        seen.append(kwargs)
+        return str(snapshot)
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={
+            "model_subdir": "language_model",
+            "tokenizer_subdir": "tokenizer",
+            "revision": "v2.0",
+            "download_dir": str(tmp_path / "cache"),
+        },
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert engine_args["model"] == os.path.join(str(snapshot), "language_model")
+    assert seen, "snapshot resolution must have been consulted"
+    for call in seen:
+        assert call.get("revision") == "v2.0"
+        assert call.get("cache_dir") == str(tmp_path / "cache")
+
+
+def test_build_engine_args_resolves_tokenizer_revision_separately(monkeypatch, tmp_path):
+    """A tokenizer pinned to a different revision resolves against its own snapshot."""
+    from huggingface_hub import HfApi
+
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    model_snapshot = tmp_path / "snapshots" / "model-rev"
+    _make_snapshot(model_snapshot, ["language_model"])
+    tokenizer_snapshot = tmp_path / "snapshots" / "tok-rev"
+    _make_snapshot(tokenizer_snapshot, ["tokenizer"])
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        if kwargs.get("revision") == "tok-rev":
+            return str(tokenizer_snapshot)
+        return str(model_snapshot)
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={
+            "model_subdir": "language_model",
+            "tokenizer_subdir": "tokenizer",
+            "revision": "model-rev",
+            "tokenizer_revision": "tok-rev",
+        },
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert engine_args["model"] == os.path.join(str(model_snapshot), "language_model")
+    assert engine_args["tokenizer"] == os.path.join(str(tokenizer_snapshot), "tokenizer")
 
 
 def test_build_engine_args_fails_closed_when_subdir_cannot_be_downloaded(monkeypatch, tmp_path):

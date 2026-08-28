@@ -85,3 +85,43 @@ def test_resolve_repo_root_reports_the_original_reference_when_unresolvable(monk
 
     with pytest.raises(FileNotFoundError, match="MiniMaxAI/MiniMax-Music3"):
         resolve_repo_root("MiniMaxAI/MiniMax-Music3")
+
+
+def test_resolve_repo_root_downloads_components_for_a_cold_cache_model_subdir(monkeypatch, tmp_path):
+    """Cold-cache stage 0: the talker gets an EXISTING ``language_model`` dir.
+
+    Stage init pre-downloads only ``language_model/`` and ``tokenizer/``, so
+    the marker walk fails although the repo id is recoverable from the cache
+    layout and one snapshot_download away from working.
+    """
+    from huggingface_hub import HfApi
+
+    snapshot = tmp_path / "models--MiniMaxAI--MiniMax-Music3" / "snapshots" / "deadbeef"
+    (snapshot / "language_model").mkdir(parents=True)
+    (snapshot / "tokenizer").mkdir()
+    seen = []
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        seen.append(repo_id)
+        _make_root(snapshot)
+        return str(snapshot)
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    assert resolve_repo_root(str(snapshot / "language_model")) == snapshot
+    assert seen == ["MiniMaxAI/MiniMax-Music3"]
+
+
+def test_resolve_repo_root_does_not_guess_a_repo_id_for_plain_directories(monkeypatch, tmp_path):
+    """A directory outside the HF cache has no recoverable repo id."""
+    from huggingface_hub import HfApi
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        raise AssertionError("must not reach the Hub for a plain directory")
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    plain = tmp_path / "language_model"
+    plain.mkdir()
+    with pytest.raises(FileNotFoundError, match="expected sibling folders"):
+        resolve_repo_root(str(plain))
