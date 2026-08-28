@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Repository-root resolution for MiniMax Music 3's multi-component checkpoint.
 
 The acoustic stage declares no ``model_subdir`` because it reads the repo root

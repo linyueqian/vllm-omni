@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Component weight loading for MiniMax Music 3.
 
 The checkpoint is a multi-component repo. The Qwen3 backbone is a normal

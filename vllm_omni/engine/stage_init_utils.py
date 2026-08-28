@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage initialization helpers for vLLM-Omni multi-stage runtime.
 
@@ -16,8 +19,8 @@ import os
 import time
 from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
-from pathlib import Path
 from dataclasses import dataclass, fields, replace
+from pathlib import Path
 from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
@@ -118,9 +121,7 @@ def _incomplete_stage_subdirs(
     that must contain a weight artifact, not merely any file.
     """
     return [
-        subdir
-        for subdir in subdirs
-        if not _subdir_is_populated(base, subdir, needs_weights=subdir in weight_subdirs)
+        subdir for subdir in subdirs if not _subdir_is_populated(base, subdir, needs_weights=subdir in weight_subdirs)
     ]
 
 
