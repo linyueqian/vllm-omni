@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 from vllm_omni.model_executor.models.minimax_music3.weights import (
+    _COMPONENT_WEIGHT_NAME,
     _ROOT_MARKERS,
     resolve_repo_root,
 )
@@ -21,8 +22,13 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _make_root(path):
+    # A real snapshot's marker folders carry their component weights; bare
+    # directories would assert the exists-means-complete predicate this suite
+    # regresses.
     for marker in _ROOT_MARKERS:
-        (path / marker).mkdir(parents=True, exist_ok=True)
+        folder = path / marker
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / _COMPONENT_WEIGHT_NAME).write_bytes(b"x")
     return path
 
 
@@ -73,6 +79,51 @@ def test_resolve_repo_root_falls_back_to_the_hub_when_the_cache_is_incomplete(mo
 
     assert resolve_repo_root("MiniMaxAI/MiniMax-Music3") == root
     assert len(calls) == 2
+
+
+def test_resolve_repo_root_retries_online_when_the_local_lookup_returns_a_partial_root(monkeypatch, tmp_path):
+    """Hub clients differ on partial caches: some raise, some return the root.
+
+    A returned partial root must fall through to the online call all the same,
+    or startup fails without ever consulting the Hub.
+    """
+    from huggingface_hub import HfApi
+
+    snapshot = tmp_path / "models--MiniMaxAI--MiniMax-Music3" / "snapshots" / "deadbeef"
+    (snapshot / "language_model").mkdir(parents=True)
+    calls = []
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        calls.append(kwargs)
+        if not kwargs.get("local_files_only"):
+            _make_root(snapshot)
+        return str(snapshot)
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    assert resolve_repo_root("MiniMaxAI/MiniMax-Music3") == snapshot
+    assert [bool(call.get("local_files_only")) for call in calls] == [True, False]
+
+
+def test_resolve_repo_root_redownloads_weightless_marker_dirs(monkeypatch, tmp_path):
+    """Marker folders without their component weights are an interrupted download."""
+    from huggingface_hub import HfApi
+
+    snapshot = tmp_path / "models--MiniMaxAI--MiniMax-Music3" / "snapshots" / "deadbeef"
+    for marker in _ROOT_MARKERS:
+        (snapshot / marker).mkdir(parents=True)
+    calls = []
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        calls.append(kwargs)
+        if not kwargs.get("local_files_only"):
+            _make_root(snapshot)
+        return str(snapshot)
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    assert resolve_repo_root("MiniMaxAI/MiniMax-Music3") == snapshot
+    assert any(not call.get("local_files_only") for call in calls)
 
 
 def test_resolve_repo_root_reports_the_original_reference_when_unresolvable(monkeypatch):

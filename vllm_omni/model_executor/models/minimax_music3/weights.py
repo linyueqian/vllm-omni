@@ -50,18 +50,34 @@ _COMPONENT_PATTERNS = (
 )
 
 
+def _snapshot_has_components(root: Path) -> bool:
+    """True when every marker folder holds its component weights."""
+    stem = Path(_COMPONENT_WEIGHT_NAME).stem
+    return all(
+        (root / marker / _COMPONENT_WEIGHT_NAME).is_file() or any((root / marker).glob(f"{stem}-*.safetensors"))
+        for marker in _ROOT_MARKERS
+    )
+
+
 def _download_component_snapshot(model: str) -> Path:
     """Resolve an HF repo id to a snapshot holding the component folders.
 
-    Cache-first, so a warm cache needs no Hub round trip.
+    Cache-first, so a warm cache needs no Hub round trip. Depending on the
+    huggingface_hub version, ``local_files_only=True`` either raises on a
+    partial cache or returns the partial snapshot root unchanged; both
+    variants must fall through to the online call, or a cold cache fails
+    startup without ever consulting the Hub.
     """
     from vllm.transformers_utils.repo_utils import hf_api
 
     patterns = list(_COMPONENT_PATTERNS)
     try:
-        return Path(hf_api().snapshot_download(model, allow_patterns=patterns, local_files_only=True))
+        cached = Path(hf_api().snapshot_download(model, allow_patterns=patterns, local_files_only=True))
     except Exception:
-        return Path(hf_api().snapshot_download(model, allow_patterns=patterns))
+        cached = None
+    if cached is not None and _snapshot_has_components(cached):
+        return cached
+    return Path(hf_api().snapshot_download(model, allow_patterns=patterns))
 
 
 def _repo_id_from_cache_path(path: Path) -> str | None:

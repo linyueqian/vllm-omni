@@ -14,8 +14,10 @@ from __future__ import annotations
 import copy
 import fcntl
 import importlib
+import json
 import multiprocessing as mp
 import os
+import re
 import time
 from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
@@ -93,7 +95,37 @@ def _missing_stage_subdirs(base: str, subdirs: Sequence[str]) -> list[str]:
 # Artifacts that make a snapshot subfolder trustworthy. A directory that
 # exists but holds none of these is an interrupted download, not a snapshot;
 # treating it as complete strips the Hub fallback vLLM would need later.
-_WEIGHT_ARTIFACT_PATTERNS = ("*.safetensors", "*.bin", "*.pt", "*.gguf", "*.index.json")
+_WEIGHT_ARTIFACT_PATTERNS = ("*.safetensors", "*.bin", "*.pt", "*.gguf")
+# Vocabulary-bearing files. Configs and chat templates are small and download
+# first, so their presence alone cannot distinguish a tokenizer folder from an
+# interrupted download.
+_TOKENIZER_ARTIFACT_NAMES = (
+    "tokenizer.json",
+    "tokenizer.model",
+    "spiece.model",
+    "sentencepiece.bpe.model",
+    "vocab.json",
+    "vocab.txt",
+)
+# HF sharded checkpoints name their pieces `<stem>-NNNNN-of-NNNNN.<ext>` and
+# always ship an index; a shard-named file without one is a partial download.
+_SHARD_NAME_RE = re.compile(r"-\d+-of-\d+\.(safetensors|bin)$")
+
+
+def _indexed_shards_complete(folder: Path) -> bool | None:
+    """Check sharded weights against their index; ``None`` when no index exists."""
+    indexes = list(folder.rglob("*.index.json"))
+    if not indexes:
+        return None
+    for index in indexes:
+        try:
+            weight_map = json.loads(index.read_text()).get("weight_map") or {}
+        except (OSError, ValueError):
+            return False
+        shards = set(weight_map.values())
+        if not shards or any(not (index.parent / shard).is_file() for shard in shards):
+            return False
+    return True
 
 
 def _subdir_is_populated(base: str, subdir: str, needs_weights: bool) -> bool:
@@ -101,10 +133,14 @@ def _subdir_is_populated(base: str, subdir: str, needs_weights: bool) -> bool:
     if not folder.is_dir():
         return False
     if needs_weights:
-        return any(next(folder.rglob(pattern), None) is not None for pattern in _WEIGHT_ARTIFACT_PATTERNS)
-    # Tokenizer-style folders carry no weights; any file beyond a bare
-    # config.json distinguishes them from an interrupted download.
-    return any(entry.is_file() and entry.name != "config.json" for entry in folder.iterdir())
+        indexed = _indexed_shards_complete(folder)
+        if indexed is not None:
+            return indexed
+        weights = [path for pattern in _WEIGHT_ARTIFACT_PATTERNS for path in folder.rglob(pattern)]
+        if not weights:
+            return False
+        return not any(_SHARD_NAME_RE.search(path.name) for path in weights)
+    return any((folder / name).is_file() for name in _TOKENIZER_ARTIFACT_NAMES)
 
 
 def _incomplete_stage_subdirs(
@@ -202,8 +238,9 @@ def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> s
     tokenizer_revision = engine_args.get("tokenizer_revision")
     download_dir = engine_args.get("download_dir")
     # A tokenizer pinned to a different revision cannot come from the model's
-    # snapshot; resolve it against its own.
-    split_tokenizer = bool(tokenizer_subdir) and tokenizer_revision is not None and tokenizer_revision != revision
+    # snapshot; resolve it against its own. An empty subdir means the snapshot
+    # root and still needs its own revision.
+    split_tokenizer = tokenizer_subdir is not None and tokenizer_revision is not None and tokenizer_revision != revision
 
     required_subdirs = [subdir for subdir in (model_subdir, tokenizer_subdir) if subdir]
     model_required = [subdir for subdir in (model_subdir,) if subdir] if split_tokenizer else required_subdirs
@@ -227,10 +264,13 @@ def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> s
                 "subfolder; the stage cannot be initialized from it."
             )
         if split_tokenizer:
+            # An empty subdir targets the snapshot root, which cannot be
+            # subset by allow_patterns; resolve the whole revision.
+            tokenizer_required = [tokenizer_subdir] if tokenizer_subdir else []
             tokenizer_base = _resolve_model_to_local_path(
-                model, [tokenizer_subdir], revision=tokenizer_revision, download_dir=download_dir
+                model, tokenizer_required, revision=tokenizer_revision, download_dir=download_dir
             )
-            missing = _missing_stage_subdirs(tokenizer_base, [tokenizer_subdir])
+            missing = _missing_stage_subdirs(tokenizer_base, tokenizer_required)
             if missing:
                 raise RuntimeError(
                     f"[stage_init] Tokenizer directory {tokenizer_base!r} has no {sorted(missing)} "
