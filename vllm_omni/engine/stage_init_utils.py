@@ -17,7 +17,6 @@ import importlib
 import json
 import multiprocessing as mp
 import os
-import re
 import time
 from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
@@ -25,6 +24,7 @@ from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import regex as re
 from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
