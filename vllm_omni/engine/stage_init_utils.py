@@ -276,6 +276,15 @@ def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> s
                     f"[stage_init] Tokenizer directory {tokenizer_base!r} has no {sorted(missing)} "
                     "subfolder; the stage cannot be initialized from it."
                 )
+            if not tokenizer_required and not _subdir_is_populated(tokenizer_base, "", False):
+                # An empty subdir means the tokenizer lives at the snapshot
+                # root, so there is no subfolder for the check above to look
+                # at and any resolved root would otherwise pass. Require the
+                # vocabulary artifacts themselves.
+                raise RuntimeError(
+                    f"[stage_init] Tokenizer directory {tokenizer_base!r} holds none of "
+                    f"{list(_TOKENIZER_ARTIFACT_NAMES)}; the stage cannot be initialized from it."
+                )
         else:
             tokenizer_base = resolved_base
 
