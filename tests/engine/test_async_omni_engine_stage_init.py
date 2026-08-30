@@ -1512,8 +1512,13 @@ def test_build_engine_args_resolves_root_tokenizer_revision_separately(monkeypat
 
     model_snapshot = tmp_path / "snapshots" / "model-rev"
     _make_snapshot(model_snapshot, ["language_model"])
+    # An empty tokenizer_subdir means the tokenizer IS the snapshot root, so
+    # the vocabulary artifact must sit at the root. Building it under
+    # ``tokenizer/`` returned a root that holds no loadable tokenizer, which
+    # the root-tokenizer validation now correctly rejects.
     tokenizer_snapshot = tmp_path / "snapshots" / "tok-rev"
-    _make_snapshot(tokenizer_snapshot, ["tokenizer"])
+    tokenizer_snapshot.mkdir(parents=True, exist_ok=True)
+    (tokenizer_snapshot / _SUBDIR_ARTIFACT["tokenizer"]).write_text("x")
 
     def fake_snapshot_download(self, repo_id, **kwargs):
         if kwargs.get("revision") == "tok-rev":
