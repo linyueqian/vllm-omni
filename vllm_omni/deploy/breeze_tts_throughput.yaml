@@ -1,4 +1,4 @@
-# Breeze-TTS-2 throughput profile for non-streaming responses on one GPU.
+# Breeze-TTS-2 non-streaming throughput profile, tested on one H100 80 GB.
 # Both streamed and complete HTTP responses use the stateful codec pipeline.
 async_chunk: true
 connectors:
@@ -10,19 +10,19 @@ connectors:
       initial_codec_chunk_frames: 16
       codec_chunk_ramp: [16]
       codec_left_context_frames: 0
-      decode_cudagraph_batch_sizes: [1, 2, 4, 8]
+      decode_cudagraph_batch_sizes: [1, 2, 4, 8, 16, 32]
       connector_get_sleep_s: 0.001
       connector_get_max_wait_first_chunk: 1000
       connector_get_max_wait: 300
 stages:
   - stage_id: 0
     devices: "0"
-    max_num_seqs: 8
+    max_num_seqs: 32
     max_model_len: 2048
     max_num_batched_tokens: 4096
     gpu_memory_utilization: 0.65
-    # Reserve enough KV for eight full-length requests.
-    kv_cache_memory_bytes: 2147483648
+    # Reserve enough KV for thirty-two full-length requests.
+    kv_cache_memory_bytes: 8589934592
     enforce_eager: false
     compilation_config:
       mode: 3
@@ -45,7 +45,7 @@ stages:
       seed: 42
   - stage_id: 1
     devices: "0"
-    max_num_seqs: 8
+    max_num_seqs: 32
     max_model_len: 32768
     max_num_batched_tokens: 32768
     gpu_memory_utilization: 0.15

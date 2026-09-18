@@ -143,11 +143,13 @@ curl --fail http://127.0.0.1:8091/v1/audio/speech \
   }' --output breeze-complete.wav
 ```
 
-The profile sets `max_num_seqs: 8` on both stages and reserves 2 GiB of stage-0
-KV cache for eight 2048-token contexts. These are physical sequence slots:
-stage 0 can run up to eight plain requests (`guidance_scale: 1.0`) or four
+The profile was tested on one H100 80 GB. It sets `max_num_seqs: 32` on both
+stages and reserves 8 GiB of stage-0 KV cache for thirty-two 2048-token contexts.
+These are physical sequence slots: stage 0 can run up to thirty-two plain
+requests (`guidance_scale: 1.0`) or sixteen
 CFG requests, since each CFG request occupies two slots. Mixed workloads share
-the same limit; additional requests queue.
+the same limit; additional requests queue. The default deployment's memory
+target does not apply to this larger profile.
 
 The internal codec uses fixed 16-frame chunks from the first chunk onward,
 with a shorter final chunk when needed. `cfg_prefill_delay_tokens: 0` removes
@@ -163,8 +165,9 @@ explicitly in the request body:
 ```bash
 python benchmarks/tts/bench_tts.py \
   --model BreezeBlue/Breeze-TTS-2 --task default_voice --locale en \
-  --host 127.0.0.1 --port 8091 --concurrency 1 2 4 8 16 \
-  --num-prompts 64 --num-warmups 32 \
+  --dataset-path benchmarks/build_dataset/seed_tts_smoke \
+  --host 127.0.0.1 --port 8091 --concurrency 1 2 4 8 16 32 64 \
+  --num-prompts 128 --num-warmups 64 \
   --output-dir results/breeze-nonstream -- \
   --extra-body '{"stream":false,"stream_format":null,"response_format":"pcm","max_new_tokens":384,"seed":42,"extra_params":{"temperature":0.9,"top_k":50,"top_p":1,"repetition_penalty":1.1,"guidance_scale":1}}'
 ```
@@ -183,6 +186,10 @@ attention masks. Longer segments use dynamically compiled encoder layers
 without retaining a separate graph workspace for each input length.
 The depth decoder uses fused QKV/MLP projections, compiled layer kernels,
 fixed frame-local KV buffers and a CUDA Graph covering all 15 depth steps.
+Graphs pad requests to power-of-two buckets, keeping CFG branches separate.
+Compiled layers reuse kernels across batch sizes, avoiding a new compilation
+for every shrinking batch. Only real requests advance their random state,
+and returned tensors exclude padded rows.
 Positive temperature, top-k and top-p are mutable GPU inputs to the captured
 sampler. Changing those settings, or changing a positive CFG scale within the
 paired path, reuses the graph. Greedy decoding uses a separate graph that skips
