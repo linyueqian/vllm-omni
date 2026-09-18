@@ -12,19 +12,19 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.sample.logits_processor import BatchUpdate, MinTokensLogitsProcessor
 
 from vllm_omni.config.stage_config import merge_sampling_constraints
-from vllm_omni.model_executor.models.breeze_tts.pipeline import BREEZE_TTS_PIPELINE
+from vllm_omni.model_executor.models.breeze_tts_2.pipeline import BREEZE_TTS_2_PIPELINE
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.fixture
 def talker_sampling_params():
-    deploy_path = Path(__file__).parents[3] / "vllm_omni" / "deploy" / "breeze_tts.yaml"
+    deploy_path = Path(__file__).parents[3] / "vllm_omni" / "deploy" / "breeze_tts_2.yaml"
     deploy = yaml.safe_load(deploy_path.read_text(encoding="utf-8"))
     params = SamplingParams(
         **merge_sampling_constraints(
             deploy["stages"][0]["default_sampling_params"],
-            BREEZE_TTS_PIPELINE.stages[0].sampling_constraints,
+            BREEZE_TTS_2_PIPELINE.stages[0].sampling_constraints,
         )
     )
     # Mirror the input processor: Breeze's text tokenizer uses EOS 1,
@@ -73,5 +73,5 @@ def test_first_step_keeps_codec_token_and_eos_logits(talker_sampling_params, cod
 
 
 def test_pipeline_disallows_minimum_tokens_that_mask_selected_codec_ids():
-    params = merge_sampling_constraints({"min_tokens": 10}, BREEZE_TTS_PIPELINE.stages[0].sampling_constraints)
+    params = merge_sampling_constraints({"min_tokens": 10}, BREEZE_TTS_2_PIPELINE.stages[0].sampling_constraints)
     assert params["min_tokens"] == 0

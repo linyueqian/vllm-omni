@@ -20,15 +20,17 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     SpeechServingContext,
     apply_max_new_tokens,
 )
-from vllm_omni.model_executor.models.breeze_tts.prompt import DEFAULT_INSTRUCTION, build_breeze_prompt
+from vllm_omni.model_executor.models.breeze_tts_2.prompt import DEFAULT_INSTRUCTION, build_breeze_prompt
 
 logger = init_logger(__name__)
 
 
 @register_tts_adapter
-class BreezeTTSAdapter(ARTTSAdapter):
-    name = "breeze_tts"
-    stage_keys = frozenset({"breeze_tts", "breeze_code2wav"})
+class BreezeTTS2Adapter(ARTTSAdapter):
+    name = "breeze_tts_2"
+    stage_keys = frozenset({"breeze_tts_2", "breeze_tts_2_codec"})
+    model_archs = frozenset({"BreezeForConditionalGeneration"})
+    detect_priority = 9
     supported_output_sample_rates = frozenset({24000})
 
     def __init__(self, ctx: SpeechServingContext) -> None:

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Offline Breeze-TTS-2 inference example (two-stage talker + codec pipeline).
 
-Uses the async-chunk deploy config (vllm_omni/deploy/breeze_tts.yaml).
+Uses the async-chunk deploy config (vllm_omni/deploy/breeze_tts_2.yaml).
 Reference checkpoint: BreezeBlue/Breeze-TTS-2.
 """
 
@@ -17,7 +17,7 @@ import torch
 from transformers import AutoTokenizer
 
 from vllm_omni import Omni
-from vllm_omni.model_executor.models.breeze_tts.prompt import DEFAULT_INSTRUCTION, build_breeze_prompt
+from vllm_omni.model_executor.models.breeze_tts_2.prompt import DEFAULT_INSTRUCTION, build_breeze_prompt
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -79,7 +79,7 @@ def parse_args():
         type=str,
         default=None,
         help="Override the deploy config path. If unset, auto-loads "
-        "vllm_omni/deploy/breeze_tts.yaml based on the HF model_type.",
+        "vllm_omni/deploy/breeze_tts_2.yaml based on the HF model_type.",
     )
     return parser.parse_args()
 

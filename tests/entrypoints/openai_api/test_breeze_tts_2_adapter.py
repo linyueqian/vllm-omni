@@ -13,8 +13,8 @@ from vllm import SamplingParams
 
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
-from vllm_omni.entrypoints.openai.tts_adapters.breeze_tts import BreezeTTSAdapter
-from vllm_omni.model_executor.models.breeze_tts.prompt import DEFAULT_INSTRUCTION
+from vllm_omni.entrypoints.openai.tts_adapters.breeze_tts_2 import BreezeTTS2Adapter
+from vllm_omni.model_executor.models.breeze_tts_2.prompt import DEFAULT_INSTRUCTION
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 REFERENCE = "data:audio/wav;base64,cHVibGljLXRlc3QtZGF0YQ=="
@@ -45,7 +45,7 @@ def adapter():
         _validate_ref_audio_format=Mock(return_value=None),
         _resolve_ref_audio=AsyncMock(return_value=(np.ones(1920, dtype=np.float32), 24000, None)),
     )
-    result = BreezeTTSAdapter(SpeechServingContext(server=server, engine_client=engine))
+    result = BreezeTTS2Adapter(SpeechServingContext(server=server, engine_client=engine))
     result.tokenizer = Mock()
     result.tokenizer.encode.side_effect = lambda text, **kwargs: list(text.encode("utf-8"))
     return result

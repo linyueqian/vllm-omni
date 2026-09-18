@@ -1,3 +1,4 @@
+# Compatibility alias for breeze_tts_2_throughput.yaml; keep both profiles synchronized.
 # Breeze-TTS-2 non-streaming throughput profile, tested on one H100 80 GB.
 # Both streamed and complete HTTP responses use the stateful codec pipeline.
 async_chunk: true

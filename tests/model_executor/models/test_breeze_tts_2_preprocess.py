@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.breeze_tts.modeling_breeze import BreezeForConditionalGeneration
+from vllm_omni.model_executor.models.breeze_tts_2.modeling_breeze import BreezeForConditionalGeneration
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

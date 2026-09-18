@@ -15,15 +15,15 @@ from transformers.models.llama.modeling_llama import LlamaModel
 from transformers.models.mimi.modeling_mimi import MimiConv1d
 
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
-from vllm_omni.model_executor.models.breeze_tts.depth_decoder import (
+from vllm_omni.model_executor.models.breeze_tts_2.depth_decoder import (
     BreezeDepthDecoder,
     sample_graph_logits,
     sample_logits,
 )
-from vllm_omni.model_executor.models.breeze_tts.modeling_breeze import BreezeForConditionalGeneration
-from vllm_omni.model_executor.models.breeze_tts.prompt import CFG_UNCOND_SUFFIX, build_breeze_prompt
-from vllm_omni.model_executor.models.breeze_tts.reference_encoder import BreezeReferenceConv
-from vllm_omni.model_executor.stage_input_processors.breeze_tts import expand_cfg_prompts, talker2code2wav_async_chunk
+from vllm_omni.model_executor.models.breeze_tts_2.modeling_breeze import BreezeForConditionalGeneration
+from vllm_omni.model_executor.models.breeze_tts_2.prompt import CFG_UNCOND_SUFFIX, build_breeze_prompt
+from vllm_omni.model_executor.models.breeze_tts_2.reference_encoder import BreezeReferenceConv
+from vllm_omni.model_executor.stage_input_processors.breeze_tts_2 import expand_cfg_prompts, talker2code2wav_async_chunk
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

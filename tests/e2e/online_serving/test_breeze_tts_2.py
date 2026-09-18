@@ -17,7 +17,7 @@ pytestmark = [
     pytest.mark.tts,
     pytest.mark.parametrize(
         "omni_server",
-        [OmniServerParams(model=MODEL, stage_config_path=get_deploy_config_path("breeze_tts.yaml"))],
+        [OmniServerParams(model=MODEL, stage_config_path=get_deploy_config_path("breeze_tts_2.yaml"))],
         indirect=True,
     ),
 ]

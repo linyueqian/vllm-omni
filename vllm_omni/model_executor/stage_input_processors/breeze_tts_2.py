@@ -8,7 +8,7 @@ import torch
 from vllm.v1.request import Request
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
-from vllm_omni.model_executor.models.breeze_tts.prompt import CFG_UNCOND_SUFFIX
+from vllm_omni.model_executor.models.breeze_tts_2.prompt import CFG_UNCOND_SUFFIX
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
 if TYPE_CHECKING:

@@ -124,7 +124,7 @@ repository root.
 
 ```bash
 vllm-omni serve BreezeBlue/Breeze-TTS-2 --omni \
-  --deploy-config vllm_omni/deploy/breeze_tts_throughput.yaml \
+  --deploy-config vllm_omni/deploy/breeze_tts_2_throughput.yaml \
   --host 127.0.0.1 --port 8091
 ```
 
@@ -230,10 +230,13 @@ Prefix caching and chunked prefill are disabled because prompt token IDs
 reserve positions for externally encoded embeddings. The deployment requires
 `async_chunk: true`, including for complete HTTP responses.
 
-The previous `breeze_tts_2.yaml` deployment filename remains available.
-For a copied custom configuration, migrate to `breeze_tts.yaml`: the stages
-are now `breeze_tts` and `breeze_code2wav`, and codec chunk controls use
-`codec_chunk_frames`, `initial_codec_chunk_frames` and `codec_chunk_ramp`.
+The accelerated implementation retains the `breeze_tts_2` model package,
+`breeze_tts_2` and `breeze_tts_2_codec` stage names, and default
+`breeze_tts_2.yaml` deployment. The shorter `breeze_tts.yaml` and
+`breeze_tts_throughput.yaml` deployment filenames remain compatibility aliases.
+For a copied custom configuration, use the current `breeze_tts_2.yaml` as
+the starting point: codec chunk controls use `codec_chunk_frames`,
+`initial_codec_chunk_frames` and `codec_chunk_ramp`.
 Defaults now use a 2048-token context and temperature 0.9; set temperature
 to zero explicitly when comparing greedy generation with the earlier runtime.
 
@@ -244,7 +247,7 @@ also does not expose dual CFG.
 
 ## Offline inference and validation
 
-`vllm_omni.model_executor.models.breeze_tts.prompt.build_breeze_prompt`
+`vllm_omni.model_executor.models.breeze_tts_2.prompt.build_breeze_prompt`
 accepts a checkpoint tokenizer, text, instructions, sampling parameters,
 and optional `ref_audio=(waveform, sample_rate)` plus `ref_text`. Pass its
 result to `Omni.generate()` using the default Breeze deployment. Waveform
@@ -256,9 +259,10 @@ admission. GPU tests compare padded batched text graphs with independent
 eager encoders and exercise depth graphs across CFG scales and batch shapes.
 
 ```bash
-pytest -v tests/model_executor/models/test_breeze_tts.py \
+pytest -v tests/model_executor/models/test_breeze_tts_2.py \
+  tests/model_executor/models/test_breeze_tts_2_registration.py \
   tests/core/sched/test_omni_cfg_ar_scheduler.py -m 'core_model and cpu'
-pytest -v tests/model_executor/models/test_breeze_tts_graphs.py -m 'core_model and cuda'
+pytest -v tests/model_executor/models/test_breeze_tts_2_graphs.py -m 'core_model and cuda'
 pytest -v tests/e2e/online_serving/test_breeze_tts_2.py \
   -m 'core_model and tts' --run-level=core_model
 pytest -v tests/e2e/online_serving/test_breeze_tts_2.py \

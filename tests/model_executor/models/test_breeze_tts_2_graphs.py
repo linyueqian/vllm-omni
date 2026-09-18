@@ -8,9 +8,9 @@ from transformers import LlamaConfig, T5Gemma2TextConfig
 from transformers.models.t5gemma2.modeling_t5gemma2 import T5Gemma2TextEncoder
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.model_executor.models.breeze_tts.depth_decoder import BreezeDepthDecoder
-from vllm_omni.model_executor.models.breeze_tts.modeling_breeze import BreezeForConditionalGeneration
-from vllm_omni.model_executor.models.breeze_tts.text_encoder_graph import (
+from vllm_omni.model_executor.models.breeze_tts_2.depth_decoder import BreezeDepthDecoder
+from vllm_omni.model_executor.models.breeze_tts_2.modeling_breeze import BreezeForConditionalGeneration
+from vllm_omni.model_executor.models.breeze_tts_2.text_encoder_graph import (
     BreezeTextEncoderCompiled,
     BreezeTextEncoderGraph,
 )

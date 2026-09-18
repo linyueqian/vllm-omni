@@ -17,11 +17,11 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_omni.config.model import OmniModelConfig
-from vllm_omni.model_executor.models.breeze_tts.configuration_breeze import BreezeConfig
-from vllm_omni.model_executor.models.breeze_tts.depth_decoder import BreezeDepthDecoder, sample_logits
-from vllm_omni.model_executor.models.breeze_tts.prompt import CFG_UNCOND_SUFFIX
-from vllm_omni.model_executor.models.breeze_tts.reference_encoder import BreezeReferenceEncoder
-from vllm_omni.model_executor.models.breeze_tts.text_encoder_graph import (
+from vllm_omni.model_executor.models.breeze_tts_2.configuration_breeze import BreezeConfig
+from vllm_omni.model_executor.models.breeze_tts_2.depth_decoder import BreezeDepthDecoder, sample_logits
+from vllm_omni.model_executor.models.breeze_tts_2.prompt import CFG_UNCOND_SUFFIX
+from vllm_omni.model_executor.models.breeze_tts_2.reference_encoder import BreezeReferenceEncoder
+from vllm_omni.model_executor.models.breeze_tts_2.text_encoder_graph import (
     BreezeTextEncoderCompiled,
     BreezeTextEncoderGraph,
 )
