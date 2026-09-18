@@ -16,9 +16,10 @@ include `soxr` to reproduce reference-audio resampling.
 vllm-omni serve BreezeBlue/Breeze-TTS-2 --omni --host 127.0.0.1 --port 8091
 ```
 
-The default configuration uses one CUDA GPU, BF16 generation and FP32 reference
-encoding and waveform decoding. It targets GPUs with at least 16 GiB available
-for the deployment; other workloads consume additional memory.
+The default configuration uses one CUDA GPU, BF16 generation and codec
+computation, and FP32 reference encoding. Decoded waveform tensors are converted
+to FP32 before response formatting. It targets GPUs with at least 16 GiB
+available for the deployment; other workloads consume additional memory.
 
 On WSL2, set vLLM's supported pinned-memory option before starting the server:
 
