@@ -3,6 +3,7 @@
 
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -1129,6 +1130,44 @@ def test_decode_batch_without_mtp_accepts_wrapper_input_ids_none(monkeypatch):
     assert ids.data_ptr() == runner.input_ids.gpu.data_ptr()
     assert model.calls == [("batch", ["first", "second"], [False, False])]
     torch.testing.assert_close(embeds, torch.tensor([[10.0] * 4, [11.0] * 4]))
+
+
+@pytest.mark.parametrize(
+    "offsets",
+    [
+        pytest.param([0, 2, 3], id="gap"),
+        pytest.param([1, 0, 2], id="reversed"),
+        pytest.param([0, 0, 1], id="duplicate"),
+        pytest.param([-1, 0, 1], id="negative-contiguous-start"),
+        pytest.param([1, 2, 3], id="contiguous-out-of-bounds"),
+    ],
+)
+def test_decode_batch_without_mtp_rejects_invalid_offsets_before_model_hook(monkeypatch, offsets):
+    rows = [("first", 5, 5, 1), ("second", 5, 6, 1)]
+    runner, scheduled, _, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    _without_mtp_buffers(runner)
+    model = DecodeOnlyPreprocessModel(rewrite_ids=True)
+    runner.model = model
+    scalar_hook = Mock(wraps=model.preprocess)
+    batch_hook = Mock(wraps=model.preprocess_decode_batch)
+    monkeypatch.setattr(model, "preprocess", scalar_hook)
+    monkeypatch.setattr(model, "preprocess_decode_batch", batch_hook)
+    runner.query_start_loc.cpu = torch.tensor(offsets, dtype=torch.int32)
+    runner.inputs_embeds = DummyBuffer(torch.full((4, 4), -99.0))
+    ids_before = runner.input_ids.gpu.clone()
+    embeds_before = runner.inputs_embeds.gpu.clone()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Non-MTP batched decode preprocessing requires contiguous in-bounds token offsets",
+    ):
+        runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+
+    # These checks remain active when the runner is imported under python -O.
+    scalar_hook.assert_not_called()
+    batch_hook.assert_not_called()
+    torch.testing.assert_close(runner.input_ids.gpu, ids_before, rtol=0, atol=0)
+    torch.testing.assert_close(runner.inputs_embeds.gpu, embeds_before, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("invalid", ["embeddings", "ids", "updates"])

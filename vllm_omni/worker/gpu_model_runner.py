@@ -1783,7 +1783,10 @@ class OmniGPUModelRunner(GPUModelRunner):
                     # spans are contiguous in the runner's capture buffers.
                     start = start_offsets_b[0]
                     end = start + len(req_ids_b)
-                    assert start_offsets_b == list(range(start, end))
+                    if start < 0 or end > preprocess_input_ids.shape[0] or start_offsets_b != list(range(start, end)):
+                        raise RuntimeError(
+                            "Non-MTP batched decode preprocessing requires contiguous in-bounds token offsets"
+                        )
                     ids_b = preprocess_input_ids[start:end]
                     req_input_ids, req_embeds, updates = batch_decode_preprocess(
                         input_ids=ids_b,
