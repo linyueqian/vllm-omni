@@ -250,9 +250,18 @@ class BreezeDepthDecoder(nn.Module):
     ) -> torch.Tensor:
         batch = hidden.shape[0]
         branches = 2 if guidance_scale != 1.0 else 1
+        requests = first.shape[0]
+        if batch != requests * branches or len(generators) != requests:
+            raise ValueError("Depth generation requires one token and generator per request and aligned CFG branches")
+        if requests == 0:
+            return first.new_empty((0, self.num_codebooks))
+        # Buckets bound captured workspace shapes as live requests arrive and
+        # finish. Compiled layers share code across those batch dimensions.
+        request_bucket = 1 << (requests - 1).bit_length()
+        batch_bucket = request_bucket * branches
         # Greedy decoding needs no sorting, probability filtering, or RNG
         # workspace. Capture it separately from the mutable sampled path.
-        key = (batch, branches, temperature == 0)
+        key = (batch_bucket, branches, temperature == 0)
         parameters = (temperature, top_k, top_p)
         entry = self._graphs.get(key)
         if entry is None:
@@ -260,17 +269,31 @@ class BreezeDepthDecoder(nn.Module):
                 self._compiled_layer = torch.compile(
                     BreezeDepthLayer.forward,
                     fullgraph=True,
-                    dynamic=False,
+                    dynamic=True,
                     options={"epilogue_fusion": False, "max_autotune": True},
                 )
                 self._compiled_sampler = torch.compile(sample_graph_logits, fullgraph=True, dynamic=False)
-            entry = BreezeDepthGraph(self, hidden, first, parameters, guidance_scale)
+            entry = BreezeDepthGraph(
+                self,
+                hidden.new_empty((batch_bucket, hidden.shape[-1])),
+                first.new_empty((request_bucket,)),
+                parameters,
+                guidance_scale,
+            )
             self._graphs[key] = entry
         if entry.parameter_values != parameters:
             entry.parameters.copy_(entry.parameters.new_tensor(parameters))
             entry.parameter_values = parameters
-        entry.hidden.copy_(hidden)
-        entry.first.copy_(first)
+        if batch == batch_bucket:
+            entry.hidden.copy_(hidden)
+        else:
+            # CFG graphs keep all conditioned rows before all unconditional
+            # rows. Pad each branch separately so matching rows stay paired.
+            for branch in range(branches):
+                entry.hidden[branch * request_bucket : branch * request_bucket + requests].copy_(
+                    hidden[branch * requests : (branch + 1) * requests]
+                )
+        entry.first[:requests].copy_(first)
         if entry.guidance_scale is not None and entry.guidance_value != guidance_scale:
             entry.guidance_scale.fill_(guidance_scale)
             entry.guidance_value = guidance_scale
@@ -285,7 +308,7 @@ class BreezeDepthDecoder(nn.Module):
         entry.graph.replay()
         # The tiny RVQ result outlives this replay in request state and the
         # transfer queue. The graph owns and overwrites its output workspace.
-        return entry.output.clone()
+        return entry.output[:requests].clone()
 
 
 class BreezeDepthGraph:

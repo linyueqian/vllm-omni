@@ -75,10 +75,7 @@ def test_text_graph_masks_padding_and_local_attention_across_replays(full_precis
             torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@torch.inference_mode()
-def test_depth_graph_survives_interleaved_batches_and_workspace_allocations() -> None:
-    torch.manual_seed(42)
+def _make_depth_decoder() -> BreezeDepthDecoder:
     config = LlamaConfig(
         hidden_size=32,
         intermediate_size=64,
@@ -97,10 +94,18 @@ def test_depth_graph_survives_interleaved_batches_and_workspace_allocations() ->
             "original_max_position_embeddings": 16,
         },
     )
-    config.num_codebooks = 4
+    config.num_codebooks = 16
     config.audio_embed_size = 48
     depth = BreezeDepthDecoder(config).to("cuda").eval()
     torch.nn.init.normal_(depth.codebooks_head, std=0.1)
+    return depth
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@torch.inference_mode()
+def test_depth_graph_survives_interleaved_batches_and_workspace_allocations(full_precision_matmul) -> None:
+    torch.manual_seed(42)
+    depth = _make_depth_decoder()
     hidden = torch.randn(2, 48, device="cuda")
     first = torch.tensor([7, 11], device="cuda")
     generators = [torch.Generator(device="cuda").manual_seed(seed) for seed in (42, 99)]
@@ -112,7 +117,7 @@ def test_depth_graph_survives_interleaved_batches_and_workspace_allocations() ->
     )
     for batch in (1, 2, 1, 2):
         # Unowned allocations made before graph capture would be recycled here.
-        pressure = [torch.full((batch, 2, 4, 8), float("nan"), device="cuda") for _ in range(32)]
+        pressure = [torch.full((batch, 2, depth.num_codebooks, 8), float("nan"), device="cuda") for _ in range(32)]
         actual = depth.generate_frames(
             hidden[:batch], first[:batch], temperature=0, top_k=0, top_p=1, generators=generators[:batch]
         )
@@ -161,6 +166,88 @@ def test_depth_graph_survives_interleaved_batches_and_workspace_allocations() ->
             assert depth._graphs[(2, 2, True)] is graph
         graph = depth._graphs[(2, 2, True)]
         sample(2)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@torch.inference_mode()
+def test_depth_graph_buckets_bound_shapes_and_preserve_requests(full_precision_matmul) -> None:
+    torch.manual_seed(17)
+    depth = _make_depth_decoder()
+    hidden = torch.randn(32, 48, device="cuda")
+    uncond = torch.randn_like(hidden)
+    first = torch.arange(32, device="cuda")
+    generators = [torch.Generator(device="cuda").manual_seed(42 + index) for index in range(32)]
+    reference_generators = [torch.Generator(device="cuda").manual_seed(42 + index) for index in range(32)]
+
+    expected_greedy = torch.cat(
+        [
+            depth.generate_frame(
+                hidden[index : index + 1],
+                first[index : index + 1],
+                temperature=0,
+                top_k=0,
+                top_p=1,
+                generator=reference_generators[index],
+            )
+            for index in range(32)
+        ]
+    )
+    retained: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for batch in (*range(1, 33), 17, 11, 3, 1):
+        rows = list(reversed(range(batch)))
+        actual = depth.generate_frames(
+            hidden[rows], first[rows], temperature=0, top_k=0, top_p=1, generators=[generators[row] for row in rows]
+        )
+        expected = expected_greedy[rows]
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        retained.append((actual, expected.clone()))
+    assert set(depth._graphs) == {(batch, 1, True) for batch in (1, 2, 4, 8, 16, 32)}
+
+    for temperature, guidance_scale in ((0.9, 1.0), (0.0, 4.0), (0.9, 4.0)):
+        for batch in (3, 5, 11, 7, 3, 1):
+            rows = list(reversed(range(batch)))
+            batch_hidden = hidden[rows]
+            if guidance_scale != 1:
+                batch_hidden = torch.cat((batch_hidden, uncond[rows]))
+            expected = []
+            for row in rows:
+                row_hidden = hidden[row : row + 1]
+                if guidance_scale != 1:
+                    row_hidden = torch.cat((row_hidden, uncond[row : row + 1]))
+                expected.append(
+                    depth._generate_frame(
+                        row_hidden,
+                        first[row : row + 1],
+                        depth._allocate_cache(row_hidden),
+                        temperature,
+                        10,
+                        0.8,
+                        reference_generators[row],
+                        guidance_scale=guidance_scale if guidance_scale != 1 else None,
+                    )
+                )
+            actual = depth.generate_frames(
+                batch_hidden,
+                first[rows],
+                temperature=temperature,
+                top_k=10,
+                top_p=0.8,
+                generators=[generators[row] for row in rows],
+                guidance_scale=guidance_scale,
+            )
+            expected_frames = torch.cat(expected)
+            torch.testing.assert_close(actual, expected_frames, atol=0, rtol=0)
+            retained.append((actual, expected_frames.clone()))
+            # Padding must not draw RNG, and inactive request streams must not advance.
+            for generator, reference in zip(generators, reference_generators, strict=True):
+                torch.testing.assert_close(generator.get_state(), reference.get_state(), atol=0, rtol=0)
+
+    expected_keys = {(batch, 1, True) for batch in (1, 2, 4, 8, 16, 32)}
+    expected_keys.update((batch, 1, False) for batch in (1, 4, 8, 16))
+    expected_keys.update((batch, 2, greedy) for batch in (2, 8, 16, 32) for greedy in (False, True))
+    assert set(depth._graphs) == expected_keys
+    for actual, expected in retained:
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)

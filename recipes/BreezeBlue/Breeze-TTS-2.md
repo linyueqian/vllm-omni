@@ -166,7 +166,7 @@ python benchmarks/tts/bench_tts.py \
   --host 127.0.0.1 --port 8091 --concurrency 1 2 4 8 16 \
   --num-prompts 64 --num-warmups 32 \
   --output-dir results/breeze-nonstream -- \
-  --extra-body '{"stream":false,"stream_format":null,"response_format":"pcm","max_new_tokens":384,"seed":42,"extra_params":{"temperature":0,"top_k":0,"top_p":1,"repetition_penalty":1.1,"guidance_scale":1}}'
+  --extra-body '{"stream":false,"stream_format":null,"response_format":"pcm","max_new_tokens":384,"seed":42,"extra_params":{"temperature":0.9,"top_k":50,"top_p":1,"repetition_penalty":1.1,"guidance_scale":1}}'
 ```
 
 Use the same dataset and sampling settings when comparing deployment profiles.
@@ -183,9 +183,10 @@ attention masks. Longer segments use dynamically compiled encoder layers
 without retaining a separate graph workspace for each input length.
 The depth decoder uses fused QKV/MLP projections, compiled layer kernels,
 fixed frame-local KV buffers and a CUDA Graph covering all 15 depth steps.
-Temperature, top-k and top-p are mutable GPU inputs to the captured sampler.
-Changing those settings, or changing a positive CFG scale within the paired
-path, reuses the graph. Each request owns its random-number generator.
+Positive temperature, top-k and top-p are mutable GPU inputs to the captured
+sampler. Changing those settings, or changing a positive CFG scale within the
+paired path, reuses the graph. Greedy decoding uses a separate graph that skips
+sorting and random sampling. Each request owns its random-number generator.
 
 Reference encoding uses dynamic-shape compilation with CUDA Graphs disabled
 for that path, so large reference-convolution workspaces remain reusable by
