@@ -5727,11 +5727,13 @@ class TestTTSAsyncOffloading:
 
         async def pcm_generator():
             try:
-                yield SimpleNamespace(
-                    multimodal_output={
+                yield OmniRequestOutput(
+                    request_id="req-close",
+                    final_output_type="audio",
+                    _multimodal_output={
                         "audio": torch.zeros(16, dtype=torch.float32),
                         "sr": 24000,
-                    }
+                    },
                 )
             finally:
                 # Engine abort waits for stage acknowledgments. Retain an

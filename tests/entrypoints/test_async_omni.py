@@ -564,7 +564,7 @@ def test_generate_waits_for_abort_inside_cancelled_asgi_scope():
             async for _ in omni.generate(
                 prompt={"prompt": "prompt"},
                 request_id="cancel-asgi",
-                sampling_params_list=[SimpleNamespace()],
+                sampling_params_list=[SamplingParams()],
                 output_modalities=["image"],
             ):
                 pass
@@ -606,7 +606,7 @@ def test_generate_bounds_abort_inside_cancelled_asgi_scope(monkeypatch):
             async for _ in omni.generate(
                 prompt={"prompt": "prompt"},
                 request_id="cancel-asgi-hanging-abort",
-                sampling_params_list=[SimpleNamespace()],
+                sampling_params_list=[SamplingParams()],
                 output_modalities=["image"],
             ):
                 pass

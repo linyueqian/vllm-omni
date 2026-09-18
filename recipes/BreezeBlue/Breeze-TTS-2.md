@@ -113,7 +113,48 @@ Different GPU kernels and batch shapes can still change sampled outputs.
 For streamed PCM, use `"stream": true`, `"stream_format": "audio"`, and
 `"response_format": "pcm"`. Output is mono signed 16-bit little-endian PCM at
 24 kHz. Complete WAV responses accumulate the same internal streaming output.
-The first chunks contain 1, 2, 4 and 5 codec frames, then remain at 5 frames.
+With the default deployment, the first chunks contain 1, 2, 4 and 5 codec
+frames, then remain at 5 frames.
+
+## Non-streaming throughput profile
+
+For concurrent complete responses, select the throughput deployment from the
+repository root. This profile's performance qualification is pending.
+
+```bash
+vllm-omni serve BreezeBlue/Breeze-TTS-2 --omni \
+  --deploy-config vllm_omni/deploy/breeze_tts_throughput.yaml \
+  --host 127.0.0.1 --port 8091
+```
+
+Request a complete WAV with `"stream": false` and omit `stream_format`.
+Setting `"stream_format": "audio"` enables streaming even when `stream` is false.
+
+```bash
+curl --fail http://127.0.0.1:8091/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "BreezeBlue/Breeze-TTS-2",
+    "input": "Hello, welcome to the speech synthesis demonstration.",
+    "stream": false,
+    "response_format": "wav",
+    "seed": 42,
+    "max_new_tokens": 250
+  }' --output breeze-complete.wav
+```
+
+The profile sets `max_num_seqs: 8` on both stages and reserves 2 GiB of stage-0
+KV cache for eight 2048-token contexts. These are physical sequence slots:
+stage 0 can run up to eight plain requests (`guidance_scale: 1.0`) or four
+CFG requests, since each CFG request occupies two slots. Mixed workloads share
+the same limit; additional requests queue.
+
+The internal codec uses fixed 16-frame chunks from the first chunk onward,
+with a shorter final chunk when needed. `cfg_prefill_delay_tokens: 0` removes
+the default eight-frame admission delay, so waiting requests can enter as soon
+as scheduling and KV capacity permit. The stateful codec still requires
+`async_chunk: true` for these complete HTTP responses. Warm the expected text
+lengths and concurrency before measuring the profile.
 
 ## Pipeline and optimization
 

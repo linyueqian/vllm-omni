@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from types import SimpleNamespace
-
 import pytest
 from vllm import SamplingParams
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus
 
@@ -45,7 +44,10 @@ def _scheduler(monkeypatch, waiting, running=()):
             request.num_computed_tokens += count
             request.append_output_token_ids(0)
             scheduled[request.request_id] = count
-        return SimpleNamespace(num_scheduled_tokens=scheduled)
+        output = SchedulerOutput.make_empty()
+        output.num_scheduled_tokens = scheduled
+        output.total_num_scheduled_tokens = sum(scheduled.values())
+        return output
 
     monkeypatch.setattr(OmniARScheduler, "schedule", advance)
     return scheduler

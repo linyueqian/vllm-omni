@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU regression coverage for Breeze's public speech request compatibility."""
 
-from types import SimpleNamespace
+from concurrent.futures import Executor
+from dataclasses import dataclass
 from unittest.mock import AsyncMock, Mock
 
 import numpy as np
@@ -19,10 +20,27 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 REFERENCE = "data:audio/wav;base64,cHVibGljLXRlc3QtZGF0YQ=="
 
 
+@dataclass
+class ModelConfigStub:
+    max_model_len: int
+
+
+@dataclass
+class EngineStub:
+    model_config: ModelConfigStub
+
+
+@dataclass
+class ServerStub:
+    _tts_executor: Executor | None
+    _validate_ref_audio_format: Mock
+    _resolve_ref_audio: AsyncMock
+
+
 @pytest.fixture
 def adapter():
-    engine = SimpleNamespace(model_config=SimpleNamespace(max_model_len=32))
-    server = SimpleNamespace(
+    engine = EngineStub(model_config=ModelConfigStub(max_model_len=32))
+    server = ServerStub(
         _tts_executor=None,
         _validate_ref_audio_format=Mock(return_value=None),
         _resolve_ref_audio=AsyncMock(return_value=(np.ones(1920, dtype=np.float32), 24000, None)),

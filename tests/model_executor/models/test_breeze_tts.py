@@ -3,7 +3,7 @@
 """Check depth attention against HF Llama and request-local sampling state."""
 
 from collections import defaultdict
-from types import SimpleNamespace
+from dataclasses import dataclass
 from unittest.mock import Mock
 
 import numpy as np
@@ -276,10 +276,21 @@ def test_codec_chunk_ramp_keeps_frame_order_and_flushes_partial_tail(mocker) -> 
     assert tail.meta.finished.item()
 
 
+@dataclass
+class TalkerConfig:
+    vocab_size: int
+    eos_token_id: int
+
+
+@dataclass
+class DepthStub:
+    generate_frames: Mock
+
+
 def _small_talker():
     model = BreezeForConditionalGeneration.__new__(BreezeForConditionalGeneration)
     torch.nn.Module.__init__(model)
-    model.config = SimpleNamespace(vocab_size=8, eos_token_id=7)
+    model.config = TalkerConfig(vocab_size=8, eos_token_id=7)
     model.num_codebooks, model.codebook_size, model.hidden_size = 3, 4, 2
     model.lm_head = torch.nn.Linear(2, 8, bias=False)
     with torch.no_grad():
@@ -288,7 +299,7 @@ def _small_talker():
         model.lm_head.weight[2] = torch.tensor([9.5, 0.0])
         model.lm_head.weight[3] = torch.tensor([0.0, 10.0])
         model.lm_head.weight[7] = torch.tensor([-10.0, -10.0])
-    model.depth_decoder = SimpleNamespace(
+    model.depth_decoder = DepthStub(
         generate_frames=Mock(side_effect=lambda hidden, first, **kwargs: first[:, None].repeat(1, 3))
     )
     return model
