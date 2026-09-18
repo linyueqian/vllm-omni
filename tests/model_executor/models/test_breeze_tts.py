@@ -21,7 +21,7 @@ from vllm_omni.model_executor.models.breeze_tts.depth_decoder import (
     sample_logits,
 )
 from vllm_omni.model_executor.models.breeze_tts.modeling_breeze import BreezeForConditionalGeneration
-from vllm_omni.model_executor.models.breeze_tts.prompt import build_breeze_prompt
+from vllm_omni.model_executor.models.breeze_tts.prompt import CFG_UNCOND_SUFFIX, build_breeze_prompt
 from vllm_omni.model_executor.models.breeze_tts.reference_encoder import BreezeReferenceConv
 from vllm_omni.model_executor.stage_input_processors.breeze_tts import expand_cfg_prompts, talker2code2wav_async_chunk
 
@@ -369,3 +369,112 @@ def test_talker_eos_does_not_shift_live_state_or_poison_the_next_batch():
     model.make_omni_output(torch.tensor([[0.0, 1.0]]), model_intermediate_buffer=[live], request_token_spans=[(0, 1)])
     assert live["breeze_state"]["history"].tolist() == [[3, 3]]
     assert model.compute_logits(torch.zeros(1, 2)).argmax(-1).tolist() == [0]
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.9])
+@torch.inference_mode()
+def test_talker_mixed_eos_and_cfg_matches_independent_request_state(temperature):
+    """Batch EOS decisions must not mix CFG state or change a request's RNG stream."""
+    finished_companion = "finished_cfg" + CFG_UNCOND_SUFFIX
+    live_companion = "live_cfg" + CFG_UNCOND_SUFFIX
+    order = ["finished_cfg", "live_plain", finished_companion, "finished_plain", live_companion, "live_cfg"]
+    hidden_by_id = {
+        "finished_cfg": [-1.0, -1.0],
+        finished_companion: [-1.0, -1.0],
+        "finished_plain": [-1.0, -1.0],
+        "live_plain": [0.0, 1.0],
+        "live_cfg": [1.0, 0.0],
+        live_companion: [1.0, 0.0],
+    }
+
+    def make_infos():
+        infos = {request_id: _request_info(request_id) for request_id in order}
+        for index, (request_id, info) in enumerate(infos.items()):
+            info["breeze_sampling"].update(temperature=temperature, top_k=1)
+            info["breeze_state"]["generator"].manual_seed(42 + index)
+            info["breeze_state"]["history"] = torch.tensor([[3, 3]])
+            if "cfg" in request_id:
+                info["breeze_prompt"]["guidance_scale"] = 4.0
+            if request_id.endswith(CFG_UNCOND_SUFFIX):
+                info["breeze_prompt"]["role"] = "uncond"
+        return infos
+
+    def sample_depth(hidden, first, *, temperature, generators, **kwargs):
+        # Consume request-local RNG state in the downstream phase as well as
+        # codebook-0 sampling, without requiring depth CUDA graphs on CPU.
+        tail = (
+            torch.stack([torch.randint(0, 4, (2,), generator=generator) for generator in generators])
+            if temperature > 0
+            else first[:, None].expand(-1, 2)
+        )
+        return torch.cat((first[:, None], tail), dim=1)
+
+    batched, independent = _small_talker(), _small_talker()
+    batched.depth_decoder.generate_frames.side_effect = sample_depth
+    independent.depth_decoder.generate_frames.side_effect = sample_depth
+    batch_infos, independent_infos = make_infos(), make_infos()
+    saved_frames = []
+    # The second step drops both EOS requests and moves the live CFG companion
+    # ahead of its parent, exercising shrinking and reordered batches.
+    for step_ids in (order, [live_companion, "live_cfg", "live_plain"]):
+        expected_audio, expected_tokens = {}, {}
+        for request_id in step_ids:
+            if request_id.endswith(CFG_UNCOND_SUFFIX):
+                continue
+            pair = [request_id]
+            if independent_infos[request_id]["breeze_prompt"]["guidance_scale"] != 1.0:
+                pair.append(request_id + CFG_UNCOND_SUFFIX)
+            result = independent.make_omni_output(
+                torch.tensor([hidden_by_id[rid] for rid in pair]),
+                model_intermediate_buffer=[independent_infos[rid] for rid in pair],
+                request_token_spans=[(i, i + 1) for i in range(len(pair))],
+            )
+            tokens = independent.compute_logits(torch.zeros(len(pair), 2)).argmax(-1)
+            for index, rid in enumerate(pair):
+                expected_audio[rid] = result.multimodal_outputs["codes"]["audio"][index].clone()
+                expected_tokens[rid] = tokens[index]
+
+        result = batched.make_omni_output(
+            torch.tensor([hidden_by_id[rid] for rid in step_ids]),
+            model_intermediate_buffer=[batch_infos[rid] for rid in step_ids],
+            request_token_spans=[(i, i + 1) for i in range(len(step_ids))],
+        )
+        actual_tokens = batched.compute_logits(torch.zeros(len(step_ids), 2)).argmax(-1)
+        for index, rid in enumerate(step_ids):
+            actual = result.multimodal_outputs["codes"]["audio"][index]
+            torch.testing.assert_close(actual, expected_audio[rid], atol=0, rtol=0)
+            torch.testing.assert_close(actual_tokens[index], expected_tokens[rid], atol=0, rtol=0)
+            saved_frames.append((actual, actual.clone()))
+        for rid in order:
+            actual, expected = batch_infos[rid]["breeze_state"], independent_infos[rid]["breeze_state"]
+            for key in ("history", "current"):
+                torch.testing.assert_close(actual[key], expected[key], atol=0, rtol=0)
+            torch.testing.assert_close(actual["generator"].get_state(), expected["generator"].get_state())
+
+    for rid in ("finished_cfg", finished_companion, "finished_plain", live_companion):
+        assert batch_infos[rid]["breeze_state"]["history"].tolist() == [[3, 3]]
+    assert batch_infos["live_cfg"]["breeze_state"]["history"].tolist() == [[3, 3, 1, 2]]
+    assert batch_infos["live_plain"]["breeze_state"]["history"].tolist() == [[3, 3, 3, 3]]
+    assert batch_infos["live_cfg"]["breeze_state"]["current"] is batch_infos[live_companion]["breeze_state"]["current"]
+    for original, snapshot in saved_frames:
+        torch.testing.assert_close(original, snapshot, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_talker_all_eos_preserves_history_and_skips_depth():
+    model = _small_talker()
+    infos = [_request_info("first"), _request_info("second")]
+    for info in infos:
+        info["breeze_state"]["history"] = torch.tensor([[1, 2]])
+    output = model.make_omni_output(
+        torch.tensor([[-1.0, -1.0], [-2.0, -2.0]]),
+        model_intermediate_buffer=infos,
+        request_token_spans=[(0, 1), (1, 2)],
+    )
+
+    model.depth_decoder.generate_frames.assert_not_called()
+    assert model.compute_logits(torch.zeros(2, 2)).argmax(-1).tolist() == [7, 7]
+    assert all(frame.numel() == 0 for frame in output.multimodal_outputs["codes"]["audio"])
+    for info in infos:
+        assert info["breeze_state"]["history"].tolist() == [[1, 2]]
+        assert info["breeze_state"]["current"].tolist() == [[0, 0, 0]]

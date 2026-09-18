@@ -119,7 +119,7 @@ frames, then remain at 5 frames.
 ## Non-streaming throughput profile
 
 For concurrent complete responses, select the throughput deployment from the
-repository root. This profile's performance qualification is pending.
+repository root.
 
 ```bash
 vllm-omni serve BreezeBlue/Breeze-TTS-2 --omni \
@@ -155,6 +155,24 @@ the default eight-frame admission delay, so waiting requests can enter as soon
 as scheduling and KV capacity permit. The stateful codec still requires
 `async_chunk: true` for these complete HTTP responses. Warm the expected text
 lengths and concurrency before measuring the profile.
+
+The shared benchmark defaults to streaming. Override both `stream` and
+`stream_format` to measure complete responses, and set the generation limit
+explicitly in the request body:
+
+```bash
+python benchmarks/tts/bench_tts.py \
+  --model BreezeBlue/Breeze-TTS-2 --task default_voice --locale en \
+  --host 127.0.0.1 --port 8091 --concurrency 1 2 4 8 16 \
+  --num-prompts 64 --num-warmups 32 \
+  --output-dir results/breeze-nonstream -- \
+  --extra-body '{"stream":false,"stream_format":null,"response_format":"pcm","max_new_tokens":384,"seed":42,"extra_params":{"temperature":0,"top_k":0,"top_p":1,"repetition_penalty":1.1,"guidance_scale":1}}'
+```
+
+Use the same dataset and sampling settings when comparing deployment profiles.
+Verify completed and failed request counts in each result. For complete
+responses, compare throughput and RTF; first-response timing represents
+completion latency. Run ASR separately: the benchmark's WER mode forces streaming.
 
 ## Pipeline and optimization
 

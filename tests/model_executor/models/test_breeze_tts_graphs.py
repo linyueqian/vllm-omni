@@ -9,6 +9,7 @@ from transformers.models.t5gemma2.modeling_t5gemma2 import T5Gemma2TextEncoder
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.breeze_tts.depth_decoder import BreezeDepthDecoder
+from vllm_omni.model_executor.models.breeze_tts.modeling_breeze import BreezeForConditionalGeneration
 from vllm_omni.model_executor.models.breeze_tts.text_encoder_graph import (
     BreezeTextEncoderCompiled,
     BreezeTextEncoderGraph,
@@ -129,14 +130,22 @@ def test_depth_graph_survives_interleaved_batches_and_workspace_allocations() ->
         )
 
     sampled = sample(1)
-    first_graph = depth._graphs[(1, 1)]
+    sampled_graph = depth._graphs[(1, 1, False)]
+    greedy_graph = depth._graphs[(1, 1, True)]
+    assert sampled_graph is not greedy_graph
     sample(2)
     torch.testing.assert_close(sample(1), sampled, atol=0, rtol=0)
-    for temperature, top_k, top_p in ((0.0, 0, 1.0), (0.7, 20, 0.95), (1.2, 0, 0.8)):
-        depth.generate_frames(
+    for temperature, top_k, top_p in ((0.0, 0, 1.0), (0.7, 20, 0.95), (0.0, 1, 0.2), (1.2, 0, 0.8)):
+        rng_before = generators[0].get_state()
+        actual = depth.generate_frames(
             hidden[:1], first[:1], temperature=temperature, top_k=top_k, top_p=top_p, generators=generators[:1]
         )
-        assert depth._graphs[(1, 1)] is first_graph
+        if temperature == 0:
+            assert depth._graphs[(1, 1, True)] is greedy_graph
+            torch.testing.assert_close(actual, expected[:1], atol=0, rtol=0)
+            torch.testing.assert_close(generators[0].get_state(), rng_before, atol=0, rtol=0)
+        else:
+            assert depth._graphs[(1, 1, False)] is sampled_graph
     torch.testing.assert_close(sample(1), sampled, atol=0, rtol=0)
 
     graph = None
@@ -149,6 +158,50 @@ def test_depth_graph_survives_interleaved_batches_and_workspace_allocations() ->
         )
         torch.testing.assert_close(actual_cfg, expected_cfg, atol=0, rtol=0)
         if graph is not None:
-            assert depth._graphs[(2, 2)] is graph
-        graph = depth._graphs[(2, 2)]
+            assert depth._graphs[(2, 2, True)] is graph
+        graph = depth._graphs[(2, 2, True)]
         sample(2)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@torch.inference_mode()
+def test_batched_decode_embedding_matches_scalar_bfloat16() -> None:
+    # Use the checkpoint's RVQ table dimensions without loading its backbone.
+    model = BreezeForConditionalGeneration.__new__(BreezeForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.num_codebooks, model.hidden_size = 16, 2048
+    model.register_buffer("offsets", torch.arange(16, device="cuda") * 2051)
+    model.depth_decoder = torch.nn.Module()
+    torch.manual_seed(17)
+    model.depth_decoder.embed_tokens = torch.nn.Embedding(16 * 2051, 2048, device="cuda", dtype=torch.bfloat16)
+    for seed in (17, 42, 99):
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        frames = torch.randint(0, 2051, (32, 16), device="cuda", generator=generator)
+        frames[1] = frames[0]
+        for batch in (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 7, 1):
+            # Reverse physical rows and revisit smaller batches after expansion.
+            current_frames = [row[None] for row in frames[:batch].flip(0)]
+            if batch > 1:
+                # CFG branches share their generated audio frame.
+                current_frames[-2] = current_frames[-1]
+            infos = [
+                {
+                    "_omni_is_prefill": False,
+                    "breeze_state": {"current": current},
+                    "global_request_id": [str(index)],
+                    "breeze_prompt": {},
+                    "breeze_sampling": {},
+                }
+                for index, current in enumerate(current_frames)
+            ]
+            ids = torch.zeros(batch, device="cuda", dtype=torch.long)
+            expected = torch.cat(
+                [
+                    model.preprocess(input_ids=ids[index : index + 1], input_embeds=None, **info)[1]
+                    for index, info in enumerate(infos)
+                ]
+            )
+            output_ids, actual, updates = model.preprocess_decode_batch(input_ids=ids, req_infos=infos)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            assert output_ids is ids
+            assert updates == [{} for _ in infos]

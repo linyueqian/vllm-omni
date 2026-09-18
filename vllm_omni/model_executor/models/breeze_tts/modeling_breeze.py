@@ -205,6 +205,31 @@ class BreezeForConditionalGeneration(nn.Module):
         embeds = self.depth_decoder.embed_tokens(breeze_state["current"] + self.offsets).sum(1)
         return input_ids, embeds, {}
 
+    def preprocess_decode_batch(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        req_infos: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        """Embed one current RVQ frame per physical decode row, including CFG."""
+        if input_ids.numel() != len(req_infos):
+            raise ValueError("Breeze decode requires one token per request")
+        frames: list[torch.Tensor] = []
+        for info in req_infos:
+            state = info.get("breeze_state")
+            if info.get("_omni_is_prefill") or state is None:
+                raise ValueError("Breeze decode requires initialized per-request state")
+            current = state["current"]
+            if current.shape != (1, self.num_codebooks):
+                raise ValueError("Breeze decode requires one RVQ frame per request")
+            frames.append(current)
+        if not frames:
+            embeds = self.depth_decoder.embed_tokens.weight.new_empty((0, self.hidden_size))
+        else:
+            current = torch.cat(frames, dim=0)
+            embeds = self.depth_decoder.embed_tokens(current + self.offsets).sum(1)
+        return input_ids, embeds, [{} for _ in req_infos]
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -247,7 +272,7 @@ class BreezeForConditionalGeneration(nn.Module):
         ]
         infos = model_intermediate_buffer
         request_rows = {cast(list[str], info["global_request_id"])[0]: index for index, info in enumerate(infos)}
-        groups: dict[tuple[float, int, float, float], list[tuple[list[int], torch.Tensor, torch.Tensor]]] = {}
+        sampled_rows: list[tuple[list[int], torch.Tensor, torch.Tensor, tuple[float, int, float, float]]] = []
         for index, (info, (start, end)) in enumerate(zip(infos, request_token_spans, strict=True)):
             if not 0 <= start < end <= model_outputs.shape[0]:
                 raise RuntimeError("Invalid Breeze request span")
@@ -285,11 +310,20 @@ class BreezeForConditionalGeneration(nn.Module):
             first = sample_logits(
                 logits, sampling["temperature"], sampling["top_k"], sampling["top_p"], state["generator"]
             )
-            if first.item() == self.config.eos_token_id:
+            parameters = (sampling["temperature"], sampling["top_k"], sampling["top_p"], guidance_scale)
+            sampled_rows.append((indices, hidden, first, parameters))
+
+        # Queue every codebook-0 sample before one batch readback decides EOS.
+        # Sampling retains request order; history writes consume no RNG, and
+        # depth draws still follow all codebook-0 draws in the same group order.
+        first_ids = torch.cat([row[2] for row in sampled_rows]).to("cpu").tolist() if sampled_rows else []
+        groups: dict[tuple[float, int, float, float], list[tuple[list[int], torch.Tensor, torch.Tensor]]] = {}
+        for (indices, hidden, first, parameters), first_id in zip(sampled_rows, first_ids, strict=True):
+            if first_id == self.config.eos_token_id:
                 self._next_tokens[indices] = self.config.eos_token_id
                 continue
-            state["history"] = torch.cat((history, first[:, None]), dim=1)
-            parameters = (sampling["temperature"], sampling["top_k"], sampling["top_p"], guidance_scale)
+            state = cast(BreezeState, infos[indices[0]]["breeze_state"])
+            state["history"] = torch.cat((state["history"], first[:, None]), dim=1)
             groups.setdefault(parameters, []).append((indices, hidden, first))
         for (temperature, top_k, top_p, guidance_scale), rows in groups.items():
             # Depth batches place every conditioned row before every

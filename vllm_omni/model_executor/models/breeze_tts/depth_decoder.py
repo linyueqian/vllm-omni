@@ -168,7 +168,7 @@ class BreezeDepthDecoder(nn.Module):
             torch.arange(self.num_codebooks)[None, :] <= torch.arange(self.num_codebooks)[:, None],
             persistent=False,
         )
-        self._graphs: dict[tuple[int, int], BreezeDepthGraph] = {}
+        self._graphs: dict[tuple[int, int, bool], BreezeDepthGraph] = {}
         self._compiled_layer = None
         self._compiled_sampler = None
 
@@ -202,6 +202,7 @@ class BreezeDepthDecoder(nn.Module):
         noise: torch.Tensor | None = None,
         guidance_scale: float | torch.Tensor | None = None,
         sampling_parameters: torch.Tensor | None = None,
+        greedy: bool = False,
     ) -> torch.Tensor:
         batch = hidden.shape[0]
         branches = 2 if guidance_scale is not None else 1
@@ -216,7 +217,7 @@ class BreezeDepthDecoder(nn.Module):
             sin = self.rope_sin[start:end].to(x.dtype)[None, None]
             for layer, cache in zip(self.layers, caches, strict=True):
                 args = (x, self.positions[start:end], cache, self.causal_mask[start:end][None, None], cos, sin)
-                if noise is None:
+                if noise is None and not greedy:
                     x = layer(*args)
                 else:
                     x = self._compiled_layer(layer, *args)
@@ -225,7 +226,9 @@ class BreezeDepthDecoder(nn.Module):
                 cond, uncond = logits.chunk(2, dim=0)
                 logits = uncond + guidance_scale * (cond - uncond)
             logits[:, self.vocab_size - 3 :] = -torch.inf
-            if noise is None:
+            if greedy:
+                token = logits.argmax(-1)
+            elif noise is None:
                 token = sample_logits(logits, temperature, top_k, top_p, generator)
             else:
                 token = self._compiled_sampler(logits, sampling_parameters, noise[:, codebook])
@@ -247,7 +250,9 @@ class BreezeDepthDecoder(nn.Module):
     ) -> torch.Tensor:
         batch = hidden.shape[0]
         branches = 2 if guidance_scale != 1.0 else 1
-        key = (batch, branches)
+        # Greedy decoding needs no sorting, probability filtering, or RNG
+        # workspace. Capture it separately from the mutable sampled path.
+        key = (batch, branches, temperature == 0)
         parameters = (temperature, top_k, top_p)
         entry = self._graphs.get(key)
         if entry is None:
@@ -270,6 +275,7 @@ class BreezeDepthDecoder(nn.Module):
             entry.guidance_scale.fill_(guidance_scale)
             entry.guidance_value = guidance_scale
         if temperature > 0:
+            assert entry.noise is not None
             for row, generator in enumerate(generators):
                 # Match the 15 independent exponential draws used by
                 # torch.multinomial(..., num_samples=1), preserving each
@@ -292,12 +298,17 @@ class BreezeDepthGraph:
         guidance_scale: float = 1.0,
     ) -> None:
         self.parameter_values = parameters
+        self.greedy = parameters[0] == 0
         self.parameters = hidden.new_tensor(parameters, dtype=torch.float32)
         self.guidance_value = guidance_scale
         self.guidance_scale = hidden.new_tensor(guidance_scale, dtype=torch.float32) if guidance_scale != 1.0 else None
         self.hidden = torch.zeros_like(hidden)
         self.first = torch.zeros_like(first)
-        self.noise = hidden.new_ones((first.shape[0], model.num_codebooks - 1, model.vocab_size), dtype=torch.float32)
+        self.noise = (
+            None
+            if self.greedy
+            else hidden.new_ones((first.shape[0], model.num_codebooks - 1, model.vocab_size), dtype=torch.float32)
+        )
         # Captured kernels retain addresses, not the Python tensors allocated
         # before capture. Keep every KV allocation alive with its graph.
         self.caches = model._allocate_cache(hidden)
@@ -312,6 +323,7 @@ class BreezeDepthGraph:
                 self.noise,
                 self.guidance_scale,
                 self.parameters,
+                greedy=self.greedy,
             )
         current_omni_platform.synchronize()
         self.graph = torch.cuda.CUDAGraph()
@@ -327,4 +339,5 @@ class BreezeDepthGraph:
                 self.noise,
                 self.guidance_scale,
                 self.parameters,
+                greedy=self.greedy,
             )
