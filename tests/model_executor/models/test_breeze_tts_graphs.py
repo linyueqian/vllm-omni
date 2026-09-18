@@ -17,9 +17,21 @@ from vllm_omni.model_executor.models.breeze_tts.text_encoder_graph import (
 pytestmark = [pytest.mark.core_model]
 
 
+@pytest.fixture
+def full_precision_matmul():
+    # Different padded shapes can select different TF32 kernels. Compare
+    # masking and replay semantics independently of that reduced precision.
+    original_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(original_precision)
+
+
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @torch.inference_mode()
-def test_text_graph_masks_padding_and_local_attention_across_replays() -> None:
+def test_text_graph_masks_padding_and_local_attention_across_replays(full_precision_matmul) -> None:
     torch.manual_seed(42)
     config = T5Gemma2TextConfig(
         vocab_size=64,

@@ -63,7 +63,7 @@ class _FakeDecoder(nn.Module):
         chunk_size: int = 300,
         left_context_size: int = 25,
         max_batch_size: int = 0,
-    ) -> torch.Tensor:
+    ) -> list[torch.Tensor]:
         self.batched_decode_calls.append(
             {
                 "chunk_size": chunk_size,
@@ -131,6 +131,7 @@ def _make_model(
                 load_config=SimpleNamespace(),
                 model_config=SimpleNamespace(
                     model="unused",
+                    dtype=torch.bfloat16,
                     revision=None,
                     stage_connector_config=stage_connector_config,
                     async_chunk=async_chunk,
@@ -157,7 +158,10 @@ def _load_weights_noop(model: Qwen3TTSCode2Wav) -> set[str]:
         def __init__(self, *_: object, **__: object):
             pass
 
-        def load_weights(self, _weights: object) -> set[str]:
+        def load_weights(self, _weights: object, *, mapper: object | None = None) -> set[str]:
+            # vLLM 0.29 dropped skip_prefixes from AutoWeightsLoader; the model
+            # now passes the stage exclusions as a WeightsMapper instead.
+            del mapper
             return {"decoder.fake_weight"}
 
     with (
@@ -713,3 +717,16 @@ def test_invalid_decode_chunking_is_rejected():
 
     with pytest.raises(ValueError, match="decode_chunk_frames=0"):
         _load_weights_noop(model)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_load_weights_uses_model_dtype_before_precomputing_caches(dtype):
+    model = _make_model()
+    model.vllm_config.model_config.dtype = dtype
+    model.decoder = nn.Linear(2, 2)
+    cache_dtypes = []
+    model.decoder.precompute_snake_caches = lambda: cache_dtypes.append(model.decoder.weight.dtype)
+
+    assert _load_weights_noop(model) == {"decoder.fake_weight"}
+    assert model.decoder.weight.dtype is dtype
+    assert cache_dtypes == [dtype]

@@ -22,6 +22,7 @@ def build_breeze_prompt(
     text: str,
     instructions: str = DEFAULT_INSTRUCTION,
     *,
+    speaker: str = "S0",
     ref_audio: tuple[np.ndarray, int] | None = None,
     ref_text: str | None = None,
     guidance_scale: float = 1.0,
@@ -46,7 +47,8 @@ def build_breeze_prompt(
         raise ValueError("Invalid Breeze sampling parameters")
     if (ref_audio is None) != (ref_text is None):
         raise ValueError("Breeze voice cloning requires both ref_audio and ref_text")
-    target = tokenizer.encode(f"[S0]<ins_bos>{instructions}<ins_eos>{text}", add_special_tokens=True)
+    speaker_tag = speaker if speaker.startswith("[") and speaker.endswith("]") else f"[{speaker}]"
+    target = tokenizer.encode(f"{speaker_tag}<ins_bos>{instructions}<ins_eos>{text}", add_special_tokens=True)
     conditioning: dict[str, Any] = {"target_ids": target, "guidance_scale": guidance_scale, "role": "cond"}
     prefix_length = 0
     if ref_audio is not None:
@@ -65,7 +67,7 @@ def build_breeze_prompt(
             length = math.ceil(waveform.size * SAMPLE_RATE / sample_rate)
             waveform = AudioResampler(target_sr=SAMPLE_RATE, method="soxr").resample(waveform, orig_sr=sample_rate)
             waveform = np.pad(waveform, (0, max(0, length - waveform.size)))[:length]
-        reference_ids = tokenizer.encode(f"[S0]{ref_text}", add_special_tokens=True)
+        reference_ids = tokenizer.encode(f"{speaker_tag}{ref_text}", add_special_tokens=True)
         frames = math.ceil(waveform.size / ENCODE_DOWNSAMPLE_RATE)
         conditioning.update(
             reference_ids=reference_ids,
@@ -73,7 +75,7 @@ def build_breeze_prompt(
         )
         prefix_length = len(reference_ids) + frames + 1
     if guidance_scale != 1.0:
-        conditioning["negative_ids"] = tokenizer.encode(f"[S0]{text}", add_special_tokens=True)
+        conditioning["negative_ids"] = tokenizer.encode(f"{speaker_tag}{text}", add_special_tokens=True)
     prompt = tokens_input(prompt_token_ids=[0] * (prefix_length + len(target)))
     prompt["additional_information"] = {
         "breeze_prompt": conditioning,

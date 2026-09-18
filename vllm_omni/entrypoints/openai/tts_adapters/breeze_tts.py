@@ -75,36 +75,39 @@ class BreezeTTSAdapter(ARTTSAdapter):
     def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
         if not request.input.strip():
             return "Input text cannot be empty"
-        if request.voice not in (None, "default"):
-            return "Breeze uses instructions or ref_audio/ref_text; named voices are not supported"
+        if request.speed is not None and request.speed != 1.0:
+            return "Breeze does not support speed adjustment"
+        if request.language is not None:
+            return "Breeze infers the language from the input text; the language field is not supported"
         if request.ref_audio_2 is not None or request.speaker_embedding is not None:
             return "Breeze accepts one reference recording and its transcript"
         has_reference = request.ref_audio is not None
         if has_reference:
-            if (
-                not isinstance(request.ref_audio, str)
-                or not isinstance(request.ref_text, str)
-                or not request.ref_text.strip()
-            ):
+            reference = request.ref_audio
+            if isinstance(reference, list):
+                if len(reference) != 1:
+                    return "Breeze supports exactly one reference recording"
+                reference = reference[0]
+            if not isinstance(reference, str) or not isinstance(request.ref_text, str) or not request.ref_text.strip():
                 return "Breeze voice cloning requires one ref_audio URL and a non-empty ref_text transcript"
-            error = self.ctx.server._validate_ref_audio_format(request.ref_audio)
+            error = self.ctx.server._validate_ref_audio_format(reference)
             if error:
                 return error
         elif request.ref_text is not None:
             return "Breeze ref_text requires ref_audio"
         expected_task = "Base" if has_reference else "VoiceDesign"
-        if request.task_type not in (None, expected_task):
+        if request.task_type not in (None, "CustomVoice", expected_task):
             return f"Breeze requires task_type='{expected_task}' for this conditioning"
-        if request.x_vector_only_mode is not None:
+        if request.x_vector_only_mode:
             return "Breeze does not support x_vector_only_mode"
         extra = request.extra_params or {}
-        supported = {"guidance_scale", "temperature", "top_k", "top_p", "repetition_penalty"}
+        supported = {"guidance_scale", "cfg_scale", "temperature", "top_k", "top_p", "repetition_penalty"}
         if unknown := set(extra) - supported:
             return f"Unsupported Breeze parameters: {sorted(unknown)}"
         for key, value in extra.items():
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                 return f"Breeze {key} must be a finite number"
-        if extra.get("guidance_scale", 1.0) <= 0 or extra.get("repetition_penalty", 1.1) <= 0:
+        if extra.get("guidance_scale", extra.get("cfg_scale", 1.0)) <= 0 or extra.get("repetition_penalty", 1.1) <= 0:
             return "Breeze guidance_scale and repetition_penalty must be positive"
         if extra.get("temperature", 0.9) < 0 or not 0 < extra.get("top_p", 1.0) <= 1:
             return "Breeze requires temperature >= 0 and 0 < top_p <= 1"
@@ -130,9 +133,10 @@ class BreezeTTSAdapter(ARTTSAdapter):
             self.tokenizer,
             request.input,
             DEFAULT_INSTRUCTION if request.instructions is None else request.instructions,
+            speaker=request.voice if request.voice and request.voice != "default" else "S0",
             ref_audio=reference,
             ref_text=request.ref_text,
-            guidance_scale=float(extra.get("guidance_scale", 1.0)),
+            guidance_scale=float(extra.get("guidance_scale", extra.get("cfg_scale", 1.0))),
             temperature=float(extra.get("temperature", sampling.temperature)),
             top_k=max(int(extra.get("top_k", sampling.top_k)), 0),
             top_p=float(extra.get("top_p", sampling.top_p)),
@@ -147,7 +151,8 @@ class BreezeTTSAdapter(ARTTSAdapter):
     ) -> PreparedRequest:
         reference = None
         if request.ref_audio is not None:
-            waveform, sample_rate, _ = await self.ctx.server._resolve_ref_audio(request.ref_audio)
+            audio = request.ref_audio[0] if isinstance(request.ref_audio, list) else request.ref_audio
+            waveform, sample_rate, _ = await self.ctx.server._resolve_ref_audio(audio)
             reference = (np.asarray(waveform, dtype=np.float32), sample_rate)
         prompt = await self._build_async(request, sampling_params_list[0], reference)
         return PreparedRequest(prompt=prompt, model_type=self.name)

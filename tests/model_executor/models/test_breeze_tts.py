@@ -3,6 +3,8 @@
 """Check depth attention against HF Llama and request-local sampling state."""
 
 from collections import defaultdict
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -18,6 +20,7 @@ from vllm_omni.model_executor.models.breeze_tts.depth_decoder import (
     sample_graph_logits,
     sample_logits,
 )
+from vllm_omni.model_executor.models.breeze_tts.modeling_breeze import BreezeForConditionalGeneration
 from vllm_omni.model_executor.models.breeze_tts.prompt import build_breeze_prompt
 from vllm_omni.model_executor.models.breeze_tts.reference_encoder import BreezeReferenceConv
 from vllm_omni.model_executor.stage_input_processors.breeze_tts import expand_cfg_prompts, talker2code2wav_async_chunk
@@ -213,6 +216,24 @@ def test_graph_sampler_matches_scalar_filtering_with_identical_noise(parameters)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("top_p", [0.25, 0.5, 0.75])
+@pytest.mark.parametrize("top_k", [0, 2])
+def test_graph_sampler_excludes_token_after_exact_nucleus_boundary(top_p, top_k) -> None:
+    # Equal probabilities make the CDF boundary exact in float32. Bias the
+    # shared noise toward the first token outside that nucleus so retaining
+    # one extra candidate deterministically changes the sampled token.
+    logits = torch.tensor([[0.0, 0.0, 0.0, 0.0, -torch.inf, -torch.inf, -torch.inf]])
+    noise = torch.ones_like(logits)
+    first_excluded = int(top_p * 4)
+    noise[:, first_excluded] = 0.001
+    parameters = (1.0, top_k, top_p)
+    expected = sample_logits(logits, *parameters, torch.Generator().manual_seed(42), noise)
+    actual = sample_graph_logits(logits, torch.tensor(parameters), noise)
+
+    assert expected.item() != first_excluded
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_codec_chunks_preserve_zero_frames_and_flush_each_request_once(mocker) -> None:
     manager = mocker.Mock()
     manager.connector.config = {"extra": {"codec_chunk_frames": 5, "initial_codec_chunk_frames": 5}}
@@ -253,3 +274,87 @@ def test_codec_chunk_ramp_keeps_frame_order_and_flushes_partial_tail(mocker) -> 
     assert [len(part) for part in outputs] == [1, 2, 4, 5, 3]
     torch.testing.assert_close(torch.cat(outputs), torch.arange(15)[:, None].expand(-1, 16))
     assert tail.meta.finished.item()
+
+
+def _small_talker():
+    model = BreezeForConditionalGeneration.__new__(BreezeForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(vocab_size=8, eos_token_id=7)
+    model.num_codebooks, model.codebook_size, model.hidden_size = 3, 4, 2
+    model.lm_head = torch.nn.Linear(2, 8, bias=False)
+    with torch.no_grad():
+        model.lm_head.weight.zero_()
+        model.lm_head.weight[1] = torch.tensor([10.0, 0.0])
+        model.lm_head.weight[2] = torch.tensor([9.5, 0.0])
+        model.lm_head.weight[3] = torch.tensor([0.0, 10.0])
+        model.lm_head.weight[7] = torch.tensor([-10.0, -10.0])
+    model.depth_decoder = SimpleNamespace(
+        generate_frames=Mock(side_effect=lambda hidden, first, **kwargs: first[:, None].repeat(1, 3))
+    )
+    return model
+
+
+def _request_info(request_id):
+    return {
+        "global_request_id": [request_id],
+        "breeze_prompt": {"role": "cond", "guidance_scale": 1.0},
+        "breeze_sampling": {"temperature": 0.0, "top_k": 0, "top_p": 1.0, "repetition_penalty": 1.1},
+        "breeze_state": {
+            "generator": torch.Generator().manual_seed(42),
+            "history": torch.empty(1, 0, dtype=torch.long),
+            "current": torch.zeros(1, 3, dtype=torch.long),
+        },
+    }
+
+
+@torch.inference_mode()
+def test_talker_history_and_generators_follow_requests_across_reordering_and_new_admission():
+    model = _small_talker()
+    first, second = _request_info("first"), _request_info("second")
+    # Unequal spans must select the last hidden row of each request.
+    model.make_omni_output(
+        torch.tensor([[0.0, 1.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]]),
+        model_intermediate_buffer=[first, second],
+        request_token_spans=[(0, 3), (3, 4)],
+    )
+    reordered = model.make_omni_output(
+        torch.tensor([[0.0, 1.0], [1.0, 0.0]]),
+        model_intermediate_buffer=[second, first],
+        request_token_spans=[(0, 1), (1, 2)],
+    )
+    assert [frame[0, 0].item() for frame in reordered.multimodal_outputs["codes"]["audio"]] == [3, 2]
+    assert first["breeze_state"]["history"].tolist() == [[1, 2]]
+    assert second["breeze_state"]["history"].tolist() == [[3, 3]]
+    generators = model.depth_decoder.generate_frames.call_args.kwargs["generators"]
+    assert generators[0] is second["breeze_state"]["generator"]
+    assert generators[1] is first["breeze_state"]["generator"]
+
+    newcomer = _request_info("newcomer")
+    admitted = model.make_omni_output(
+        torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
+        model_intermediate_buffer=[newcomer, first],
+        request_token_spans=[(0, 1), (1, 2)],
+    )
+    assert [frame[0, 0].item() for frame in admitted.multimodal_outputs["codes"]["audio"]] == [1, 1]
+    assert newcomer["breeze_state"]["history"].tolist() == [[1]]
+    assert first["breeze_state"]["history"].tolist() == [[1, 2, 1]]
+    assert second["breeze_state"]["history"].tolist() == [[3, 3]]
+
+
+@torch.inference_mode()
+def test_talker_eos_does_not_shift_live_state_or_poison_the_next_batch():
+    model = _small_talker()
+    finished, live = _request_info("finished"), _request_info("live")
+    output = model.make_omni_output(
+        torch.tensor([[-1.0, -1.0], [0.0, 1.0]]),
+        model_intermediate_buffer=[finished, live],
+        request_token_spans=[(0, 1), (1, 2)],
+    )
+    assert output.multimodal_outputs["codes"]["audio"][0].numel() == 0
+    assert finished["breeze_state"]["history"].numel() == 0
+    assert live["breeze_state"]["current"].tolist() == [[3, 3, 3]]
+    assert model.compute_logits(torch.zeros(2, 2)).argmax(-1).tolist() == [7, 0]
+
+    model.make_omni_output(torch.tensor([[0.0, 1.0]]), model_intermediate_buffer=[live], request_token_spans=[(0, 1)])
+    assert live["breeze_state"]["history"].tolist() == [[3, 3]]
+    assert model.compute_logits(torch.zeros(1, 2)).argmax(-1).tolist() == [0]

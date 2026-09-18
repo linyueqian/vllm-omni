@@ -47,6 +47,8 @@ curl --fail http://127.0.0.1:8091/v1/audio/speech \
   }' --output breeze.wav
 ```
 
+The `voice` field selects a speaker tag, such as `S0` or `[S0]`; omitting it
+uses `[S0]`. These are checkpoint prompt tags, not a catalog of named voices.
 Omitting `instructions` uses `Speak clearly and naturally.`. An explicitly
 empty instruction remains empty. Vocal-event tokens, including `(laughs)`
 and `[笑]`, are passed to the checkpoint unchanged.
@@ -54,7 +56,8 @@ and `[笑]`, are passed to the checkpoint unchanged.
 ## Voice Clone and Voice Direction
 
 Add `ref_audio` and its exact `ref_text` transcript. Reference audio accepts the
-shared speech API's audio URLs and base64 data URLs. The shared resolver's
+shared speech API's audio URLs and base64 data URLs, either as a string or
+a one-item list. The shared resolver's
 format, duration and local-file access restrictions apply.
 
 ```json
@@ -73,7 +76,8 @@ format, duration and local-file access restrictions apply.
 Use `guidance_scale: 1.0` with the default instruction for ordinary cloning.
 Reference audio plus a delivery instruction and CFG provides Voice Direction.
 When explicitly specified, `task_type` is `Base` for reference conditioning
-and `VoiceDesign` without reference audio.
+and `VoiceDesign` without reference audio. The legacy `CustomVoice` value
+also remains accepted.
 
 Stereo references are averaged to mono and resampled to 24 kHz with soxr HQ.
 Reference text is encoded independently from the target text. The reference
@@ -92,6 +96,9 @@ Supported `extra_params`:
 | `top_k` | 50 | Zero or -1 disables top-k filtering |
 | `top_p` | 1.0 | Nucleus sampling probability in (0, 1] |
 | `repetition_penalty` | 1.1 | Positive penalty applied to the first codebook's generated history |
+
+`cfg_scale` remains an alias for `guidance_scale`; `guidance_scale` takes
+precedence when both are supplied.
 
 CFG combines conditional and unconditional logits in the Qwen3 output head
 and all 15 remaining depth codebooks. Both branches retain reference audio
@@ -154,6 +161,13 @@ requests or one CFG request at a time. Additional CFG requests queue.
 Prefix caching and chunked prefill are disabled because prompt token IDs
 reserve positions for externally encoded embeddings. The deployment requires
 `async_chunk: true`, including for complete HTTP responses.
+
+The previous `breeze_tts_2.yaml` deployment filename remains available.
+For a copied custom configuration, migrate to `breeze_tts.yaml`: the stages
+are now `breeze_tts` and `breeze_code2wav`, and codec chunk controls use
+`codec_chunk_frames`, `initial_codec_chunk_frames` and `codec_chunk_ramp`.
+Defaults now use a 2048-token context and temperature 0.9; set temperature
+to zero explicitly when comparing greedy generation with the earlier runtime.
 
 The supported execution scope is one CUDA GPU, TP=1, PP=1 and unquantized
 released weights. Named voices, speaker embeddings, dual CFG and multiple

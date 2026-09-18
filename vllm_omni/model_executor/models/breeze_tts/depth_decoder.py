@@ -57,8 +57,11 @@ def sample_graph_logits(logits: torch.Tensor, parameters: torch.Tensor, noise: t
     cutoff = torch.where(top_k > 0, top_k, logits.shape[-1]).long().clamp(1, logits.shape[-1]) - 1
     threshold = values.gather(-1, cutoff.expand(values.shape[0], 1))
     values = values.masked_fill(values < threshold, -torch.inf)
-    cumulative = values.softmax(-1).cumsum(-1)
-    remove = F.pad(cumulative[..., :-1] > top_p, (1, 0), value=False) & (top_p < 1)
+    probabilities = values.softmax(-1)
+    cumulative = probabilities.cumsum(-1)
+    # Use the same boundary and arithmetic as the eager sampler, including
+    # an exactly representable cumulative probability equal to top_p.
+    remove = (cumulative - probabilities >= top_p) & (top_p < 1)
     values = values.masked_fill(remove, -torch.inf)
     # Argmax of p / Exp(1) is the single-sample multinomial algorithm.
     selected = (values.softmax(-1) / noise.gather(-1, indices)).argmax(-1, keepdim=True)

@@ -20,7 +20,7 @@ BREEZE_TTS_PIPELINE = PipelineConfig(
             async_chunk_process_next_stage_input_func=(
                 "vllm_omni.model_executor.stage_input_processors.breeze_tts.talker2code2wav_async_chunk"
             ),
-            sampling_constraints={"detokenize": False, "stop_token_ids": [2051]},
+            sampling_constraints={"detokenize": False, "stop_token_ids": [2051], "ignore_eos": True, "min_tokens": 0},
         ),
         StagePipelineConfig(
             stage_id=1,
