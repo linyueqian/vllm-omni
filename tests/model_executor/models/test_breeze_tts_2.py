@@ -20,6 +20,7 @@ from vllm_omni.model_executor.models.breeze_tts_2.depth_decoder import (
     sample_graph_logits,
     sample_logits,
 )
+from vllm_omni.model_executor.models.breeze_tts_2.first_code_sampler import BreezeFirstCodeSampler
 from vllm_omni.model_executor.models.breeze_tts_2.modeling_breeze import BreezeForConditionalGeneration
 from vllm_omni.model_executor.models.breeze_tts_2.prompt import CFG_UNCOND_SUFFIX, build_breeze_prompt
 from vllm_omni.model_executor.models.breeze_tts_2.reference_encoder import BreezeReferenceConv
@@ -290,6 +291,7 @@ class DepthStub:
 def _small_talker():
     model = BreezeForConditionalGeneration.__new__(BreezeForConditionalGeneration)
     torch.nn.Module.__init__(model)
+    model._first_code_sampler = BreezeFirstCodeSampler()
     model.config = TalkerConfig(vocab_size=8, eos_token_id=7)
     model.num_codebooks, model.codebook_size, model.hidden_size = 3, 4, 2
     model.lm_head = torch.nn.Linear(2, 8, bias=False)
@@ -391,6 +393,10 @@ def test_talker_mixed_eos_and_cfg_matches_independent_request_state(temperature)
         infos = {request_id: _request_info(request_id) for request_id in order}
         for index, (request_id, info) in enumerate(infos.items()):
             info["breeze_sampling"].update(temperature=temperature, top_k=1)
+            if "cfg" not in request_id:
+                # Interleave distinct sampler groups while each request still
+                # matches its independently decoded state and RNG trajectory.
+                info["breeze_sampling"].update(temperature=temperature * 0.5, top_p=0.8)
             info["breeze_state"]["generator"].manual_seed(42 + index)
             info["breeze_state"]["history"] = torch.tensor([[3, 3]])
             if "cfg" in request_id:
@@ -413,6 +419,7 @@ def test_talker_mixed_eos_and_cfg_matches_independent_request_state(temperature)
     batched.depth_decoder.generate_frames.side_effect = sample_depth
     independent.depth_decoder.generate_frames.side_effect = sample_depth
     batch_infos, independent_infos = make_infos(), make_infos()
+    initial_rng = {rid: info["breeze_state"]["generator"].get_state() for rid, info in batch_infos.items()}
     saved_frames = []
     # The second step drops both EOS requests and moves the live CFG companion
     # ahead of its parent, exercising shrinking and reordered batches.
@@ -450,6 +457,24 @@ def test_talker_mixed_eos_and_cfg_matches_independent_request_state(temperature)
             for key in ("history", "current"):
                 torch.testing.assert_close(actual[key], expected[key], atol=0, rtol=0)
             torch.testing.assert_close(actual["generator"].get_state(), expected["generator"].get_state())
+
+    # Unconditional companions never own sampling; an EOS request consumes
+    # only codebook-0 sampling, with no downstream depth draws.
+    for rid in (finished_companion, live_companion):
+        torch.testing.assert_close(batch_infos[rid]["breeze_state"]["generator"].get_state(), initial_rng[rid])
+    for rid in ("finished_cfg", "finished_plain"):
+        reference_generator = torch.Generator().set_state(initial_rng[rid])
+        sampling = batch_infos[rid]["breeze_sampling"]
+        sample_logits(
+            torch.zeros(1, batched.config.vocab_size),
+            sampling["temperature"],
+            sampling["top_k"],
+            sampling["top_p"],
+            reference_generator,
+        )
+        torch.testing.assert_close(
+            batch_infos[rid]["breeze_state"]["generator"].get_state(), reference_generator.get_state()
+        )
 
     for rid in ("finished_cfg", finished_companion, "finished_plain", live_companion):
         assert batch_infos[rid]["breeze_state"]["history"].tolist() == [[3, 3]]

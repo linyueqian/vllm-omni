@@ -297,7 +297,14 @@ class BreezeDepthDecoder(nn.Module):
         if entry.guidance_scale is not None and entry.guidance_value != guidance_scale:
             entry.guidance_scale.fill_(guidance_scale)
             entry.guidance_value = guidance_scale
-        if temperature > 0:
+        if entry.noise_generators is not None:
+            # Graphs retain placeholder generator states. Copy each live
+            # request's seed and post-codebook-0 offset into its current row;
+            # replacing a generator state would invalidate the captured RNG.
+            for placeholder, generator in zip(entry.noise_generators, generators):
+                placeholder.manual_seed(generator.initial_seed())
+                placeholder.set_offset(generator.get_offset())
+        elif temperature > 0:
             assert entry.noise is not None
             for row, generator in enumerate(generators):
                 # Match the 15 independent exponential draws used by
@@ -306,6 +313,11 @@ class BreezeDepthDecoder(nn.Module):
                 for codebook in range(self.num_codebooks - 1):
                     entry.noise[row, codebook].exponential_(generator=generator)
         entry.graph.replay()
+        if entry.noise_generators is not None:
+            # Replay advances host offsets without synchronizing the device.
+            # Padded rows have no request state to update.
+            for placeholder, generator in zip(entry.noise_generators, generators):
+                generator.set_offset(placeholder.get_offset())
         # The tiny RVQ result outlives this replay in request state and the
         # transfer queue. The graph owns and overwrites its output workspace.
         return entry.output[:requests].clone()
@@ -332,6 +344,11 @@ class BreezeDepthGraph:
             if self.greedy
             else hidden.new_ones((first.shape[0], model.num_codebooks - 1, model.vocab_size), dtype=torch.float32)
         )
+        self.noise_generators: list[torch.Generator] | None = None
+        if not self.greedy and current_platform.is_cuda() and hasattr(torch.cuda.CUDAGraph, "register_generator_state"):
+            self.noise_generators = [torch.Generator(device=hidden.device) for _ in range(first.shape[0])]
+            # Materialize the distribution kernel before graph capture.
+            self._fill_noise()
         # Captured kernels retain addresses, not the Python tensors allocated
         # before capture. Keep every KV allocation alive with its graph.
         self.caches = model._allocate_cache(hidden)
@@ -350,9 +367,14 @@ class BreezeDepthGraph:
             )
         current_omni_platform.synchronize()
         self.graph = torch.cuda.CUDAGraph()
+        if self.noise_generators is not None:
+            for generator in self.noise_generators:
+                self.graph.register_generator_state(generator)
         with torch.cuda.graph(
             self.graph, pool=current_platform.get_global_graph_pool(), capture_error_mode="thread_local"
         ):
+            if self.noise_generators is not None:
+                self._fill_noise()
             self.output = model._generate_frame(
                 self.hidden,
                 self.first,
@@ -364,3 +386,11 @@ class BreezeDepthGraph:
                 self.parameters,
                 greedy=self.greedy,
             )
+
+    def _fill_noise(self) -> None:
+        assert self.noise is not None and self.noise_generators is not None
+        for row, generator in enumerate(self.noise_generators):
+            # Preserve the shape and ordering of independent multinomial
+            # draws; one larger draw would consume a different RNG stream.
+            for codebook in range(self.noise.shape[1]):
+                self.noise[row, codebook].exponential_(generator=generator)

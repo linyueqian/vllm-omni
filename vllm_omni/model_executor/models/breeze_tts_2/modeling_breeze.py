@@ -18,7 +18,8 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.model_executor.models.breeze_tts_2.configuration_breeze import BreezeConfig
-from vllm_omni.model_executor.models.breeze_tts_2.depth_decoder import BreezeDepthDecoder, sample_logits
+from vllm_omni.model_executor.models.breeze_tts_2.depth_decoder import BreezeDepthDecoder
+from vllm_omni.model_executor.models.breeze_tts_2.first_code_sampler import BreezeFirstCodeSampler
 from vllm_omni.model_executor.models.breeze_tts_2.prompt import CFG_UNCOND_SUFFIX
 from vllm_omni.model_executor.models.breeze_tts_2.reference_encoder import BreezeReferenceEncoder
 from vllm_omni.model_executor.models.breeze_tts_2.text_encoder_graph import (
@@ -83,6 +84,7 @@ class BreezeForConditionalGeneration(nn.Module):
         self._long_text_encoder = BreezeTextEncoderCompiled(self.text_encoder, self.text_encoder_proj)
         self.reference_encoder = BreezeReferenceEncoder(vllm_config)
         self.depth_decoder = BreezeDepthDecoder(self.config.depth_decoder_config)
+        self._first_code_sampler = BreezeFirstCodeSampler()
         self.lm_head = nn.Linear(self.hidden_size, self.config.vocab_size, bias=False, dtype=torch.float32)
         self.register_buffer(
             "offsets", torch.arange(self.num_codebooks) * self.config.audio_vocab_size, persistent=False
@@ -272,7 +274,7 @@ class BreezeForConditionalGeneration(nn.Module):
         ]
         infos = model_intermediate_buffer
         request_rows = {cast(list[str], info["global_request_id"])[0]: index for index, info in enumerate(infos)}
-        sampled_rows: list[tuple[list[int], torch.Tensor, torch.Tensor, tuple[float, int, float, float]]] = []
+        prepared_rows: list[tuple[list[int], torch.Tensor, torch.Tensor, tuple[float, int, float, float]]] = []
         for index, (info, (start, end)) in enumerate(zip(infos, request_token_spans, strict=True)):
             if not 0 <= start < end <= model_outputs.shape[0]:
                 raise RuntimeError("Invalid Breeze request span")
@@ -307,15 +309,33 @@ class BreezeForConditionalGeneration(nn.Module):
                 selected = logits.gather(1, history)
                 penalty = sampling["repetition_penalty"]
                 logits.scatter_(1, history, torch.where(selected < 0, selected * penalty, selected / penalty))
-            first = sample_logits(
-                logits, sampling["temperature"], sampling["top_k"], sampling["top_p"], state["generator"]
-            )
             parameters = (sampling["temperature"], sampling["top_k"], sampling["top_p"], guidance_scale)
-            sampled_rows.append((indices, hidden, first, parameters))
+            prepared_rows.append((indices, hidden, logits, parameters))
 
-        # Queue every codebook-0 sample before one batch readback decides EOS.
-        # Sampling retains request order; history writes consume no RNG, and
-        # depth draws still follow all codebook-0 draws in the same group order.
+        generators = [cast(BreezeState, infos[row[0][0]]["breeze_state"])["generator"] for row in prepared_rows]
+        sampling_groups: dict[tuple[float, int, float], list[int]] = {}
+        for position, (_, _, _, (temperature, top_k, top_p, _)) in enumerate(prepared_rows):
+            sampling_groups.setdefault((temperature, top_k, top_p), []).append(position)
+        positions_by_group = list(sampling_groups.values())
+        if len({id(generator) for generator in generators}) != len(generators):
+            # Normally each request owns a generator. Preserve sequential draw
+            # ordering even if callers supply shared state across parameter groups.
+            positions_by_group = [[position] for position in range(len(prepared_rows))]
+        first_codes: dict[int, torch.Tensor] = {}
+        for positions in positions_by_group:
+            temperature, top_k, top_p, _ = prepared_rows[positions[0]][3]
+            first = self._first_code_sampler.sample(
+                [prepared_rows[position][2] for position in positions],
+                (temperature, top_k, top_p),
+                [generators[position] for position in positions],
+            )
+            first_codes.update(zip(positions, first, strict=True))
+        sampled_rows = [
+            (indices, hidden, first_codes[position], parameters)
+            for position, (indices, hidden, _, parameters) in enumerate(prepared_rows)
+        ]
+        # Read back EOS once after all first-code samples. Restore request order
+        # before grouping depth work so its RNG and CFG ordering stay unchanged.
         first_ids = torch.cat([row[2] for row in sampled_rows]).to("cpu").tolist() if sampled_rows else []
         groups: dict[tuple[float, int, float, float], list[tuple[list[int], torch.Tensor, torch.Tensor]]] = {}
         for (indices, hidden, first, parameters), first_id in zip(sampled_rows, first_ids, strict=True):
