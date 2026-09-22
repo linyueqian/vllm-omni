@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.model_executor.models.test_breeze_tts_2 import _request_info, _small_talker
+from tests.model_executor.models.breeze_tts_2_helpers import _request_info, _small_talker
 from vllm_omni.model_executor.models.breeze_tts_2.depth_decoder import sample_logits
 from vllm_omni.model_executor.models.breeze_tts_2.prompt import CFG_UNCOND_SUFFIX
 

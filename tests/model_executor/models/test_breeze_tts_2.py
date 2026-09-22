@@ -3,8 +3,6 @@
 """Check depth attention against HF Llama and request-local sampling state."""
 
 from collections import defaultdict
-from dataclasses import dataclass
-from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -14,14 +12,13 @@ from transformers import LlamaConfig, MimiConfig
 from transformers.models.llama.modeling_llama import LlamaModel
 from transformers.models.mimi.modeling_mimi import MimiConv1d
 
+from tests.model_executor.models.breeze_tts_2_helpers import _request_info, _small_talker
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.model_executor.models.breeze_tts_2.depth_decoder import (
     BreezeDepthDecoder,
     sample_graph_logits,
     sample_logits,
 )
-from vllm_omni.model_executor.models.breeze_tts_2.first_code_sampler import BreezeFirstCodeSampler
-from vllm_omni.model_executor.models.breeze_tts_2.modeling_breeze import BreezeForConditionalGeneration
 from vllm_omni.model_executor.models.breeze_tts_2.prompt import CFG_UNCOND_SUFFIX, build_breeze_prompt
 from vllm_omni.model_executor.models.breeze_tts_2.reference_encoder import BreezeReferenceConv
 from vllm_omni.model_executor.stage_input_processors.breeze_tts_2 import expand_cfg_prompts, talker2code2wav_async_chunk
@@ -275,49 +272,6 @@ def test_codec_chunk_ramp_keeps_frame_order_and_flushes_partial_tail(mocker) -> 
     assert [len(part) for part in outputs] == [1, 2, 4, 5, 3]
     torch.testing.assert_close(torch.cat(outputs), torch.arange(15)[:, None].expand(-1, 16))
     assert tail.meta.finished.item()
-
-
-@dataclass
-class TalkerConfig:
-    vocab_size: int
-    eos_token_id: int
-
-
-@dataclass
-class DepthStub:
-    generate_frames: Mock
-
-
-def _small_talker():
-    model = BreezeForConditionalGeneration.__new__(BreezeForConditionalGeneration)
-    torch.nn.Module.__init__(model)
-    model._first_code_sampler = BreezeFirstCodeSampler()
-    model.config = TalkerConfig(vocab_size=8, eos_token_id=7)
-    model.num_codebooks, model.codebook_size, model.hidden_size = 3, 4, 2
-    model.lm_head = torch.nn.Linear(2, 8, bias=False)
-    with torch.no_grad():
-        model.lm_head.weight.zero_()
-        model.lm_head.weight[1] = torch.tensor([10.0, 0.0])
-        model.lm_head.weight[2] = torch.tensor([9.5, 0.0])
-        model.lm_head.weight[3] = torch.tensor([0.0, 10.0])
-        model.lm_head.weight[7] = torch.tensor([-10.0, -10.0])
-    model.depth_decoder = DepthStub(
-        generate_frames=Mock(side_effect=lambda hidden, first, **kwargs: first[:, None].repeat(1, 3))
-    )
-    return model
-
-
-def _request_info(request_id):
-    return {
-        "global_request_id": [request_id],
-        "breeze_prompt": {"role": "cond", "guidance_scale": 1.0},
-        "breeze_sampling": {"temperature": 0.0, "top_k": 0, "top_p": 1.0, "repetition_penalty": 1.1},
-        "breeze_state": {
-            "generator": torch.Generator().manual_seed(42),
-            "history": torch.empty(1, 0, dtype=torch.long),
-            "current": torch.zeros(1, 3, dtype=torch.long),
-        },
-    }
 
 
 @torch.inference_mode()

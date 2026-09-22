@@ -24,6 +24,13 @@ def sample_logits(
     generator: torch.Generator,
     noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Sample using scalar parameters, optionally with pre-drawn noise.
+
+    Keep the filtering contract aligned with ``sample_graph_logits``: scale
+    in FP32, retain top-k ties, and remove nucleus candidates only when the
+    cumulative mass before them is >= top_p. Temperature zero selects argmax
+    without drawing RNG. The parity tests cover ties and exact boundaries.
+    """
     if temperature == 0:
         return logits.argmax(-1)
     scores = logits.float() / temperature
@@ -50,6 +57,12 @@ def sample_graph_logits(logits: torch.Tensor, parameters: torch.Tensor, noise: t
     Filtering keeps ties at the top-k threshold, and keeps the first token
     crossing the nucleus boundary. The three reserved codec IDs remain in
     the RNG workspace, with zero probability, as in the reference sampler.
+
+    Replay can change parameters, so selection uses tensor operations rather
+    than ``sample_logits``' Python branches on scalar parameters. Keep their
+    FP32 scaling and top-k/top-p boundaries aligned without sharing that
+    control flow. This path consumes supplied noise; its caller owns RNG
+    advancement and must avoid advancing request RNG for greedy decoding.
     """
     temperature, top_k, top_p = parameters.unbind()
     scaled = logits.float() / torch.where(temperature > 0, temperature, 1.0)
