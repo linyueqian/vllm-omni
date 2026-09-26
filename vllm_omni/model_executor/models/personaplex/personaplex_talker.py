@@ -437,6 +437,29 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         self._personaplex_duplex_stage0_runtime = runtime
         return runtime
 
+    def preprocess_batch(
+        self,
+        *,
+        req_ids: list[str],
+        model_intermediate_buffer: dict[str, dict[str, Any]],
+        device: torch.device,
+    ) -> None:
+        """Encode every live duplex append of this step in one shared-encoder call."""
+        del device
+        appends: list[dict[str, Any]] = []
+        for req_id in req_ids:
+            info = model_intermediate_buffer.get(req_id)
+            if not isinstance(info, dict):
+                continue
+            duplex = info.get("duplex")
+            if not isinstance(duplex, dict):
+                additional = info.get("additional_information")
+                duplex = additional.get("duplex") if isinstance(additional, dict) else None
+            if isinstance(duplex, dict) and duplex.get("data_plane") is True:
+                appends.append(duplex)
+        if appends:
+            self._duplex_stage0_runtime().encode_appends(appends)
+
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         runtime = getattr(self, "_personaplex_duplex_stage0_runtime", None)
         if runtime is None:
