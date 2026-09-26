@@ -172,12 +172,28 @@ class PersonaPlexStage0DuplexRuntime:
         streaming state advances exactly once per frame. Appends that cannot be
         admitted are left for ``prepare_append`` to reject.
         """
-        rows: list[tuple[PersonaPlexStage0SessionState, tuple[int, int], np.ndarray]] = []
+        parsed: list[tuple[str, int, int, dict[str, Any]]] = []
         for duplex in appends:
             try:
-                session_id, epoch, seq = _append_identity(duplex)
+                parsed.append((*_append_identity(duplex), duplex))
+            except ValueError:
+                continue
+        # A cancel can put a session's aborted epoch and its restarted epoch in
+        # one step. Only the newest epoch is live: admitting it closes the old
+        # one, so the old append must neither be encoded nor re-leased.
+        newest: dict[str, int] = {}
+        for session_id, epoch, _, _ in parsed:
+            newest[session_id] = max(epoch, newest.get(session_id, epoch))
+        for session_id, epoch in self.sessions:
+            if session_id in newest:
+                newest[session_id] = max(epoch, newest[session_id])
+        rows: list[tuple[PersonaPlexStage0SessionState, tuple[int, int], np.ndarray]] = []
+        for session_id, epoch, seq, duplex in parsed:
+            if epoch != newest[session_id]:
+                continue
+            try:
                 state = self._session_state(session_id, epoch)
-            except (RuntimeError, ValueError):
+            except RuntimeError:
                 continue
             identity = (epoch, seq)
             if identity in (state.prepared_identity, state.encoded_identity) or seq <= state.last_seq:

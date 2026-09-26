@@ -406,3 +406,19 @@ def test_encode_appends_leaves_over_capacity_appends_to_prepare_append() -> None
     assert list(runtime.sessions) == [("session", 0)]
     with pytest.raises(RuntimeError, match="capacity 1"):
         runtime.prepare_append(_duplex_info(seq=1, session_id="other"), prompt_len=18)
+
+
+@pytest.mark.parametrize("old_first", [True, False])
+def test_encode_appends_ignores_the_aborted_epoch_in_a_cancel_overlap(old_first: bool) -> None:
+    codec = _FakeCodec()
+    runtime = _runtime(codec, max_sessions=2)
+    runtime.prepare_append(_duplex_info(seq=1), prompt_len=18, request_id="req-e0")
+    runtime.prepare_append(_duplex_info(seq=2), prompt_len=19, request_id="req-e0")
+
+    old, new = _duplex_info(seq=3), _duplex_info(seq=1, epoch=1)
+    runtime.encode_appends([old, new] if old_first else [new, old])
+    restarted = runtime.prepare_append(new, prompt_len=18, request_id="req-e1")
+
+    assert list(runtime.sessions) == [("session", 1)]
+    assert restarted.user_codes[:, 0].tolist() == [1]
+    assert codec.encode_calls == 3
