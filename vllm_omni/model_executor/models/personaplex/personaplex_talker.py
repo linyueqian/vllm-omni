@@ -173,7 +173,9 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         if not audio_codes_list:
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
         audio_codes = torch.cat(audio_codes_list, dim=0)
-        hidden = hidden[: int(audio_codes.shape[0])]
+        # Keep every token row: the runner indexes this tensor with token-space
+        # logits indices, and a step can mix a new session's multi-row prefill
+        # with one-row live appends, so the audio row count is not the token count.
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs={"codes": {"audio": audio_codes}})
 
     # ------------------------------------------------------------------
