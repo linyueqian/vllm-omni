@@ -528,6 +528,7 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
                 device=hidden.device,
                 dtype=torch.bool,
             ),
+            num_steps=self.num_active_codebooks,
         ).to(torch.long)
         runtime = self._duplex_stage0_runtime()
         for row, request_id in enumerate(req_ids):
