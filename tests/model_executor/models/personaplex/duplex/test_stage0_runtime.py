@@ -13,8 +13,10 @@ from vllm_omni.model_executor.models.personaplex.duplex.policy import (
     SINE_TOKENS,
 )
 from vllm_omni.model_executor.models.personaplex.duplex.stage0 import (
+    PersonaPlexStage0CapacityError,
     PersonaPlexStage0DuplexRuntime,
     PersonaPlexStage0PreparedAppend,
+    PersonaPlexStage0StaleEpochError,
 )
 from vllm_omni.model_executor.models.personaplex.personaplex_talker import (
     PersonaPlexTalkerForConditionalGeneration,
@@ -408,17 +410,101 @@ def test_encode_appends_leaves_over_capacity_appends_to_prepare_append() -> None
         runtime.prepare_append(_duplex_info(seq=1, session_id="other"), prompt_len=18)
 
 
-@pytest.mark.parametrize("old_first", [True, False])
-def test_encode_appends_ignores_the_aborted_epoch_in_a_cancel_overlap(old_first: bool) -> None:
-    codec = _FakeCodec()
-    runtime = _runtime(codec, max_sessions=2)
+def _restart_overlap(runtime: PersonaPlexStage0DuplexRuntime) -> tuple[dict, dict]:
+    """Epoch 0 of a session is live, then a cancel restarts it as epoch 1 while
+    epoch 0's aborted request still has an append in the same scheduler step."""
     runtime.prepare_append(_duplex_info(seq=1), prompt_len=18, request_id="req-e0")
     runtime.prepare_append(_duplex_info(seq=2), prompt_len=19, request_id="req-e0")
+    return _duplex_info(seq=3), _duplex_info(seq=1, epoch=1)
 
-    old, new = _duplex_info(seq=3), _duplex_info(seq=1, epoch=1)
-    runtime.encode_appends([old, new] if old_first else [new, old])
-    restarted = runtime.prepare_append(new, prompt_len=18, request_id="req-e1")
+
+@pytest.mark.parametrize("max_sessions", [1, 2])
+@pytest.mark.parametrize("encode_old_first", [True, False])
+@pytest.mark.parametrize("prepare_old_first", [True, False])
+def test_cancel_overlap_full_processing_order_never_re_leases_the_aborted_epoch(
+    max_sessions: int, encode_old_first: bool, prepare_old_first: bool
+) -> None:
+    codec = _FakeCodec()
+    runtime = _runtime(codec, max_sessions=max_sessions)
+    old, new = _restart_overlap(runtime)
+
+    # One scheduler step: batched encode, then per-request prepare, then sampling.
+    runtime.encode_appends([old, new] if encode_old_first else [new, old])
+    order = [("req-e0", old, 19), ("req-e1", new, 18)]
+    restarted = None
+    for request_id, duplex, prompt_len in order if prepare_old_first else order[::-1]:
+        if request_id == "req-e0":
+            with pytest.raises(PersonaPlexStage0StaleEpochError):
+                runtime.prepare_append(duplex, prompt_len=prompt_len, request_id=request_id)
+        else:
+            restarted = runtime.prepare_append(duplex, prompt_len=prompt_len, request_id=request_id)
+    for request_id in ("req-e0", "req-e1"):
+        runtime.record_sample(request_id=request_id, text_token=5, agent_codes=list(range(8)))
+    runtime.close_request("req-e0")  # the engine's late finish of the aborted request
 
     assert list(runtime.sessions) == [("session", 1)]
-    assert restarted.user_codes[:, 0].tolist() == [1]
+    assert len(runtime._free_slots) == max_sessions - 1
+    assert restarted is not None and restarted.user_codes[:, 0].tolist() == [1]
     assert codec.encode_calls == 3
+    assert runtime.sessions[("session", 1)].sampled_identity == (1, 1)
+
+
+def test_codec_init_failure_propagates_after_one_attempt() -> None:
+    attempts = 0
+
+    def failing_codec():
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("CUDA out of memory while building the Mimi encoder")
+
+    runtime = PersonaPlexStage0DuplexRuntime(
+        _FakeTalker(),
+        model_path="/unused",
+        device="cpu",
+        codec_factory=failing_codec,
+        max_sessions=16,
+        tokenizer=lambda _text: [7, 8, 9],
+        voice_loader=lambda _voice: {},
+    )
+    appends = [_duplex_info(seq=1, session_id=f"s{i}") for i in range(16)]
+
+    with pytest.raises(RuntimeError, match="out of memory"):
+        runtime.encode_appends(appends)
+    assert attempts == 1
+    assert not runtime.sessions
+
+
+def test_capacity_error_is_a_dedicated_exception() -> None:
+    runtime = _runtime(_FakeCodec(), max_sessions=1)
+    runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
+
+    with pytest.raises(PersonaPlexStage0CapacityError, match="capacity 1"):
+        runtime.prepare_append(_duplex_info(seq=1, session_id="other"), prompt_len=18)
+
+
+def test_talker_gives_the_aborted_epoch_a_neutral_row_in_the_same_step() -> None:
+    codec = _FakeCodec()
+    runtime = _runtime(codec, max_sessions=1)
+    old, new = _restart_overlap(runtime)
+    talker = PersonaPlexTalkerForConditionalGeneration.__new__(PersonaPlexTalkerForConditionalGeneration)
+    torch.nn.Module.__init__(talker)
+    talker._personaplex_duplex_stage0_runtime = runtime
+    talker._dtype = torch.float32
+    talker.mtp_hidden_size = 4
+
+    infos = {
+        "req-e0": {"duplex": old, "request_id": "req-e0", "duplex_prompt_len": 19, "duplex_token_offset": 0},
+        "req-e1": {"duplex": new, "request_id": "req-e1", "duplex_prompt_len": 18, "duplex_token_offset": 0},
+    }
+    talker.preprocess_batch(req_ids=list(infos), model_intermediate_buffer=infos, device=torch.device("cpu"))
+    outs = {
+        req: talker.preprocess(torch.zeros(1, dtype=torch.long), None, _omni_is_prefill=True, **info)
+        for req, info in infos.items()
+    }
+
+    _, stale_embeds, stale_info = outs["req-e0"]
+    assert stale_info["duplex"] == {"stage0_stale": True}
+    assert torch.count_nonzero(stale_embeds) == 0
+    assert stale_info["pplex_depformer_audio_tokens"].numel() == 16
+    assert outs["req-e1"][2]["duplex"]["epoch"] == 1
+    assert list(runtime.sessions) == [("session", 1)]

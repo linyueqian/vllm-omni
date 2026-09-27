@@ -325,11 +325,18 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
                 prompt_len = int(prompt_len_raw)
             except (TypeError, ValueError):
                 prompt_len = span
-            prepared = self._duplex_stage0_runtime().prepare_append(
-                duplex,
-                prompt_len=prompt_len,
-                request_id=(str(info_dict["request_id"]) if isinstance(info_dict.get("request_id"), str) else None),
+            from vllm_omni.model_executor.models.personaplex.duplex.stage0 import (
+                PersonaPlexStage0StaleEpochError,
             )
+
+            try:
+                prepared = self._duplex_stage0_runtime().prepare_append(
+                    duplex,
+                    prompt_len=prompt_len,
+                    request_id=(str(info_dict["request_id"]) if isinstance(info_dict.get("request_id"), str) else None),
+                )
+            except PersonaPlexStage0StaleEpochError:
+                return self._stale_append_passthrough(input_ids, span)
             offset_raw = info_dict.get("duplex_token_offset", 0)
             try:
                 offset = max(0, int(offset_raw))
@@ -436,6 +443,29 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         )
         self._personaplex_duplex_stage0_runtime = runtime
         return runtime
+
+    def _stale_append_passthrough(
+        self, input_ids: torch.Tensor, span: int
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Neutral inputs for a request of a superseded epoch that is still in this step.
+
+        The engine already aborted it and discards its output; it only has to keep
+        the batch shapes valid without touching the live session's encoder row.
+        """
+        from vllm_omni.model_executor.models.personaplex.duplex.policy import SILENCE_TOKENS
+
+        device = input_ids.device
+        silence = torch.tensor(SILENCE_TOKENS, dtype=torch.long)
+        embeds = torch.zeros((span, self.mtp_hidden_size), device=device, dtype=self._dtype)
+        return (
+            input_ids,
+            embeds,
+            {
+                "pplex_depformer_audio_tokens": torch.cat([silence, silence]),
+                "pplex_depformer_audio_provided": torch.zeros(2 * silence.numel(), dtype=torch.bool),
+                "duplex": {"stage0_stale": True},
+            },
+        )
 
     def preprocess_batch(
         self,

@@ -27,6 +27,14 @@ from vllm_omni.model_executor.models.personaplex.duplex.policy import (
 _FRAME_SAMPLES = FRAME_SIZE
 
 
+class PersonaPlexStage0CapacityError(RuntimeError):
+    """Every streaming encoder row is leased by a live session."""
+
+
+class PersonaPlexStage0StaleEpochError(RuntimeError):
+    """The append belongs to an epoch that a newer epoch of the same session has superseded."""
+
+
 @dataclass(slots=True)
 class PersonaPlexStage0PreparedAppend:
     input_ids: Any
@@ -159,6 +167,9 @@ class PersonaPlexStage0DuplexRuntime:
         self._voice_loader = voice_loader
         self.sessions: dict[tuple[str, int], PersonaPlexStage0SessionState] = {}
         self.request_sessions: dict[str, tuple[str, int]] = {}
+        # Requests of a superseded epoch that still reached this step; they are
+        # finished by the engine and must not lease a row or record a sample.
+        self._stale_requests: set[str] = set()
         if codec is not None:
             codec.streaming_init(max_sessions)
             self._codec = codec
@@ -193,7 +204,9 @@ class PersonaPlexStage0DuplexRuntime:
                 continue
             try:
                 state = self._session_state(session_id, epoch)
-            except RuntimeError:
+            except PersonaPlexStage0CapacityError:
+                # Left for prepare_append to reject. Any other error (e.g. the
+                # shared codec failing to initialize) propagates immediately.
                 continue
             identity = (epoch, seq)
             if identity in (state.prepared_identity, state.encoded_identity) or seq <= state.last_seq:
@@ -216,7 +229,12 @@ class PersonaPlexStage0DuplexRuntime:
         session_id, epoch, seq = _append_identity(duplex)
         identity = (epoch, seq)
         key = (session_id, epoch)
-        state = self._session_state(session_id, epoch)
+        try:
+            state = self._session_state(session_id, epoch)
+        except PersonaPlexStage0StaleEpochError:
+            if request_id:
+                self._stale_requests.add(request_id)
+            raise
         if request_id:
             state.request_ids.add(request_id)
             self.request_sessions[request_id] = key
@@ -366,6 +384,8 @@ class PersonaPlexStage0DuplexRuntime:
         """Commit one sampled temporal frame for the next live append."""
         import torch
 
+        if request_id in self._stale_requests:
+            return
         key = self.request_sessions.get(request_id)
         if key is None:
             raise KeyError(f"PersonaPlex Stage 0 request is not attached to a live session: {request_id}")
@@ -400,6 +420,7 @@ class PersonaPlexStage0DuplexRuntime:
         state.sampled_identity = state.prepared_identity
 
     def close_request(self, request_id: str) -> None:
+        self._stale_requests.discard(request_id)
         key = self.request_sessions.pop(request_id, None)
         if key is None:
             return
@@ -431,10 +452,20 @@ class PersonaPlexStage0DuplexRuntime:
         # engine aborted that request, but its finish notification may still
         # be in flight, so release it here rather than let the two epochs share
         # the encoder budget.
+        # The reverse also holds: once a newer epoch is live, an append of an
+        # older epoch is a leftover of the aborted request and must not re-lease
+        # a row (at capacity it would fail the whole step).
+        newer = [k[1] for k in self.sessions if k[0] == session_id and k[1] > epoch]
+        if newer:
+            raise PersonaPlexStage0StaleEpochError(
+                f"PersonaPlex Stage 0 epoch {epoch} of session {session_id} is superseded by epoch {max(newer)}"
+            )
         for stale_key in [k for k in self.sessions if k[0] == session_id and k[1] < epoch]:
             self.close_session(*stale_key)
         if len(self.sessions) >= self.max_sessions or not self._free_slots:
-            raise RuntimeError(f"PersonaPlex Stage 0 session capacity {self.max_sessions} is exhausted")
+            raise PersonaPlexStage0CapacityError(
+                f"PersonaPlex Stage 0 session capacity {self.max_sessions} is exhausted"
+            )
         self._shared_codec()
         state = PersonaPlexStage0SessionState(session_id=session_id, epoch=epoch, slot=self._free_slots.pop())
         self.sessions[key] = state
