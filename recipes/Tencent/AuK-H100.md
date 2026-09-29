@@ -12,7 +12,7 @@
   both with `Qwen/Qwen2.5-Omni-3B` as the frozen encoder
 - Task: zero-shot TTS, instruct TTS, content and acoustic editing,
   paralinguistic editing, speech enhancement, speaker and music separation
-- Mode: offline inference (online chat serving is not yet qualified)
+- Mode: offline inference and online `/v1/audio/speech` (online chat serving is not yet qualified)
 - Hardware: 1x H100 80GB
 - Maintainer: Community
 
@@ -130,10 +130,16 @@ Measured on one H100 against the upstream implementation with the same seeds
 and mean VAE latents (four cookbook cases, base checkpoint): identical
 transcripts, speaker similarity to the upstream output 0.993 to 0.999, log-mel
 L1 0.11 to 0.47 (the upstream VAE-resampling noise floor is 0.39). Flash:
-0.989 to 0.999 and 0.24 to 0.51. Wall per request on the second call: base
-1.0 to 2.0 s for 3.5 to 10.9 s of audio, Flash 0.17 to 0.30 s; engine start
-about 47 s with a warm page cache, plus the codec decode compile on the
-diffusion stage (about a minute on a cold Inductor cache, ~30 s warm).
+0.989 to 0.999 and 0.24 to 0.51.
+
+Latency with the DiT and codec CUDA graphs, measured end to end on one
+H200-class GPU with both stages on it, concurrency 1, median of 10 warm
+requests: base (32 steps, CFG 2) zero-shot 0.25 / 0.31 / 0.40 s for 3 / 6 /
+12 s of audio, instruct TTS 0.17 / 0.23 / 0.32 s; Flash zero-shot 0.08 /
+0.10 / 0.14 s. The first request after start is 1.2 to 1.6 s, because the
+common shapes are compiled at startup. Engine start adds the codec decode
+compile and the DiT warmup to model loading (a few minutes on a cold
+Inductor cache, about 30 s less warm).
 
 ## Notes
 
@@ -173,7 +179,7 @@ diffusion stage (about a minute on a cold Inductor cache, ~30 s warm).
 | --- | --- | --- |
 | Offline `Omni.generate` | supported (base and Flash) | `docs/getting_started/quickstart.md` |
 | Online `/v1/chat/completions` with audio | not yet qualified | `docs/serving/` |
-| `/v1/audio/speech` | not supported (needs a TTS adapter) | `docs/contributing/model/adding_tts_model.md` |
+| `/v1/audio/speech` | supported (base and Flash, `instructions` or `task_type`) | `docs/user_guide/examples/online_serving/text_to_speech.md` |
 | Streaming / async chunk | not supported | `docs/design/feature/async_chunk.md` |
 | Batching across requests | one request per DiT forward | `docs/user_guide/diffusion/` |
 | Tensor / sequence parallelism | not supported | `docs/configuration/composable_parallel.md` |
