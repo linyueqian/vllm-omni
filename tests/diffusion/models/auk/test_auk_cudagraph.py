@@ -146,6 +146,7 @@ def test_bucket_padding_preserves_real_frame_outputs(cfg_strength: float) -> Non
     torch.testing.assert_close(padded[:, : x.shape[1]], eager)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
 @pytest.mark.parametrize("cfg_strength", [0.0, 2.0])
@@ -186,6 +187,7 @@ def test_single_request_graph_replay_matches_eager_and_updates_inputs(cfg_streng
     assert len(wrapper._cache) == 1
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
 def test_graph_capture_failure_is_propagated(mocker) -> None:

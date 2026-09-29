@@ -27,8 +27,11 @@ class AuKAdapter(ARTTSAdapter):
     """Translate Speech API fields into the existing AuK encoder/DiT prompt."""
 
     name = "auk"
-    stage_keys = frozenset({"encoder"})
+    # AuK's entry stage uses the generic ``model_stage="encoder"``, which other
+    # pipelines (MiniMax H3) also declare, so both stage discovery and
+    # model-type detection go through the architecture instead.
     model_archs = frozenset({"AuKForConditionalGeneration"})
+    arch_identifies_entry_stage = True
 
     def normalize(self, request: OpenAICreateSpeechRequest) -> None:
         if request.task_type is None:

@@ -125,7 +125,11 @@ def auk_adapter(mocker):
 
 def test_auk_adapter_detection(mocker):
     assert detect_tts_model_type("encoder", "AuKForConditionalGeneration") == "auk"
-    assert AuKAdapter.stage_keys == frozenset({"encoder"})
+    # ``encoder`` is shared with MiniMax H3, so AuK must not claim the stage key.
+    assert AuKAdapter.stage_keys == frozenset()
+    assert AuKAdapter.arch_identifies_entry_stage
+    assert detect_tts_model_type("encoder", "MiniMaxH3Encoder") is None
+    assert detect_tts_model_type("encoder", None) is None
 
     server = mocker.Mock(spec=OmniOpenAIServingSpeech)
     server._diffusion_mode = False
