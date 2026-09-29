@@ -23,6 +23,7 @@ from safetensors import safe_open
 from torch import nn
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer, dit_state_dict, sample_latents
@@ -218,20 +219,22 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
 
         Defining this hook replaces the runner's generic transformer compile,
         so the DiT's ``diffusion_compile_granularity`` is honoured here: full
-        compiles the whole transformer lazily, exactly as the runner would;
-        regional is a no-op because the DiT declares no repeated blocks. The
-        startup cost worth paying is the VAE decode, whose buckets are
-        compiled and captured before the first request.
+        compiles the whole denoise step;
+        regional compiles the double- and single-stream blocks. Compilation is
+        lazy and happens in the DiT CUDA graph's warm-up, before capture, so
+        each graph replays the compiled kernels. The startup cost worth paying
+        is the VAE decode, whose buckets are compiled and captured before the
+        first request.
         """
         granularity = self.od_config.diffusion_compile_granularity
+        dynamic = self.od_config.diffusion_compile_dynamic
         if granularity == "full":
-            self.dit.compile(dynamic=self.od_config.diffusion_compile_dynamic)
-            logger.info(
-                "AuK DiT configured for lazy full torch.compile with dynamic=%s",
-                self.od_config.diffusion_compile_dynamic,
-            )
+            # The samplers drive prepare() and step() directly rather than
+            # __call__, so the per-step body is what gets compiled.
+            self.dit.step = torch.compile(self.dit.step, dynamic=dynamic)
         else:
-            logger.info("AuK DiT declares no repeated blocks; regional torch.compile is a no-op, running eager")
+            regionally_compile(self.dit, dynamic=dynamic)
+        logger.info("AuK DiT configured for lazy %s torch.compile with dynamic=%s", granularity, dynamic)
         self.vae_decode.warmup(self.device)
 
     # The assembled checkpoint is not a diffusers layout: __init__ reads
