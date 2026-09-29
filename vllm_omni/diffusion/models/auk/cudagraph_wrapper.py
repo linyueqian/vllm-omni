@@ -41,8 +41,8 @@ class AuKCUDAGraphWrapper:
     copied into the graph's static context, so the replayed steps skip it.
     """
 
-    _TARGET_ALIGNMENT = 64
-    _TEXT_ALIGNMENT = 64
+    _TARGET_ALIGNMENT = 32
+    _TEXT_ALIGNMENT = 32
     _REF_ALIGNMENT = 50
 
     def __init__(self, dit: AuKTransformer, *, enabled: bool = True, max_graphs: int = 32) -> None:
