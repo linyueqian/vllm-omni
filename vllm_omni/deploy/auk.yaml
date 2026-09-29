@@ -44,7 +44,11 @@ stages:
     devices: "0"
     max_num_seqs: 1
     gpu_memory_utilization: 0.35
-    enforce_eager: true
+    enforce_eager: false
+    model_config:
+      # Maximum number of cached DiT graphs. When the cache reaches this limit,
+      # capturing a new shape retires all existing graphs before capture.
+      max_dit_graphs: 32
     default_sampling_params:
       seed: 0
       num_inference_steps: 32
