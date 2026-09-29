@@ -147,8 +147,11 @@ diffusion stage (about a minute on a cold Inductor cache, ~30 s warm).
   graphs at startup (128/256/512 latent frames, i.e. up to 10.24 s; longer
   clips are decoded in overlapping 512-frame tiles of the same graph;
   override with `model_config.auk_vae_compile_shapes` and
-  `auk_vae_tile_frames`). The DiT itself stays eager unless
-  `diffusion_compile_granularity: full`. `enable_prefix_caching` must stay off
+  `auk_vae_tile_frames`). Each DiT denoise step replays a per-shape CUDA
+  graph of the regionally compiled double- and single-stream blocks; the
+  per-request conditioning (text projection, reference embedding, padding
+  biases, rotary tables) is prepared once per request outside the graph.
+  `enable_prefix_caching` must stay off
   for the encoder: a cache hit skips prompt positions that the fused
   condition needs. `enable_chunked_prefill` is off by default: forcing it
   (128-token chunks, so two to three chunks per prompt) reproduces the
