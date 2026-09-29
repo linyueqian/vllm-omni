@@ -144,8 +144,9 @@ diffusion stage (about a minute on a cold Inductor cache, ~30 s warm).
 - Key flags: `enforce_eager` on the encoder stage (it walks the decoder
   layers itself for the layer fusion); the diffusion stage runs with
   `enforce_eager: false` so the codec decode is compiled into bucketed CUDA
-  graphs at startup (128/256/512 latent frames, i.e. up to 10.24 s; longer
-  clips are decoded in overlapping 512-frame tiles of the same graph;
+  graphs at startup (the deploy config sets 160/320/640 latent frames, i.e.
+  up to 12.8 s; longer clips are decoded in overlapping 640-frame tiles of
+  the same graph;
   override with `model_config.auk_vae_compile_shapes` and
   `auk_vae_tile_frames`). Each DiT denoise step replays a per-shape CUDA
   graph of the regionally compiled double- and single-stream blocks; the

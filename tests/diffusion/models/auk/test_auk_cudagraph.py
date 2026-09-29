@@ -77,14 +77,14 @@ def test_graph_inputs_use_bounded_length_buckets() -> None:
 
     padded = wrapper._bucket_inputs(x, text, c_mask, ref, ref_mask)
 
-    assert padded[0].shape == (1, 128, 4)
-    assert padded[1].shape == (1, 128)
-    assert padded[2].shape == (1, 128, 8)
-    assert padded[3].shape == (1, 128)
+    assert padded[0].shape == (1, 96, 4)
+    assert padded[1].shape == (1, 96)
+    assert padded[2].shape == (1, 96, 8)
+    assert padded[3].shape == (1, 96)
     assert padded[4].shape == (1, 100, 4)
     assert padded[5].shape == (1, 100)
     assert [mask.sum().item() for mask in (padded[1], padded[3], padded[5])] == [65, 65, 51]
-    assert wrapper._key(padded[0], padded[2], padded[4], False) == (128, 128, 100, False)
+    assert wrapper._key(padded[0], padded[2], padded[4], False) == (96, 96, 100, False)
     assert wrapper.max_graphs == 32
 
 
