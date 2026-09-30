@@ -206,18 +206,39 @@ def test_fused_activation_is_skipped_off_cuda() -> None:
     assert activation(x).shape == (1, 4, 16)
 
 
+def _activation_input(layout: str, length: int) -> torch.Tensor:
+    """A ``[2, 6, length]`` input, contiguous or as a strided view of a larger buffer."""
+    if layout == "contiguous":
+        x = torch.randn(2, 6, length, device="cuda")
+    elif layout == "transposed":
+        x = torch.randn(2, length, 6, device="cuda").transpose(1, 2)
+    elif layout == "sliced":
+        x = torch.randn(2, 8, 2 * length, device="cuda")[:, 1:7, ::2]
+    else:
+        raise ValueError(layout)
+    assert x.shape == (2, 6, length)
+    if length > 1:  # contiguity of a single-sample view depends on the layout
+        assert x.is_contiguous() == (layout == "contiguous")
+    return x * 3
+
+
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="The fused activation kernels require CUDA")
+@pytest.mark.parametrize("layout", ["contiguous", "transposed", "sliced"])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("length", [1, 7, 1000])
+# The kernels tile the output in blocks of 1024 samples: the 2x oversampled
+# signal crosses a block boundary at 512 input samples and the decimated one at
+# 1024, so both sides of each boundary are covered, plus short and odd lengths.
+@pytest.mark.parametrize("length", [1, 7, 511, 512, 513, 1000, 1023, 1024, 1025])
 @torch.inference_mode()
-def test_fused_activation_matches_the_eager_modules(causal: bool, length: int) -> None:
+def test_fused_activation_matches_the_eager_modules(layout: str, causal: bool, length: int) -> None:
     torch.manual_seed(0)
     activation = AliasFreeActivation(SnakeBeta(6, alpha_logscale=True), causal=causal).to("cuda")
     with torch.no_grad():
         activation.act.alpha.normal_(0.0, 0.3)
         activation.act.beta.normal_(0.0, 0.3)
-    x = torch.randn(2, 6, length, device="cuda") * 3
+    x = _activation_input(layout, length)
+    original = x.clone()
 
     activation.use_fused = False
     eager = activation(x)
@@ -228,6 +249,8 @@ def test_fused_activation_matches_the_eager_modules(causal: bool, length: int) -
     # Same fp32 arithmetic, only the order in which the taps are summed differs.
     assert fused.shape == eager.shape
     torch.testing.assert_close(fused, eager, atol=1e-5, rtol=1e-5)
+    # Neither path writes into its (possibly strided) input.
+    torch.testing.assert_close(x, original, atol=0, rtol=0)
 
 
 @pytest.mark.cuda
