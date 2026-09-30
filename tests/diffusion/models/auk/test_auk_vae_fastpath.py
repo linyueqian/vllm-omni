@@ -11,7 +11,7 @@ eager off CUDA) and the tiled decode of long clips.
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE, LowPass, SnakeBeta, Upsample
+from vllm_omni.diffusion.models.auk.auk_vae import AliasFreeActivation, AuKVAE, LowPass, SnakeBeta, Upsample
 from vllm_omni.diffusion.models.auk.vae_cudagraph import AuKVAEDecodeGraph, plan_tiles
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -196,6 +196,38 @@ def test_tiled_decode_matches_the_whole_decode() -> None:
     assert AuKVAEDecodeGraph(vae, tile_frames=0).tile_frames == 0
     with pytest.raises(ValueError, match="must exceed"):
         AuKVAEDecodeGraph(vae, tile_frames=60)
+
+
+@torch.inference_mode()
+def test_fused_activation_is_skipped_off_cuda() -> None:
+    activation = AliasFreeActivation(SnakeBeta(4, alpha_logscale=True))
+    x = torch.randn(1, 4, 16)
+    assert not activation._fused_eligible(x)
+    assert activation(x).shape == (1, 4, 16)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="The fused activation kernels require CUDA")
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("length", [1, 7, 1000])
+@torch.inference_mode()
+def test_fused_activation_matches_the_eager_modules(causal: bool, length: int) -> None:
+    torch.manual_seed(0)
+    activation = AliasFreeActivation(SnakeBeta(6, alpha_logscale=True), causal=causal).to("cuda")
+    with torch.no_grad():
+        activation.act.alpha.normal_(0.0, 0.3)
+        activation.act.beta.normal_(0.0, 0.3)
+    x = torch.randn(2, 6, length, device="cuda") * 3
+
+    activation.use_fused = False
+    eager = activation(x)
+    activation.use_fused = True
+    assert activation._fused_eligible(x)
+    fused = activation(x)
+
+    # Same fp32 arithmetic, only the order in which the taps are summed differs.
+    assert fused.shape == eager.shape
+    torch.testing.assert_close(fused, eager, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.cuda
