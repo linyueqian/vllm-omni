@@ -157,18 +157,21 @@ def test_single_request_graph_replay_matches_eager_and_updates_inputs(cfg_streng
             inputs["ref"],
             inputs["ref_mask"],
         )
-        key = wrapper._key(bucketed[0], bucketed[2], bucketed[4], cfg_strength >= 1e-5)
+        # sample_latents passes the grid, so the key carries its step count (two steps here).
+        key = wrapper._key(bucketed[0], bucketed[2], bucketed[4], cfg_strength >= 1e-5, 2)
         assert key in wrapper._cache
 
         # The static context was refreshed for this request's conditioning.
         entry = wrapper._cache[key]
-        fresh = wrapper._prepare(*bucketed, cfg_strength >= 1e-5)
+        grid = torch.tensor([0.0, 0.4], device="cuda")
+        fresh = wrapper._prepare(*bucketed, cfg_strength >= 1e-5, grid)
         for static, want in zip(entry.static_ctx.tensors(), fresh.tensors(), strict=True):
             if want is None:
                 assert static is None
             else:
                 torch.testing.assert_close(static, want)
         torch.testing.assert_close(entry.static_timestep, torch.tensor(0.4, device="cuda"))
+        assert int(entry.static_step) == 1
 
     assert len(wrapper._cache) == 1
 
