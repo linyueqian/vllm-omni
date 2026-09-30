@@ -492,6 +492,40 @@ class TestRequestParsing:
         assert call["sample"] is True
         assert isinstance(call["generator"], torch.Generator)
 
+    def test_reference_latents_are_cached_by_content(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        clip = _silence(1.0)
+
+        for _ in range(3):
+            pipeline.forward(_batch(_prompt(audio=clip, knobs={"gen_seconds": 1.0}), seed=1))
+        # A different clip is a new entry, the first one still hits.
+        other = (np.full_like(clip[0], 0.25), clip[1])
+        pipeline.forward(_batch(_prompt(audio=other, knobs={"gen_seconds": 1.0}), seed=1))
+        pipeline.forward(_batch(_prompt(audio=clip, knobs={"gen_seconds": 1.0}), seed=1))
+
+        assert len(pipeline.vae.encode_calls) == 2
+        assert calls[0]["ref"] is calls[1]["ref"] is calls[4]["ref"]
+
+    def test_posterior_draws_and_disabled_cache_always_encode(self, build_pipeline):
+        pipeline, _ = build_pipeline()
+        for _ in range(2):
+            pipeline.forward(
+                _batch(_prompt(audio=_silence(1.0), knobs={"gen_seconds": 1.0, "vae_sample": True}), seed=1)
+            )
+        assert len(pipeline.vae.encode_calls) == 2
+
+        pipeline, _ = build_pipeline(model_config={"auk_ref_cache_size": 0})
+        for _ in range(2):
+            pipeline.forward(_batch(_prompt(audio=_silence(1.0), knobs={"gen_seconds": 1.0}), seed=1))
+        assert len(pipeline.vae.encode_calls) == 2
+
+    def test_reference_cache_is_bounded(self, build_pipeline):
+        pipeline, _ = build_pipeline(model_config={"auk_ref_cache_size": 2})
+        for level in (0.1, 0.2, 0.3):
+            clip = (np.full(SAMPLE_RATE, level, dtype=np.float32), SAMPLE_RATE)
+            pipeline.forward(_batch(_prompt(audio=clip, knobs={"gen_seconds": 1.0}), seed=1))
+        assert len(pipeline._ref_cache) == 2
+
     def test_one_request_per_forward(self, build_pipeline):
         pipeline, _ = build_pipeline()
         batch = _batch(_prompt(knobs={"gen_seconds": 1.0}), seed=1)
