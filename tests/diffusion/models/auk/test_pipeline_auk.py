@@ -39,6 +39,7 @@ it resolves to is not an assembled one.
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import os
@@ -55,9 +56,13 @@ from torch import nn
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.auk import pipeline_auk
+from vllm_omni.diffusion.models.auk.batching import AuKBatchRequest
 from vllm_omni.diffusion.models.auk.pipeline_auk import AuKPipeline
+from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 LATENT_DIM = 64
@@ -71,6 +76,7 @@ FLASH_T_GRID = [0.0, 0.07612049579620361, 0.2928932309150696, 0.6173166036605835
 CKPT_DIR = os.environ.get("AUK_OMNI_CKPT_DIR") or os.environ.get("AUK_CKPT_DIR")
 PARITY_REF = os.environ.get("AUK_PARITY_REF")
 # An assembled directory is the only thing this pipeline can load.
+_stub_uids = itertools.count()
 IS_ASSEMBLED = bool(CKPT_DIR) and (Path(CKPT_DIR).expanduser() / "config.json").is_file()
 
 # Measured on the released base checkpoint: mean frame cosine 0.961 to 0.968,
@@ -296,7 +302,7 @@ class TestRequestParsing:
 
         assert pipeline.support_audio_output is True
         assert pipeline.audio_sample_rate == SAMPLE_RATE
-        assert pipeline.supports_request_batch is False
+        assert pipeline.supports_request_batch is True
         # The warmup request cannot carry an encoder-stage text condition.
         assert pipeline.dummy_run_num_frames == 0
 
@@ -526,13 +532,166 @@ class TestRequestParsing:
             pipeline.forward(_batch(_prompt(audio=clip, knobs={"gen_seconds": 1.0}), seed=1))
         assert len(pipeline._ref_cache) == 2
 
-    def test_one_request_per_forward(self, build_pipeline):
-        pipeline, _ = build_pipeline()
-        batch = _batch(_prompt(knobs={"gen_seconds": 1.0}), seed=1)
-        batch.requests.append(batch.requests[0])
 
-        with pytest.raises(AssertionError, match="one request per forward"):
-            pipeline.forward(batch)
+class _StubBatchRunner:
+    """Batched DiT stand-in: every velocity is ``value``; records each call's membership."""
+
+    def __init__(self, value: float = 1.0) -> None:
+        self.value = value
+        self.calls: list[list[int]] = []
+
+    def make_request(self, *, text, ref, cfg, grid, latents) -> AuKBatchRequest:
+        return AuKBatchRequest(
+            uid=next(_stub_uids),
+            text=text,
+            ref=ref,
+            c=text,
+            prompt=None,
+            prompt_uncond=None,
+            cfg=cfg,
+            grid=grid,
+            modulation=torch.zeros(grid.numel() - 1, 1),
+            latents=latents,
+        )
+
+    def velocities(self, requests) -> list[torch.Tensor]:
+        self.calls.append([request.uid for request in requests])
+        return [torch.full_like(request.latents, self.value) for request in requests]
+
+
+class _StubSingleStep:
+    """Single-request graph stand-in recording whether each call reloaded its context."""
+
+    enabled = True
+
+    def __init__(self, value: float = 1.0) -> None:
+        self.value = value
+        self.new_request: list[bool] = []
+
+    def __call__(self, *, x, new_request, **_: Any) -> torch.Tensor:
+        self.new_request.append(new_request)
+        return torch.full_like(x, self.value)
+
+
+def _multi_batch(*requests: tuple[dict[str, Any], dict[str, Any]]) -> DiffusionRequestBatch:
+    return DiffusionRequestBatch(
+        requests=[
+            OmniDiffusionRequest(
+                prompt=prompt,
+                sampling_params=OmniDiffusionSamplingParams(**sampling),
+                request_id=f"auk-test-{i}",
+            )
+            for i, (prompt, sampling) in enumerate(requests)
+        ]
+    )
+
+
+def _step_state(request_id: str, prompt: dict[str, Any], **sampling: Any) -> StepRequestState:
+    return StepRequestState(request_id=request_id, sampling=OmniDiffusionSamplingParams(**sampling), prompt=prompt)
+
+
+def _run_step_waves(pipeline: AuKPipeline, states: list[StepRequestState]) -> None:
+    """Drive the step protocol the way the model runner does, one wave per step."""
+    running = list(states)
+    while running:
+        input_batch = InputBatch.make_batch(running)
+        noise_pred = pipeline.denoise_step(input_batch, states=running)
+        offset = 0
+        for state in running:
+            rows = state.latents.shape[0]
+            pipeline.step_scheduler(state, noise_pred[offset : offset + rows])
+            offset += rows
+        assert offset == noise_pred.shape[0]
+        running = [state for state in running if not state.denoise_completed]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+class TestRequestBatching:
+    def test_pipeline_supports_both_batching_modes(self, build_pipeline):
+        pipeline, _ = build_pipeline()
+
+        assert pipeline.supports_request_batch is True
+        assert supports_step_execution(pipeline)
+
+    def test_batched_forward_runs_each_request_on_its_own_grid(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        pipeline.batch_runner = runner = _StubBatchRunner(value=1.0)
+
+        outputs = pipeline.forward(
+            _multi_batch(
+                (_prompt(knobs={"gen_seconds": 1.0}), {"seed": 1, "num_inference_steps": 3, "output_type": "latent"}),
+                (_prompt(knobs={"gen_seconds": 2.0}), {"seed": 2, "num_inference_steps": 5, "output_type": "latent"}),
+            )
+        )
+
+        # Both requests share three steps; the longer grid then runs alone.
+        assert [len(members) for members in runner.calls] == [2, 2, 2, 1, 1]
+        assert not calls, "the single-request sampler must not run for a batch"
+        for output, (seed, frames) in zip(outputs, [(1, 50), (2, 100)]):
+            noise = torch.randn(1, frames, LATENT_DIM, generator=torch.Generator().manual_seed(seed))
+            # A constant unit velocity integrates to noise + 1 over [0, 1].
+            torch.testing.assert_close(output.output, noise + 1.0)
+
+    def test_batched_forward_isolates_a_failing_request(self, build_pipeline):
+        pipeline, _ = build_pipeline()
+        pipeline.batch_runner = _StubBatchRunner()
+        broken = _prompt(knobs={"gen_seconds": 1.0})
+        broken.pop("prompt_embeds")
+
+        outputs = pipeline.forward(
+            _multi_batch(
+                (broken, {"seed": 1, "output_type": "latent"}),
+                (_prompt(knobs={"gen_seconds": 1.0}), {"seed": 2, "output_type": "latent"}),
+            )
+        )
+
+        assert len(outputs) == 2
+        assert "prompt_embeds" in outputs[0].error
+        assert outputs[1].error is None
+        assert outputs[1].output.shape == (1, 50, LATENT_DIM)
+
+    def test_step_execution_batches_requests_and_matches_the_integral(self, build_pipeline):
+        pipeline, _ = build_pipeline()
+        pipeline.batch_runner = runner = _StubBatchRunner(value=1.0)
+        states = [
+            _step_state("a", _prompt(knobs={"gen_seconds": 1.0}), seed=1, num_inference_steps=2, output_type="latent"),
+            _step_state("b", _prompt(knobs={"gen_seconds": 2.0}), seed=2, num_inference_steps=4, output_type="latent"),
+        ]
+        for state in states:
+            pipeline.prepare_encode(state)
+        # The runner stacks latents by rows: a request's rows are its frames.
+        assert [tuple(state.latents.shape) for state in states] == [(50, LATENT_DIM), (100, LATENT_DIM)]
+        assert [state.total_steps for state in states] == [2, 4]
+
+        pipeline.cudagraph_wrapper = single = _StubSingleStep(value=1.0)
+        _run_step_waves(pipeline, states)
+
+        # Two batched waves, then the survivor steps alone through the single-request graph.
+        assert [len(members) for members in runner.calls] == [2, 2]
+        assert single.new_request == [True, False]
+        for state, (seed, frames) in zip(states, [(1, 50), (2, 100)]):
+            output = pipeline.post_decode(state)
+            noise = torch.randn(1, frames, LATENT_DIM, generator=torch.Generator().manual_seed(seed))
+            torch.testing.assert_close(output.output, noise + 1.0)
+            assert "auk" not in state.extra
+
+    def test_single_step_reloads_its_graph_context_when_the_request_changes(self, build_pipeline):
+        pipeline, _ = build_pipeline()
+        pipeline.batch_runner = _StubBatchRunner()
+        pipeline.cudagraph_wrapper = single = _StubSingleStep()
+        first, second = (
+            _step_state(name, _prompt(knobs={"gen_seconds": 1.0}), seed=i, num_inference_steps=3)
+            for i, name in enumerate("ab")
+        )
+        for state in (first, second):
+            pipeline.prepare_encode(state)
+
+        for state in (first, first, second, first):
+            noise_pred = pipeline.denoise_step(InputBatch.make_batch([state]), states=[state])
+            pipeline.step_scheduler(state, noise_pred)
+
+        assert single.new_request == [True, False, True, True]
 
 
 def _reference_audio_path(messages: list[dict[str, Any]]) -> str:

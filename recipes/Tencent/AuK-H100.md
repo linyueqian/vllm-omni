@@ -40,7 +40,7 @@ text, exactly as in the upstream repository's cookbook.
 | Sequence limit | reference plus target latents up to 65536 frames (about 21 minutes) |
 | Sampling knobs | `num_inference_steps` (default 32), `guidance_scale` (default 2.0), `seed`; Flash pins 4 steps, CFG 0 and its own time grid |
 | Request knobs | `gen_seconds`, `sway` (default -1.0), `t_grid`, `vae_sample` via `additional_information["auk"]` |
-| Concurrency | one request per DiT forward; the encoder stage runs with `max_num_seqs: 1`, prefix caching and chunked prefill off |
+| Concurrency | one request per DiT forward by default; opt-in batching across requests (see Notes); the encoder stage runs with `max_num_seqs: 1`, prefix caching and chunked prefill off |
 | Streaming | none: the ODE runs over the whole target |
 
 ## References
@@ -165,6 +165,19 @@ Inductor cache, about 30 s less warm).
   unchunked condition to bf16 rounding (per-token cosine 0.99999) and leaves
   request walls unchanged, because the encoder is about 3% of a base request,
   while concurrent runs stop being bit-identical to sequential ones.
+- Batching across requests: off by default. A single request already keeps
+  the GPU compute-bound (each DiT step carries both CFG branches of text,
+  reference and target, about a thousand tokens), so serving throughput
+  saturates at two requests in flight. Set `step_execution: true` and
+  `max_num_seqs: 8` on the diffusion stage to advance every running request
+  one Euler step per wave, or only `max_num_seqs: 8` to run whole requests in
+  lockstep. Each request keeps its own length, guidance and time grid, and
+  WER and speaker similarity match serial serving, and latency at
+  concurrency 1 is unchanged. With 16 requests in flight at 6 s of audio it
+  adds about a fifth of throughput for the base checkpoint and a tenth for
+  Flash when every request uses the same voice. On seed-tts voice cloning,
+  where reference clips of different lengths pad each batch to the longest,
+  it adds nothing for base and costs Flash throughput.
 - Known limitations: the encoder's audio tower runs without `flash_attn` in a
   plain vLLM install, which shifts the encoder output on audio token positions
   (per-token cosine 0.96 vs the upstream fp32 fusion; text positions 0.9999)
@@ -181,5 +194,5 @@ Inductor cache, about 30 s less warm).
 | Online `/v1/chat/completions` with audio | not yet qualified | `docs/serving/` |
 | `/v1/audio/speech` | supported (base and Flash, `instructions` or `task_type`) | `docs/user_guide/examples/online_serving/text_to_speech.md` |
 | Streaming / async chunk | not supported | `docs/design/feature/async_chunk.md` |
-| Batching across requests | one request per DiT forward | `docs/user_guide/diffusion/` |
+| Batching across requests | opt-in: `step_execution` continuous batching or request-level batching on the DiT stage | `docs/user_guide/diffusion/` |
 | Tensor / sequence parallelism | not supported | `docs/configuration/composable_parallel.md` |

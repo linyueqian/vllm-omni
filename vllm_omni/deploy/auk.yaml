@@ -55,6 +55,16 @@ stages:
   # shapes on first use. Buckets, tile size and the
   # plain-graph cache are tunable through model_config:
   #   model_config: {auk_vae_compile_shapes: [...], auk_vae_tile_frames: <frames>, auk_vae_max_graphs: 32}
+  # Requests run through the DiT one at a time. One request's step already
+  # carries about a thousand tokens (both CFG branches of text, reference and
+  # target), so the GPU is compute-bound at batch 1 and the pipeline saturates
+  # at two requests in flight. Batching can still be turned on:
+  # `step_execution: true` with `max_num_seqs` > 1 advances every running
+  # request one Euler step per wave (continuous batching), and `max_num_seqs`
+  # > 1 alone integrates whole requests in lockstep. It adds up to a fifth of
+  # throughput when requests share one voice, and nothing or less when their
+  # reference clips differ in length, because every row is padded to the
+  # longest.
   - stage_id: 1
     devices: "0"
     max_num_seqs: 1

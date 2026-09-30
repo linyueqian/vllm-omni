@@ -16,7 +16,8 @@ import json
 import os
 import time
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import numpy as np
@@ -33,9 +34,11 @@ from vllm_omni.diffusion.models.auk.auk_transformer import (
     AuKTransformer,
     build_time_grid,
     dit_state_dict,
+    initial_latents,
     sample_latents,
 )
 from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE
+from vllm_omni.diffusion.models.auk.batching import AuKBatchedStepRunner, AuKBatchRequest
 from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
 from vllm_omni.diffusion.models.auk.vae_cudagraph import AuKVAEDecodeGraph
 from vllm_omni.diffusion.models.interface import (
@@ -43,7 +46,9 @@ from vllm_omni.diffusion.models.interface import (
     SupportAudioOutput,
     SupportsComponentDiscovery,
 )
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.model_extras.auk import resolve_gen_frames
 
 logger = init_logger(__name__)
@@ -72,6 +77,21 @@ _WARMUP_TEXT_TOKENS = 96
 _REF_CACHE_SIZE = 16
 # Decorrelates the VAE posterior draw from the initial latent for the same request seed.
 _VAE_SEED_OFFSET = 0x5EED_0A0C
+
+
+@dataclass
+class _PreparedRequest:
+    """One request's validated inputs, with its reference clip already encoded."""
+
+    text: torch.Tensor
+    ref: torch.Tensor
+    gen_frames: int
+    nfe: int
+    cfg: float
+    sway: float | None
+    t_grid: list[float] | None
+    generator: torch.Generator | None
+    output_type: str
 
 
 def get_auk_post_process_func(od_config: OmniDiffusionConfig):
@@ -122,9 +142,12 @@ def _split_audio(audio: Any, default_sample_rate: int) -> tuple[Any, int]:
 class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComponentDiscovery):
     """Instruction-driven audio generation and editing with AuK.
 
-    One request per forward: the rectified-flow ODE runs over the whole target
-    span and the batch dimension carries the CFG branches, so there is nothing
-    to share between requests yet.
+    The rectified-flow ODE runs over the whole target span. Several requests
+    share each DiT step: in request-batch mode (``max_num_seqs > 1``) a
+    forward integrates its requests in lockstep, and in step-execution mode
+    the engine advances every running request one Euler step per wave, so
+    requests join and leave mid-flight. Each request keeps its own length,
+    guidance and time grid; a lone request replays the single-request graphs.
 
     Args:
         od_config: OmniDiffusion configuration. ``od_config.model`` must be an
@@ -134,7 +157,8 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         prefix: Unused; kept for the pipeline construction contract.
     """
 
-    supports_request_batch = False
+    supports_request_batch = True
+    supports_step_execution: ClassVar[bool] = True
 
     # Picked up by ``supports_audio_output`` in the diffusion engine so the
     # default stage metadata reports ``final_output_type="audio"`` and the
@@ -211,6 +235,13 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         self.cudagraph_wrapper = AuKCUDAGraphWrapper(
             self.dit, enabled=not od_config.enforce_eager, max_graphs=max_dit_graphs
         )
+        # Batched steps run eagerly unless model_config.auk_batch_cuda_graphs asks for per-shape graphs.
+        batch_graphs = bool((od_config.model_config or {}).get("auk_batch_cuda_graphs", False))
+        self.batch_runner = AuKBatchedStepRunner(
+            self.dit, enabled=batch_graphs and not od_config.enforce_eager, max_graphs=max_dit_graphs
+        )
+        # Request whose context the single-request graph holds, for step execution.
+        self._single_step_owner: int | None = None
         # The compiled decode buckets are warmed by setup_compile(), which the
         # model runner calls at startup unless the stage is enforce_eager. The
         # bucket list and the plain-graph cache size come from the stage's
@@ -346,9 +377,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         generator = sampling_params.generator
         if isinstance(generator, list):
             if len(generator) > 1:
-                logger.warning(
-                    "AuKPipeline runs one request per forward; using the first of %d generators", len(generator)
-                )
+                logger.warning("AuK takes one generator per request; using the first of %d", len(generator))
             generator = generator[0] if generator else None
         if generator is None and sampling_params.seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(int(sampling_params.seed))
@@ -494,27 +523,17 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             enabled=self.dtype in (torch.bfloat16, torch.float16),
         )
 
-    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        """Generate one waveform.
+    def _prepare_request(self, prompt_value: Any, sampling_params: Any) -> _PreparedRequest:
+        """Validate one request and encode its reference clip. Runs under inference mode.
 
-        Args:
-            req: Request batch holding exactly one request. The prompt carries
-                ``prompt_embeds`` (the fused text condition ``[nt, 2048]``), an
-                optional ``multi_modal_data["audio"]`` source clip, and
-                ``additional_information["auk"]`` with ``gen_seconds``,
-                ``sway``, ``t_grid`` and ``vae_sample``. ``num_inference_steps``,
-                ``guidance_scale`` and ``seed``/``generator`` come from the
-                sampling params.
-
-        Returns:
-            One ``DiffusionOutput`` whose ``output`` is a float32 mono waveform
-            ``[T]`` at 24 kHz, or the normalized target latents
-            ``[1, gen_frames, latent_dim]`` when ``output_type`` is ``latent``.
+        The prompt carries ``prompt_embeds`` (the fused text condition
+        ``[nt, 2048]``), an optional ``multi_modal_data["audio"]`` source clip,
+        and ``additional_information["auk"]`` with ``gen_seconds``, ``sway``,
+        ``t_grid`` and ``vae_sample``. ``num_inference_steps``,
+        ``guidance_scale`` and ``seed``/``generator`` come from the sampling
+        params.
         """
-
-        assert req.num_reqs == 1, f"AuKPipeline runs one request per forward, got {req.num_reqs}."
-        prompt = _prompt_mapping(req.prompts[0])
-        sampling_params = req.sampling_params
+        prompt = _prompt_mapping(prompt_value)
         knobs = dict((prompt.get("additional_information") or {}).get("auk") or {})
 
         text = _unwrap_single(prompt.get("prompt_embeds"))
@@ -526,60 +545,195 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         if text.ndim != 2:
             raise ValueError(f"AuK `prompt_embeds` must be [nt, text_hidden_dim], got {tuple(text.shape)}.")
         text = text.unsqueeze(0)
-        c_mask = torch.ones(text.shape[:2], dtype=torch.bool, device=self.device)
 
         generator = self._resolve_generator(sampling_params)
         audio = (prompt.get("multi_modal_data") or {}).get("audio")
-        output_type = sampling_params.output_type or "np"
+        # The VAE posterior draw gets its own generator, seeded with a fixed
+        # offset from the request seed: the initial latent then still equals
+        # the reference's fresh manual_seed draw, and the two noise streams
+        # are not copies of each other.
+        vae_generator = None
+        if knobs.get("vae_sample") and generator is not None:
+            vae_seed = (int(generator.initial_seed()) + _VAE_SEED_OFFSET) % (2**63)
+            vae_generator = torch.Generator(device=self.device).manual_seed(vae_seed)
+        ref = self._encode_source(audio, sample=bool(knobs.get("vae_sample")), generator=vae_generator)
+        gen_frames = self._target_frames(knobs.get("gen_seconds"), ref.shape[1])
+        nfe, cfg, sway, t_grid = self._resolve_schedule(sampling_params, knobs)
+        return _PreparedRequest(
+            text=text,
+            ref=ref,
+            gen_frames=gen_frames,
+            nfe=nfe,
+            cfg=cfg,
+            sway=sway,
+            t_grid=t_grid,
+            generator=generator,
+            output_type=sampling_params.output_type or "np",
+        )
 
-        with torch.inference_mode():
-            # The VAE posterior draw gets its own generator, seeded with a
-            # fixed offset from the request seed: the initial latent below then
-            # still equals the reference's fresh manual_seed draw, and the two
-            # noise streams are not copies of each other.
-            vae_generator = None
-            if knobs.get("vae_sample") and generator is not None:
-                vae_seed = (int(generator.initial_seed()) + _VAE_SEED_OFFSET) % (2**63)
-                vae_generator = torch.Generator(device=self.device).manual_seed(vae_seed)
-            ref = self._encode_source(audio, sample=bool(knobs.get("vae_sample")), generator=vae_generator)
-            ref_frames = ref.shape[1]
-            ref_mask = torch.ones(ref.shape[:2], dtype=torch.bool, device=self.device)
-            gen_frames = self._target_frames(knobs.get("gen_seconds"), ref_frames)
-            nfe, cfg, sway, t_grid = self._resolve_schedule(sampling_params, knobs)
+    def _batch_request(self, prepared: _PreparedRequest) -> AuKBatchRequest:
+        """Draw the starting noise and embed the conditioning for batched stepping."""
+        grid = build_time_grid(
+            nfe=prepared.nfe, sway_sampling_coef=prepared.sway, t_grid=prepared.t_grid, device=self.device
+        )
+        latents = initial_latents(
+            prepared.gen_frames,
+            self.latent_dim,
+            generator=prepared.generator,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        with self._dit_autocast():
+            return self.batch_runner.make_request(
+                text=prepared.text, ref=prepared.ref, cfg=prepared.cfg, grid=grid, latents=latents
+            )
 
-            with self._dit_autocast():
-                latents = sample_latents(
-                    self.dit,
-                    text=text,
-                    c_mask=c_mask,
-                    ref=ref,
-                    ref_mask=ref_mask,
-                    gen_frames=gen_frames,
-                    nfe=nfe,
-                    cfg_strength=cfg,
-                    sway_sampling_coef=sway,
-                    t_grid=t_grid,
-                    seed=None,
-                    latent_dim=self.latent_dim,
-                    device=self.device,
-                    dtype=torch.float32,
-                    generator=generator,
-                    sampler=self.cudagraph_wrapper,
-                )
-
-            latents = latents.float()
-            if not torch.isfinite(latents).all():
-                raise RuntimeError("AuK generated latents contain NaN or Inf.")
-            if output_type == "latent":
-                return [DiffusionOutput(output=latents.detach().cpu())]
-
-            wav = self.vae_decode(latents)
-
+    def _finish(self, latents: torch.Tensor, output_type: str) -> DiffusionOutput:
+        """Decode final latents ``[1, frames, latent_dim]`` into the request's output."""
+        latents = latents.float()
+        if not torch.isfinite(latents).all():
+            raise RuntimeError("AuK generated latents contain NaN or Inf.")
+        if output_type == "latent":
+            return DiffusionOutput(output=latents.detach().cpu())
+        wav = self.vae_decode(latents)
         # One mono waveform per request; the formatter expects [T].
         wav = wav.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
         if not torch.isfinite(wav).all():
             raise RuntimeError("AuK generated audio contains NaN or Inf.")
-        return [DiffusionOutput(output=wav)]
+        return DiffusionOutput(output=wav)
+
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        """Generate one waveform per request.
+
+        A single request integrates its ODE alone; several requests advance
+        together, one batched DiT step per Euler step, each on its own time
+        grid (see :meth:`_prepare_request` for the prompt layout).
+
+        Returns:
+            One ``DiffusionOutput`` per request whose ``output`` is a float32
+            mono waveform ``[T]`` at 24 kHz, or the normalized target latents
+            ``[1, gen_frames, latent_dim]`` when ``output_type`` is ``latent``.
+        """
+        with torch.inference_mode():
+            if req.num_reqs > 1:
+                return self._forward_batch(req)
+            prepared = self._prepare_request(req.prompts[0], req.sampling_params)
+            ref = prepared.ref
+            with self._dit_autocast():
+                latents = sample_latents(
+                    self.dit,
+                    text=prepared.text,
+                    c_mask=torch.ones(prepared.text.shape[:2], dtype=torch.bool, device=self.device),
+                    ref=ref,
+                    ref_mask=torch.ones(ref.shape[:2], dtype=torch.bool, device=self.device),
+                    gen_frames=prepared.gen_frames,
+                    nfe=prepared.nfe,
+                    cfg_strength=prepared.cfg,
+                    sway_sampling_coef=prepared.sway,
+                    t_grid=prepared.t_grid,
+                    seed=None,
+                    latent_dim=self.latent_dim,
+                    device=self.device,
+                    dtype=torch.float32,
+                    generator=prepared.generator,
+                    sampler=self.cudagraph_wrapper,
+                )
+            # The single-step graph now holds this request's context.
+            self._single_step_owner = None
+            return [self._finish(latents, prepared.output_type)]
+
+    def _forward_batch(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        """Run several requests' ODEs in lockstep; one request's failure does not fail the others."""
+        outputs: list[DiffusionOutput | None] = [None] * req.num_reqs
+        admitted: list[tuple[int, AuKBatchRequest, str]] = []
+        for index, (prompt, sampling_params) in enumerate(zip(req.prompts, req.sampling_params_list)):
+            try:
+                prepared = self._prepare_request(prompt, sampling_params)
+                admitted.append((index, self._batch_request(prepared), prepared.output_type))
+            except Exception as exc:
+                logger.warning("AuK request %s failed preparation: %s", req.request_ids[index], exc)
+                outputs[index] = DiffusionOutput.from_exception(exc)
+
+        running = [request for _, request, _ in admitted]
+        with self._dit_autocast():
+            while running:
+                for request, velocity in zip(running, self.batch_runner.velocities(running)):
+                    request.advance(velocity)
+                running = [request for request in running if not request.done]
+
+        for index, request, output_type in admitted:
+            try:
+                outputs[index] = self._finish(request.latents, output_type)
+            except Exception as exc:
+                logger.warning("AuK request %s failed decoding: %s", req.request_ids[index], exc)
+                outputs[index] = DiffusionOutput.from_exception(exc)
+        return [output for output in outputs if output is not None]
+
+    # Step execution: the engine advances every running request by one Euler
+    # step per scheduler wave, so requests join and leave a batch mid-flight.
+
+    def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
+        """Admit a request: encode its reference, draw its noise and embed its conditioning."""
+        prepared = self._prepare_request(state.prompt, state.sampling)
+        request = self._batch_request(prepared)
+        # The runner batches latents by rows, so a request's rows are its frames.
+        state.latents = request.latents[0]
+        state.timesteps = request.grid[:-1]
+        state.step_index = 0
+        state.extra["auk"] = request
+        state.extra["auk_output_type"] = prepared.output_type
+        return state
+
+    def denoise_step(
+        self, input_batch: InputBatch, *, states: Sequence[StepRequestState] | None = None, **kwargs: Any
+    ) -> torch.Tensor:
+        """Guided velocities of every scheduled request, stacked by frame: ``[sum frames, latent_dim]``."""
+        del input_batch  # Each request's latents are read from its own state.
+        if not states:
+            raise ValueError("AuK denoise_step needs the scheduled request states.")
+        requests: list[AuKBatchRequest] = []
+        for state in states:
+            request = state.extra["auk"]
+            request.latents = state.latents.unsqueeze(0)
+            request.step_index = state.step_index
+            requests.append(request)
+        with self._dit_autocast():
+            if len(requests) == 1:
+                velocities = [self._single_step(requests[0])]
+            else:
+                velocities = self.batch_runner.velocities(requests)
+        return torch.cat([velocity[0] for velocity in velocities], dim=0)
+
+    def _single_step(self, request: AuKBatchRequest) -> torch.Tensor:
+        """A lone request replays the single-request graph, sharing its warmed buckets."""
+        i = request.step_index
+        velocity = self.cudagraph_wrapper(
+            x=request.latents,
+            text=request.text,
+            c_mask=torch.ones(request.text.shape[:2], dtype=torch.bool, device=self.device),
+            ref=request.ref,
+            ref_mask=torch.ones(request.ref.shape[:2], dtype=torch.bool, device=self.device),
+            timestep=request.grid[i],
+            cfg_strength=request.cfg,
+            # The graph's static context holds one request; reload it when that changed.
+            new_request=i == 0 or self._single_step_owner != request.uid,
+            timesteps=request.grid[:-1],
+            step_index=i,
+        )
+        self._single_step_owner = request.uid
+        return velocity
+
+    def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
+        """One Euler step along the request's own time grid."""
+        grid = state.extra["auk"].grid
+        i = state.step_index
+        state.latents = state.latents + (grid[i + 1] - grid[i]) * noise_pred
+        state.step_index = i + 1
+
+    def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
+        state.extra.pop("auk", None)
+        output_type = state.extra.pop("auk_output_type", "np")
+        return self._finish(state.latents.unsqueeze(0), output_type)
 
 
 def _read_config(model_dir: str) -> dict[str, Any]:

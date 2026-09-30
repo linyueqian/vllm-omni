@@ -36,7 +36,14 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-__all__ = ["AuKStepContext", "AuKTransformer", "build_time_grid", "dit_state_dict", "sample_latents"]
+__all__ = [
+    "AuKStepContext",
+    "AuKTransformer",
+    "build_time_grid",
+    "dit_state_dict",
+    "initial_latents",
+    "sample_latents",
+]
 
 
 def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
@@ -675,7 +682,11 @@ class AuKTransformer(nn.Module):
         ``time`` is unused; the row broadcasts over the CFG branches.
         """
         target = self.audio_embed(x, mask=ctx.target_mask)
-        if ctx.modulation is not None and step_index is not None:
+        if ctx.modulation is not None and ctx.modulation_per_row:
+            # A batch of requests at different steps: one modulation row per batch row.
+            mods = list(torch.split(ctx.modulation, self._modulation_widths, dim=1))
+            t = None
+        elif ctx.modulation is not None and step_index is not None:
             if isinstance(step_index, int):
                 row = ctx.modulation[step_index : step_index + 1]
             else:
@@ -801,6 +812,9 @@ class AuKStepContext:
     branches: int
     #: adaLN modulations per step, ``[steps, widths]``, when the time grid was known.
     modulation: torch.Tensor | None = None
+    #: ``modulation`` holds one row per batch row, ``[rows, widths]``, rather than
+    #: one per step; set for a batch of requests whose steps differ.
+    modulation_per_row: bool = False
 
     def tensors(self) -> list[torch.Tensor | None]:
         """Every tensor field in a fixed order, rope pairs flattened."""
@@ -821,7 +835,7 @@ class AuKStepContext:
 
     def copy_(self, other: "AuKStepContext") -> None:
         """Overwrite these tensors in place with ``other``'s, for CUDA graph static inputs."""
-        if other.branches != self.branches:
+        if other.branches != self.branches or other.modulation_per_row != self.modulation_per_row:
             raise ValueError(f"AuK step context mismatch: {other.branches} vs {self.branches} branches")
         for dst, src in zip(self.tensors(), other.tensors(), strict=True):
             if (dst is None) != (src is None):
@@ -849,6 +863,7 @@ class AuKStepContext:
             rope_single=(self.rope_single[0].clone(), self.rope_single[1].clone()),
             branches=self.branches,
             modulation=_clone(self.modulation),
+            modulation_per_row=self.modulation_per_row,
         )
 
 
@@ -888,6 +903,24 @@ def build_time_grid(
             f"AuK sampling needs a strictly increasing time grid with at least two points; got {timesteps.tolist()}"
         )
     return timesteps.to(device)
+
+
+def initial_latents(
+    gen_frames: int,
+    latent_dim: int,
+    *,
+    generator: torch.Generator | None,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """The ODE's starting noise ``[1, gen_frames, latent_dim]``, from ``generator`` or the global RNG."""
+    if generator is None:
+        return torch.randn(gen_frames, latent_dim, device=device, dtype=dtype).unsqueeze(0)
+    return (
+        torch.randn(gen_frames, latent_dim, generator=generator, device=generator.device, dtype=dtype)
+        .to(device)
+        .unsqueeze(0)
+    )
 
 
 @torch.no_grad()
@@ -949,16 +982,9 @@ def sample_latents(
     dtype = dtype if dtype is not None else ref.dtype
     latent_dim = latent_dim if latent_dim is not None else dit.latent_dim
 
-    if generator is None:
-        if seed is not None:
-            torch.manual_seed(seed)
-        x = torch.randn(gen_frames, latent_dim, device=device, dtype=dtype).unsqueeze(0)
-    else:
-        x = (
-            torch.randn(gen_frames, latent_dim, generator=generator, device=generator.device, dtype=dtype)
-            .to(device)
-            .unsqueeze(0)
-        )
+    if generator is None and seed is not None:
+        torch.manual_seed(seed)
+    x = initial_latents(gen_frames, latent_dim, generator=generator, device=device, dtype=dtype)
 
     t = build_time_grid(
         nfe=nfe,
