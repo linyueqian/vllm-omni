@@ -11,6 +11,7 @@ eager off CUDA) and the tiled decode of long clips.
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.auk import auk_vae
 from vllm_omni.diffusion.models.auk.auk_vae import AliasFreeActivation, AuKVAE, LowPass, SnakeBeta, Upsample
 from vllm_omni.diffusion.models.auk.vae_cudagraph import AuKVAEDecodeGraph, plan_tiles
 
@@ -206,6 +207,18 @@ def test_fused_activation_is_skipped_off_cuda() -> None:
     assert activation(x).shape == (1, 4, 16)
 
 
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="The fused activation kernels require CUDA")
+@torch.inference_mode()
+def test_fused_activation_is_skipped_without_triton(monkeypatch: pytest.MonkeyPatch) -> None:
+    activation = AliasFreeActivation(SnakeBeta(4, alpha_logscale=True)).to("cuda")
+    x = torch.randn(1, 4, 16, device="cuda")
+    assert activation._fused_eligible(x)
+    monkeypatch.setattr(auk_vae, "HAS_TRITON", False)
+    assert not activation._fused_eligible(x)
+    assert activation(x).shape == (1, 4, 16)
+
+
 def _activation_input(layout: str, length: int) -> torch.Tensor:
     """A ``[2, 6, length]`` input, contiguous or as a strided view of a larger buffer."""
     if layout == "contiguous":
@@ -240,9 +253,7 @@ def test_fused_activation_matches_the_eager_modules(layout: str, causal: bool, l
     x = _activation_input(layout, length)
     original = x.clone()
 
-    activation.use_fused = False
-    eager = activation(x)
-    activation.use_fused = True
+    eager = activation.downsample(activation.act(activation.upsample(x)))
     assert activation._fused_eligible(x)
     fused = activation(x)
 

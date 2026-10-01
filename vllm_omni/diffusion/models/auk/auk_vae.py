@@ -32,8 +32,9 @@ from torch import nn
 from torch.nn.utils import remove_weight_norm as _fold_weight_norm
 from torch.nn.utils import weight_norm as _apply_weight_norm
 from vllm.logger import init_logger
+from vllm.triton_utils import HAS_TRITON
 
-from vllm_omni.diffusion.models.auk.alias_free_triton import alias_free_snake, fused_alias_free_available
+from vllm_omni.diffusion.models.auk.alias_free_triton import alias_free_snake
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta as _SharedSnakeBeta
 
 logger = init_logger(__name__)
@@ -320,15 +321,12 @@ class AliasFreeActivation(nn.Module):
         self.downsample = Downsample(down_ratio, down_kernel_size, causal=causal)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_fused and self._fused_eligible(x):
+        if self._fused_eligible(x):
             return self._fused_forward(x)
         return self.downsample(self.act(self.upsample(x)))
 
-    #: Route CUDA fp32 inputs through the Triton kernels in alias_free_triton;
-    #: toggled by AuKVAE.set_decode_fast_paths.
-    use_fused: bool = True
-
     def _fused_eligible(self, x: torch.Tensor) -> bool:
+        """Whether ``x`` can take the Triton kernels in alias_free_triton (CUDA fp32, AuK's filter geometry)."""
         up = self.upsample
         taps = up.filter.numel()
         return (
@@ -336,7 +334,7 @@ class AliasFreeActivation(nn.Module):
             and x.dtype == torch.float32
             and x.dim() == 3
             and isinstance(self.act, SnakeBeta)
-            and fused_alias_free_available()
+            and HAS_TRITON
             # The kernel indexes the crop from the start of the transposed
             # conv output, so the crop must cover the filter's reach, and the
             # cropped length must be exactly ratio * T.
@@ -577,21 +575,19 @@ class AuKVAE(nn.Module):
             if isinstance(module, SnakeBeta):
                 module.precompute_exp_cache()
 
-    def set_decode_fast_paths(self, *, cached_filters: bool, fused_activation: bool | None = None) -> None:
-        """Toggle the FIR modules' per-channel filter caching and the fused activation kernels.
+    def set_decode_fast_paths(self, *, cached_filters: bool) -> None:
+        """Toggle the FIR modules' per-channel filter caching.
 
-        Both are on by default. The switches exist so their cost can be
-        measured against the plain eager paths. Flip them before any CUDA graph
-        is captured or the decode is compiled: they change which kernels run,
-        and a captured graph keeps replaying the old ones.
+        On by default. The switch exists so the cache's cost can be measured
+        against the plain expand-per-call path. Flip it before any CUDA graph
+        is captured: it reallocates the cached taps, and a captured graph
+        keeps reading the old buffers.
         """
 
         for module in self.modules():
             if isinstance(module, _CachedFilter):
                 module.cache_filters = cached_filters
                 module._expanded = None
-            if fused_activation is not None and isinstance(module, AliasFreeActivation):
-                module.use_fused = fused_activation
 
     def encode(
         self, wav: torch.Tensor, *, sample: bool = False, generator: torch.Generator | None = None

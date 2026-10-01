@@ -291,6 +291,18 @@ class TestRequestParsing:
         with pytest.raises(ValueError, match="AuK max_dit_graphs must be a positive integer"):
             build_pipeline(model_config={"max_dit_graphs": max_dit_graphs})
 
+    @pytest.mark.parametrize(
+        "model_config, expected", [({}, 16), ({"auk_ref_cache_size": 0}, 0), ({"auk_ref_cache_size": 4}, 4)]
+    )
+    def test_ref_cache_size_is_taken_from_model_config(self, build_pipeline, model_config, expected):
+        pipeline, _ = build_pipeline(model_config=model_config)
+        assert pipeline._ref_cache_size == expected
+
+    @pytest.mark.parametrize("size", [-1, 1.9, True, False, "4", None])
+    def test_invalid_ref_cache_size_is_rejected(self, build_pipeline, size):
+        with pytest.raises(ValueError, match="AuK auk_ref_cache_size must be a non-negative integer"):
+            build_pipeline(model_config={"auk_ref_cache_size": size})
+
     def test_pipeline_declares_audio_output(self, build_pipeline):
         pipeline, _ = build_pipeline()
 

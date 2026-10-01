@@ -158,6 +158,9 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         max_dit_graphs = od_config.model_config.get("max_dit_graphs", 32)
         if isinstance(max_dit_graphs, bool) or not isinstance(max_dit_graphs, int) or max_dit_graphs < 1:
             raise ValueError("AuK max_dit_graphs must be a positive integer")
+        ref_cache_size = od_config.model_config.get("auk_ref_cache_size", _REF_CACHE_SIZE)
+        if isinstance(ref_cache_size, bool) or not isinstance(ref_cache_size, int) or ref_cache_size < 0:
+            raise ValueError("AuK auk_ref_cache_size must be a non-negative integer (0 disables the cache)")
         self.device = get_local_device()
         self.dtype = getattr(od_config, "dtype", None) or torch.bfloat16
 
@@ -219,7 +222,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         if model_config.get("auk_vae_tile_frames") is not None:
             vae_decode_kwargs["tile_frames"] = int(model_config["auk_vae_tile_frames"])
         self.vae_decode = AuKVAEDecodeGraph(self.vae, enabled=not od_config.enforce_eager, **vae_decode_kwargs)
-        self._ref_cache_size = max(0, int(model_config.get("auk_ref_cache_size", _REF_CACHE_SIZE)))
+        self._ref_cache_size = ref_cache_size
         self._ref_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
 
         logger.info(

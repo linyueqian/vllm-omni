@@ -18,25 +18,13 @@ decode buckets trace them instead of breaking the graph.
 from __future__ import annotations
 
 import torch
+from vllm.triton_utils import HAS_TRITON, tl, triton
 
-try:
-    import triton
-    import triton.language as tl
-
-    _HAS_TRITON = True
-except ImportError:  # pragma: no cover - CPU-only installs
-    _HAS_TRITON = False
-
-__all__ = ["alias_free_snake", "fused_alias_free_available"]
+__all__ = ["alias_free_snake"]
 
 _BLOCK = 1024
 
-
-def fused_alias_free_available() -> bool:
-    return _HAS_TRITON
-
-
-if _HAS_TRITON:
+if HAS_TRITON:
 
     @triton.jit
     def _upsample_snake_kernel(

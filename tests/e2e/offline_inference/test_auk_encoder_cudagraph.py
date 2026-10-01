@@ -66,7 +66,8 @@ LONG = _TEMPLATE.format(
 )
 SEQUENCE = [SHORT_A, SHORT_B, SHORT_A, LONG, SHORT_B, SHORT_A]
 
-# The DiT output is not inspected; keep stage 1 as cheap as it goes.
+# The DiT output is not inspected; keep stage 1 as cheap as it goes (it also
+# runs eager in both configs, see _deploy).
 GEN_SECONDS = 1.0
 NFE = 1
 
@@ -86,15 +87,23 @@ pytestmark = [
 ]
 
 
-def _eager_encoder_deploy(tmp_path: Path) -> str:
-    """``auk.yaml`` with the encoder stage forced eager and everything else unchanged."""
+def _deploy(tmp_path: Path, *, graph_encoder: bool) -> str:
+    """``auk.yaml`` with stage 1 eager, and the encoder stage eager or graphed as shipped.
+
+    Only the encoder differs between the two runs. The conditions compared here
+    are recorded before stage 1 runs, so its DiT compile, graph capture and
+    codec bucket warm-up would only add startup time; eager stage 1 skips them
+    and still takes the real stage handoff.
+    """
     with open(get_deploy_config_path("auk.yaml")) as f:
         deploy = yaml.safe_load(f)
     for stage in deploy["stages"]:
-        if stage["stage_id"] == 0:
+        if stage["stage_id"] == 1:
+            stage["enforce_eager"] = True
+        elif not graph_encoder:
             stage["enforce_eager"] = True
             stage.pop("compilation_config", None)
-    path = tmp_path / "auk_eager_encoder.yaml"
+    path = tmp_path / f"auk_{'graph' if graph_encoder else 'eager'}_encoder.yaml"
     path.write_text(yaml.safe_dump(deploy))
     return str(path)
 
@@ -134,8 +143,8 @@ def _run_sequence(deploy_config: str, monkeypatch: pytest.MonkeyPatch) -> list[t
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_encoder_graph_replay_matches_eager(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     capture_sizes = _graph_capture_sizes()
-    eager = _run_sequence(_eager_encoder_deploy(tmp_path), monkeypatch)
-    graphed = _run_sequence(get_deploy_config_path("auk.yaml"), monkeypatch)
+    eager = _run_sequence(_deploy(tmp_path, graph_encoder=False), monkeypatch)
+    graphed = _run_sequence(_deploy(tmp_path, graph_encoder=True), monkeypatch)
 
     lengths = {text: cond.shape[0] for text, cond in zip(SEQUENCE, eager)}
     for i, (ref, got) in enumerate(zip(eager, graphed)):
