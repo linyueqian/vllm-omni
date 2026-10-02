@@ -312,8 +312,13 @@ class TestRequestParsing:
 
     def test_fp8_quantization_swaps_the_block_linears(self, build_pipeline, monkeypatch):
         swapped = []
+
+        def record(dit) -> int:
+            swapped.append(dit)
+            return 160
+
         monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)
-        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", lambda dit: swapped.append(dit) or 160)
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", record)
         pipeline, _ = build_pipeline(quantization="fp8")
         assert pipeline.dit_fp8 is True
         assert swapped == [pipeline.dit]
