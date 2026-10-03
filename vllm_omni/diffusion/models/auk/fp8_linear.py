@@ -50,14 +50,18 @@ class Fp8Linear(nn.Module):
         rows = x.reshape(-1, self.in_features)
         # E4M3 has no infinity: saturate instead of overflowing into NaN.
         quantized = rows.clamp(-_FP8_MAX, _FP8_MAX).to(_FP8)
+        # _scaled_mm only fuses the bias into half-precision outputs.
+        fuse_bias = self.out_dtype != torch.float32
         out = torch._scaled_mm(
             quantized,
             self.weight,
             scale_a=self.input_scale,
             scale_b=self.weight_scale,
-            bias=self.bias,
+            bias=self.bias if fuse_bias else None,
             out_dtype=self.out_dtype,
         )
+        if self.bias is not None and not fuse_bias:
+            out = out + self.bias
         return out.reshape(*x.shape[:-1], self.out_features)
 
     def extra_repr(self) -> str:

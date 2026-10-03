@@ -116,13 +116,15 @@ def test_scales_stay_fp32_under_a_half_precision_default_dtype() -> None:
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_needs_fp8
 @torch.inference_mode()
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("bias", [True, False])
-def test_fp8_linear_matches_the_bf16_linear(bias: bool) -> None:
+def test_fp8_linear_matches_the_model_dtype_linear(bias: bool, dtype: torch.dtype) -> None:
     torch.manual_seed(1)
-    linear = nn.Linear(64, 96, bias=bias).to("cuda", torch.bfloat16)
+    linear = nn.Linear(64, 96, bias=bias).to("cuda", dtype)
     quantized = Fp8Linear(linear)
-    x = torch.randn(2, 37, 64, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(2, 37, 64, device="cuda", dtype=dtype)
 
+    # _scaled_mm only fuses the bias into half-precision outputs; fp32 adds it after the GEMM.
     out = quantized(x)
 
     expected = linear(x)
@@ -130,8 +132,37 @@ def test_fp8_linear_matches_the_bf16_linear(bias: bool) -> None:
     # Weights and activations each carry about 2.5% rounding noise: 3.7% measured.
     assert _relative_error(out, expected) < 0.06
     assert torch.nn.functional.cosine_similarity(out.float().flatten(), expected.float().flatten(), dim=0) > 0.995
-    # fp32 activations, as the layer norms hand them over under autocast, take the same path.
-    torch.testing.assert_close(quantized(x.float()), out, atol=0, rtol=0)
+    if dtype == torch.bfloat16:
+        # fp32 activations, as the layer norms hand them over under autocast, take the same path.
+        torch.testing.assert_close(quantized(x.float()), out, atol=0, rtol=0)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@_needs_fp8
+@torch.inference_mode()
+def test_fp8_step_runs_with_an_fp32_model() -> None:
+    # The QKV and attention output projections carry a bias, which an fp32 output cannot fuse.
+    reference = _make_dit("cuda", torch.float32)
+    dit = _make_dit("cuda", torch.float32)
+    assert quantize_block_linears(dit) == 24
+
+    torch.manual_seed(3)
+    text = torch.randn(1, 32, 8, device="cuda")
+    c_mask = torch.ones(1, 32, dtype=torch.bool, device="cuda")
+    ref = torch.randn(1, 50, 4, device="cuda")
+    ref_mask = torch.ones(1, 50, dtype=torch.bool, device="cuda")
+    x = torch.randn(1, 64, 4, device="cuda")
+    grid = build_time_grid(nfe=4, sway_sampling_coef=-1.0, t_grid=None, device="cuda")
+
+    def velocity(model: AuKTransformer) -> torch.Tensor:
+        ctx = model.prepare(
+            text, target_len=64, c_mask=c_mask, ref=ref, ref_mask=ref_mask, cfg_infer=True, timesteps=grid[:-1]
+        )
+        return model.step(x, grid[0], ctx, step_index=0)
+
+    fp8 = velocity(dit)
+    assert fp8.dtype == torch.float32 and torch.isfinite(fp8).all()
+    assert _relative_error(fp8, velocity(reference)) < 0.05
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
