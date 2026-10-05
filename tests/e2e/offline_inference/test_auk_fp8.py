@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -52,12 +53,15 @@ pytestmark = [
 ]
 
 
-def _fp8_deploy(tmp_path: Path) -> str:
-    """``auk.yaml`` with FP8 on the diffusion stage and a startup trimmed to what the test uses."""
+IGNORED_LAYER = "dit.transformer_blocks.0.attn.to_qkv"
+
+
+def _fp8_deploy(tmp_path: Path, quantization: Any) -> str:
+    """``auk.yaml`` with ``quantization`` on the diffusion stage and a startup trimmed to what the test uses."""
     with open(get_deploy_config_path("auk.yaml")) as f:
         deploy = yaml.safe_load(f)
     stage = next(s for s in deploy["stages"] if s["stage_id"] == 1)
-    stage["diffusion_quantization_config"] = "fp8"
+    stage["diffusion_quantization_config"] = quantization
     # Compile and capture the one DiT shape on its first request instead of
     # warming the 3/6/12 s shapes, and warm a single codec bucket.
     stage["model_config"] = {
@@ -80,13 +84,27 @@ def _waveform(output) -> np.ndarray:
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-def test_auk_fp8_zero_shot_tts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    swapped: list[tuple[int, int]] = []
+@pytest.mark.parametrize(
+    ("quantization", "fp8", "ignored"),
+    [
+        ("fp8", True, None),
+        # A per-component config resolves to its dit entry, which may skip layers.
+        ({"dit": {"method": "fp8", "ignored_layers": [IGNORED_LAYER]}, "vae": None}, True, IGNORED_LAYER),
+        ({"dit": None}, False, None),
+    ],
+    ids=["fp8", "component-ignored-layer", "component-dit-null"],
+)
+def test_auk_fp8_zero_shot_tts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, quantization: Any, fp8: bool, ignored: str | None
+) -> None:
+    swapped: list[tuple[int, int, Any]] = []
     original = pipeline_auk.quantize_block_linears
 
-    def recording_quantize(dit: torch.nn.Module) -> int:
-        count = original(dit)
-        swapped.append((count, sum(isinstance(module, Fp8Linear) for module in dit.modules())))
+    def recording_quantize(dit: torch.nn.Module, **kwargs: Any) -> int:
+        count = original(dit, **kwargs)
+        modules = dict(dit.named_modules())
+        kept = modules[ignored.removeprefix("dit.")] if ignored else None
+        swapped.append((count, sum(isinstance(module, Fp8Linear) for module in dit.modules()), kept))
         return count
 
     wav, sr = sf.read(str(REFERENCE_WAV_PATH), dtype="float32", always_2d=False)
@@ -94,15 +112,22 @@ def test_auk_fp8_zero_shot_tts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     # The diffusion stage is built in this process, so the patch must precede Omni.
     with monkeypatch.context() as patch:
         patch.setattr(pipeline_auk, "quantize_block_linears", recording_quantize)
-        with OmniRunner(str(Path(_model_dir or ".").resolve()), deploy_config=_fp8_deploy(tmp_path)) as runner:
+        with OmniRunner(
+            str(Path(_model_dir or ".").resolve()), deploy_config=_fp8_deploy(tmp_path, quantization)
+        ) as runner:
             # The first request compiles the blocks and captures the step graph; the second replays it.
             audios = [
                 _waveform(runner.omni.generate(prompt, auk_sampling_params(nfe=NFE, cfg=2.0, seed=0))[0])
                 for _ in range(2)
             ]
 
-    # Every block linear of the released checkpoint was swapped, once.
-    assert len(swapped) == 1 and swapped[0][0] == swapped[0][1] > 0, swapped
+    if fp8:
+        # Every block linear of the released checkpoint not named in ignored_layers was swapped, once.
+        assert len(swapped) == 1 and swapped[0][0] == swapped[0][1] > 0, swapped
+        if ignored:
+            assert type(swapped[0][2]) is torch.nn.Linear, swapped
+    else:
+        assert swapped == [], swapped
     expected = math.ceil(GEN_SECONDS * SAMPLE_RATE / HOP) * HOP
     for audio in audios:
         assert audio.size == expected, f"expected {expected} samples, got {audio.size}"

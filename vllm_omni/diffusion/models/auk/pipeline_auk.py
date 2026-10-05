@@ -46,6 +46,7 @@ from vllm_omni.diffusion.models.interface import (
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_extras.auk import resolve_gen_frames
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig, resolve_component_quant_config
 
 logger = init_logger(__name__)
 
@@ -96,14 +97,36 @@ def get_auk_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-def _wants_fp8(quant_config: Any) -> bool:
-    """Whether the stage asked for FP8 GEMMs; any other quantization method is rejected."""
+def _dit_fp8_config(quant_config: Any) -> Any | None:
+    """The stage's FP8 config for the DiT, or None when the DiT stays unquantized.
+
+    A per-component config is resolved to its ``dit`` entry first. Only the
+    DiT can be quantized, so a component config naming any other part of the
+    pipeline, any method other than ``fp8``, and FP8 options this pipeline
+    cannot honour are rejected rather than silently ignored.
+    """
     if quant_config is None:
-        return False
+        return None
+    if isinstance(quant_config, ComponentQuantizationConfig):
+        others = [p for p, c in quant_config.component_configs.items() if c is not None and p.split(".")[0] != "dit"]
+        if others:
+            raise ValueError(f"AuK quantizes only the DiT; set components {others} to null")
+    quant_config = resolve_component_quant_config(quant_config, "dit")
+    if quant_config is None:
+        return None
     name = quant_config.get_name() if hasattr(quant_config, "get_name") else str(quant_config)
     if name != "fp8":
         raise ValueError(f"AuK supports only 'fp8' quantization of the DiT, got {name!r}")
-    return True
+    unsupported = []
+    if getattr(quant_config, "is_checkpoint_fp8_serialized", False):
+        unsupported.append("is_checkpoint_fp8_serialized")
+    if getattr(quant_config, "weight_block_size", None):
+        unsupported.append("weight_block_size")
+    if getattr(quant_config, "activation_scheme", "dynamic") != "dynamic":
+        unsupported.append("activation_scheme")
+    if unsupported:
+        raise ValueError(f"AuK's online FP8 DiT does not support the FP8 options {unsupported}")
+    return quant_config
 
 
 def _prompt_mapping(prompt: Any) -> dict[str, Any]:
@@ -225,9 +248,14 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         # Opt-in FP8 GEMMs for the block linears (stage `diffusion_quantization_config: fp8`).
         # The swap happens before compilation and graph capture, which then see the FP8 modules.
         self.dit_fp8 = False
-        if _wants_fp8(getattr(od_config, "quantization_config", None)):
+        fp8_config = _dit_fp8_config(getattr(od_config, "quantization_config", None))
+        if fp8_config is not None:
             if fp8_supported(self.device):
-                count = quantize_block_linears(self.dit)
+                count = quantize_block_linears(
+                    self.dit,
+                    ignored_layers=list(getattr(fp8_config, "ignored_layers", None) or ()),
+                    match_mode=getattr(fp8_config, "ignored_layers_match_mode", "exact"),
+                )
                 self.dit_fp8 = True
                 logger.info("AuK DiT: %d block linears run as FP8 GEMMs", count)
             else:

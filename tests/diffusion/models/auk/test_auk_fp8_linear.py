@@ -75,6 +75,34 @@ def test_only_the_token_wise_block_linears_are_swapped() -> None:
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("ignored_layers", "match_mode"),
+    [
+        (["dit.transformer_blocks.0.attn.to_qkv"], "exact"),
+        ([".transformer_blocks.0.attn.to_qkv"], "suffix"),
+        (["dit.transformer_blocks.0.attn.to_qkv"], "substring"),
+    ],
+)
+def test_ignored_layers_keep_the_model_dtype(ignored_layers: list[str], match_mode: str) -> None:
+    dit = _make_dit()
+    assert quantize_block_linears(dit, ignored_layers=ignored_layers, match_mode=match_mode) < 24
+    assert type(dit.transformer_blocks[0].attn.to_qkv) is nn.Linear
+    # Only the named layer keeps the model dtype, not its namesakes in other blocks.
+    assert isinstance(dit.transformer_blocks[1].attn.to_qkv, Fp8Linear)
+    assert isinstance(dit.single_transformer_blocks[0].attn.to_qkv, Fp8Linear)
+    assert isinstance(dit.transformer_blocks[0].ff_x.linear_in, Fp8Linear)
+
+
+@pytest.mark.cpu
+def test_ignored_layers_that_name_no_dit_module_are_rejected() -> None:
+    dit = _make_dit()
+    with pytest.raises(ValueError, match="match no module of the AuK DiT"):
+        quantize_block_linears(dit, ignored_layers=["vae.decoder.conv_in"])
+    # Nothing was swapped before the error.
+    assert type(dit.transformer_blocks[0].attn.to_qkv) is nn.Linear
+
+
+@pytest.mark.cpu
 def test_linears_the_fp8_gemm_cannot_take_are_left_alone() -> None:
     dit = _make_dit()
     block = dit.single_transformer_blocks[0]

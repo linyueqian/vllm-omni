@@ -14,6 +14,8 @@ produces the activation and adds no kernel of its own.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 from torch import nn
 
@@ -85,17 +87,42 @@ def _block_linears(block: nn.Module) -> list[tuple[nn.Module, str]]:
     return targets
 
 
-def quantize_block_linears(dit: nn.Module) -> int:
+def _matches(name: str, pattern: str, match_mode: str) -> bool:
+    if match_mode == "exact":
+        return name == pattern
+    if match_mode == "substring":
+        return pattern in name
+    if match_mode == "suffix":
+        return name.endswith(pattern)
+    raise ValueError(f"Unsupported ignored_layers match mode {match_mode!r}")
+
+
+def quantize_block_linears(
+    dit: nn.Module,
+    ignored_layers: Sequence[str] = (),
+    match_mode: str = "exact",
+    prefix: str = "dit",
+) -> int:
     """Swap the token-wise linears of every DiT block for :class:`Fp8Linear`; returns the count.
 
     The embeddings, the adaLN modulations and the output projection keep the
-    model dtype. Call this after the weights are loaded and on the inference
-    device, and before any compilation or CUDA graph capture.
+    model dtype. Linears named in ``ignored_layers`` (full names under
+    ``prefix``, e.g. ``dit.transformer_blocks.0.attn.to_qkv``, matched as
+    vLLM's ``Fp8Config`` does) also keep it; an entry that names no module of
+    the DiT is rejected rather than ignored. Call this after the weights are
+    loaded and on the inference device, and before any compilation or CUDA
+    graph capture.
     """
+    names = {id(module): f"{prefix}.{name}" if name else prefix for name, module in dit.named_modules()}
+    unmatched = [p for p in ignored_layers if not any(_matches(n, p, match_mode) for n in names.values())]
+    if unmatched:
+        raise ValueError(f"ignored_layers {unmatched} match no module of the AuK DiT (match mode {match_mode!r})")
     count = 0
     for block in list(dit.transformer_blocks) + list(dit.single_transformer_blocks):
         for parent, attribute in _block_linears(block):
             linear = parent._modules[attribute]
+            if any(_matches(names[id(linear)], p, match_mode) for p in ignored_layers):
+                continue
             # The FP8 GEMM needs both feature dimensions to be multiples of 16.
             if isinstance(linear, nn.Linear) and linear.in_features % 16 == 0 and linear.out_features % 16 == 0:
                 parent._modules[attribute] = Fp8Linear(linear)

@@ -228,7 +228,7 @@ def build_pipeline(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline_auk, "AuKVAE", _StubVAE)
 
     def _build(
-        variant: str = "base", *, model_config: dict[str, Any] | None = None, quantization: str | None = None
+        variant: str = "base", *, model_config: dict[str, Any] | None = None, quantization: Any = None
     ) -> tuple[AuKPipeline, list[dict[str, Any]]]:
         calls: list[dict[str, Any]] = []
         monkeypatch.setattr(pipeline_auk, "sample_latents", _stub_sampler(calls))
@@ -306,14 +306,16 @@ class TestRequestParsing:
 
     def test_dit_stays_in_the_model_dtype_by_default(self, build_pipeline, monkeypatch):
         monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)
-        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", lambda dit: pytest.fail("FP8 was not requested"))
+        monkeypatch.setattr(
+            pipeline_auk, "quantize_block_linears", lambda dit, **_: pytest.fail("FP8 was not requested")
+        )
         pipeline, _ = build_pipeline()
         assert pipeline.dit_fp8 is False
 
     def test_fp8_quantization_swaps_the_block_linears(self, build_pipeline, monkeypatch):
         swapped = []
 
-        def record(dit) -> int:
+        def record(dit, **kwargs) -> int:
             swapped.append(dit)
             return 160
 
@@ -324,13 +326,52 @@ class TestRequestParsing:
         assert swapped == [pipeline.dit]
 
     def test_fp8_quantization_is_skipped_on_an_unsupported_device(self, build_pipeline, monkeypatch):
-        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", lambda dit: pytest.fail("no FP8 GEMMs on CPU"))
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", lambda dit, **_: pytest.fail("no FP8 GEMMs on CPU"))
         pipeline, _ = build_pipeline(quantization="fp8")
         assert pipeline.dit_fp8 is False
 
     def test_other_quantization_methods_are_rejected(self, build_pipeline):
         with pytest.raises(ValueError, match="AuK supports only 'fp8' quantization"):
             build_pipeline(quantization="int8")
+
+    @pytest.mark.parametrize(
+        ("quantization", "expected"),
+        [
+            ({"dit": {"method": "fp8"}, "vae": None}, True),
+            ({"dit": None}, False),
+            ({"dit": None, "vae": None}, False),
+        ],
+    )
+    def test_per_component_config_resolves_the_dit_entry(self, build_pipeline, monkeypatch, quantization, expected):
+        swapped = []
+        monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", lambda dit, **_: swapped.append(dit) or 160)
+        pipeline, _ = build_pipeline(quantization=quantization)
+        assert pipeline.dit_fp8 is expected
+        assert swapped == ([pipeline.dit] if expected else [])
+
+    def test_quantizing_a_component_other_than_the_dit_is_rejected(self, build_pipeline):
+        with pytest.raises(ValueError, match="AuK quantizes only the DiT"):
+            build_pipeline(quantization={"dit": {"method": "fp8"}, "vae": {"method": "fp8"}})
+
+    def test_ignored_layers_reach_the_fp8_swap(self, build_pipeline, monkeypatch):
+        calls = []
+        monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", lambda dit, **kwargs: calls.append(kwargs) or 159)
+        layer = "dit.transformer_blocks.0.attn.to_qkv"
+        build_pipeline(quantization={"dit": {"method": "fp8", "ignored_layers": [layer]}, "vae": None})
+        assert calls == [{"ignored_layers": [layer], "match_mode": "exact"}]
+
+    @pytest.mark.parametrize(
+        ("options", "rejected"),
+        [
+            ({"activation_scheme": "static"}, "activation_scheme"),
+            ({"is_checkpoint_fp8_serialized": True}, "is_checkpoint_fp8_serialized"),
+        ],
+    )
+    def test_fp8_options_the_dit_cannot_honour_are_rejected(self, build_pipeline, options, rejected):
+        with pytest.raises(ValueError, match=rejected):
+            build_pipeline(quantization={"method": "fp8", **options})
 
     def test_pipeline_declares_audio_output(self, build_pipeline):
         pipeline, _ = build_pipeline()
