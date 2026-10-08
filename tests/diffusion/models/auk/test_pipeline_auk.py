@@ -354,6 +354,24 @@ class TestRequestParsing:
         with pytest.raises(ValueError, match="AuK quantizes only the DiT"):
             build_pipeline(quantization={"dit": {"method": "fp8"}, "vae": {"method": "fp8"}})
 
+    @pytest.mark.parametrize(
+        "quantization",
+        [
+            # A child-only scope would otherwise quantize nothing.
+            {"dit.transformer_blocks.0": {"method": "fp8"}},
+            # A null child under an FP8 DiT would otherwise still be quantized.
+            {"dit": {"method": "fp8"}, "dit.transformer_blocks.0": None},
+            # A different method on a child would otherwise be ignored.
+            {"dit": {"method": "fp8"}, "dit.transformer_blocks.0": {"method": "int8"}},
+        ],
+        ids=["child-only", "child-null", "child-other-method"],
+    )
+    def test_scopes_below_the_dit_are_rejected(self, build_pipeline, monkeypatch, quantization):
+        monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", lambda dit, **_: pytest.fail("must not quantize"))
+        with pytest.raises(ValueError, match="does not support the sub-scopes"):
+            build_pipeline(quantization=quantization)
+
     def test_ignored_layers_reach_the_fp8_swap(self, build_pipeline, monkeypatch):
         calls = []
         monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)

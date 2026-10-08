@@ -108,7 +108,15 @@ def _dit_fp8_config(quant_config: Any) -> Any | None:
     if quant_config is None:
         return None
     if isinstance(quant_config, ComponentQuantizationConfig):
-        others = [p for p, c in quant_config.component_configs.items() if c is not None and p.split(".")[0] != "dit"]
+        components = quant_config.component_configs
+        # The whole DiT takes one config; per-layer opt-outs go through ignored_layers.
+        scoped = [p for p in components if p != "dit" and p.split(".")[0] == "dit"]
+        if scoped:
+            raise ValueError(
+                f"AuK quantizes the DiT as one component and does not support the sub-scopes {scoped}; "
+                "configure 'dit' and list the linears to keep in the model dtype in its ignored_layers"
+            )
+        others = [p for p, c in components.items() if c is not None and p != "dit"]
         if others:
             raise ValueError(f"AuK quantizes only the DiT; set components {others} to null")
     quant_config = resolve_component_quant_config(quant_config, "dit")
