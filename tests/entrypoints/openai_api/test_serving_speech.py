@@ -6096,7 +6096,7 @@ class TestTTSAsyncOffloading:
         assert struct.unpack("<I", chunks[0][24:28])[0] == 8000
 
     @pytest.mark.asyncio
-    async def test_generate_audio_chunks_discards_ref_audio_artifact_warmup_on_close(self, qwen3_tts_server):
+    async def test_generate_audio_chunks_closes_engine_stream_when_cancelled_on_close(self, qwen3_tts_server):
         closed = asyncio.Event()
 
         async def pcm_generator():
