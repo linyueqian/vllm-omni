@@ -1735,13 +1735,17 @@ class CosyVoice3Model(
             # weight updates (RL training loops, in-place reloads) were
             # reverted to the on-disk checkpoint without any error.
             weights = list(weights)
+            # The first load must cover every talker-specific parameter, as
+            # the strict load_state_dict path did; later calls may carry any
+            # subset. The flag is set only once a load has succeeded.
+            first_load = not getattr(self, "_talker_weights_loaded", False)
             if weights:
-                self._load_talker_weights(weights)
-            elif not getattr(self, "_talker_weights_loaded", False):
+                self._load_talker_weights(weights, require_complete=first_load)
+            elif first_load:
                 llm_weight_path = os.path.join(self.model_dir, "llm.pt")
                 device = next(self.parameters()).device
                 checkpoint = torch.load(llm_weight_path, map_location=device)
-                self._load_talker_weights(checkpoint.items())
+                self._load_talker_weights(checkpoint.items(), require_complete=True)
                 self.model.to(device)
             self._talker_weights_loaded = True
             self.model.eval()
@@ -1757,7 +1761,12 @@ class CosyVoice3Model(
         # unused text lm_head uninitialized on the talker stage).
         return None
 
-    def _load_talker_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+    def _load_talker_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        *,
+        require_complete: bool = False,
+    ) -> None:
         """Load checkpoint-schema tensors into the live talker modules.
 
         Names follow the native ``llm.pt`` layout: ``llm.model.model.*`` for
@@ -1768,18 +1777,44 @@ class CosyVoice3Model(
         and is skipped. Accepts the full checkpoint or any subset, e.g.
         buckets streamed by a weight-update loop, and loads in place so
         CUDA graphs stay valid.
+
+        With ``require_complete`` every ``speech_embedding.*`` and
+        ``llm_decoder.*`` parameter must be present. Names and shapes are
+        validated before anything is copied, so a rejected call leaves the
+        talker-specific parameters untouched.
         """
+        talker_params = {
+            f"{module_name}.{attr}": param
+            for module_name in ("speech_embedding", "llm_decoder")
+            for attr, param in getattr(self.model, module_name).named_parameters()
+        }
         qwen_weights: list[tuple[str, torch.Tensor]] = []
+        talker_updates: dict[str, torch.Tensor] = {}
         for name, tensor in weights:
             if name.startswith("llm.model.model."):
                 qwen_weights.append((name[len("llm.model.model.") :], tensor))
-            elif name.startswith("speech_embedding.") or name.startswith("llm_decoder."):
-                module_name, _, attr = name.partition(".")
-                param = getattr(getattr(self.model, module_name), attr)
-                param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
+            elif name in talker_params:
+                talker_updates[name] = tensor
             elif name.startswith("llm.model.lm_head."):
                 continue
             else:
                 raise ValueError(f"unexpected CosyVoice3 talker checkpoint tensor {name!r}")
+
+        if require_complete:
+            missing = sorted(talker_params.keys() - talker_updates.keys())
+            if missing:
+                raise ValueError(f"CosyVoice3 talker checkpoint is missing required tensors: {missing}")
+        # copy_ broadcasts, so compare shapes explicitly before copying.
+        mismatched = [
+            f"{name}: checkpoint {tuple(tensor.shape)} vs parameter {tuple(talker_params[name].shape)}"
+            for name, tensor in talker_updates.items()
+            if tensor.shape != talker_params[name].shape
+        ]
+        if mismatched:
+            raise ValueError(f"CosyVoice3 talker checkpoint tensor shape mismatch: {'; '.join(mismatched)}")
+
+        for name, tensor in talker_updates.items():
+            param = talker_params[name]
+            param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
         if qwen_weights:
             self.model.llm.model.load_weights(iter(qwen_weights))

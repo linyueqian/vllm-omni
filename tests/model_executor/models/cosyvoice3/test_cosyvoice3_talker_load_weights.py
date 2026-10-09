@@ -184,6 +184,72 @@ def test_empty_iterator_after_an_iterator_load_does_not_read_the_file(tmp_path, 
     assert torch.all(model.model.llm.model.norm.weight == 4.0)
 
 
+def test_first_load_missing_decoder_tensors_is_rejected_and_stays_incomplete(tmp_path, monkeypatch):
+    _write_llm_pt(tmp_path, 3.0)
+    model = _make_talker_model(tmp_path)
+    load_calls = _count_torch_load(monkeypatch)
+    talker = model.model
+    embedding_before = talker.speech_embedding.weight.detach().clone()
+
+    with pytest.raises(ValueError, match=r"missing required tensors: \['llm_decoder.bias', 'llm_decoder.weight'\]"):
+        model.load_weights([("speech_embedding.weight", torch.full((_SPEECH_VOCAB, _HIDDEN), 5.0))])
+
+    # Nothing was copied and the load is not marked complete, so a later
+    # empty call still initializes from the checkpoint file.
+    assert torch.equal(talker.speech_embedding.weight, embedding_before)
+    assert not getattr(model, "_talker_weights_loaded", False)
+
+    model.load_weights(iter(()))
+
+    assert load_calls == [str(tmp_path / "llm.pt")]
+    assert torch.all(talker.speech_embedding.weight == 3.0)
+    assert torch.all(talker.llm_decoder.weight == 3.0)
+    assert torch.all(talker.llm_decoder.bias == 3.0)
+
+
+def test_checkpoint_file_missing_decoder_tensors_is_rejected(tmp_path):
+    checkpoint = _checkpoint(3.0)
+    del checkpoint["llm_decoder.weight"]
+    torch.save(checkpoint, tmp_path / "llm.pt")
+    model = _make_talker_model(tmp_path)
+
+    with pytest.raises(ValueError, match=r"missing required tensors: \['llm_decoder.weight'\]"):
+        model.load_weights(iter(()))
+
+    assert not getattr(model, "_talker_weights_loaded", False)
+
+
+def test_broadcastable_but_unequal_shape_is_rejected_without_copying(tmp_path):
+    model = _make_talker_model(tmp_path)
+    model.load_weights(_checkpoint(1.0).items())
+    talker = model.model
+
+    # [1, 4] broadcasts into the [6, 4] embedding, so copy_ alone would
+    # accept it and overwrite every row.
+    with pytest.raises(ValueError, match=r"shape mismatch: speech_embedding.weight: checkpoint \(1, 4\) vs"):
+        model.load_weights(
+            [
+                ("llm_decoder.bias", torch.full((_SPEECH_VOCAB,), 8.0)),
+                ("speech_embedding.weight", torch.full((1, _HIDDEN), 5.0)),
+            ]
+        )
+
+    assert torch.all(talker.speech_embedding.weight == 1.0)
+    # The valid tensor in the same call is not applied either.
+    assert torch.all(talker.llm_decoder.bias == 1.0)
+
+
+def test_first_load_with_unequal_shape_is_rejected(tmp_path):
+    model = _make_talker_model(tmp_path)
+    checkpoint = _checkpoint(2.0)
+    checkpoint["llm_decoder.bias"] = torch.full((1,), 2.0)
+
+    with pytest.raises(ValueError, match=r"shape mismatch: llm_decoder.bias: checkpoint \(1,\) vs parameter \(6,\)"):
+        model.load_weights(checkpoint.items())
+
+    assert not getattr(model, "_talker_weights_loaded", False)
+
+
 def test_unexpected_tensor_name_is_rejected(tmp_path):
     model = _make_talker_model(tmp_path)
 
