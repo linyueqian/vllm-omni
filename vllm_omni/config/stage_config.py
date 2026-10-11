@@ -154,9 +154,7 @@ def _apply_diffusion_parallel_runtime_overrides(
         ulysses_degree = parallel_config_dict.get("ulysses_degree") or 1
         ring_degree = parallel_config_dict.get("ring_degree") or 1
         allgather_degree = parallel_config_dict.get("allgather_degree") or 1
-        parallel_config_dict["sequence_parallel_size"] = (
-            allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
-        )
+        parallel_config_dict["sequence_parallel_size"] = ulysses_degree * ring_degree * allgather_degree
 
     if parallel_config_dict is not None:
         engine_args["parallel_config"] = parallel_config_dict
@@ -269,6 +267,11 @@ class StagePipelineConfig:
     # next stage over the connector. Only diffusion producers need this; AR
     # stages already send through ``send_full_payload_outputs``.
     stage_output_payload_keys: tuple[str, ...] = ()
+    # Set on an async-chunk receiving stage. The orchestrator calls it with the
+    # original prompt when it submits this stage's prewarm placeholder; it
+    # returns a flat ``{name: Tensor | scalar}`` dict (or ``None``) sent under
+    # ``ASYNC_CHUNK_PREWARM_NS`` so the stage can warm up before chunk 0.
+    async_chunk_prewarm_payload_func: str | None = None
     omni_kv_config: dict[str, Any] | None = None
     scheduler_cls: str | None = None
     # Model subdirectory indirections: for multi-component HF repos where the
@@ -1167,6 +1170,8 @@ def _build_extras(
         extras["prompt_expand_func"] = ps.prompt_expand_func
     if ps.cfg_kv_collect_func:
         extras["cfg_kv_collect_func"] = ps.cfg_kv_collect_func
+    if ps.async_chunk_prewarm_payload_func:
+        extras["async_chunk_prewarm_payload_func"] = ps.async_chunk_prewarm_payload_func
     if ps.extras:
         extras.update(ps.extras)
     return extras
