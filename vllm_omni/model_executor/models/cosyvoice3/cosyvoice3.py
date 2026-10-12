@@ -67,6 +67,12 @@ from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
 
+# vLLM stacks these Qwen2 projections; the checkpoint carries one tensor per shard.
+_QWEN2_STACKED_SHARDS = {
+    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+    "gate_up_proj": ("gate_proj", "up_proj"),
+}
+
 # Process-wide cache of per-model mm-processor runtime components (tokenizer,
 # feat_extractor, campplus session/engine). The mm processor is re-created per
 # request (mm_processor_cache_gb: 0), so this avoids rebuilding them every time.
@@ -1779,9 +1785,10 @@ class CosyVoice3Model(
         CUDA graphs stay valid.
 
         With ``require_complete`` every ``speech_embedding.*`` and
-        ``llm_decoder.*`` parameter must be present. Names and shapes are
-        validated before anything is copied, so a rejected call leaves the
-        talker-specific parameters untouched.
+        ``llm_decoder.*`` parameter and every transformer tensor must be
+        present, counting each shard of a stacked parameter separately.
+        Names and shapes are validated before anything is copied, so a
+        rejected call leaves the talker untouched.
         """
         talker_params = {
             f"{module_name}.{attr}": param
@@ -1802,6 +1809,10 @@ class CosyVoice3Model(
 
         if require_complete:
             missing = sorted(talker_params.keys() - talker_updates.keys())
+            qwen_names = {name for name, _ in qwen_weights}
+            missing += sorted(
+                f"llm.model.model.{name}" for name in self._talker_transformer_tensor_names() - qwen_names
+            )
             if missing:
                 raise ValueError(f"CosyVoice3 talker checkpoint is missing required tensors: {missing}")
         # copy_ broadcasts, so compare shapes explicitly before copying.
@@ -1818,3 +1829,15 @@ class CosyVoice3Model(
             param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
         if qwen_weights:
             self.model.llm.model.load_weights(iter(qwen_weights))
+
+    def _talker_transformer_tensor_names(self) -> set[str]:
+        """Checkpoint names the talker transformer needs, one per stacked shard."""
+        names: set[str] = set()
+        for name, _ in self.model.llm.model.named_parameters():
+            for stacked, shards in _QWEN2_STACKED_SHARDS.items():
+                if f".{stacked}." in f".{name}":
+                    names.update(name.replace(stacked, shard) for shard in shards)
+                    break
+            else:
+                names.add(name)
+        return names

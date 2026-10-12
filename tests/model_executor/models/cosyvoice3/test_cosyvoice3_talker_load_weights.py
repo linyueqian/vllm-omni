@@ -192,7 +192,13 @@ def test_first_load_missing_decoder_tensors_is_rejected_and_stays_incomplete(tmp
     embedding_before = talker.speech_embedding.weight.detach().clone()
 
     with pytest.raises(ValueError, match=r"missing required tensors: \['llm_decoder.bias', 'llm_decoder.weight'\]"):
-        model.load_weights([("speech_embedding.weight", torch.full((_SPEECH_VOCAB, _HIDDEN), 5.0))])
+        model.load_weights(
+            [
+                ("speech_embedding.weight", torch.full((_SPEECH_VOCAB, _HIDDEN), 5.0)),
+                ("llm.model.model.norm.weight", torch.full((_HIDDEN,), 5.0)),
+                ("llm.model.model.norm.bias", torch.full((_HIDDEN,), 5.0)),
+            ]
+        )
 
     # Nothing was copied and the load is not marked complete, so a later
     # empty call still initializes from the checkpoint file.
@@ -255,3 +261,90 @@ def test_unexpected_tensor_name_is_rejected(tmp_path):
 
     with pytest.raises(ValueError, match="unexpected CosyVoice3 talker checkpoint tensor 'input_embedding.weight'"):
         model.load_weights([("input_embedding.weight", torch.zeros(2, 2))])
+
+
+def test_first_load_with_heads_only_is_rejected_and_stays_incomplete(tmp_path, monkeypatch):
+    _write_llm_pt(tmp_path, 3.0)
+    model = _make_talker_model(tmp_path)
+    load_calls = _count_torch_load(monkeypatch)
+    talker = model.model
+    embedding_before = talker.speech_embedding.weight.detach().clone()
+    heads = {name: tensor for name, tensor in _checkpoint(5.0).items() if not name.startswith("llm.")}
+
+    with pytest.raises(
+        ValueError,
+        match=r"missing required tensors: \['llm.model.model.norm.bias', 'llm.model.model.norm.weight'\]",
+    ):
+        model.load_weights(heads.items())
+
+    # Neither the heads nor the transformer were touched, and a later empty
+    # call still initializes everything from the checkpoint file.
+    assert torch.equal(talker.speech_embedding.weight, embedding_before)
+    assert talker.llm.model.load_calls == []
+    assert not getattr(model, "_talker_weights_loaded", False)
+
+    model.load_weights(iter(()))
+
+    assert load_calls == [str(tmp_path / "llm.pt")]
+    assert torch.all(talker.speech_embedding.weight == 3.0)
+    assert torch.all(talker.llm.model.norm.weight == 3.0)
+
+
+class _FakeStackedQwen2(nn.Module):
+    """Transformer whose parameters use vLLM's stacked projection names."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([nn.Module()])
+        self.layers[0].self_attn = nn.Module()
+        self.layers[0].self_attn.qkv_proj = nn.Linear(_HIDDEN, 3 * _HIDDEN, bias=False)
+        self.layers[0].mlp = nn.Module()
+        self.layers[0].mlp.gate_up_proj = nn.Linear(_HIDDEN, 2 * _HIDDEN, bias=False)
+        self.layers[0].mlp.down_proj = nn.Linear(_HIDDEN, _HIDDEN, bias=False)
+        self.load_calls: list[list[str]] = []
+
+    def load_weights(self, weights):
+        self.load_calls.append([name for name, _ in weights])
+
+
+_STACKED_SHARD_NAMES = [
+    "layers.0.self_attn.q_proj.weight",
+    "layers.0.self_attn.k_proj.weight",
+    "layers.0.self_attn.v_proj.weight",
+    "layers.0.mlp.gate_proj.weight",
+    "layers.0.mlp.up_proj.weight",
+    "layers.0.mlp.down_proj.weight",
+]
+
+
+def _stacked_checkpoint() -> dict[str, torch.Tensor]:
+    checkpoint = {name: tensor for name, tensor in _checkpoint(2.0).items() if not name.startswith("llm.model.model.")}
+    for name in _STACKED_SHARD_NAMES:
+        checkpoint[f"llm.model.model.{name}"] = torch.full((_HIDDEN, _HIDDEN), 2.0)
+    return checkpoint
+
+
+def test_first_load_requires_every_shard_of_a_stacked_parameter(tmp_path):
+    model = _make_talker_model(tmp_path)
+    model.model.llm.model = _FakeStackedQwen2()
+    checkpoint = _stacked_checkpoint()
+    del checkpoint["llm.model.model.layers.0.self_attn.v_proj.weight"]
+    del checkpoint["llm.model.model.layers.0.mlp.up_proj.weight"]
+
+    with pytest.raises(ValueError) as excinfo:
+        model.load_weights(checkpoint.items())
+
+    assert "'llm.model.model.layers.0.mlp.up_proj.weight'" in str(excinfo.value)
+    assert "'llm.model.model.layers.0.self_attn.v_proj.weight'" in str(excinfo.value)
+    assert model.model.llm.model.load_calls == []
+    assert not getattr(model, "_talker_weights_loaded", False)
+
+
+def test_first_load_with_all_stacked_shards_is_accepted(tmp_path):
+    model = _make_talker_model(tmp_path)
+    model.model.llm.model = _FakeStackedQwen2()
+
+    model.load_weights(_stacked_checkpoint().items())
+
+    assert sorted(model.model.llm.model.load_calls[0]) == sorted(_STACKED_SHARD_NAMES)
+    assert model._talker_weights_loaded
