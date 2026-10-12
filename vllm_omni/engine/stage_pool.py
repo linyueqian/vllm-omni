@@ -1168,8 +1168,12 @@ class StagePool:
 
     # ---- Stage-local polling ----
 
-    async def _poll_stage_raw(self, client: StagePoolLLMClient) -> EngineCoreOutputs | None:
-        """Pull raw EngineCoreOutputs from a stage replica without processing."""
+    async def read_llm_raw_output(self, client: StagePoolLLMClient) -> EngineCoreOutputs | None:
+        """Await one raw EngineCore batch from *client*; ``None`` if it is empty.
+
+        Untimed read shared by both orchestration loops; the legacy loop bounds
+        it through ``poll_llm_raw_output``.
+        """
         outputs = await client.get_output_async()
         # Keep scheduler-only / finished-only batches. Omni schedulers mirror
         # upstream by emitting SchedulerStats on throttled ticks even when no
@@ -1179,15 +1183,6 @@ class StagePool:
             return None
         self._rehydrate_pooling_output_payloads(outputs)
         return outputs
-
-    async def read_llm_raw_output(self, client: StagePoolLLMClient) -> EngineCoreOutputs | None:
-        """Await one raw EngineCore batch from *client*; ``None`` if it is empty.
-
-        Untimed counterpart of ``poll_llm_raw_output`` for the event-driven
-        orchestration loop, so both loops share the keep/drop rule and the
-        MR V2 payload rehydration.
-        """
-        return await self._poll_stage_raw(client)
 
     @staticmethod
     def _rehydrate_pooling_output_payloads(outputs: EngineCoreOutputs) -> None:
@@ -1255,7 +1250,7 @@ class StagePool:
         client = cast(StagePoolLLMClient, raw_client)
         try:
             return await asyncio.wait_for(
-                self._poll_stage_raw(client),
+                self.read_llm_raw_output(client),
                 timeout=timeout_s,
             )
         except asyncio.TimeoutError:
@@ -1264,7 +1259,7 @@ class StagePool:
             raise
         except Exception:
             logger.exception(
-                "[StagePool] _poll_stage_raw failed for stage-%s replica-%s",
+                "[StagePool] read_llm_raw_output failed for stage-%s replica-%s",
                 self.stage_id,
                 replica_id,
             )

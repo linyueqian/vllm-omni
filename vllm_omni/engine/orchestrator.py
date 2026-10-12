@@ -80,10 +80,9 @@ def cleanup_request_artifact_dirs(artifact_dirs: set[str] | list[str]) -> None:
         shutil.rmtree(artifact_dir, ignore_errors=True)
 
 
-# The orchestration loop (and the serving-side final-output drain in
-# entrypoints/async_omni.py) is event-driven by default: one reader task per
-# live LLM stage replica awaits its client directly — the same pattern vLLM's
-# own AsyncLLM output handler uses — and feeds a single serial dispatch queue.
+# The orchestration loop is event-driven by default: one reader task per live
+# LLM stage replica awaits its client directly — the same pattern vLLM's own
+# AsyncLLM output handler uses — and feeds a single serial dispatch queue.
 # VLLM_OMNI_EVENT_DRIVEN_ORCH=0 selects the legacy 1 ms poll loop instead.
 _EVENT_DRIVEN_ORCH_ENV = "VLLM_OMNI_EVENT_DRIVEN_ORCH"
 
@@ -1234,8 +1233,10 @@ class OrchestratorBase:
                     reaped.append(task)
 
         # Membership changes (replica attach/detach/eviction) wake the dispatcher
-        # so a new replica gets its reader at once; the periodic reconcile stays
-        # as the backstop for anything that bypasses the pool API.
+        # so a new replica gets its reader on the next dispatcher turn instead
+        # of the next periodic tick. Reconcile runs in the dispatcher, so it
+        # still waits behind an in-flight output routing await. The periodic
+        # reconcile stays as the backstop for anything that bypasses the pool API.
         reconcile_event = asyncio.Event()
         loop = asyncio.get_running_loop()
 
