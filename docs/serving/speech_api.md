@@ -987,16 +987,16 @@ Use `/v1/audio/voices` to list available voices for the loaded model.
 Multi-stage omni deployments route stage outputs through a single orchestrator
 loop. The legacy loop polls every stage replica on a 1 ms cadence. The
 event-driven mode replaces the poll with one reader task per live stage
-replica awaiting its client directly, and switches the serving-side
-final-output drain to a condition-variable wakeup at the same time. Every
-pipeline uses the event-driven mode by default; the legacy poll remains
-available as an opt-out.
+replica awaiting its client directly. Every pipeline uses the event-driven
+mode by default; the legacy poll remains available as an opt-out. The
+serving-side final-output loop is independent of this setting: it is always
+woken when the orchestrator queues output.
 
 **Configuration (environment variables):**
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | On | Selects between event-driven wakeups and the legacy 1 ms poll for the orchestration loop and the final-output drain. The value is resolved at orchestrator construction and separately when the final-output drain starts. `1`, `true`, `yes`, or `on` keeps event-driven mode, ignoring case and surrounding whitespace; any other value, such as `0`, selects the legacy poll loop. |
+| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | On | Selects between event-driven wakeups and the legacy 1 ms poll for the orchestration loop. The value is resolved at orchestrator construction. `1`, `true`, `yes`, or `on` keeps event-driven mode, ignoring case and surrounding whitespace; any other value, such as `0`, selects the legacy poll loop. |
 
 Set it on the process that runs the orchestrator (stage 0 of an omni deployment)
 before starting the server when overriding the default. For example,
