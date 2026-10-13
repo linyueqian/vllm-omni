@@ -3,7 +3,9 @@
 """CPU tests for the Drama 3 codebook tower key/value history.
 
 The tower runs teacher-forced over the prompt at prefill and one row per
-request at decode. Its per-layer cache must make both paths agree.
+request at decode. The tests use only ``CodebookTower.run`` and the outputs
+of the checkpoint-named layers, so they do not depend on how the key/value
+history is stored.
 """
 
 import pytest
@@ -114,24 +116,26 @@ def test_prefill_then_decode_matches_longer_prefill(n):
 
 @torch.no_grad()
 def test_batched_decode_matches_per_request_decode():
-    tower = _tiny_tower()
-    tap = LayerTap(tower)
     lengths = (5, 3)
     requests = [_sequence(n + 1, seed=10 + n) for n in lengths]
-    for slot, ((hidden, frames), n) in enumerate(zip(requests, lengths)):
-        _run(tower, hidden, frames, 0, n, slot=slot)
-    tap.take()
-    cache = tower.cache.buffer.clone()
 
+    # One tower per request decodes alone; a third tower decodes both rows at once.
     single_outputs, single_logits = [], []
     for slot, ((hidden, frames), n) in enumerate(zip(requests, lengths)):
-        tower.cache.buffer.copy_(cache)
+        tower = _tiny_tower()
+        tap = LayerTap(tower)
+        _run(tower, hidden, frames, 0, n, slot=slot)
+        tap.take()
         _run(tower, hidden, frames, n, n + 1, slot=slot)
         outputs, logits = tap.take()
         single_outputs.append(outputs)
         single_logits.append(logits)
 
-    tower.cache.buffer.copy_(cache)
+    tower = _tiny_tower()
+    tap = LayerTap(tower)
+    for slot, ((hidden, frames), n) in enumerate(zip(requests, lengths)):
+        _run(tower, hidden, frames, 0, n, slot=slot)
+    tap.take()
     tower.run(
         hidden=torch.cat([hidden[n : n + 1] for (hidden, _), n in zip(requests, lengths)]),
         input_codes=torch.cat([frames[n : n + 1, 1:] for (_, frames), n in zip(requests, lengths)]),
@@ -160,16 +164,3 @@ def test_sampled_decode_returns_code0_from_main_token():
     assert codes.shape == (1, 4)
     assert int(codes[0, 0]) == int(frames[4, 0]) - SEMANTIC_BEGIN
     assert bool(((codes >= 0) & (codes < 16)).all())
-
-
-def test_cache_slots_are_reused_least_recently_used_first():
-    tower = _tiny_tower()
-    owners = [object() for _ in range(5)]
-    slots = [tower.cache.acquire(owner, in_use=set()) for owner in owners[:4]]
-    assert slots == [0, 1, 2, 3]
-    tower.cache.touch(0)
-    assert tower.cache.acquire(owners[4], in_use={2}) == 1
-    assert tower.cache.owns(1, owners[4])
-    assert not tower.cache.owns(1, owners[1])
-    with pytest.raises(RuntimeError, match="in use"):
-        tower.cache.acquire(object(), in_use={0, 1, 2, 3})

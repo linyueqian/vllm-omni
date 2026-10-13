@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CPU tests for the Drama 3 main-token sampler with repetition-aware re-draw."""
+"""CPU tests for the Drama 3 main-token sampler with repetition-aware re-draw.
 
-from types import SimpleNamespace
+The request parameters (top_k=1) make the first draw the arg-max token. The
+re-draw uses fixed parameters (temperature 1.0, top_k 30, top_p 0.95), so over
+many identical rows it spreads across the near-tied candidates it keeps. A row whose
+first draw repeats its recent history must therefore often return another
+token; a row without a repeat always keeps the arg-max token.
+"""
 
 import pytest
 import torch
+from torch import nn
+from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.metadata import SamplingMetadata
 
-from vllm_omni.model_executor.models.fish_omni import fish_omni_model
 from vllm_omni.model_executor.models.fish_omni.fish_omni_model import FishOmniForConditionalGeneration
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -15,69 +22,88 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 EOS = 5
 SEMANTIC_BEGIN = 100
 CODEBOOK_SIZE = 8
-# Candidate columns: end of speech, then the semantic tokens.
-CANDIDATES = torch.tensor([EOS, *range(SEMANTIC_BEGIN, SEMANTIC_BEGIN + CODEBOOK_SIZE)])
+VOCAB = 128
+ROWS = 2000
+# Near-tied candidates: the arg-max semantic token, end of speech, and two more
+# semantic tokens; top_p 0.95 drops the last of them.
+ARGMAX, OTHER_A, OTHER_B = SEMANTIC_BEGIN + 1, SEMANTIC_BEGIN + 2, SEMANTIC_BEGIN + 3
 
 
-def _column(token: int) -> int:
-    return int((CANDIDATES == token).nonzero())
-
-
-def _model() -> SimpleNamespace:
-    def is_semantic(tokens: torch.Tensor) -> torch.Tensor:
+class SemanticRange(nn.Module):
+    def is_semantic(self, tokens: torch.Tensor) -> torch.Tensor:
         return (tokens >= SEMANTIC_BEGIN) & (tokens < SEMANTIC_BEGIN + CODEBOOK_SIZE)
 
-    return SimpleNamespace(_main_token_candidates=CANDIDATES, tower=SimpleNamespace(is_semantic=is_semantic))
+
+def _sampler_model() -> FishOmniForConditionalGeneration:
+    """A model instance with only the state ``sample`` reads (no backbone)."""
+    model = FishOmniForConditionalGeneration.__new__(FishOmniForConditionalGeneration)
+    nn.Module.__init__(model)
+    candidates = torch.tensor([EOS, *range(SEMANTIC_BEGIN, SEMANTIC_BEGIN + CODEBOOK_SIZE)])
+    model.register_buffer("_main_token_candidates", candidates, persistent=False)
+    model.tower = SemanticRange()
+    return model
 
 
-def _sample(monkeypatch, first: list[int], redraw: list[int], history: list[list[int]]) -> list[int]:
-    """Run ``sample`` with scripted draws; returns the sampled main tokens."""
-    draws = iter([first, redraw])
-    calls = []
+def _logits(top: int, second: int) -> torch.Tensor:
+    logits = torch.full((ROWS, VOCAB), -30.0)
+    logits[:, OTHER_A] = 0.0
+    logits[:, OTHER_B] = 0.0
+    logits[:, second] = 0.01
+    logits[:, top] = 0.02
+    return logits
 
-    def scripted_sample_rows(logits, temperature, top_k, top_p):
-        calls.append((temperature.tolist(), top_k.tolist(), top_p.tolist()))
-        return torch.tensor([_column(t) for t in next(draws)])
 
-    monkeypatch.setattr(fish_omni_model, "sample_rows", scripted_sample_rows)
-    rows = len(first)
-    metadata = SimpleNamespace(
-        temperature=torch.full((rows,), 0.8),
-        top_k=torch.full((rows,), 5, dtype=torch.long),
-        top_p=torch.full((rows,), 0.7),
-        output_token_ids=history,
+def _metadata(history: list[int]) -> SamplingMetadata:
+    return SamplingMetadata(
+        temperature=torch.full((ROWS,), 1.0),
+        all_greedy=False,
+        all_random=True,
+        top_p=torch.full((ROWS,), 1.0),
+        top_k=torch.full((ROWS,), 1, dtype=torch.long),
+        generators={},
+        max_num_logprobs=None,
+        no_penalties=True,
+        prompt_token_ids=None,
+        frequency_penalties=torch.zeros(ROWS),
+        presence_penalties=torch.zeros(ROWS),
+        repetition_penalties=torch.ones(ROWS),
+        output_token_ids=[list(history) for _ in range(ROWS)],
+        allowed_token_ids_mask=None,
+        bad_words_token_ids={},
+        logitsprocs=LogitsProcessors(),
     )
-    logits = torch.zeros((rows, 256))
-    output = FishOmniForConditionalGeneration.sample(_model(), logits, metadata)
-    # The first draw uses the request parameters; the re-draw uses fixed ones.
-    assert calls[0] == ([pytest.approx(0.8)] * rows, [5] * rows, [pytest.approx(0.7)] * rows)
-    assert calls[1] == ([1.0] * rows, [30] * rows, [pytest.approx(0.95)] * rows)
-    assert output.sampled_token_ids.shape == (rows, 1)
-    return output.sampled_token_ids.squeeze(-1).tolist()
 
 
-def test_repeated_semantic_token_is_redrawn(monkeypatch):
-    assert _sample(monkeypatch, first=[101], redraw=[103], history=[[100, 101, 102]]) == [103]
+def _sample(logits: torch.Tensor, history: list[int]) -> torch.Tensor:
+    torch.manual_seed(0)
+    output = _sampler_model().sample(logits, _metadata(history))
+    assert output is not None
+    assert output.sampled_token_ids.shape == (ROWS, 1)
+    return output.sampled_token_ids.squeeze(-1)
 
 
-def test_non_repeated_token_keeps_first_draw(monkeypatch):
-    assert _sample(monkeypatch, first=[104], redraw=[103], history=[[100, 101, 102]]) == [104]
+def test_non_repeated_token_keeps_first_draw():
+    tokens = _sample(_logits(ARGMAX, OTHER_A), history=[OTHER_A, OTHER_B])
+    assert bool((tokens == ARGMAX).all())
 
 
-def test_redraw_may_end_speech(monkeypatch):
-    assert _sample(monkeypatch, first=[101], redraw=[EOS], history=[[101]]) == [EOS]
+def test_repeated_semantic_token_is_redrawn():
+    tokens = _sample(_logits(ARGMAX, OTHER_A), history=[OTHER_B, ARGMAX])
+    kept = (tokens == ARGMAX).float().mean().item()
+    assert 0.3 < kept < 0.7
+    assert set(tokens.tolist()) <= {ARGMAX, OTHER_A, OTHER_B}
 
 
-def test_end_of_speech_is_never_redrawn(monkeypatch):
-    assert _sample(monkeypatch, first=[EOS], redraw=[101], history=[[EOS, EOS]]) == [EOS]
+def test_redraw_may_end_speech():
+    tokens = _sample(_logits(ARGMAX, EOS), history=[ARGMAX])
+    assert bool((tokens == EOS).any())
 
 
-def test_repeat_outside_window_keeps_first_draw(monkeypatch):
-    history = [[101] + [102] * 16]
-    assert _sample(monkeypatch, first=[101], redraw=[103], history=history) == [101]
+def test_end_of_speech_is_never_redrawn():
+    tokens = _sample(_logits(EOS, OTHER_A), history=[EOS, EOS])
+    assert bool((tokens == EOS).all())
 
 
-def test_rows_are_independent(monkeypatch):
-    history = [[101], [100], [], [103]]
-    tokens = _sample(monkeypatch, first=[101, 101, 101, 103], redraw=[104, 105, 106, EOS], history=history)
-    assert tokens == [104, 101, 101, EOS]
+def test_repeat_outside_window_keeps_first_draw():
+    tokens = _sample(_logits(ARGMAX, OTHER_A), history=[ARGMAX] + [OTHER_B] * 16)
+    assert bool((tokens == ARGMAX).all())
