@@ -19,7 +19,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.cuda import CUDAGraph
-from vllm.vllm_flash_attn import flash_attn_varlen_func
+from vllm.platforms import current_platform
+from vllm.vllm_flash_attn import flash_attn_varlen_func, is_fa_version_supported
 
 from .configuration_fish_omni import FishOmniAudioDecoderConfig
 
@@ -178,6 +179,8 @@ class TowerAttention(nn.Module):
         self.wo = nn.Linear(q_width, config.dim, bias=False)
         self.q_norm = GemmaRMSNorm(self.head_dim, config.norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, config.norm_eps)
+        # FA3 has native Hopper kernels; the FA2 build needs a slow driver JIT there.
+        self.fa_version = 3 if current_platform.is_device_capability(90) and is_fa_version_supported(3) else 2
 
     def forward(
         self,
@@ -211,6 +214,7 @@ class TowerAttention(nn.Module):
                 block_table=batch.block_table,
                 softmax_scale=self.head_dim**-0.5,
                 causal=True,
+                fa_version=self.fa_version,
             )
         else:
             attended = self._attend_reference(query, batch, key_cache, value_cache)

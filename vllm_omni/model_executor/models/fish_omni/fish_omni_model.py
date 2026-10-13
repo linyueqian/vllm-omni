@@ -29,7 +29,7 @@ from vllm.model_executor.models.qwen3_5 import Qwen3_5MoeForCausalLM
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 
-from vllm_omni.model_executor.models.fish_speech.dac_encoder import encode_reference_audio_codes
+from vllm_omni.model_executor.models.fish_speech.dac_encoder import _load_dac_codec, encode_reference_audio_codes
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
@@ -441,4 +441,7 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
         missing = set(tower_params) - tower_loaded
         if missing:
             raise ValueError(f"fish_omni: {len(missing)} tower weights missing, e.g. {sorted(missing)[:4]}")
+        # Load the reference-audio encoder now, so the first voice-clone request
+        # does not pay for it.
+        _load_dac_codec(self.model_path, device=self.tower.row_offsets.device, dtype=torch.float32)
         return loaded | {f"tower.{name}" for name in tower_loaded}
