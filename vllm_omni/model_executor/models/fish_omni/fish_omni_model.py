@@ -288,7 +288,8 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
         return update
 
     def _prefill_tower(self, hidden_states: torch.Tensor, frames: torch.Tensor) -> TowerState:
-        """Teacher-force the tower over prompt rows 0..n-2 (row p's next frame is p+1)."""
+        """Claim a cache slot and queue prompt rows 0..n-2 for the tower (row p's next
+        frame is p + 1); the next decode step runs all queued requests together."""
         frames = frames.to(hidden_states.device)
         rows = int(frames.shape[0])
         state = TowerState(
@@ -299,18 +300,31 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
         )
         state.slot = self.tower.cache.acquire(state, in_use=set())
         if rows > 1:
-            n = rows - 1
-            device = hidden_states.device
-            self.tower.run(
-                hidden=hidden_states[:n].to(torch.bfloat16),
-                input_codes=frames[:n, 1:],
-                input_is_semantic=self.tower.is_semantic(frames[:n, 0]),
-                next_main_tokens=frames[1:, 0],
-                next_codes=frames[1:, 1:],
-                batch=TowerBatch.prefill(state.slot, n, device),
-                sampling=_HEAD_SAMPLING,
-            )
+            # The runner reuses its hidden-state buffer next step, so keep a copy.
+            state.pending = (hidden_states[: rows - 1].to(torch.bfloat16).clone(), frames)
         return state
+
+    def _run_pending_prefills(self, states: list[TowerState]) -> None:
+        """Teacher-force the queued prompt rows of ``states`` in one tower call."""
+        pending = [s for s in states if s.pending is not None]
+        if not pending:
+            return
+        hidden = torch.cat([s.pending[0] for s in pending])
+        frames = [s.pending[1] for s in pending]
+        inputs = torch.cat([f[:-1] for f in frames])
+        targets = torch.cat([f[1:] for f in frames])
+        counts = [int(f.shape[0]) - 1 for f in frames]
+        self.tower.run(
+            hidden=hidden,
+            input_codes=inputs[:, 1:],
+            input_is_semantic=self.tower.is_semantic(inputs[:, 0]),
+            next_main_tokens=targets[:, 0],
+            next_codes=targets[:, 1:],
+            batch=TowerBatch.groups([s.slot for s in pending], [0] * len(pending), counts, hidden.device),
+            sampling=_HEAD_SAMPLING,
+        )
+        for s in pending:
+            s.pending = None
 
     # -------------------- codebook tower per decode step --------------------
 
@@ -340,6 +354,7 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
         live_states = [states[i] for i in live]
         for s in live_states:
             self.tower.cache.touch(s.slot)
+        self._run_pending_prefills(live_states)
         # Host-built indices go up in one pinned, non-blocking copy.
         host = torch.tensor(
             [live, [s.slot for s in live_states], [s.next_position for s in live_states]], dtype=torch.long

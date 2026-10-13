@@ -108,6 +108,13 @@ class TowerKVCache:
         self._last_use[slot] = self._clock
 
 
+def _upload(host: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Copy small host metadata to ``device`` without stalling the host on CUDA."""
+    if device.type == "cuda":
+        return host.pin_memory().to(device, non_blocking=True)
+    return host.to(device)
+
+
 @dataclass(frozen=True)
 class TowerBatch:
     """Where this call's rows sit in the cache.
@@ -150,6 +157,28 @@ class TowerBatch:
         )
 
     @staticmethod
+    def groups(slots: list[int], firsts: list[int], ends: list[int], device: torch.device) -> TowerBatch:
+        """Rows ``firsts[g]..ends[g]-1`` of request ``g``, for several requests at once."""
+        counts = [end - first for first, end in zip(firsts, ends)]
+        row_slots = [slot for slot, count in zip(slots, counts) for _ in range(count)]
+        row_positions = [p for first, end in zip(firsts, ends) for p in range(first, end)]
+        bounds = [0]
+        for count in counts:
+            bounds.append(bounds[-1] + count)
+        rows = len(row_slots)
+        row_data = _upload(torch.tensor(row_slots + row_positions, dtype=torch.long), device)
+        meta = _upload(torch.tensor(slots + bounds + ends, dtype=torch.int32), device)
+        groups = len(slots)
+        return TowerBatch(
+            slots=row_data[:rows],
+            positions=row_data[rows:],
+            block_table=meta[:groups].view(groups, 1),
+            cu_seqlens_q=meta[groups : 2 * groups + 1],
+            seq_used=meta[2 * groups + 1 :],
+            max_rows=max(counts),
+        )
+
+    @staticmethod
     def prefill(slot: int, rows: int, device: torch.device) -> TowerBatch:
         return TowerBatch.extend(slot, 0, rows, device)
 
@@ -162,6 +191,8 @@ class TowerState:
     next_position: int
     input_frame: torch.Tensor  # [num_codebooks] codes of the frame at next_position
     input_is_semantic: torch.Tensor  # [] bool, on device
+    # Prompt rows still to teacher-force through the tower: (hidden [n, dim], frames [n + 1, 1 + Q]).
+    pending: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class TowerAttention(nn.Module):
