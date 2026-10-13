@@ -13,7 +13,7 @@ Module names follow the checkpoint (``audio_decoder*``) so weights load by name.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
@@ -100,6 +100,10 @@ class TowerKVCache:
         self._last_use[slot] = self._clock
         return slot
 
+    def release(self, slot: int, owner: object) -> None:
+        if 0 <= slot < self.slots and self._owner[slot] is owner:
+            self._owner[slot] = None
+
     def owns(self, slot: int, owner: object) -> bool:
         return self._owner[slot] is owner
 
@@ -108,7 +112,7 @@ class TowerKVCache:
         self._last_use[slot] = self._clock
 
 
-def _upload(host: torch.Tensor, device: torch.device) -> torch.Tensor:
+def to_device(host: torch.Tensor, device: torch.device) -> torch.Tensor:
     """Copy small host metadata to ``device`` without stalling the host on CUDA."""
     if device.type == "cuda":
         return host.pin_memory().to(device, non_blocking=True)
@@ -166,8 +170,8 @@ class TowerBatch:
         for count in counts:
             bounds.append(bounds[-1] + count)
         rows = len(row_slots)
-        row_data = _upload(torch.tensor(row_slots + row_positions, dtype=torch.long), device)
-        meta = _upload(torch.tensor(slots + bounds + ends, dtype=torch.int32), device)
+        row_data = to_device(torch.tensor(row_slots + row_positions, dtype=torch.long), device)
+        meta = to_device(torch.tensor(slots + bounds + ends, dtype=torch.int32), device)
         groups = len(slots)
         return TowerBatch(
             slots=row_data[:rows],
@@ -193,6 +197,8 @@ class TowerState:
     input_is_semantic: torch.Tensor  # [] bool, on device
     # Prompt rows still to teacher-force through the tower: (hidden [n, dim], frames [n + 1, 1 + Q]).
     pending: tuple[torch.Tensor, torch.Tensor] | None = None
+    # Codes [Q] of every generated frame so far, to rebuild the rows after a preemption.
+    generated: list[torch.Tensor] = field(default_factory=list)
 
 
 class TowerAttention(nn.Module):

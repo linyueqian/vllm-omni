@@ -33,7 +33,7 @@ from vllm_omni.model_executor.models.fish_speech.dac_encoder import _load_dac_co
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
-from .codebook_tower import CodebookTower, TowerBatch, TowerDecodeGraphs, TowerState, sample_rows
+from .codebook_tower import CodebookTower, TowerBatch, TowerDecodeGraphs, TowerState, sample_rows, to_device
 from .configuration_fish_omni import FishOmniConfig
 from .prompt import Reference, build_prompt_frames, prompt_length
 
@@ -71,7 +71,8 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
         self.tower = CodebookTower(
             decoder_config,
             semantic_begin_id=self._semantic_begin_id,
-            cache_slots=2 * max_seqs,
+            # Running requests plus preempted ones waiting to resume.
+            cache_slots=4 * max_seqs,
             max_len=int(vllm_config.model_config.max_model_len),
         )
 
@@ -105,7 +106,9 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
 
         self._speaker_cache = get_speaker_cache()
         self._tokenizer = None
-        logger.info(
+        # Tower states by request id, so finished requests release their cache slot.
+        self._request_states: dict[str, TowerState] = {}
+        logger.debug(
             "fish_omni: mamba_ssm_cache_dtype=%s, mamba_cache_dtype=%s",
             vllm_config.cache_config.mamba_ssm_cache_dtype,
             vllm_config.cache_config.mamba_cache_dtype,
@@ -242,27 +245,74 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
             return input_ids, self.embed_input_ids(input_ids), {}
 
         if span > 1:
-            # Prefill (chunked prefill is off, so one span holds the whole prompt).
-            frames = self.build_frames(info_dict, device)
-            if int(frames.shape[0]) != span:
+            # Prefill (chunked prefill is off, so one span holds the whole prompt),
+            # or a recompute after preemption: the prompt plus the tokens generated so far.
+            frames = self.build_frames(info_dict, device).to(device)
+            prompt_rows = int(frames.shape[0])
+            codes = torch.zeros((span, self._num_codebooks), dtype=torch.long, device=device)
+            update: dict[str, Any] = {"drama3_prompt": {"frames": frames}}
+            if span > prompt_rows:
+                generated = self._recompute_frames(
+                    input_ids[prompt_rows:].to(device=device, dtype=torch.long), info_dict, prompt_rows, span
+                )
+                frames = torch.cat((frames, generated))
+                # The last generated token's frame is new: hand it to the codec.
+                codes[-1] = generated[-1, 1:]
+                update = {"drama3_prompt": None}
+            elif span != prompt_rows:
                 raise ValueError(
-                    f"fish_omni prompt has {int(frames.shape[0])} rows but the request reserved {span} "
+                    f"fish_omni prompt has {prompt_rows} rows but the request reserved {span} "
                     "placeholder tokens; size prompt_token_ids with "
                     "estimate_prompt_len_from_additional_information"
                 )
-            frames = frames.to(device)
+            elif isinstance(info_dict.get("drama3_tower"), TowerState):
+                # A fresh prefill replaces any state left from an earlier run of this id.
+                self.tower.cache.release(info_dict["drama3_tower"].slot, info_dict["drama3_tower"])
+                update["drama3_tower"] = None
             is_semantic = self.tower.is_semantic(frames[:, 0])
             embeds = self.tower.backbone_embedding(self.embed_input_ids(frames[:, 0]), frames[:, 1:], is_semantic)
-            zeros = torch.zeros((span, self._num_codebooks), dtype=torch.long, device=device)
-            return (
-                frames[:, 0].clone(),
-                embeds.to(torch.bfloat16),
-                {"drama3_prompt": {"frames": frames}, "codes": {"audio": zeros}},
-            )
+            update["codes"] = {"audio": codes}
+            return frames[:, 0].clone(), embeds.to(torch.bfloat16), update
 
         last_hidden = info_dict.get("hidden_states", {}).get("last")
         if not isinstance(last_hidden, torch.Tensor):
             raise RuntimeError("fish_omni decode step has no backbone hidden state from the previous step")
+        return self._decode_inputs(input_ids, last_hidden, device)
+
+    def _recompute_frames(
+        self, generated_ids: torch.Tensor, info: dict[str, Any], prompt_rows: int, span: int
+    ) -> torch.Tensor:
+        """Frame rows [G, 1 + Q] of the G tokens generated before a preemption.
+
+        The tower state keeps the codes of every generated frame it has produced.
+        Only the last token has none yet (it was sampled but never fed back), so
+        its frame is sampled now from the hidden state the tower would have used.
+        The tower cache keeps its history, so it is not prefilled again.
+        """
+        state = info.get("drama3_tower")
+        count = int(generated_ids.shape[0])
+        if not isinstance(state, TowerState) or not self.tower.cache.owns(state.slot, state):
+            raise RuntimeError(
+                "fish_omni cannot resume a preempted request whose codebook-tower history was "
+                "released; raise gpu_memory_utilization or lower max_num_seqs to avoid preemption"
+            )
+        if len(state.generated) == count - 1:
+            last_hidden = info.get("hidden_states", {}).get("last")
+            if not isinstance(last_hidden, torch.Tensor) or state.next_position != prompt_rows + count - 2:
+                raise RuntimeError("fish_omni preempted request has no hidden state for its last token")
+            self._tower_step([state], generated_ids[-1:], last_hidden.reshape(1, -1).to(generated_ids.device))
+        if len(state.generated) != count:
+            raise RuntimeError(
+                f"fish_omni recompute of {span} rows expects {count} generated frames, the tower has "
+                f"{len(state.generated)}"
+            )
+        logger.info("fish_omni: resuming a preempted request after %d generated frames", count)
+        codes = torch.stack(state.generated).to(generated_ids.device)
+        return torch.cat((generated_ids.unsqueeze(-1), codes), dim=-1)
+
+    def _decode_inputs(
+        self, input_ids: torch.Tensor, last_hidden: torch.Tensor, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         embeds = self.embed_input_ids(input_ids.reshape(-1).to(torch.long)).reshape(1, -1)
         return (
             input_ids,
@@ -301,7 +351,7 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
         state.slot = self.tower.cache.acquire(state, in_use=set())
         if rows > 1:
             # The runner reuses its hidden-state buffer next step, so keep a copy.
-            state.pending = (hidden_states[: rows - 1].to(torch.bfloat16).clone(), frames)
+            state.pending = (hidden_states[: rows - 1].to(self._tower_dtype).clone(), frames)
         return state
 
     def _run_pending_prefills(self, states: list[TowerState]) -> None:
@@ -352,37 +402,60 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
             logger.warning("fish_omni: %d of %d rows have no tower state", len(states) - len(live), len(states))
 
         live_states = [states[i] for i in live]
-        for s in live_states:
-            self.tower.cache.touch(s.slot)
-        self._run_pending_prefills(live_states)
-        # Host-built indices go up in one pinned, non-blocking copy.
-        host = torch.tensor(
-            [live, [s.slot for s in live_states], [s.next_position for s in live_states]], dtype=torch.long
-        ).pin_memory()
-        index, slots, positions = host.to(device, non_blocking=True).unbind(0)
+        if req_ids is not None:
+            for i in live:
+                self._request_states[req_ids[i]] = states[i]
+        index = to_device(torch.tensor(live, dtype=torch.long), device)
         embeds = embeds.clone()
+        frame_codes, is_semantic = self._tower_step(live_states, main_tokens[index], last_talker_hidden[index])
+        embeds[index] = self.tower.backbone_embedding(embeds[index], frame_codes, is_semantic).to(embeds.dtype)
+        codes[index] = frame_codes
+        return embeds, codes
+
+    def _tower_step(
+        self, states: list[TowerState], main_tokens: torch.Tensor, hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample the codes of each request's next frame (main token given) and
+        advance its tower state. Returns (codes [rows, Q], main token is semantic)."""
+        device = main_tokens.device
+        for s in states:
+            self.tower.cache.touch(s.slot)
+        self._run_pending_prefills(states)
+        slots, positions = to_device(
+            torch.tensor([[s.slot for s in states], [s.next_position for s in states]], dtype=torch.long), device
+        ).unbind(0)
         step_inputs = {
-            "hidden": last_talker_hidden[index].to(torch.bfloat16),
-            "input_codes": torch.stack([s.input_frame for s in live_states]),
-            "input_is_semantic": torch.stack([s.input_is_semantic for s in live_states]),
-            "next_main_tokens": main_tokens[index],
+            "hidden": hidden.to(self._tower_dtype),
+            "input_codes": torch.stack([s.input_frame for s in states]),
+            "input_is_semantic": torch.stack([s.input_is_semantic for s in states]),
+            "next_main_tokens": main_tokens,
         }
         if self._tower_graphs is not None and not self._tower_graphs.covers(1):
-            self._tower_graphs.capture(device, torch.bfloat16)
-        if self._tower_graphs is not None and self._tower_graphs.covers(len(live)):
+            self._tower_graphs.capture(device, self._tower_dtype)
+        if self._tower_graphs is not None and self._tower_graphs.covers(len(states)):
             frame_codes = self._tower_graphs.run(**step_inputs, slots=slots, positions=positions)
         else:
             frame_codes = self.tower.run(
                 **step_inputs, next_codes=None, batch=TowerBatch.decode(slots, positions), sampling=_HEAD_SAMPLING
             )
-        is_semantic = self.tower.is_semantic(main_tokens[index])
-        embeds[index] = self.tower.backbone_embedding(embeds[index], frame_codes, is_semantic).to(embeds.dtype)
-        codes[index] = frame_codes
-        for row, state in enumerate(live_states):
+        is_semantic = self.tower.is_semantic(main_tokens)
+        for row, state in enumerate(states):
             state.next_position += 1
             state.input_frame = frame_codes[row]
             state.input_is_semantic = is_semantic[row]
-        return embeds, codes
+            state.generated.append(frame_codes[row])
+        return frame_codes, is_semantic
+
+    @property
+    def _tower_dtype(self) -> torch.dtype:
+        return self.tower.audio_decoder.codebook_embeddings.weight.dtype
+
+    def on_requests_finished(self, finished_req_ids: Iterable[str]) -> None:
+        """Return finished requests' tower cache slots."""
+        for req_id in finished_req_ids:
+            state = self._request_states.pop(req_id, None)
+            if state is not None:
+                self.tower.cache.release(state.slot, state)
 
     # -------------------- main-token sampling --------------------
 
