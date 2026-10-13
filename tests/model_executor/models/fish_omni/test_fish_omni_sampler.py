@@ -107,3 +107,79 @@ def test_end_of_speech_is_never_redrawn():
 def test_repeat_outside_window_keeps_first_draw():
     tokens = _sample(_logits(ARGMAX, OTHER_A), history=[ARGMAX] + [OTHER_B] * 16)
     assert bool((tokens == ARGMAX).all())
+
+
+def _metadata_with(
+    rows: int,
+    temperature: torch.Tensor | None,
+    all_greedy: bool,
+    generators: dict[int, torch.Generator] | None = None,
+) -> SamplingMetadata:
+    return SamplingMetadata(
+        temperature=temperature,
+        all_greedy=all_greedy,
+        all_random=not all_greedy,
+        top_p=None,
+        top_k=None,
+        generators=generators or {},
+        max_num_logprobs=None,
+        no_penalties=True,
+        prompt_token_ids=None,
+        frequency_penalties=torch.zeros(rows),
+        presence_penalties=torch.zeros(rows),
+        repetition_penalties=torch.ones(rows),
+        output_token_ids=[[] for _ in range(rows)],
+        allowed_token_ids_mask=None,
+        bad_words_token_ids={},
+        logitsprocs=LogitsProcessors(),
+    )
+
+
+def _spread_logits(rows: int) -> torch.Tensor:
+    """Several plausible semantic tokens, with OTHER_A the arg-max."""
+    logits = torch.full((rows, VOCAB), -30.0)
+    logits[:, ARGMAX] = 0.5
+    logits[:, OTHER_B] = 0.5
+    logits[:, OTHER_A] = 1.0
+    return logits
+
+
+def test_all_greedy_batch_takes_argmax() -> None:
+    """vLLM passes temperature=None when every row is greedy."""
+    rows = 256
+    torch.manual_seed(0)
+    output = _sampler_model().sample(_spread_logits(rows), _metadata_with(rows, None, all_greedy=True))
+    assert output is not None
+    assert (output.sampled_token_ids[:, 0] == OTHER_A).all()
+
+
+def test_greedy_rows_in_mixed_batch_take_argmax() -> None:
+    """A greedy row (temperature -1) does not depend on who shares its batch."""
+    rows = 256
+    temperature = torch.full((rows,), 1.0)
+    temperature[::2] = -1.0
+    torch.manual_seed(0)
+    output = _sampler_model().sample(_spread_logits(rows), _metadata_with(rows, temperature, all_greedy=False))
+    assert output is not None
+    sampled = output.sampled_token_ids[:, 0]
+    assert (sampled[::2] == OTHER_A).all()
+    assert (sampled[1::2] != OTHER_A).any()
+
+
+def test_request_generator_controls_its_rows() -> None:
+    """A seeded row repeats under the same seed and ignores the global RNG."""
+    rows = 64
+
+    def run(global_seed: int) -> torch.Tensor:
+        torch.manual_seed(global_seed)
+        generators = {0: torch.Generator().manual_seed(123)}
+        output = _sampler_model().sample(
+            _spread_logits(rows), _metadata_with(rows, torch.full((rows,), 1.0), False, generators)
+        )
+        assert output is not None
+        return output.sampled_token_ids[:, 0]
+
+    draws_a = torch.stack([run(seed)[0] for seed in range(16)])
+    assert (draws_a == draws_a[0]).all()
+    unseeded = torch.stack([run(seed)[1] for seed in range(16)])
+    assert (unseeded != unseeded[0]).any()

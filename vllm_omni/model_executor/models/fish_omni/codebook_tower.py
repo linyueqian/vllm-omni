@@ -356,40 +356,51 @@ class _FrameEmbeddings(nn.Module):
         self.codebook_embeddings = nn.Embedding(config.vocab_size * config.num_codebooks, config.dim)
 
 
+# Temperatures at or below this are greedy (vLLM marks greedy rows with -1).
+_GREEDY_TEMPERATURE = 1e-5
+
+
 def sample_rows(
-    logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    generators: dict[int, torch.Generator] | None = None,
 ) -> torch.Tensor:
     """Sample a column index per row, with per-row temperature, top-k and top-p.
 
     A candidate survives when its rank is below top_k and the probability mass
-    before and including it stays within top_p; the most likely candidate is
-    never filtered out."""
-    scaled = logits.float() / temperature.float().clamp(min=1e-5).unsqueeze(-1)
+    before and including it, over the whole row, stays within top_p; the most
+    likely candidate is never filtered out. Greedy rows take the argmax. Rows
+    listed in ``generators`` draw from their own generator.
+    """
+    greedy = temperature <= _GREEDY_TEMPERATURE
+    scaled = logits.float() / temperature.float().clamp(min=_GREEDY_TEMPERATURE).unsqueeze(-1)
     sorted_logits, order = torch.sort(scaled, dim=-1, descending=True)
     cumulative = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
     ranks = torch.arange(sorted_logits.shape[-1], device=logits.device).unsqueeze(0)
     drop = (cumulative > top_p.float().unsqueeze(-1)) | (ranks >= top_k.unsqueeze(-1))
     drop[:, 0] = False
     probs = torch.softmax(sorted_logits.masked_fill(drop, float("-inf")), dim=-1)
-    return torch.gather(order, -1, _draw(probs)).squeeze(-1)
-
-
-def _draw(probs: torch.Tensor) -> torch.Tensor:
-    """One categorical draw per row (exponential race), without host syncs."""
     noise = torch.empty_like(probs).exponential_(1.0)
-    return torch.argmax(probs / noise, dim=-1, keepdim=True)
+    for row, generator in (generators or {}).items():
+        if row < noise.shape[0]:
+            noise[row].exponential_(1.0, generator=generator)
+    choice = torch.argmax(probs / noise, dim=-1, keepdim=True)
+    choice = torch.where(greedy.unsqueeze(-1), torch.zeros_like(choice), choice)
+    return torch.gather(order, -1, choice).squeeze(-1)
 
 
 def sample_top_k_top_p(logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> torch.Tensor:
-    """Sample one token per row with scalar parameters (same filter as sample_rows)."""
-    scaled = logits.float() / max(temperature, 1e-5)
-    k = min(top_k, scaled.shape[-1]) if top_k > 0 else scaled.shape[-1]
-    top_logits, top_ids = torch.topk(scaled, k, dim=-1)
-    probs = torch.softmax(top_logits, dim=-1)
-    drop = torch.cumsum(probs, dim=-1) > top_p
-    drop[:, 0] = False
-    probs = torch.softmax(top_logits.masked_fill(drop, float("-inf")), dim=-1)
-    return torch.gather(top_ids, -1, _draw(probs)).squeeze(-1)
+    """sample_rows with the same scalar parameters for every row."""
+    rows, width = logits.shape
+    k = top_k if 0 < top_k <= width else width
+    return sample_rows(
+        logits,
+        torch.full((rows,), temperature, device=logits.device),
+        torch.full((rows,), k, device=logits.device, dtype=torch.long),
+        torch.full((rows,), top_p, device=logits.device),
+    )
 
 
 class CodebookTower(nn.Module):

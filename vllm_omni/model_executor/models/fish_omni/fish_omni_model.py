@@ -392,7 +392,9 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
         Each row draws among end-of-speech and the semantic tokens with its own
         temperature / top-k / top-p. When a semantic draw repeats one of the
         request's last 16 main tokens, the row takes a second draw with fixed
-        parameters instead; that draw may end the speech.
+        parameters instead; that draw may end the speech. Greedy rows take the
+        argmax for the first draw; the re-draw still samples. A request's seed
+        drives both draws (it does not reach the residual codebook heads).
         """
         rows = int(logits.shape[0])
         if rows == 0:
@@ -407,11 +409,13 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
                 return torch.full((rows,), default, device=device, dtype=dtype)
             return value[:rows].to(device=device, dtype=dtype)
 
-        temperature = per_row(sampling_metadata.temperature, 1.0, torch.float32)
+        # vLLM passes no temperatures when every row is greedy; -1 marks a greedy row.
+        temperature = per_row(sampling_metadata.temperature, -1.0, torch.float32)
+        generators = getattr(sampling_metadata, "generators", None) or {}
         top_k = per_row(sampling_metadata.top_k, width, torch.long)
         top_k = torch.where((top_k <= 0) | (top_k > width), torch.full_like(top_k, width), top_k)
         top_p = per_row(sampling_metadata.top_p, 1.0, torch.float32)
-        first = candidates[sample_rows(candidate_logits, temperature, top_k, top_p)]
+        first = candidates[sample_rows(candidate_logits, temperature, top_k, top_p, generators)]
         ras_temperature, ras_top_k, ras_top_p = _RAS_SAMPLING
         redraw = candidates[
             sample_rows(
@@ -419,6 +423,7 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
                 torch.full((rows,), ras_temperature, device=device),
                 torch.full((rows,), ras_top_k, device=device, dtype=torch.long),
                 torch.full((rows,), ras_top_p, device=device),
+                generators,
             )
         ]
         history = sampling_metadata.output_token_ids or [[] for _ in range(rows)]
