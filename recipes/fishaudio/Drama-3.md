@@ -80,9 +80,28 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     }' --output cloned.wav
 ```
 
-Inline event tags and speaker tags go in the input text, for example
-`"[sighs] Fine. If we miss it, it's on you. [laughs] Well, maybe that's fair."`
-or `"<|speaker:0|> Hi. <|speaker:1|> Hello."` (speakers 0..15).
+#### Event and emotion tags
+
+Non-verbal events and delivery are controlled only through the input text.
+Write a short natural-language descriptor in square brackets where the event
+should happen:
+
+```text
+[sighs] Fine. If we miss it, it's on you. [laughs] Well, maybe that's fair.
+```
+
+- There is no fixed tag list. Tags are ordinary text (no special tokens), so
+  any short descriptor is accepted; wordings close to the ones Fish Audio
+  documents work best: `[sighs]`, `[laughs]`, `[laughing]`, `[whisper]`,
+  `[angry]`, `[excited]`, `[pause]`.
+- Speaker tags `<|speaker:0|>` … `<|speaker:15|>` are the only special control
+  tokens: `"<|speaker:0|> Hi. <|speaker:1|> Hello."`. Text without a leading
+  speaker tag is spoken by speaker 0.
+- The reference clip also shapes delivery implicitly (an expressive or pause-heavy
+  reference carries over), but it is not a targeted control.
+- A tag or filler word at the very start of a line ("[sighs] …", "Yeah. …")
+  more often renders the first word or event and then only silence until
+  `max_new_tokens`; mid-sentence tags are more reliable.
 
 Offline (`Omni`): pass `additional_information` with `text`, `ref_text`,
 `ref_audio_wav`, `ref_audio_sr` (and optionally `voice_name` to cache the

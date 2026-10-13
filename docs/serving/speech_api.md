@@ -819,7 +819,7 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 | ------- | ------------- |
 | `fishaudio/drama-3` | 35B-total / 3B-active MoE TTS with a codebook tower and the DAC codec (44.1 kHz). Supports text-to-speech and voice cloning. |
 
-Drama 3 uses `ref_audio` and `ref_text` for voice cloning, like Fish Speech S2 Pro. Speaker tags (`<|speaker:N|>`) and event tags (for example `[sighs]`) go in `input`. See the [Drama 3 section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#fish-audio-drama-3) for details.
+Drama 3 uses `ref_audio` and `ref_text` for voice cloning, like Fish Speech S2 Pro. Speaker tags (`<|speaker:N|>`) and event tags (for example `[sighs]`) go in `input`; event tags are free-form bracketed text, not a fixed list (see the [Drama 3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/fishaudio/Drama-3.md#event-and-emotion-tags)). See the [Drama 3 section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#fish-audio-drama-3) for details.
 
 ### Voxtral TTS
 
