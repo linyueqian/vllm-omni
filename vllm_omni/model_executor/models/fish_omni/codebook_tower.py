@@ -18,6 +18,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.cuda import CUDAGraph
+from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 from .configuration_fish_omni import FishOmniAudioDecoderConfig
 
@@ -53,32 +55,37 @@ def interleaved_rope(states: torch.Tensor, positions: torch.Tensor, rotary_dim: 
 
 
 class TowerKVCache:
-    """Dense per-request key/value history for every tower layer.
+    """Per-request key/value history for every tower layer.
 
-    One slot per live request: [slots, layers, 2, max_len, kv_heads, head_dim].
-    Allocated on first use; a request takes a slot at prefill and keeps it until
-    the slot is reclaimed for a newer request (least recently used first).
+    Each layer owns one key and one value tensor [slots, max_len, kv_heads,
+    head_dim]; flash-attention reads it as a paged cache with one block per
+    slot. Allocated on first use; a request takes a slot at prefill and keeps
+    it until the slot is reclaimed for a newer request (least recently used).
     """
 
     def __init__(self, *, slots: int, layers: int, max_len: int, kv_heads: int, head_dim: int) -> None:
         self.slots = slots
         self.layers = layers
-        self.max_len = max_len
+        # Paged flash-attention needs the block size to be a multiple of 256.
+        self.max_len = -(-max_len // 256) * 256
         self.kv_heads = kv_heads
         self.head_dim = head_dim
-        self.buffer: torch.Tensor | None = None
+        self.keys: list[torch.Tensor] = []
+        self.values: list[torch.Tensor] = []
         self._owner: list[object | None] = [None] * slots
         self._last_use = [0] * slots
         self._clock = 0
 
-    def ensure(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        if self.buffer is None:
-            self.buffer = torch.zeros(
-                (self.slots, self.layers, 2, self.max_len, self.kv_heads, self.head_dim),
-                device=device,
-                dtype=dtype,
-            )
-        return self.buffer
+    @property
+    def scratch_slot(self) -> int:
+        """A slot no request owns; padding rows of captured graphs write here."""
+        return self.slots
+
+    def ensure(self, device: torch.device, dtype: torch.dtype) -> None:
+        if not self.keys:
+            shape = (self.slots + 1, self.max_len, self.kv_heads, self.head_dim)
+            self.keys = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(self.layers)]
+            self.values = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(self.layers)]
 
     def acquire(self, owner: object, in_use: set[int]) -> int:
         self._clock += 1
@@ -100,6 +107,52 @@ class TowerKVCache:
         self._last_use[slot] = self._clock
 
 
+@dataclass(frozen=True)
+class TowerBatch:
+    """Where this call's rows sit in the cache.
+
+    Rows are grouped by request: decode has one row per request, prefill one
+    request with many rows. ``seq_used`` counts each group's cached keys after
+    this call's rows are written.
+    """
+
+    slots: torch.Tensor  # [rows] cache slot per row
+    positions: torch.Tensor  # [rows]
+    block_table: torch.Tensor  # [groups, 1] int32 slot per group
+    cu_seqlens_q: torch.Tensor  # [groups + 1] int32
+    seq_used: torch.Tensor  # [groups] int32
+    max_rows: int
+
+    @staticmethod
+    def decode(slots: torch.Tensor, positions: torch.Tensor) -> TowerBatch:
+        rows = slots.shape[0]
+        return TowerBatch(
+            slots=slots,
+            positions=positions,
+            block_table=slots.to(torch.int32).view(rows, 1),
+            cu_seqlens_q=torch.arange(rows + 1, device=slots.device, dtype=torch.int32),
+            seq_used=(positions + 1).to(torch.int32),
+            max_rows=1,
+        )
+
+    @staticmethod
+    def extend(slot: int, first: int, end: int, device: torch.device) -> TowerBatch:
+        """Rows ``first..end-1`` of one request; earlier positions are already cached."""
+        rows = end - first
+        return TowerBatch(
+            slots=torch.full((rows,), slot, device=device, dtype=torch.long),
+            positions=torch.arange(first, end, device=device),
+            block_table=torch.full((1, 1), slot, device=device, dtype=torch.int32),
+            cu_seqlens_q=torch.tensor([0, rows], device=device, dtype=torch.int32),
+            seq_used=torch.tensor([end], device=device, dtype=torch.int32),
+            max_rows=rows,
+        )
+
+    @staticmethod
+    def prefill(slot: int, rows: int, device: torch.device) -> TowerBatch:
+        return TowerBatch.extend(slot, 0, rows, device)
+
+
 @dataclass(eq=False)
 class TowerState:
     """Per-request tower progress, kept in the request's intermediate buffer."""
@@ -107,7 +160,7 @@ class TowerState:
     slot: int
     next_position: int
     input_frame: torch.Tensor  # [num_codebooks] codes of the frame at next_position
-    input_is_semantic: bool
+    input_is_semantic: torch.Tensor  # [] bool, on device
 
 
 class TowerAttention(nn.Module):
@@ -129,58 +182,63 @@ class TowerAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        positions: torch.Tensor,
-        layer_cache: torch.Tensor,
-        slots: torch.Tensor,
+        batch: TowerBatch,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
     ) -> torch.Tensor:
-        """x [rows, dim]; positions [rows]; slots [rows] index ``layer_cache``
-        [slots, 2, max_len, kv_heads, head_dim]. Rows of one slot must be in
-        position order, and a slot's cached positions must all precede them."""
+        """Write this call's keys/values at ``batch`` and attend causally over each
+        request's history. x [rows, dim] -> [rows, dim]."""
         rows = x.shape[0]
         q_width = self.n_head * self.head_dim
         kv_width = self.n_kv * self.head_dim
         query, gate, key, value = self.wqkv(x).split([q_width, q_width, kv_width, kv_width], dim=-1)
         query = self.q_norm(query.reshape(-1, self.head_dim)).view(rows, self.n_head, self.head_dim)
         key = self.k_norm(key.reshape(-1, self.head_dim)).view(rows, self.n_kv, self.head_dim)
-        query = interleaved_rope(query, positions, self.rotary_dim, self.rope_base)
-        key = interleaved_rope(key, positions, self.rotary_dim, self.rope_base)
-        value = value.view(rows, self.n_kv, self.head_dim)
+        query = interleaved_rope(query, batch.positions, self.rotary_dim, self.rope_base)
+        key = interleaved_rope(key, batch.positions, self.rotary_dim, self.rope_base)
+        value = value.reshape(rows, self.n_kv, self.head_dim)
+        key_cache[batch.slots, batch.positions] = key.to(key_cache.dtype)
+        value_cache[batch.slots, batch.positions] = value.to(value_cache.dtype)
+        if key_cache.is_cuda:
+            attended = flash_attn_varlen_func(
+                q=query.contiguous(),
+                k=key_cache,
+                v=value_cache,
+                max_seqlen_q=batch.max_rows,
+                cu_seqlens_q=batch.cu_seqlens_q,
+                max_seqlen_k=key_cache.shape[1],
+                seqused_k=batch.seq_used,
+                block_table=batch.block_table,
+                softmax_scale=self.head_dim**-0.5,
+                causal=True,
+            )
+        else:
+            attended = self._attend_reference(query, batch, key_cache, value_cache)
+        return self.wo(attended.reshape(rows, q_width) * torch.sigmoid(gate))
 
-        layer_cache[slots, 0, positions] = key.to(layer_cache.dtype)
-        layer_cache[slots, 1, positions] = value.to(layer_cache.dtype)
-
-        # Group rows by slot: [groups, rows_per_group]. Decode has one row per
-        # slot; prefill has one slot with many rows.
-        unique_slots, inverse = torch.unique(slots, return_inverse=True)
-        if unique_slots.numel() == rows:
-            key_len = int(positions.max().item()) + 1
-            keys = layer_cache[slots, 0, :key_len].transpose(1, 2)  # [rows, kv, len, d]
-            values = layer_cache[slots, 1, :key_len].transpose(1, 2)
-            mask = torch.arange(key_len, device=x.device).unsqueeze(0) <= positions.unsqueeze(1)
-            attended = F.scaled_dot_product_attention(
-                query.unsqueeze(2),
-                keys,
-                values,
-                attn_mask=mask[:, None, None, :],
-                enable_gqa=True,
-            ).squeeze(2)
-        elif unique_slots.numel() == 1:
-            slot = int(unique_slots.item())
-            key_len = int(positions.max().item()) + 1
-            keys = layer_cache[slot, 0, :key_len].transpose(0, 1).unsqueeze(0)
-            values = layer_cache[slot, 1, :key_len].transpose(0, 1).unsqueeze(0)
-            mask = torch.arange(key_len, device=x.device).unsqueeze(0) <= positions.unsqueeze(1)
-            attended = F.scaled_dot_product_attention(
-                query.transpose(0, 1).unsqueeze(0),
+    @staticmethod
+    def _attend_reference(
+        query: torch.Tensor, batch: TowerBatch, key_cache: torch.Tensor, value_cache: torch.Tensor
+    ) -> torch.Tensor:
+        """Plain PyTorch causal attention over each group's history (non-CUDA devices)."""
+        outputs = []
+        bounds = batch.cu_seqlens_q.tolist()
+        for group, (start, stop) in enumerate(zip(bounds[:-1], bounds[1:])):
+            slot = int(batch.block_table[group, 0])
+            used = int(batch.seq_used[group])
+            keys = key_cache[slot, :used].transpose(0, 1).unsqueeze(0)
+            values = value_cache[slot, :used].transpose(0, 1).unsqueeze(0)
+            positions = batch.positions[start:stop]
+            mask = torch.arange(used, device=query.device).unsqueeze(0) <= positions.unsqueeze(1)
+            out = F.scaled_dot_product_attention(
+                query[start:stop].transpose(0, 1).unsqueeze(0),
                 keys,
                 values,
                 attn_mask=mask[None, None],
                 enable_gqa=True,
-            )[0].transpose(0, 1)
-        else:
-            raise ValueError("tower attention takes one row per slot, or many rows of one slot")
-        attended = attended.reshape(rows, q_width)
-        return self.wo(attended * torch.sigmoid(gate))
+            )
+            outputs.append(out[0].transpose(0, 1))
+        return torch.cat(outputs)
 
 
 class TowerFeedForward(nn.Module):
@@ -223,9 +281,9 @@ class TowerLayer(nn.Module):
         code_ids: torch.Tensor,
         code_is_valid: torch.Tensor,
         extra_input: torch.Tensor | None,
-        positions: torch.Tensor,
-        layer_cache: torch.Tensor,
-        slots: torch.Tensor,
+        batch: TowerBatch,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
     ) -> torch.Tensor:
         table: nn.Embedding = getattr(self, self.embedding_name)
         embedded = torch.where(
@@ -237,7 +295,7 @@ class TowerLayer(nn.Module):
             embedded = embedded + extra_input.to(embedded.dtype)
         mixed = self.eh_proj(torch.cat((self.enorm(embedded), self.hnorm(hidden)), dim=-1))
         block = self.transformer_layer
-        attended = block.attention(block.attention_norm(mixed), positions, layer_cache, slots)
+        attended = block.attention(block.attention_norm(mixed), batch, key_cache, value_cache)
         ffn_input, residual = block.ffn_norm(attended, mixed)
         out, _ = self.final_layernorm(block.feed_forward(ffn_input), residual)
         return out
@@ -278,7 +336,13 @@ def sample_rows(
     drop = (cumulative > top_p.float().unsqueeze(-1)) | (ranks >= top_k.unsqueeze(-1))
     drop[:, 0] = False
     probs = torch.softmax(sorted_logits.masked_fill(drop, float("-inf")), dim=-1)
-    return torch.gather(order, -1, torch.multinomial(probs, 1)).squeeze(-1)
+    return torch.gather(order, -1, _draw(probs)).squeeze(-1)
+
+
+def _draw(probs: torch.Tensor) -> torch.Tensor:
+    """One categorical draw per row (exponential race), without host syncs."""
+    noise = torch.empty_like(probs).exponential_(1.0)
+    return torch.argmax(probs / noise, dim=-1, keepdim=True)
 
 
 def sample_top_k_top_p(logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> torch.Tensor:
@@ -290,8 +354,7 @@ def sample_top_k_top_p(logits: torch.Tensor, temperature: float, top_k: int, top
     drop = torch.cumsum(probs, dim=-1) > top_p
     drop[:, 0] = False
     probs = torch.softmax(top_logits.masked_fill(drop, float("-inf")), dim=-1)
-    choice = torch.multinomial(probs, 1)
-    return torch.gather(top_ids, -1, choice).squeeze(-1)
+    return torch.gather(top_ids, -1, _draw(probs)).squeeze(-1)
 
 
 class CodebookTower(nn.Module):
@@ -344,13 +407,13 @@ class CodebookTower(nn.Module):
         input_is_semantic: torch.Tensor,
         next_main_tokens: torch.Tensor,
         next_codes: torch.Tensor | None,
-        positions: torch.Tensor,
-        slots: torch.Tensor,
+        batch: TowerBatch,
         sampling: tuple[float, int, float],
     ) -> torch.Tensor:
         """Run all tower layers. With ``next_codes`` (prefill) the codes are teacher
         forced; without it (decode) codes 1.. are sampled. Returns next codes [rows, Q]."""
-        cache = self.cache.ensure(hidden.device, hidden.dtype)
+        self.cache.ensure(hidden.device, hidden.dtype)
+        keys, values = self.cache.keys, self.cache.values
         label_is_semantic = self.is_semantic(next_main_tokens)
         code0 = (next_main_tokens - self.semantic_begin_id).clamp(0, self.codebook_size - 1)
         shared_input = self._shared_input(input_codes, input_is_semantic)
@@ -361,18 +424,95 @@ class CodebookTower(nn.Module):
                 code0,
                 label_is_semantic,
                 shared_input if i == 0 else None,
-                positions,
-                cache[:, layer_index],
-                slots,
+                batch,
+                keys[layer_index],
+                values[layer_index],
             )
             layer_index += 1
         codes = [code0]
         for r, (layer, head) in enumerate(zip(self.audio_decoder_mtp.layers, self.audio_decoder_mtp.heads)):
             current = codes[-1] if next_codes is None else next_codes[:, r]
-            hidden = layer(hidden, current, label_is_semantic, None, positions, cache[:, layer_index], slots)
+            hidden = layer(hidden, current, label_is_semantic, None, batch, keys[layer_index], values[layer_index])
             layer_index += 1
             if next_codes is None:
                 codes.append(sample_top_k_top_p(head(hidden), *sampling))
         if next_codes is not None:
             return next_codes
         return torch.stack(codes, dim=-1)
+
+
+class TowerDecodeGraphs:
+    """CUDA graphs of one tower decode step per batch-size bucket.
+
+    Inputs are copied into static buffers; rows past the batch are padding that
+    write to the tower cache's scratch slot, so no live request is touched.
+    """
+
+    def __init__(self, tower: CodebookTower, batch_sizes: tuple[int, ...], sampling: tuple[float, int, float]):
+        self.tower = tower
+        self.batch_sizes = tuple(sorted(set(batch_sizes)))
+        self.sampling = sampling
+        self._graphs: dict[int, tuple[CUDAGraph, dict[str, torch.Tensor], torch.Tensor]] = {}
+
+    @torch.inference_mode()
+    def capture(self, device: torch.device, dtype: torch.dtype) -> None:
+        tower = self.tower
+        tower.cache.ensure(device, dtype)
+        scratch = tower.cache.scratch_slot
+        dim = tower.config.dim
+        pool = torch.cuda.graph_pool_handle()
+        for size in self.batch_sizes:
+            buffers = {
+                "hidden": torch.zeros(size, dim, device=device, dtype=dtype),
+                "input_codes": torch.zeros(size, tower.num_codebooks, device=device, dtype=torch.long),
+                "input_is_semantic": torch.zeros(size, device=device, dtype=torch.bool),
+                "main": torch.full((size,), tower.semantic_begin_id, device=device, dtype=torch.long),
+                "slots": torch.full((size,), scratch, device=device, dtype=torch.long),
+                "positions": torch.zeros(size, device=device, dtype=torch.long),
+            }
+
+            def step() -> torch.Tensor:
+                return tower.run(
+                    hidden=buffers["hidden"],
+                    input_codes=buffers["input_codes"],
+                    input_is_semantic=buffers["input_is_semantic"],
+                    next_main_tokens=buffers["main"],
+                    next_codes=None,
+                    batch=TowerBatch.decode(buffers["slots"], buffers["positions"]),
+                    sampling=self.sampling,
+                )
+
+            step()
+            torch.accelerator.synchronize(device)
+            graph = CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool):
+                output = step()
+            self._graphs[size] = (graph, buffers, output)
+
+    def covers(self, rows: int) -> bool:
+        return bool(self._graphs) and rows <= self.batch_sizes[-1]
+
+    @torch.inference_mode()
+    def run(
+        self,
+        hidden: torch.Tensor,
+        input_codes: torch.Tensor,
+        input_is_semantic: torch.Tensor,
+        next_main_tokens: torch.Tensor,
+        slots: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        rows = hidden.shape[0]
+        size = next(s for s in self.batch_sizes if s >= rows)
+        graph, buffers, output = self._graphs[size]
+        buffers["hidden"][:rows].copy_(hidden)
+        buffers["input_codes"][:rows].copy_(input_codes)
+        buffers["input_is_semantic"][:rows].copy_(input_is_semantic)
+        buffers["main"][:rows].copy_(next_main_tokens)
+        buffers["slots"][:rows].copy_(slots)
+        buffers["positions"][:rows].copy_(positions)
+        if rows < size:
+            buffers["slots"][rows:].fill_(self.tower.cache.scratch_slot)
+            buffers["positions"][rows:].zero_()
+        graph.replay()
+        return output[:rows].clone()

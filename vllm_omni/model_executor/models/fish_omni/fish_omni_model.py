@@ -33,7 +33,7 @@ from vllm_omni.model_executor.models.fish_speech.dac_encoder import encode_refer
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
-from .codebook_tower import CodebookTower, TowerState, sample_rows
+from .codebook_tower import CodebookTower, TowerBatch, TowerDecodeGraphs, TowerState, sample_rows
 from .configuration_fish_omni import FishOmniConfig
 from .prompt import Reference, build_prompt_frames, prompt_length
 
@@ -91,6 +91,16 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("hidden_states", "last")}
         # The tower loop has data-dependent lengths and Python control flow.
         self.talker_mtp_graph_safe = False
+        # The tower step keeps its own CUDA graphs (captured on first decode).
+        self._tower_graphs = (
+            None
+            if vllm_config.model_config.enforce_eager
+            else TowerDecodeGraphs(
+                self.tower,
+                tuple(sorted({b for b in (1, 2, 4, 8, 16, 32, 64) if b < max_seqs} | {max_seqs})),
+                _HEAD_SAMPLING,
+            )
+        )
         self.talker_mtp_accepts_req_infos = True
 
         self._speaker_cache = get_speaker_cache()
@@ -285,7 +295,7 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
             slot=-1,
             next_position=rows - 1,
             input_frame=frames[-1, 1:].clone(),
-            input_is_semantic=bool(self.tower.is_semantic(frames[-1:, 0]).item()),
+            input_is_semantic=self.tower.is_semantic(frames[-1, 0]),
         )
         state.slot = self.tower.cache.acquire(state, in_use=set())
         if rows > 1:
@@ -297,8 +307,7 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
                 input_is_semantic=self.tower.is_semantic(frames[:n, 0]),
                 next_main_tokens=frames[1:, 0],
                 next_codes=frames[1:, 1:],
-                positions=torch.arange(n, device=device),
-                slots=torch.full((n,), state.slot, device=device, dtype=torch.long),
+                batch=TowerBatch.prefill(state.slot, n, device),
                 sampling=_HEAD_SAMPLING,
             )
         return state
@@ -328,30 +337,36 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
         if len(live) != len(states):
             logger.warning("fish_omni: %d of %d rows have no tower state", len(states) - len(live), len(states))
 
-        index = torch.tensor(live, device=device)
         live_states = [states[i] for i in live]
         for s in live_states:
             self.tower.cache.touch(s.slot)
+        # Host-built indices go up in one pinned, non-blocking copy.
+        host = torch.tensor(
+            [live, [s.slot for s in live_states], [s.next_position for s in live_states]], dtype=torch.long
+        ).pin_memory()
+        index, slots, positions = host.to(device, non_blocking=True).unbind(0)
         embeds = embeds.clone()
-        positions = torch.tensor([s.next_position for s in live_states], device=device)
-        frame_codes = self.tower.run(
-            hidden=last_talker_hidden[index].to(torch.bfloat16),
-            input_codes=torch.stack([s.input_frame for s in live_states]).to(device),
-            input_is_semantic=torch.tensor([s.input_is_semantic for s in live_states], device=device),
-            next_main_tokens=main_tokens[index],
-            next_codes=None,
-            positions=positions,
-            slots=torch.tensor([s.slot for s in live_states], device=device),
-            sampling=_HEAD_SAMPLING,
-        )
+        step_inputs = {
+            "hidden": last_talker_hidden[index].to(torch.bfloat16),
+            "input_codes": torch.stack([s.input_frame for s in live_states]),
+            "input_is_semantic": torch.stack([s.input_is_semantic for s in live_states]),
+            "next_main_tokens": main_tokens[index],
+        }
+        if self._tower_graphs is not None and not self._tower_graphs.covers(1):
+            self._tower_graphs.capture(device, torch.bfloat16)
+        if self._tower_graphs is not None and self._tower_graphs.covers(len(live)):
+            frame_codes = self._tower_graphs.run(**step_inputs, slots=slots, positions=positions)
+        else:
+            frame_codes = self.tower.run(
+                **step_inputs, next_codes=None, batch=TowerBatch.decode(slots, positions), sampling=_HEAD_SAMPLING
+            )
         is_semantic = self.tower.is_semantic(main_tokens[index])
         embeds[index] = self.tower.backbone_embedding(embeds[index], frame_codes, is_semantic).to(embeds.dtype)
         codes[index] = frame_codes
-        semantic_flags = is_semantic.tolist()
         for row, state in enumerate(live_states):
             state.next_position += 1
             state.input_frame = frame_codes[row]
-            state.input_is_semantic = bool(semantic_flags[row])
+            state.input_is_semantic = is_semantic[row]
         return embeds, codes
 
     # -------------------- main-token sampling --------------------

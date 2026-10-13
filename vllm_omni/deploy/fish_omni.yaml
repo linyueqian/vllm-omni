@@ -14,7 +14,7 @@ connectors:
       # ~21.5 Hz codec; 25 frames ≈ 1.16 s of audio.
       codec_chunk_frames: 25
       codec_left_context_frames: 25
-      initial_codec_chunk_frames: 4
+      initial_codec_chunk_frames: 2
 
 stages:
   - stage_id: 0

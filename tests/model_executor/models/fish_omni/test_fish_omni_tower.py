@@ -11,7 +11,7 @@ history is stored.
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.fish_omni.codebook_tower import CodebookTower
+from vllm_omni.model_executor.models.fish_omni.codebook_tower import CodebookTower, TowerBatch
 from vllm_omni.model_executor.models.fish_omni.configuration_fish_omni import FishOmniAudioDecoderConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -55,15 +55,13 @@ def _sequence(rows: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
 
 def _run(tower: CodebookTower, hidden, frames, first: int, end: int, slot: int, sampled: bool = False):
     """Run rows first..end-1 of one request; frame p is the input and p + 1 the target."""
-    rows = end - first
     return tower.run(
         hidden=hidden[first:end],
         input_codes=frames[first:end, 1:],
         input_is_semantic=tower.is_semantic(frames[first:end, 0]),
         next_main_tokens=frames[first + 1 : end + 1, 0],
         next_codes=None if sampled else frames[first + 1 : end + 1, 1:],
-        positions=torch.arange(first, end),
-        slots=torch.full((rows,), slot, dtype=torch.long),
+        batch=TowerBatch.extend(slot, first, end, torch.device("cpu")),
         sampling=SAMPLING,
     )
 
@@ -144,8 +142,7 @@ def test_batched_decode_matches_per_request_decode():
         ),
         next_main_tokens=torch.cat([frames[n + 1 : n + 2, 0] for (_, frames), n in zip(requests, lengths)]),
         next_codes=torch.cat([frames[n + 1 : n + 2, 1:] for (_, frames), n in zip(requests, lengths)]),
-        positions=torch.tensor(lengths),
-        slots=torch.tensor([0, 1]),
+        batch=TowerBatch.decode(torch.tensor([0, 1]), torch.tensor(lengths)),
         sampling=SAMPLING,
     )
     batch_outputs, batch_logits = tap.take()
