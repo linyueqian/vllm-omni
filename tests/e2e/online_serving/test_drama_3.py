@@ -18,7 +18,7 @@ from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-MODEL = os.environ.get("DRAMA3_MODEL_PATH", "fishaudio/drama-3")
+MODEL = "fishaudio/drama-3"
 DEFAULT_AUDIO_SPEECH_TIMEOUT_S = 300.0
 # The DAC codec decodes at 44.1 kHz; raw PCM carries no header.
 SAMPLE_RATE = 44100

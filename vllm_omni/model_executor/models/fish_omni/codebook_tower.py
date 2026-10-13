@@ -13,7 +13,7 @@ Module names follow the checkpoint (``audio_decoder*``) so weights load by name.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
@@ -100,12 +100,23 @@ class TowerKVCache:
         self._last_use[slot] = self._clock
         return slot
 
+    def release(self, slot: int, owner: object) -> None:
+        if 0 <= slot < self.slots and self._owner[slot] is owner:
+            self._owner[slot] = None
+
     def owns(self, slot: int, owner: object) -> bool:
         return self._owner[slot] is owner
 
     def touch(self, slot: int) -> None:
         self._clock += 1
         self._last_use[slot] = self._clock
+
+
+def to_device(host: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Copy small host metadata to ``device`` without stalling the host on CUDA."""
+    if device.type == "cuda":
+        return host.pin_memory().to(device, non_blocking=True)
+    return host.to(device)
 
 
 @dataclass(frozen=True)
@@ -150,6 +161,28 @@ class TowerBatch:
         )
 
     @staticmethod
+    def groups(slots: list[int], firsts: list[int], ends: list[int], device: torch.device) -> TowerBatch:
+        """Rows ``firsts[g]..ends[g]-1`` of request ``g``, for several requests at once."""
+        counts = [end - first for first, end in zip(firsts, ends)]
+        row_slots = [slot for slot, count in zip(slots, counts) for _ in range(count)]
+        row_positions = [p for first, end in zip(firsts, ends) for p in range(first, end)]
+        bounds = [0]
+        for count in counts:
+            bounds.append(bounds[-1] + count)
+        rows = len(row_slots)
+        row_data = to_device(torch.tensor(row_slots + row_positions, dtype=torch.long), device)
+        meta = to_device(torch.tensor(slots + bounds + ends, dtype=torch.int32), device)
+        groups = len(slots)
+        return TowerBatch(
+            slots=row_data[:rows],
+            positions=row_data[rows:],
+            block_table=meta[:groups].view(groups, 1),
+            cu_seqlens_q=meta[groups : 2 * groups + 1],
+            seq_used=meta[2 * groups + 1 :],
+            max_rows=max(counts),
+        )
+
+    @staticmethod
     def prefill(slot: int, rows: int, device: torch.device) -> TowerBatch:
         return TowerBatch.extend(slot, 0, rows, device)
 
@@ -162,6 +195,10 @@ class TowerState:
     next_position: int
     input_frame: torch.Tensor  # [num_codebooks] codes of the frame at next_position
     input_is_semantic: torch.Tensor  # [] bool, on device
+    # Prompt rows still to teacher-force through the tower: (hidden [n, dim], frames [n + 1, 1 + Q]).
+    pending: tuple[torch.Tensor, torch.Tensor] | None = None
+    # Codes [Q] of every generated frame so far, to rebuild the rows after a preemption.
+    generated: list[torch.Tensor] = field(default_factory=list)
 
 
 class TowerAttention(nn.Module):
@@ -325,40 +362,51 @@ class _FrameEmbeddings(nn.Module):
         self.codebook_embeddings = nn.Embedding(config.vocab_size * config.num_codebooks, config.dim)
 
 
+# Temperatures at or below this are greedy (vLLM marks greedy rows with -1).
+_GREEDY_TEMPERATURE = 1e-5
+
+
 def sample_rows(
-    logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    generators: dict[int, torch.Generator] | None = None,
 ) -> torch.Tensor:
     """Sample a column index per row, with per-row temperature, top-k and top-p.
 
     A candidate survives when its rank is below top_k and the probability mass
-    before and including it stays within top_p; the most likely candidate is
-    never filtered out."""
-    scaled = logits.float() / temperature.float().clamp(min=1e-5).unsqueeze(-1)
+    before and including it, over the whole row, stays within top_p; the most
+    likely candidate is never filtered out. Greedy rows take the argmax. Rows
+    listed in ``generators`` draw from their own generator.
+    """
+    greedy = temperature <= _GREEDY_TEMPERATURE
+    scaled = logits.float() / temperature.float().clamp(min=_GREEDY_TEMPERATURE).unsqueeze(-1)
     sorted_logits, order = torch.sort(scaled, dim=-1, descending=True)
     cumulative = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
     ranks = torch.arange(sorted_logits.shape[-1], device=logits.device).unsqueeze(0)
     drop = (cumulative > top_p.float().unsqueeze(-1)) | (ranks >= top_k.unsqueeze(-1))
     drop[:, 0] = False
     probs = torch.softmax(sorted_logits.masked_fill(drop, float("-inf")), dim=-1)
-    return torch.gather(order, -1, _draw(probs)).squeeze(-1)
-
-
-def _draw(probs: torch.Tensor) -> torch.Tensor:
-    """One categorical draw per row (exponential race), without host syncs."""
     noise = torch.empty_like(probs).exponential_(1.0)
-    return torch.argmax(probs / noise, dim=-1, keepdim=True)
+    for row, generator in (generators or {}).items():
+        if row < noise.shape[0]:
+            noise[row].exponential_(1.0, generator=generator)
+    choice = torch.argmax(probs / noise, dim=-1, keepdim=True)
+    choice = torch.where(greedy.unsqueeze(-1), torch.zeros_like(choice), choice)
+    return torch.gather(order, -1, choice).squeeze(-1)
 
 
 def sample_top_k_top_p(logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> torch.Tensor:
-    """Sample one token per row with scalar parameters (same filter as sample_rows)."""
-    scaled = logits.float() / max(temperature, 1e-5)
-    k = min(top_k, scaled.shape[-1]) if top_k > 0 else scaled.shape[-1]
-    top_logits, top_ids = torch.topk(scaled, k, dim=-1)
-    probs = torch.softmax(top_logits, dim=-1)
-    drop = torch.cumsum(probs, dim=-1) > top_p
-    drop[:, 0] = False
-    probs = torch.softmax(top_logits.masked_fill(drop, float("-inf")), dim=-1)
-    return torch.gather(top_ids, -1, _draw(probs)).squeeze(-1)
+    """sample_rows with the same scalar parameters for every row."""
+    rows, width = logits.shape
+    k = top_k if 0 < top_k <= width else width
+    return sample_rows(
+        logits,
+        torch.full((rows,), temperature, device=logits.device),
+        torch.full((rows,), k, device=logits.device, dtype=torch.long),
+        torch.full((rows,), top_p, device=logits.device),
+    )
 
 
 class CodebookTower(nn.Module):
