@@ -104,8 +104,11 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         # The request's own prompt rows (prompt_len also counts the generated
         # frames a resumed request brings back as prompt rows).
         self.base_prompt_len = np.zeros(self.max_num_seqs, dtype=np.int64)
-        self._pending_slots: list[tuple[int, list[float], list[int], list[int]]] = []
-        self._pending_history: list[tuple[int, torch.Tensor]] = []
+        # Slot writes waiting for the next step, by slot: a slot reused before
+        # the step keeps only its newest request's values (index_copy_ with
+        # repeated indices would pick one of them arbitrarily).
+        self._pending_slots: dict[int, tuple[list[float], list[int], list[int]]] = {}
+        self._pending_history: dict[int, torch.Tensor] = {}
         self._valid_rows: list[bool] = []
         self._partitioned = bool(getattr(vllm_config.model_config, "async_chunk", False))
         self._warned_top_k = False
@@ -172,7 +175,9 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         self.prompt_len[req_index] = rows.shape[0]
         self.base_prompt_len[req_index] = len(prompt_ids)
         if history is not None:
-            self._pending_history.append((req_index, history.to(torch.int16)))
+            self._pending_history[req_index] = history.to(torch.int16)
+        else:
+            self._pending_history.pop(req_index, None)
 
         params = new_req_data.sampling_params
         temperature = float(params.temperature) if params is not None else 1.0
@@ -194,7 +199,7 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         window = self.buffers.slot_ras.shape[1]
         tail = rows[-window:, 0].tolist()
         ras = [-1] * (window - len(tail)) + tail
-        self._pending_slots.append((req_index, [temperature, top_p], [top_k, generated], ras))
+        self._pending_slots[req_index] = ([temperature, top_p], [top_k, generated], ras)
 
     def remove_request(self, req_index_or_id) -> None:
         index = self._resolve_req_index(req_index_or_id)
@@ -233,7 +238,7 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         buffers = self.buffers
         # [slot, temperature bits, top_p bits, top_k, generated, ras...] as int64.
         packed = np.zeros((len(self._pending_slots), self._slot_pool.size[1]), dtype=np.int64)
-        for i, (slot, floats, ints, ras) in enumerate(self._pending_slots):
+        for i, (slot, (floats, ints, ras)) in enumerate(self._pending_slots.items()):
             packed[i, 0] = slot
             packed[i, 1:3] = np.asarray(floats, dtype=np.float64).view(np.int64)
             packed[i, 3:5] = ints
@@ -247,7 +252,7 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         buffers.slot_top_k.index_copy_(0, slots, device[:, 3])
         buffers.slot_generated.index_copy_(0, slots, device[:, 4])
         buffers.slot_ras.index_copy_(0, slots, device[:, 5:])
-        for slot, history in self._pending_history:
+        for slot, history in self._pending_history.items():
             buffers.slot_history[slot, : history.shape[0]].copy_(history, non_blocking=True)
         self._pending_history.clear()
         self._last_decode_key = None

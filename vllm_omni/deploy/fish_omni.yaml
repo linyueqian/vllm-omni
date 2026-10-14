@@ -27,10 +27,10 @@ connectors:
       ar_prefill_admission_min_batch: 6
       ar_prefill_admission_max_wait_ms: 100
       ar_prefill_admission_min_running: 32
-      # Stage 1 decodes first chunks in their own step instead of behind
-      # continuations.
-      generation_first_chunk_express: true
       fish_speech_dac_dtype: fp16
+      # CUDA: the codec decodes channels-last, replayed from its own CUDA
+      # graphs per (batch, frames) bucket of these windows.
+      fish_speech_dac_cuda_graphs: true
       # Each stream keeps its convolution history and window-transformer
       # keys / values between windows: a window decodes only its new frames
       # and windows splice as in decoding the whole utterance at once.

@@ -141,10 +141,12 @@ which returns the exact prompt row count.
   checkpoint's `mamba_ssm_dtype` is float32): +7% / +13% audio-s/s at 64 /
   128 streams with the same Seed-TTS-Eval WER and speaker similarity. Set
   `mamba_ssm_cache_dtype: float32` to keep the checkpoint's dtype.
-- The codec stage keeps each stream's convolution history and window
-  transformer keys / values between windows (`fish_speech_dac_stateful`), so
-  a window decodes only its new frames and windows splice as in decoding the
-  whole utterance.
+- On CUDA the codec stage decodes channels-last from its own CUDA graphs
+  (`fish_speech_dac_cuda_graphs`) and keeps each stream's convolution history
+  and window transformer keys / values between windows
+  (`fish_speech_dac_stateful`), so a window decodes only its new frames and
+  windows splice as in decoding the whole utterance. Elsewhere it uses the
+  module decoder, re-decoding each window's left context.
 
 #### Measured performance (1x H200, both stages on one GPU)
 

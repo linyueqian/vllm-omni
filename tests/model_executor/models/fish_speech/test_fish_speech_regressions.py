@@ -226,6 +226,23 @@ def test_dac_decoder_dtype_can_be_configured():
     assert decoder._dac_dtype == torch.float16
 
 
+def test_dac_codec_graphs_and_history_are_opt_in():
+    """Without codec keys (Fish Speech S2 Pro's deploys) the module decoder runs; the
+    stateful codec builds on the channels-last graphs, so it needs them."""
+    _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
+
+    def build(extra):
+        cfg = SimpleNamespace(model_config=SimpleNamespace(model="unused", stage_connector_config={"extra": extra}))
+        return FishSpeechDACDecoder(vllm_config=cfg)
+
+    default = build({})
+    assert not default._cuda_graphs and not default._stateful
+    both = build({"fish_speech_dac_cuda_graphs": True, "fish_speech_dac_stateful": True})
+    assert both._cuda_graphs and both._stateful
+    with pytest.raises(ValueError, match="fish_speech_dac_cuda_graphs"):
+        build({"fish_speech_dac_stateful": True})
+
+
 def test_structured_voice_clone_prefill_adds_full_codebooks_with_decode_scale(monkeypatch):
     slow_ar_module, _, FishSpeechSlowARForConditionalGeneration = _fish_speech_regression_modules()
     model = object.__new__(FishSpeechSlowARForConditionalGeneration)

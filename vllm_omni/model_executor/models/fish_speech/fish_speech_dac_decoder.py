@@ -33,6 +33,7 @@ from vllm_omni.model_executor.models.fish_speech.dac_utils import (
     build_dac_codec,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -82,6 +83,7 @@ class FishSpeechDACDecoder(nn.Module):
     # Set in __init__ / at codec load; defaults keep partially built decoders usable.
     _channels_last = None
     _graphs = None
+    _cuda_graphs = False
     _stateful = False
 
     # Streaming with per-request convolution history keys slots by the
@@ -124,14 +126,19 @@ class FishSpeechDACDecoder(nn.Module):
             "fish_speech_dac_max_batch",
             "dac_max_batch",
         )
-        # On CUDA the decoder runs channels-last (no NCHW<->NHWC reformatting,
-        # fast dilated convs, a fused Snake), its window transformer compiled,
-        # as CUDA graphs per (batch, frames) bucket of the streaming windows.
+        # Opt-in, CUDA only: the decoder runs channels-last (no NCHW<->NHWC
+        # reformatting, fast dilated convs, a fused Snake), its window
+        # transformer compiled, as its own CUDA graphs per (batch, frames)
+        # bucket of the streaming windows (captured during the profiling run,
+        # where the codec loads). Otherwise the module decoder runs.
         self._channels_last = None
+        self._cuda_graphs = bool(extra_cfg.get("fish_speech_dac_cuda_graphs", False))
         # Keep every request's convolution history and window-transformer
         # keys / values between windows: a window then decodes only its new
         # frames, as decoding the whole utterance would.
         self._stateful = bool(extra_cfg.get("fish_speech_dac_stateful", False))
+        if self._stateful and not self._cuda_graphs:
+            raise ValueError("fish_speech_dac_stateful needs fish_speech_dac_cuda_graphs (the channels-last decoder)")
         self._stream_slots = {}
         self._free_stream_slots = []
         # Frames each slotted request has decoded (its next window's position).
@@ -250,7 +257,10 @@ class FishSpeechDACDecoder(nn.Module):
         codec.eval()
         self._codec = codec
         self._codec_decode_takes_lengths = len(inspect.signature(codec.decode).parameters) >= 2
-        if codec.decoder is not None and str(device).startswith("cuda"):
+        if self._cuda_graphs and not current_omni_platform.is_cuda():
+            logger.warning("fish_speech_dac_cuda_graphs needs CUDA; decoding with the module decoder")
+            self._cuda_graphs = self._stateful = False
+        if codec.decoder is not None and self._cuda_graphs:
             from vllm_omni.model_executor.models.fish_speech.dac_channels_last import ChannelsLastDACDecoder
 
             self._channels_last = ChannelsLastDACDecoder(codec)

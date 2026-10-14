@@ -57,8 +57,8 @@ def make_state(monkeypatch):
         state.prompts = {}
         state.prompt_len = np.zeros(4, dtype=np.int64)
         state.base_prompt_len = np.zeros(4, dtype=np.int64)
-        state._pending_slots = []
-        state._pending_history = []
+        state._pending_slots = {}
+        state._pending_history = {}
         state._warned_top_k = False
         state._seeds = {}
         state._seed_generator = None
@@ -84,8 +84,8 @@ def test_new_request_stages_its_prompt_rows(make_state):
     state.add_request(1, _request("a"))
     assert np.array_equal(state.prompts[1], PROMPT.numpy())
     assert state.prompt_len[1] == PROMPT.shape[0]
-    slot, _, (top_k, generated), ras = state._pending_slots[-1]
-    assert (slot, top_k, generated) == (1, 30, 0)
+    _, (top_k, generated), ras = state._pending_slots[1]
+    assert (top_k, generated) == (30, 0)
     assert ras[-PROMPT.shape[0] :] == PROMPT[:, 0].tolist()
 
 
@@ -110,12 +110,33 @@ def test_preempted_request_resumes_with_its_generated_frames(make_state):
     assert state.prompt_len[2] == PROMPT.shape[0] + 3
     # Its next sampled frame is frame 3, which keys its seeded noise.
     assert state.base_prompt_len[2] == PROMPT.shape[0]
-    _, _, (_, generated), ras = state._pending_slots[-1]
+    _, (_, generated), ras = state._pending_slots[2]
     assert generated == 3
     assert ras[-3:] == main
     # The resumed slot gets its code history back, for a later preemption.
-    slot, history = state._pending_history[-1]
-    assert slot == 2 and torch.equal(history, codes)
+    assert list(state._pending_history) == [2] and torch.equal(state._pending_history[2], codes)
+
+
+def test_slot_reused_before_a_step_keeps_only_the_newest_request(make_state):
+    """A request added and finished before any step (e.g. aborted at once) leaves
+    nothing for the next request in its slot: one slot write, that request's own
+    values, no code history, and the finished request's seed is gone."""
+    state = make_state()
+    state.add_request(1, _request("a"))
+    state.buffers.slot_history[1, :2] = 1
+    state.buffers.slot_generated[1] = 2
+    state.on_request_preempted("a", 1)
+    state.add_request(0, _request("a", generated=[105, 106], seed=7))
+    assert 0 in state._pending_history and "a" in state._seeds
+    state.on_requests_finished({"a"})
+
+    later = _request("b")
+    later.sampling_params = SimpleNamespace(temperature=0.5, top_k=8, top_p=0.7, seed=None)
+    state.add_request(0, later)
+    (temperature, top_p), (top_k, generated), _ = state._pending_slots[0]
+    assert (temperature, top_p, top_k, generated) == (0.5, 0.7, 8, 0)
+    assert 0 not in state._pending_history
+    assert "a" not in state._seeds and "a" not in state._suspended
 
 
 def test_resume_without_kept_codes_fails_loudly(make_state):

@@ -176,7 +176,7 @@ In sequential mode, each stage must wait for the previous stage to complete enti
      - **Chunk ID and key construction**: Builds keys like `{req_id}_{stage_id}_{chunk_id}` for put/get
      - **Async get**: `load_async(request)` enqueues the request; background **recv_loop** polls the connector (non-blocking); when data is available, updates the request and marks it in `_finished_load_reqs`; scheduler calls `get_finished_requests()` to learn which requests have chunks ready
      - **Async put**: `save_async(pooling_output, request)` admits the request and enqueues a save task; background **save_loop** runs `custom_process_next_stage_input_func` to build the payload (chunk accumulation, e.g. code2wav chunk_size, lives in the processor's per-request state) and performs `connector.put()`
-     - **Batched put**: when the processor module also defines `<func>_batch(transfer_manager, pooling_outputs, requests, is_finished) -> list[payload | None]` and the stage needs no per-step token updates, `OmniARScheduler` hands a whole step's saves to `save_async_batch`: one queued task and one processor call per step, with payloads in request order. Requests are not snapshotted for it (the batch form reads only request ids and the finish flags); while it runs, every live request is marked in flight as around the single processor, so a cancel's sender cleanup defers to the save loop
+     - **Batched put**: when the processor module also defines `<func>_batch(transfer_manager, pooling_outputs, requests, is_finished) -> list[payload | None]`, the batch form opts in with `per_step_batch = True`, and the stage needs no per-step token updates, `OmniARScheduler` hands a whole step's saves to `save_async_batch`: one queued task and one processor call per step, with payloads in request order. Requests are not snapshotted for it, so an opted-in batch form reads nothing of a request but its ids and takes finishing from the flags it is given; while it runs, every live request is marked in flight as around the single processor, so a cancel's sender cleanup defers to the save loop
 
 3. **Stage Input Processors**: Custom functions that process stage outputs into chunks for different models
    - Receive **transfer_manager** (OmniChunkTransferAdapter)
@@ -276,7 +276,7 @@ stages:
 
 ### Scheduling Under Load
 
-Connector `extra` keys tune when chunked stages run work:
+Connector `extra` keys tune when a chunked AR stage admits new requests:
 
 ```yaml
 connectors:
@@ -288,12 +288,9 @@ connectors:
       ar_prefill_admission_min_batch: 6
       ar_prefill_admission_max_wait_ms: 100
       ar_prefill_admission_min_running: 32
-      # Generation stage: first chunks decode in their own step.
-      generation_first_chunk_express: true
 ```
 
 - `ar_prefill_admission_min_batch` / `ar_prefill_admission_max_wait_ms` / `ar_prefill_admission_min_running`: arrivals share one prefill / mixed step instead of each turning a decode step into one. Off unless `ar_prefill_admission_min_batch` > 1, which requires a positive `ar_prefill_admission_max_wait_ms`; below `ar_prefill_admission_min_running` running requests, arrivals are admitted at once. The wait counts against time to first audio, so keep it well under the first chunk's latency (Fish Audio Drama 3 at 128 streams: RTF 0.578 -> 0.513 with the values above).
-- `generation_first_chunk_express`: a generation stage decodes waiting first chunks in a step of their own, ahead of ready continuations (never two such steps in a row), for any async chunk transport.
 
 ### Code2Wav Batch Configuration
 

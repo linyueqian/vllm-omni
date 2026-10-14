@@ -418,13 +418,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         already_finished_reqs: set[Request] = set()
         # An express step isolates first chunks from ready continuations.
         # Two express steps never run back to back; the optional slack guard
-        # requires playback headroom before delaying a continuation. Any async
-        # chunk transport qualifies: a stateless codec stage (one stream =
-        # one request whose prompt grows by chunks) gains the same.
+        # requires playback headroom before delaying a continuation.
         first_chunk_express = getattr(self, "_first_chunk_express", False)
         express = (
             first_chunk_express
-            and async_chunk_transport
+            and native_chunks
             and not self._last_step_express
             and any(
                 r.request_id not in self._chunk_started

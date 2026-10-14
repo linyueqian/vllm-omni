@@ -574,6 +574,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         flat_tts_config: bool = False,
         active_stream_window: int = 0,
         connector_extra: dict | None = None,
+        custom_process_next_stage_input_func: str | None = None,
     ):
         connector = mocker.MagicMock()
         connector.stage_id = stage_id
@@ -623,6 +624,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             hf_config=hf_config,
             hf_config_name="tts_config" if stage_id == 1 else None,
             active_stream_window=active_stream_window,
+            custom_process_next_stage_input_func=custom_process_next_stage_input_func,
             stage_connector_config={
                 "name": "SharedMemoryConnector",
                 "extra": connector_extra or {},
@@ -1190,6 +1192,26 @@ def test_generation_window_ending_the_audio_is_not_decoded_again(build_adapter, 
     assert request.prompt_token_ids == []
     assert not _has_async_chunk_payload_to_run(request)
     assert request.additional_information["codes"]["audio"].shape == (NUM_CODEBOOKS, 0)
+
+
+_PROCESSORS = "vllm_omni.model_executor.stage_input_processors"
+
+
+@pytest.mark.parametrize(
+    "processor, batch_form",
+    [
+        (f"{_PROCESSORS}.fish_omni.fish_omni_to_dac_decoder_async_chunk", "fish_omni_to_dac_decoder_async_chunk_batch"),
+        # These modules' batch forms serve the MRv2 native output worker; their
+        # scalar builders read the live request, so per-step saves leave them alone.
+        (f"{_PROCESSORS}.qwen3_tts.talker2code2wav_async_chunk", None),
+        (f"{_PROCESSORS}.higgs_audio_v3.talker2code2wav_async_chunk", None),
+        (f"{_PROCESSORS}.moss_tts.talker2codec_raw_async_chunk", None),
+    ],
+)
+def test_per_step_saves_take_only_opted_in_batch_forms(build_adapter, processor, batch_form):
+    adapter, _ = build_adapter(stage_id=0, custom_process_next_stage_input_func=processor)
+    batch = adapter.custom_process_next_stage_input_batch_func
+    assert (batch.__name__ if batch is not None else None) == batch_form
 
 
 def test_save_async(build_adapter):

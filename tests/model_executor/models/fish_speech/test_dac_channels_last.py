@@ -85,6 +85,31 @@ def test_dac_decode_graphs_match_eager_with_padding():
 
 
 @cuda
+def test_rows_with_fewer_frames_share_a_bucket_graph():
+    """Windows of 13, 16 and 9 frames replay one 16-frame graph, padded at the end: each
+    row's real frames decode as that window alone (causal convs and attention)."""
+    from vllm_omni.model_executor.models.fish_speech.dac_channels_last import ChannelsLastDACDecoder, DACDecodeGraphs
+
+    decoder = ChannelsLastDACDecoder(_codec(torch.float16))
+    _full_transformer(decoder)
+    graphs = DACDecodeGraphs(decoder, 10, [16], max_padded_frames=64, max_batch=4)
+    graphs.capture(torch.device("cuda"))
+    torch.manual_seed(3)
+    lengths = (13, 16, 9)
+    windows = [_codes(1, n) for n in lengths]
+    batch = torch.zeros((len(lengths), 10, 16), dtype=torch.long, device="cuda")
+    for row, codes in enumerate(windows):
+        batch[row, :, : codes.shape[-1]] = codes[0]
+    with torch.inference_mode():
+        expected = [decoder(codes)[0, 0].float() for codes in windows]
+    audio = graphs(batch)
+    assert audio.shape[-1] == 16 * decoder.hop_length
+    for row, (frames, ref) in enumerate(zip(lengths, expected, strict=True)):
+        got = audio[row, 0, : frames * decoder.hop_length]
+        assert _snr(got, ref) > 50, (frames, _snr(got, ref))
+
+
+@cuda
 def test_conv_context_trim_keeps_new_frames_exact():
     from vllm_omni.model_executor.models.fish_speech.dac_channels_last import (
         ChannelsLastDACDecoder,

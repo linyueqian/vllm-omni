@@ -59,6 +59,20 @@ def test_top_p_uses_full_vocabulary_mass():
     assert torch.allclose(_frequencies(draws, 64)[:4], expected, atol=0.03)
 
 
+def test_greedy_rows_in_a_mixed_batch_take_the_argmax():
+    """A greedy request (temperature 0, or vLLM's -1) takes the argmax whatever shares its
+    batch; sampled rows next to it still spread over the near-tied tokens."""
+    sampler, noise = _sampler()
+    logits = torch.full((ROWS, 64), -30.0, device="cuda")
+    logits[:, :3] = torch.tensor([0.5, 1.0, 0.5], device="cuda")
+    temperature = _rows(1.0)
+    temperature[0::4] = 0.0
+    temperature[2::4] = -1.0
+    draws = sampler.code(logits, temperature, _rows(1 << 20, torch.long), _rows(1.0), noise, 0)
+    assert (draws[0::2] == 1).all()
+    assert set(draws[1::2].tolist()) == {0, 1, 2}
+
+
 def test_top_p_keeps_the_most_likely_token():
     sampler, noise = _sampler()
     logits = torch.zeros((ROWS, 64), device="cuda")

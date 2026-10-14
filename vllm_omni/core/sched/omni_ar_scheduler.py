@@ -578,8 +578,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
-        # One processor call per step when the next-stage processor has a batch
-        # form (it only needs per-request finish flags, not step tokens).
+        # One processor call per step when the next-stage processor has an
+        # opted-in batch form (``per_step_batch``; it needs per-request finish
+        # flags, not step tokens).
         batch_saves: list[dict[str, Any]] | None = (
             []
             if inspect.isfunction(

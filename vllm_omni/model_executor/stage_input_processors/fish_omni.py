@@ -188,4 +188,8 @@ def _advance(
     )
 
 
+# Per-step saves (OmniChunkTransferAdapter.save_async_batch) skip the request
+# snapshot: this batch form reads only request ids and the finish flags given.
+fish_omni_to_dac_decoder_async_chunk_batch.per_step_batch = True  # type: ignore[attr-defined]
+
 __all__ = ["fish_omni_to_dac_decoder_async_chunk", "fish_omni_to_dac_decoder_async_chunk_batch"]

@@ -182,13 +182,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
         # Optional ``<func>_batch(transfer_manager, multimodal_outputs, requests,
         # is_finished)``: one call per scheduler step, one payload (or None)
-        # per request, in order. See ``save_async_batch``.
+        # per request, in order. See ``save_async_batch``. Opt-in: the batch
+        # form must set ``per_step_batch = True``, since per-step saves skip
+        # the request snapshot (other ``_batch`` forms serve other callers).
         self.custom_process_next_stage_input_batch_func: Callable[..., list[OmniPayloadStruct | None]] | None = None
         if custom_process_next_stage_input_func:
             module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
             module = importlib.import_module(module_path)
             self.custom_process_next_stage_input_func = getattr(module, func_name)
-            self.custom_process_next_stage_input_batch_func = getattr(module, f"{func_name}_batch", None)
+            batch_func = getattr(module, f"{func_name}_batch", None)
+            if getattr(batch_func, "per_step_batch", False) is True:
+                self.custom_process_next_stage_input_batch_func = batch_func
         self._processor_accepts_step_tokens: dict[Callable[..., Any], bool] = {}
         # mapping for request id and chunk id
         self.put_req_chunk: dict[str, int] = defaultdict(int)
@@ -442,10 +446,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         Each entry holds ``save_async``'s keyword arguments. Admission (stale
         generations, preemption, sender fences) is per request as in
-        ``save_async``, but requests are not snapshotted -- the batch
-        processor reads only their ids and the finish flags -- and the step is
-        one queued task: the save loop runs the processor once over it and
-        puts only the payloads it returns.
+        ``save_async``, but requests are not snapshotted, and the step is one
+        queued task: the save loop runs the processor once over it and puts
+        only the payloads it returns. Only a batch form that sets
+        ``per_step_batch = True`` gets here; by doing so it reads nothing of a
+        request but its ids, and takes finishing from the flags it is given.
         """
         tasks = [task for task in (self._admit_save(**entry, snapshot=False) for entry in entries) if task is not None]
         if tasks:
@@ -833,7 +838,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         )
                     )
                 except Exception as e:
-                    logger.error(f"Failed to use the batch next-stage input processor for payload extraction: {e}")
+                    # The batch form may have advanced some requests' state
+                    # already, so the scalar form is not re-run: these
+                    # requests lose this step's chunk.
+                    logger.error(
+                        "Batch next-stage input processor failed; requests %s lose this step's chunk: %s",
+                        [t["request"].external_req_id for t in live],
+                        e,
+                    )
         finally:
             with self._sender_state_lock:
                 for external_req_id, token in marked:
