@@ -92,9 +92,28 @@ def test_recompute_without_tower_history_fails_loudly() -> None:
 
 
 @torch.inference_mode()
-def test_finished_request_releases_its_slot() -> None:
+def test_request_finished_before_first_decode_releases_its_slot() -> None:
+    """Prefill, then finish with no decode step (max_tokens=1, immediate end of
+    speech, or a cancel): the public hooks alone must free the slot and drop the
+    queued prompt rows."""
     model = _model()
-    state = model._prefill_tower(torch.randn(PROMPT_ROWS, DIM), _prompt_frames())
-    model._request_states["req-1"] = state
-    model.on_requests_finished({"req-1"})
+    frames = _prompt_frames()
+    update = model.postprocess(torch.randn(PROMPT_ROWS, DIM), request_id="r", drama3_prompt={"frames": frames})
+    state = update["drama3_tower"]
+    assert model.tower.cache.owns(state.slot, state)
+    assert state.pending is not None
+    model.on_requests_finished({"r"})
+    assert not model.tower.cache.owns(state.slot, state)
+    assert state.pending is None
+    assert "r" not in model._request_states
+
+
+@torch.inference_mode()
+def test_finished_request_after_decode_releases_its_slot() -> None:
+    model = _model()
+    hidden = torch.randn(PROMPT_ROWS + 1, DIM)
+    update = model.postprocess(hidden[:PROMPT_ROWS], request_id="r", drama3_prompt={"frames": _prompt_frames()})
+    state = update["drama3_tower"]
+    model._tower_step([state], torch.tensor([SEMANTIC_BEGIN + 3]), hidden[PROMPT_ROWS - 1 : PROMPT_ROWS])
+    model.on_requests_finished({"r"})
     assert not model.tower.cache.owns(state.slot, state)

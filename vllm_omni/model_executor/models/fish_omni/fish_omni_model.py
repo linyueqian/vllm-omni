@@ -333,7 +333,13 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
         prompt = info.get("drama3_prompt")
         state = info.get("drama3_tower")
         if hidden_states.shape[0] > 1 and isinstance(prompt, dict) and not isinstance(state, TowerState):
-            update["drama3_tower"] = self._prefill_tower(hidden_states, prompt["frames"])
+            state = self._prefill_tower(hidden_states, prompt["frames"])
+            # Register at allocation, so a request that ends before its first decode
+            # (max_tokens=1, an immediate end-of-speech, a cancel) still frees its slot.
+            request_id = info.get("request_id")
+            if isinstance(request_id, str):
+                self._request_states[request_id] = state
+            update["drama3_tower"] = state
             update["drama3_prompt"] = None
         return update
 
@@ -451,10 +457,11 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
         return self.tower.audio_decoder.codebook_embeddings.weight.dtype
 
     def on_requests_finished(self, finished_req_ids: Iterable[str]) -> None:
-        """Return finished requests' tower cache slots."""
+        """Return finished requests' tower cache slots and drop queued prompt rows."""
         for req_id in finished_req_ids:
             state = self._request_states.pop(req_id, None)
             if state is not None:
+                state.pending = None
                 self.tower.cache.release(state.slot, state)
 
     # -------------------- main-token sampling --------------------
