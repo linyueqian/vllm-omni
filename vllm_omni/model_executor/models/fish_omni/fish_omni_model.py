@@ -29,7 +29,11 @@ from vllm.model_executor.models.qwen3_5 import Qwen3_5MoeForCausalLM
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 
-from vllm_omni.model_executor.models.fish_speech.dac_encoder import _load_dac_codec, encode_reference_audio_codes
+from vllm_omni.model_executor.models.fish_speech.dac_encoder import (
+    _load_dac_codec,
+    encode_reference_audio_codes,
+    reference_audio_samples,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
@@ -231,7 +235,8 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
         if isinstance(codes, torch.Tensor):
             frames.append(int(codes.shape[0]))
         elif wav is not None:
-            samples = len(wav) * _CODEC_SAMPLE_RATE / int(_first(info.get("ref_audio_sr")))
+            rate = int(_first(info.get("ref_audio_sr")))
+            samples = reference_audio_samples(np.shape(wav)) * _CODEC_SAMPLE_RATE / rate
             frames.append(math.ceil(math.ceil(samples) / _CODEC_HOP))
         if frames:
             transcripts.append(str(_first(info.get("ref_text")) or ""))
