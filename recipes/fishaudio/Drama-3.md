@@ -123,23 +123,27 @@ which returns the exact prompt row count.
 
 #### Measured performance (1x H100 80GB, both stages on one GPU)
 
-Streaming `/v1/audio/speech` (SSE, pcm), one voice-clone reference, the
-sampling above, warm server, warmup at each concurrency excluded.
+Default `vllm_omni/deploy/fish_omni.yaml` at revision 13389ee7 of this PR
+(vLLM 0.31.0), fresh environment and model download. Streaming
+`/v1/audio/speech` (SSE, pcm), one voice-clone reference, the sampling above,
+warm server, warmup at each concurrency excluded.
 
-| Concurrency | TTFA p50 | TTFA p95 | RTF (mean) | Frames/s |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | 292 ms | 310 ms | 0.73 | 30 |
-| 4 | 450 ms | 593 ms | 0.86 | 92 |
-| 8 | 620 ms | 787 ms | 0.97 | 116 |
+| Concurrency | TTFA p50 | TTFA p95 | RTF (mean) |
+| ---: | ---: | ---: | ---: |
+| 1 | 126 ms | 141 ms | 0.28 |
+| 4 | 246 ms | 300 ms | 0.40 |
+| 8 | 360 ms | 518 ms | 0.51 |
 
 #### Known limitations
 
-- The codebook tower runs eagerly in PyTorch with a dense per-request KV
-  history and no CUDA graphs; it is the main decode cost. RTF approaches 1.0
-  at concurrency 8.
-- Some prompts with inline event tags (for example `[hesitates]`, `[sighs]`)
-  can stop speaking after the event and emit silence until `max_tokens`; the
-  reference implementation shows the same behaviour at a similar rate.
+- The codebook tower decode step replays CUDA graphs (one per batch-size
+  bucket; eager with `enforce_eager`); its teacher-forced prompt pass runs
+  eagerly, batched across requests that start in the same step. With the
+  codec on the same GPU, codec calls share the GPU with decode steps at
+  higher concurrency.
+- Some takes stop speaking after the first word or event and emit silence
+  until `max_tokens`. This is model behaviour; it is more frequent for lines
+  that start with a filler word or a tag, and with pause-heavy references.
 - `previous_takes` (editing as continuation) and long-text chunking are not
   exposed by the speech API yet. Per-request seeds do not apply to the
   codebook heads.
