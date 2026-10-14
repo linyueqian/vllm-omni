@@ -33,7 +33,15 @@ from vllm_omni.model_executor.models.fish_speech.dac_encoder import _load_dac_co
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
-from .codebook_tower import CodebookTower, TowerBatch, TowerDecodeGraphs, TowerState, sample_rows, to_device
+from .codebook_tower import (
+    CodebookTower,
+    TowerBatch,
+    TowerDecodeGraphs,
+    TowerState,
+    paged_flash_attention,
+    sample_rows,
+    to_device,
+)
 from .configuration_fish_omni import FishOmniConfig
 from .prompt import Reference, build_prompt_frames, prompt_length
 
@@ -93,9 +101,10 @@ class FishOmniForConditionalGeneration(Qwen3_5MoeForCausalLM):
         # The tower loop has data-dependent lengths and Python control flow.
         self.talker_mtp_graph_safe = False
         # The tower step keeps its own CUDA graphs (captured on first decode).
+        # The plain-attention fallback reads lengths on the host, so it cannot be captured.
         self._tower_graphs = (
             None
-            if vllm_config.model_config.enforce_eager
+            if vllm_config.model_config.enforce_eager or paged_flash_attention() is None
             else TowerDecodeGraphs(
                 self.tower,
                 tuple(sorted({b for b in (1, 2, 4, 8, 16, 32, 64) if b < max_seqs} | {max_seqs})),
