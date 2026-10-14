@@ -12,17 +12,32 @@ Module names follow the checkpoint (``audio_decoder*``) so weights load by name.
 
 from __future__ import annotations
 
+import functools
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.cuda import CUDAGraph
 from vllm.platforms import current_platform
-from vllm.vllm_flash_attn import flash_attn_varlen_func, is_fa_version_supported
 
 from .configuration_fish_omni import FishOmniAudioDecoderConfig
+
+
+@functools.cache
+def paged_flash_attention() -> tuple[Callable[..., Any], int] | None:
+    """vLLM's paged varlen flash attention and the version to use, or None when
+    this build has no flash-attention extension (for example on ROCm)."""
+    try:
+        from vllm.vllm_flash_attn import flash_attn_varlen_func, is_fa_version_supported
+    except ImportError:
+        return None
+    # FA3 has native Hopper kernels; the FA2 build needs a slow driver JIT there.
+    version = 3 if current_platform.is_device_capability(90) and is_fa_version_supported(3) else 2
+    return flash_attn_varlen_func, version
 
 
 class GemmaRMSNorm(nn.Module):
@@ -216,8 +231,6 @@ class TowerAttention(nn.Module):
         self.wo = nn.Linear(q_width, config.dim, bias=False)
         self.q_norm = GemmaRMSNorm(self.head_dim, config.norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, config.norm_eps)
-        # FA3 has native Hopper kernels; the FA2 build needs a slow driver JIT there.
-        self.fa_version = 3 if current_platform.is_device_capability(90) and is_fa_version_supported(3) else 2
 
     def forward(
         self,
@@ -239,7 +252,9 @@ class TowerAttention(nn.Module):
         value = value.reshape(rows, self.n_kv, self.head_dim)
         key_cache[batch.slots, batch.positions] = key.to(key_cache.dtype)
         value_cache[batch.slots, batch.positions] = value.to(value_cache.dtype)
-        if key_cache.is_cuda:
+        flash = paged_flash_attention() if key_cache.is_cuda else None
+        if flash is not None:
+            flash_attn_varlen_func, fa_version = flash
             attended = flash_attn_varlen_func(
                 q=query.contiguous(),
                 k=key_cache,
@@ -251,7 +266,7 @@ class TowerAttention(nn.Module):
                 block_table=batch.block_table,
                 softmax_scale=self.head_dim**-0.5,
                 causal=True,
-                fa_version=self.fa_version,
+                fa_version=fa_version,
             )
         else:
             attended = self._attend_reference(query, batch, key_cache, value_cache)
@@ -261,7 +276,7 @@ class TowerAttention(nn.Module):
     def _attend_reference(
         query: torch.Tensor, batch: TowerBatch, key_cache: torch.Tensor, value_cache: torch.Tensor
     ) -> torch.Tensor:
-        """Plain PyTorch causal attention over each group's history (non-CUDA devices)."""
+        """Plain PyTorch causal attention over each group's history (no flash attention)."""
         outputs = []
         bounds = batch.cu_seqlens_q.tolist()
         for group, (start, stop) in enumerate(zip(bounds[:-1], bounds[1:])):
