@@ -115,15 +115,15 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
         if not defaults:
             return defaults
         configured = list(defaults)
-        # The Code2Wav request lives for the whole session. CUMULATIVE output
-        # makes the output processor re-concatenate every earlier waveform on
-        # each frame, so per-frame cost grows with session length.
-        for index in range(1, len(configured)):
-            params = configured[index]
-            if isinstance(params, SamplingParams):
-                params = params.clone()
-                params.output_kind = RequestOutputKind.DELTA
-                configured[index] = params
+        # The final (Code2Wav) request lives for the whole session. CUMULATIVE
+        # output makes the output processor re-concatenate every earlier
+        # waveform on each frame, so per-frame cost grows with session length.
+        # PersonaPlexDataPlaneSession.audio_output_is_delta relies on this.
+        final = configured[-1]
+        if len(configured) > 1 and isinstance(final, SamplingParams):
+            final = final.clone()
+            final.output_kind = RequestOutputKind.DELTA
+            configured[-1] = final
         stage0 = defaults[0]
         if isinstance(stage0, SamplingParams):
             # Greedy, one temporal token per frame: the native stepper takes

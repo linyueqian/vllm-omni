@@ -332,6 +332,18 @@ def test_sampling_params_are_greedy_on_stage0_and_delta_on_code2wav() -> None:
     assert _plugin().configure_sampling_params(runtime_config={}, defaults=()) == ()
 
 
+def test_only_the_final_stage_switches_to_delta_output() -> None:
+    defaults = (SamplingParams(), SamplingParams(), SamplingParams())
+
+    configured = _plugin().configure_sampling_params(runtime_config={}, defaults=defaults)
+
+    assert [params.output_kind for params in configured] == [
+        RequestOutputKind.CUMULATIVE,
+        RequestOutputKind.CUMULATIVE,
+        RequestOutputKind.DELTA,
+    ]
+
+
 def test_plan_append_reserves_one_slot_plus_prefill_on_the_first_seq() -> None:
     plugin = _plugin()
     fence = DuplexFence("session", epoch=3, turn_id=1)

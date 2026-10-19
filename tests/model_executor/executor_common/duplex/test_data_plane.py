@@ -87,6 +87,25 @@ def test_delta_audio_passes_through_unsliced() -> None:
     assert [item["text"] for item in projected] == ["he", "llo", ""]
 
 
+@pytest.mark.parametrize("as_tensor", [False, True])
+def test_delta_audio_chunks_that_arrive_together_are_joined(as_tensor: bool) -> None:
+    import torch
+
+    plane = _DeltaDataPlane(_encode_audio)
+    plane.begin_request("req")
+    context = DuplexDataPlaneContext(response_format="wav", modalities=("audio", "text"))
+    chunks = [np.arange(4, dtype=np.float32), np.arange(3, dtype=np.float32)]
+    if as_tensor:
+        chunks = [torch.from_numpy(chunk) for chunk in chunks]
+    output = _output("req", text="", samples=0)
+    output.multimodal_output["model_outputs"] = chunks
+
+    projected = list(plane.project({"data_plane_outputs": [output]}, context=context))
+
+    # Ragged chunks from several steps reach the encoder as one flat waveform.
+    assert [item["audio_data"] for item in projected] == ["audio-7"]
+
+
 def test_subclass_constants_and_default_sample_rate_reach_the_projection() -> None:
     plane = _TestDataPlane(_encode_audio)
     output = SimpleNamespace(
