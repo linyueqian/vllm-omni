@@ -47,6 +47,9 @@ class CumulativeAudioTextDataPlane(DuplexDataPlane):
     runner_kv_backed: bool = True
     owned_runtime: bool = False
     default_sample_rate_hz: int = 24000
+    # True when the final stage runs with ``RequestOutputKind.DELTA``: each
+    # output then carries only its new samples, so they pass through unsliced.
+    audio_output_is_delta: bool = False
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         self._encode_audio = encode_audio
@@ -99,10 +102,13 @@ class CumulativeAudioTextDataPlane(DuplexDataPlane):
         state = self._requests.setdefault(request_id, _RequestCursor()) if request_id is not None else _RequestCursor()
         multimodal = multimodal_output(output, completion)
         audio = audio_value(multimodal)
-        audio_delta = slice_audio_delta(audio, state.audio_samples)
-        total_samples = audio_sample_count(audio)
-        if total_samples is not None:
-            state.audio_samples = total_samples
+        if self.audio_output_is_delta:
+            audio_delta = audio if audio_sample_count(audio) else None
+        else:
+            audio_delta = slice_audio_delta(audio, state.audio_samples)
+            total_samples = audio_sample_count(audio)
+            if total_samples is not None:
+                state.audio_samples = total_samples
 
         text = text_value(multimodal, completion)
         delta_text = text_delta(text, state.text)
