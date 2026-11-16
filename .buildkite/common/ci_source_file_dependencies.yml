@@ -326,6 +326,11 @@ x-personaplex: &personaplex
   - vllm_omni/model_executor/stage_input_processors/personaplex.py
   - vllm_omni/deploy/personaplex.yaml
 
+x-haru: &haru
+  - vllm_omni/model_executor/models/haru/
+  - vllm_omni/transformers_utils/configs/haru.py
+  - vllm_omni/deploy/haru.yaml
+
 x-joy-image: &joy_image
   - vllm_omni/diffusion/models/joy_image/
 
@@ -869,6 +874,26 @@ source_file_dependencies:
     - tests/entrypoints/openai_api/test_duplex_api_server.py
     - tests/model_executor/models/minicpmo_4_5/duplex/
     - tests/protocol/
+
+  # Haru runs on the V1 AR runner, which calls its preprocess_batch,
+  # post_sample_multimodal_outputs and on_requests_finished hooks.
+  omni_haru_duplex_function:
+    - *haru
+    - *duplex
+    - *gpu_v1_workers
+    - vllm_omni/worker/gpu_model_runner.py
+    - vllm_omni/core/sched/
+    - vllm_omni/model_executor/common/duplex/
+    - vllm_omni/model_executor/common/request_outputs.py
+    - vllm_omni/model_executor/duplex_sampling.py
+    - vllm_omni/engine/orchestrator.py
+    - vllm_omni/engine/stage_engine_core_proc.py
+    - vllm_omni/config/stage_config.py
+    - tests/e2e/online_serving/test_haru_duplex.py
+    - tests/assets/minicpmo_4_5/
+    - tests/helpers/mark.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
 
   # Runner-specific paths supplement the shared duplex dependencies in CUDA
   # ready without widening the V1 jobs that consume the shared key.
